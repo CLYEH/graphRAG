@@ -27,10 +27,38 @@ loop back to step 3.
    git push -u origin task/<id>
    gh pr create --fill --base main
    ```
-7. **Wait for GitHub gates** on the PR — **both** must go green:
-   - CI pipeline (`.github/workflows/ci.yml`)
-   - the bound **Codex** review approves
-   **Either fails → back to step 3** (fix on the same branch, push, checks re-run).
+7. **Wait for GitHub gates** on the PR — all must be satisfied:
+   - **CI** green — required checks `backend` / `frontend` / `integration` (GitHub-enforced).
+   - **Codex review** — after a PR opens, judge `chatgpt-codex-connector[bot]` by its
+     **reaction** plus its **unresolved review threads**. Do **not** use a raw comment
+     `length` as the verdict: the list endpoints keep returning historical comments after
+     they're resolved, so a count would latch "changes-wanted" forever. Only these states,
+     and the two pending ones are **not** failures:
+
+     | state | signal | loop action |
+     |---|---|---|
+     | reviewing | 👀 `eyes` reaction, no unresolved threads | **wait** (pending — not a failure) |
+     | not seen yet | no reaction, no Codex comment/thread | comment `@codex review`, then **wait** |
+     | approved | 👍 `+1` reaction | **PASS** |
+     | changes wanted | ≥1 **unresolved** Codex review thread (or a top-level change-request comment) | **back to step 3** |
+
+     ```bash
+     # reaction verdict: +1 = approved, eyes = still reviewing
+     gh api repos/CLYEH/graphRAG/issues/<pr>/reactions \
+       --jq '[.[]|select(.user.login=="chatgpt-codex-connector[bot]")|.content]'
+     # changes-wanted = UNRESOLVED Codex review threads (ignores resolved/historical ones)
+     gh api graphql -f query='{repository(owner:"CLYEH",name:"graphRAG"){pullRequest(number:<pr>){
+       reviewThreads(first:50){nodes{isResolved comments(first:1){nodes{author{login}}}}}}}}' \
+       --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+              |select(.isResolved==false and .comments.nodes[0].author.login=="chatgpt-codex-connector")]|length'
+     ```
+   - **Conversations resolved** — GitHub blocks merge (`required_conversation_resolution`)
+     until every Codex thread is addressed and resolved (PR UI, or
+     `gh api graphql` → `resolveReviewThread`).
+   **Only unresolved threads / a fresh change-request → back to step 3** (fix, push, resolve
+   threads, let Codex re-review). `eyes` and "not seen yet" are pending — wait/poke, never a
+   failure. (CI is GitHub-hard; Codex's *verdict wait* is loop-enforced; Codex's *unresolved
+   comments* are GitHub-hard.)
 8. **Merge & advance** — merge the PR, delete the branch, `git switch main && git pull`,
    check off the item in `TASKS.md`, return to step 1.
 

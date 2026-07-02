@@ -9,7 +9,10 @@ A task is done only when it passes **four gates** and its PR merges (full flow i
 1. **Local gates green** — `uv run poe check-all` (backend fmt/lint/type/test + frontend). `check-full` if it touches stores.
 2. **Local agent review** — the `code-reviewer` subagent returns `VERDICT: PASS`.
 3. **CI green** on the PR (`.github/workflows/ci.yml`).
-4. **Bound Codex review** approves on the PR.
+4. **Codex review** — `chatgpt-codex-connector[bot]` reacts 👍 (`+1`) with no open suggestions.
+   👀 = still reviewing (wait); no reaction & no comment = poke it with `@codex review`; a new
+   Codex comment = changes wanted → back to step 3. Unresolved Codex threads block merge
+   (GitHub `required_conversation_resolution`); resolve them before merging.
 A failure at gate 2, 3, or 4 sends you back to implementation. Never loosen
 `ruff`/`mypy`/`tsconfig`/test configs to pass — fix the code. Push is per-task to a
 `task/<id>` branch → PR; never commit straight to `main`.
