@@ -1,5 +1,7 @@
 # graphRAG
 
+[![CI](https://github.com/CLYEH/graphRAG/actions/workflows/ci.yml/badge.svg)](https://github.com/CLYEH/graphRAG/actions/workflows/ci.yml)
+
 Multi-project **hybrid RAG platform** — clean raw data into a knowledge graph and
 expose it to agents over **MCP**, with a Web Console for humans to import, clean,
 inspect, review, and query. Each project (A/B/C…) has its own data and its own MCP
