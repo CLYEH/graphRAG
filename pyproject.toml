@@ -30,6 +30,9 @@ dev = [
     "pre-commit>=3.8",
     "jsonschema>=4.20",
     "types-jsonschema>=4.20",
+    "pyyaml>=6.0",
+    "types-pyyaml>=6.0",
+    "openapi-spec-validator>=0.7.1",
 ]
 
 # ---- tooling -------------------------------------------------------------

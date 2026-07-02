@@ -1,0 +1,2093 @@
+# graphRAG Console API — frozen contract (Track 0 P0, DESIGN §15/§27.2, DR-002).
+# Evolution is additive-only; a breaking change bumps info.version and adds a DESIGN §26 entry.
+openapi: 3.1.0
+info:
+  title: graphRAG Console API
+  version: "1.0"
+  description: |
+    Frozen OpenAPI contract for the graphRAG Console backend (DESIGN §15, DR-002).
+    `core`/`api`/`web` all build against this document; the FastAPI app (BA0) must
+    generate a spec that matches it.
+
+    ## Conventions (frozen)
+    - **Success envelope** — every JSON success body is
+      `{ "data": <payload>, "meta": { "request_id", "build_id", "elapsed_ms" } }`.
+    - **Error envelope** — every error body is
+      `{ "error": { "code": <ErrorCode>, "message", "details", "request_id" } }`.
+      Status mapping: 400 `VALIDATION_ERROR`/`QUERY_UNSAFE` · 404 `*_NOT_FOUND` ·
+      409 `IDEMPOTENCY_CONFLICT`/`JOB_CONFLICT`/`BUILD_NOT_READY`/`NO_ACTIVE_BUILD` ·
+      429 `RATE_LIMITED` · 503 `STORE_UNAVAILABLE` · 504 `QUERY_TIMEOUT` · 500 `INTERNAL`.
+    - **Pagination** — list endpoints take `?limit=&cursor=` (opaque cursor) and return
+      `meta.next_cursor` (`null` on the last page).
+    - **Sorting / filtering** — `?sort=field:asc|desc` and `?filter[field]=value`.
+    - **Long operations** — return `202` with `{data: {job_id, status}}`; progress via
+      `GET /jobs/{job_id}/events` (SSE, events `job.update|job.done|job.failed`).
+    - **Idempotency** — every POST outside `/query/*` accepts an `Idempotency-Key`
+      header. Same key + same request hash → the stored original response is replayed;
+      same key + different request hash → `409 IDEMPOTENCY_CONFLICT`. Keys expire after
+      a TTL (default 24h, tunable). Query endpoints are read-only RPC and take no key.
+    - **Build scoping** — reads are served from the single active build (DR-001/DR-006);
+      `meta.build_id` reports which build served the request (`null` if none involved).
+    - **Auth placeholder** — all endpoints require the `bearerAuth` scheme (DESIGN §23);
+      the local single-principal deployment may accept any token.
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+tags:
+  - name: projects
+  - name: sources
+  - name: builds
+  - name: jobs
+  - name: inspect
+  - name: review
+  - name: query
+  - name: health
+
+paths:
+  /projects:
+    get:
+      operationId: listProjects
+      tags: [projects]
+      summary: List projects
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Filter"
+      responses:
+        "200":
+          description: Projects page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      operationId: createProject
+      tags: [projects]
+      summary: Create a project
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectCreate"
+      responses:
+        "201":
+          description: Project created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectResponse"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: getProject
+      tags: [projects]
+      summary: Get a project
+      responses:
+        "200":
+          description: Project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectResponse"
+              example:
+                data:
+                  name: acme
+                  display_name: ACME corpus
+                  description: Product & org knowledge base
+                  config: {}
+                  created_at: "2026-07-01T09:00:00Z"
+                meta:
+                  request_id: 6f1c2a4e-9b0d-4c39-9a55-1f2f3a4b5c6d
+                  build_id: null
+                  elapsed_ms: 4
+        default:
+          $ref: "#/components/responses/Error"
+    patch:
+      operationId: updateProject
+      tags: [projects]
+      summary: Update a project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectUpdate"
+      responses:
+        "200":
+          description: Updated project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectResponse"
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      operationId: deleteProject
+      tags: [projects]
+      summary: Delete a project
+      responses:
+        "204":
+          description: Deleted (no body).
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/sources:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: listSources
+      tags: [sources]
+      summary: List data sources
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Filter"
+      responses:
+        "200":
+          description: Sources page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SourceListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      operationId: addSource
+      tags: [sources]
+      summary: Register a data source
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SourceCreate"
+      responses:
+        "201":
+          description: Source registered.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SourceResponse"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/ingest:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    post:
+      operationId: triggerIngest
+      tags: [sources]
+      summary: Trigger ingestion (long operation)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IngestRequest"
+      responses:
+        "202":
+          description: Ingest job accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobAcceptedResponse"
+              example:
+                data:
+                  job_id: 0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f
+                  status: queued
+                meta:
+                  request_id: 3f0a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8
+                  build_id: null
+                  elapsed_ms: 12
+        "409":
+          $ref: "#/components/responses/Conflict"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/build:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    post:
+      operationId: triggerBuild
+      tags: [builds]
+      summary: Trigger a full build (long operation)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BuildRequest"
+      responses:
+        "202":
+          description: Build job accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobAcceptedResponse"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/builds:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: listBuilds
+      tags: [builds]
+      summary: List builds
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Filter"
+      responses:
+        "200":
+          description: Builds page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/builds/{build_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+      - $ref: "#/components/parameters/BuildIdPath"
+    get:
+      operationId: getBuild
+      tags: [builds]
+      summary: Get a build
+      responses:
+        "200":
+          description: Build.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/builds/{build_id}/activate:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+      - $ref: "#/components/parameters/BuildIdPath"
+    post:
+      operationId: activateBuild
+      tags: [builds]
+      summary: Activate a ready build (atomic single-transaction switch, DR-001)
+      description: |
+        Preflight (DESIGN §14): build is `ready`, eval passes the threshold, and the
+        three stores agree on build_id counts. Any failure rejects the activation
+        (`409 BUILD_NOT_READY`).
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Build activated; previous active build archived.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildResponse"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/builds/{build_id}/rollback:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+      - $ref: "#/components/parameters/BuildIdPath"
+    post:
+      operationId: rollbackBuild
+      tags: [builds]
+      summary: Roll back to a previous ready/archived build (atomic, DR-001)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Rollback applied; the given build is active again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildResponse"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /jobs/{job_id}:
+    parameters:
+      - $ref: "#/components/parameters/JobIdPath"
+    get:
+      operationId: getJob
+      tags: [jobs]
+      summary: Get job status
+      responses:
+        "200":
+          description: Job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /jobs/{job_id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/JobIdPath"
+    post:
+      operationId: cancelJob
+      tags: [jobs]
+      summary: Request job cancellation
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "202":
+          description: Cancellation requested.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobAcceptedResponse"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /jobs/{job_id}/events:
+    parameters:
+      - $ref: "#/components/parameters/JobIdPath"
+    get:
+      operationId: streamJobEvents
+      tags: [jobs]
+      summary: Job progress stream (Server-Sent Events)
+      description: |
+        SSE stream (DESIGN §27.2). Frozen event names: `job.update`, `job.done`,
+        `job.failed`; each event's `data:` line is a JSON `JobEvent`. Example frames:
+
+            event: job.update
+            data: {"job_id":"0c9f…","status":"running","step":"graph","progress":0.42,"message":null,"ts":"2026-07-02T07:12:03Z"}
+
+            event: job.done
+            data: {"job_id":"0c9f…","status":"done","step":null,"progress":1,"message":"build ready","ts":"2026-07-02T07:15:40Z"}
+      x-sse-events: ["job.update", "job.done", "job.failed"]
+      responses:
+        "200":
+          description: Event stream; ends after `job.done` / `job.failed`.
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/JobEvent"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/documents:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: listDocuments
+      tags: [inspect]
+      summary: List documents (active build)
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Filter"
+      responses:
+        "200":
+          description: Documents page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/documents/{document_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+      - $ref: "#/components/parameters/DocumentIdPath"
+    get:
+      operationId: getDocument
+      tags: [inspect]
+      summary: Get a document (includes raw text)
+      responses:
+        "200":
+          description: Document.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/chunks:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: listChunks
+      tags: [inspect]
+      summary: List chunks (active build)
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Filter"
+      responses:
+        "200":
+          description: Chunks page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChunkListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/chunks/{chunk_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+      - $ref: "#/components/parameters/ChunkIdPath"
+    get:
+      operationId: getChunk
+      tags: [inspect]
+      summary: Get a chunk
+      responses:
+        "200":
+          description: Chunk.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChunkResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/entities:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: listEntities
+      tags: [inspect]
+      summary: List entities (active build)
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Filter"
+      responses:
+        "200":
+          description: Entities page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntityListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/entities/{entity_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+      - $ref: "#/components/parameters/EntityIdPath"
+    get:
+      operationId: getEntity
+      tags: [inspect]
+      summary: Get an entity
+      responses:
+        "200":
+          description: Entity.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntityResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/relations:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: listRelations
+      tags: [inspect]
+      summary: List relations (active build)
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Filter"
+      responses:
+        "200":
+          description: Relations page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/relations/{relation_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+      - $ref: "#/components/parameters/RelationIdPath"
+    get:
+      operationId: getRelation
+      tags: [inspect]
+      summary: Get a relation (with evidence)
+      responses:
+        "200":
+          description: Relation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/graph/subgraph:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: getSubgraph
+      tags: [inspect]
+      summary: Neighborhood subgraph around an entity (active build)
+      parameters:
+        - name: entity_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: hops
+          in: query
+          required: false
+          description: Traversal depth; capped by `query_policy.max_graph_hops`.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Subgraph.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubgraphResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/merge-candidates:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: listMergeCandidates
+      tags: [review]
+      summary: List entity-resolution merge candidates
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Filter"
+      responses:
+        "200":
+          description: Merge candidates page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MergeCandidateListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/merge-candidates/{candidate_id}/approve:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+      - $ref: "#/components/parameters/CandidateIdPath"
+    post:
+      operationId: approveMergeCandidate
+      tags: [review]
+      summary: Approve a merge (recorded in review_ledger, DR-003)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReviewDecisionRequest"
+      responses:
+        "200":
+          description: Decision recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MergeCandidateResponse"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/merge-candidates/{candidate_id}/reject:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+      - $ref: "#/components/parameters/CandidateIdPath"
+    post:
+      operationId: rejectMergeCandidate
+      tags: [review]
+      summary: Reject a merge (recorded in review_ledger, DR-003)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReviewDecisionRequest"
+      responses:
+        "200":
+          description: Decision recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MergeCandidateResponse"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/merge-candidates/{candidate_id}/defer:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+      - $ref: "#/components/parameters/CandidateIdPath"
+    post:
+      operationId: deferMergeCandidate
+      tags: [review]
+      summary: Defer a merge decision (stays in the review queue)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReviewDecisionRequest"
+      responses:
+        "200":
+          description: Decision recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MergeCandidateResponse"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/query/semantic:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    post:
+      operationId: querySemantic
+      tags: [query]
+      summary: Semantic (vector) retrieval
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: Retrieval result (active build).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/query/graph:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    post:
+      operationId: queryGraph
+      tags: [query]
+      summary: Graph retrieval (multi-hop / paths, guardrailed — DESIGN §21/§27.6)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: Retrieval result (active build).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/query/sql:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    post:
+      operationId: querySql
+      tags: [query]
+      summary: NL→SQL retrieval (read-only role + sqlglot AST validation — DESIGN §21/§27.6)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: Retrieval result (active build).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/query/global:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    post:
+      operationId: queryGlobal
+      tags: [query]
+      summary: Global summary retrieval (community reports)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: Retrieval result (active build).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/query/hybrid:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    post:
+      operationId: queryHybrid
+      tags: [query]
+      summary: Hybrid retrieval (router; default entry point)
+      description: |
+        Router selects and fuses modes; the routing trace is exposed in
+        `data.debug.routing_decision` when `query_policy.expose_debug` allows it.
+        Store outages degrade to the available modes with a typed warning instead of
+        failing the whole query (DESIGN §22).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: Retrieval result (active build).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+              example:
+                data:
+                  mode: hybrid
+                  build_id: 7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d
+                  results:
+                    - result_type: chunk
+                      id: 9d8c7b6a-5f4e-4d3c-b2a1-0f9e8d7c6b5a
+                      title: onboarding.md#3
+                      text: New hires get access on day one…
+                      score: 0.87
+                      confidence: 0.91
+                      source_refs:
+                        - source_type: chunk
+                          id: 9d8c7b6a-5f4e-4d3c-b2a1-0f9e8d7c6b5a
+                          source_uri: s3://acme/docs/onboarding.md
+                          metadata: { start_offset: 1204, end_offset: 1490 }
+                  graph_context: { nodes: [], edges: [], paths: [] }
+                  warnings:
+                    - code: MODE_SKIPPED
+                      message: "sql skipped: router confidence 0.12 below threshold"
+                  debug:
+                    stores_used: [qdrant, neo4j]
+                    retrieval_plan: [semantic, graph]
+                    routing_decision:
+                      selected: [semantic, graph]
+                      skipped: [sql, global]
+                      reason: entity-centric question
+                      confidence: 0.83
+                    latency_ms: 412
+                meta:
+                  request_id: 1a2b3c4d-5e6f-4a70-8b91-c2d3e4f5a6b7
+                  build_id: 7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d
+                  elapsed_ms: 431
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/health:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: getHealth
+      tags: [health]
+      summary: Project health (status light + counts + drift, DESIGN §19)
+      responses:
+        "200":
+          description: Health report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/metrics:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: getMetrics
+      tags: [health]
+      summary: Project metrics snapshot
+      responses:
+        "200":
+          description: Metrics.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricsResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/eval:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    get:
+      operationId: getEval
+      tags: [health]
+      summary: Latest eval report (golden-set metrics, DESIGN §20/§27.5)
+      responses:
+        "200":
+          description: Eval report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvalResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Auth placeholder (DESIGN §23) — swap the implementation, keep the scheme.
+
+  parameters:
+    ProjectPath:
+      name: project
+      in: path
+      required: true
+      schema:
+        type: string
+    BuildIdPath:
+      name: build_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    JobIdPath:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DocumentIdPath:
+      name: document_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ChunkIdPath:
+      name: chunk_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    EntityIdPath:
+      name: entity_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    RelationIdPath:
+      name: relation_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CandidateIdPath:
+      name: candidate_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size (default 50 🔧).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from `meta.next_cursor`; omit for the first page.
+      schema:
+        type: string
+    Sort:
+      name: sort
+      in: query
+      required: false
+      description: "`field:asc` or `field:desc`."
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9_]+:(asc|desc)$"
+    Filter:
+      name: filter
+      in: query
+      required: false
+      description: "Field filters as `filter[field]=value` (deepObject style)."
+      style: deepObject
+      explode: true
+      schema:
+        type: object
+        additionalProperties:
+          type: string
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Client-generated key (≤255 chars). Same key + same request hash replays the
+        stored original response; same key + different request hash → `409
+        IDEMPOTENCY_CONFLICT`. Keys expire after the configured TTL (default 24h 🔧).
+      schema:
+        type: string
+        maxLength: 255
+
+  responses:
+    Error:
+      description: |
+        Error envelope. Status → code mapping: 400 `VALIDATION_ERROR`/`QUERY_UNSAFE` ·
+        404 `PROJECT_NOT_FOUND`/`BUILD_NOT_FOUND`/`JOB_NOT_FOUND` · 409
+        `IDEMPOTENCY_CONFLICT`/`JOB_CONFLICT`/`BUILD_NOT_READY`/`NO_ACTIVE_BUILD` ·
+        429 `RATE_LIMITED` · 503 `STORE_UNAVAILABLE` · 504 `QUERY_TIMEOUT` · 500 `INTERNAL`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: PROJECT_NOT_FOUND
+              message: project 'acme' does not exist
+              details: null
+              request_id: 6f1c2a4e-9b0d-4c39-9a55-1f2f3a4b5c6d
+    Conflict:
+      description: |
+        Conflict — `IDEMPOTENCY_CONFLICT` (same Idempotency-Key, different request),
+        `JOB_CONFLICT` (overlapping job), `BUILD_NOT_READY` (activation preflight
+        failed) or `NO_ACTIVE_BUILD`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    # ---- envelope --------------------------------------------------------
+    Meta:
+      type: object
+      description: Success-envelope metadata (DESIGN §15).
+      required: [request_id, build_id, elapsed_ms]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        build_id:
+          description: Build that served the request; null when no build was involved.
+          type: ["string", "null"]
+          format: uuid
+        elapsed_ms:
+          type: integer
+          minimum: 0
+
+    PageMeta:
+      type: object
+      description: |
+        Envelope metadata for paginated lists — next_cursor is required so clients can
+        always distinguish the last page (null) from a non-conforming response.
+      required: [request_id, build_id, elapsed_ms, next_cursor]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        build_id:
+          description: Build that served the request; null when no build was involved.
+          type: ["string", "null"]
+          format: uuid
+        elapsed_ms:
+          type: integer
+          minimum: 0
+        next_cursor:
+          description: Opaque cursor for the next page; null on the last page.
+          type: ["string", "null"]
+
+    ErrorCode:
+      type: string
+      description: Frozen error-code enum (DESIGN §27.2; additive-only).
+      enum:
+        - PROJECT_NOT_FOUND
+        - BUILD_NOT_FOUND
+        - BUILD_NOT_READY
+        - NO_ACTIVE_BUILD
+        - VALIDATION_ERROR
+        - JOB_NOT_FOUND
+        - JOB_CONFLICT
+        - IDEMPOTENCY_CONFLICT
+        - QUERY_UNSAFE
+        - QUERY_TIMEOUT
+        - STORE_UNAVAILABLE
+        - RATE_LIMITED
+        - INTERNAL
+
+    Error:
+      type: object
+      description: |
+        The full frozen shape is always present — details is null rather than absent,
+        so error consumers never branch on missing fields.
+      required: [code, message, details, request_id]
+      properties:
+        code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+        details:
+          description: Machine-readable context (field errors, guardrail verdicts, …).
+          type: ["object", "null"]
+          additionalProperties: true
+        request_id:
+          type: string
+          format: uuid
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/Error"
+
+    WarningCode:
+      type: string
+      description: Frozen warning-code enum (DESIGN §27.2; additive-only).
+      enum:
+        - STORE_UNAVAILABLE
+        - MODE_SKIPPED
+        - PARTIAL_RESULTS
+        - LOW_CONFIDENCE
+        - GUARDRAIL_BLOCKED
+        - TRUNCATED
+
+    Warning:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          $ref: "#/components/schemas/WarningCode"
+        message:
+          type: string
+
+    # ---- projects / sources ----------------------------------------------
+    Project:
+      type: object
+      required: [name, created_at]
+      properties:
+        name:
+          type: string
+          description: Stable project key (used in paths and store scoping).
+        display_name:
+          type: ["string", "null"]
+        description:
+          type: ["string", "null"]
+        config:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+
+    ProjectCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        display_name:
+          type: ["string", "null"]
+        description:
+          type: ["string", "null"]
+        config:
+          type: object
+          additionalProperties: true
+
+    ProjectUpdate:
+      type: object
+      properties:
+        display_name:
+          type: ["string", "null"]
+        description:
+          type: ["string", "null"]
+        config:
+          type: object
+          additionalProperties: true
+
+    Source:
+      type: object
+      required: [id, uri]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          description: Connector kind (e.g. file, directory, url, database).
+        uri:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        added_at:
+          type: string
+          format: date-time
+
+    SourceCreate:
+      type: object
+      required: [uri]
+      properties:
+        kind:
+          type: string
+        uri:
+          type: string
+          minLength: 1
+        metadata:
+          type: object
+          additionalProperties: true
+
+    IngestRequest:
+      type: object
+      properties:
+        source_ids:
+          description: Restrict ingestion to these sources; omit for all.
+          type: array
+          items:
+            type: string
+            format: uuid
+
+    BuildRequest:
+      type: object
+      properties:
+        reason:
+          type: ["string", "null"]
+          description: Free-form operator note recorded on the build.
+
+    # ---- builds ------------------------------------------------------------
+    BuildStatus:
+      type: string
+      description: Build lifecycle (DESIGN §4/§14).
+      enum: [building, ready, active, failed, archived]
+
+    Build:
+      type: object
+      required: [id, project, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project:
+          type: string
+        status:
+          $ref: "#/components/schemas/BuildStatus"
+        config_hash:
+          type: ["string", "null"]
+        source_hash:
+          type: ["string", "null"]
+        started_at:
+          type: ["string", "null"]
+          format: date-time
+        finished_at:
+          type: ["string", "null"]
+          format: date-time
+        activated_at:
+          type: ["string", "null"]
+          format: date-time
+        metrics:
+          type: ["object", "null"]
+          additionalProperties: true
+        eval:
+          type: ["object", "null"]
+          additionalProperties: true
+
+    # ---- jobs ---------------------------------------------------------------
+    JobStatus:
+      type: string
+      enum: [queued, running, done, failed, cancelled]
+
+    JobAccepted:
+      type: object
+      description: 202 payload for long operations (DESIGN §15).
+      required: [job_id, status]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/JobStatus"
+
+    Job:
+      type: object
+      required: [job_id, status]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        kind:
+          type: string
+          description: e.g. ingest, build, reproject.
+        project:
+          type: ["string", "null"]
+        build_id:
+          description: Building build this job writes to; null for jobs not bound to a build (DESIGN §27.7).
+          type: ["string", "null"]
+          format: uuid
+        step:
+          type: ["string", "null"]
+        progress:
+          type: number
+          minimum: 0
+          maximum: 1
+        message:
+          type: ["string", "null"]
+        error:
+          anyOf:
+            - $ref: "#/components/schemas/Error"
+            - type: "null"
+        created_at:
+          type: ["string", "null"]
+          format: date-time
+        finished_at:
+          type: ["string", "null"]
+          format: date-time
+
+    JobEvent:
+      type: object
+      description: |
+        SSE `data:` payload; event names are job.update|job.done|job.failed (DESIGN
+        §27.2). The full frozen shape is always present — step/message are null rather
+        than absent, so SSE consumers never branch on missing fields.
+      required: [job_id, status, step, progress, message, ts]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        step:
+          type: ["string", "null"]
+        progress:
+          type: number
+          minimum: 0
+          maximum: 1
+        message:
+          type: ["string", "null"]
+        ts:
+          type: string
+          format: date-time
+
+    # ---- inspection ---------------------------------------------------------
+    Document:
+      type: object
+      required: [id, build_id, source_uri]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project:
+          type: string
+        build_id:
+          type: string
+          format: uuid
+        source_uri:
+          type: string
+        content_hash:
+          type: string
+        mime:
+          type: ["string", "null"]
+        metadata:
+          type: object
+          additionalProperties: true
+        status:
+          type: string
+        ingested_at:
+          type: ["string", "null"]
+          format: date-time
+        raw:
+          type: ["string", "null"]
+          description: Raw text; returned on detail GET only.
+
+    Chunk:
+      type: object
+      required: [id, document_id, build_id, ordinal, text]
+      properties:
+        id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        build_id:
+          type: string
+          format: uuid
+        ordinal:
+          type: integer
+        text:
+          type: string
+        token_count:
+          type: ["integer", "null"]
+        start_offset:
+          type: ["integer", "null"]
+        end_offset:
+          type: ["integer", "null"]
+        vector_point_id:
+          type: ["string", "null"]
+          format: uuid
+        metadata:
+          type: object
+          additionalProperties: true
+        status:
+          type: string
+
+    LifecycleStatus:
+      type: string
+      description: Entity/relation lifecycle (DESIGN §4/§17).
+      enum: [active, deprecated, merged, rejected, needs_review]
+
+    ReviewStatus:
+      type: string
+      enum: [unreviewed, approved, rejected]
+
+    CreatedBy:
+      type: string
+      enum: [rule, llm, manual]
+
+    Entity:
+      type: object
+      required: [id, build_id, type, canonical_name, entity_key, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: canonical_id shared by all three stores.
+        project:
+          type: string
+        build_id:
+          type: string
+          format: uuid
+        type:
+          type: string
+        canonical_name:
+          type: string
+        entity_key:
+          type: string
+          description: Cross-build stable fingerprint (DESIGN §27.3).
+        attributes:
+          type: object
+          additionalProperties: true
+        status:
+          $ref: "#/components/schemas/LifecycleStatus"
+        review_status:
+          $ref: "#/components/schemas/ReviewStatus"
+        created_by:
+          $ref: "#/components/schemas/CreatedBy"
+        created_at:
+          type: ["string", "null"]
+          format: date-time
+        updated_at:
+          type: ["string", "null"]
+          format: date-time
+
+    RelationEvidence:
+      type: object
+      required: [id, evidence_type]
+      properties:
+        id:
+          type: string
+          format: uuid
+        evidence_type:
+          type: string
+          enum: [chunk, row, manual]
+        evidence_ref:
+          type: ["string", "null"]
+        chunk_id:
+          type: ["string", "null"]
+          format: uuid
+        start_offset:
+          type: ["integer", "null"]
+        end_offset:
+          type: ["integer", "null"]
+        quote:
+          type: ["string", "null"]
+          maxLength: 512
+        source_uri:
+          type: ["string", "null"]
+          description: Denormalized so evidence survives pruning of old chunks (DESIGN §27.4).
+        confidence:
+          type: ["number", "null"]
+
+    Relation:
+      type: object
+      required: [id, build_id, src_entity_id, dst_entity_id, type, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project:
+          type: string
+        build_id:
+          type: string
+          format: uuid
+        src_entity_id:
+          type: string
+          format: uuid
+        dst_entity_id:
+          type: string
+          format: uuid
+        type:
+          type: string
+        attributes:
+          type: object
+          additionalProperties: true
+        relation_signature:
+          type: string
+          description: Cross-build stable fingerprint (DESIGN §27.3).
+        status:
+          $ref: "#/components/schemas/LifecycleStatus"
+        review_status:
+          $ref: "#/components/schemas/ReviewStatus"
+        created_by:
+          $ref: "#/components/schemas/CreatedBy"
+        confidence:
+          type: ["number", "null"]
+        evidence:
+          type: array
+          items:
+            $ref: "#/components/schemas/RelationEvidence"
+        created_at:
+          type: ["string", "null"]
+          format: date-time
+        updated_at:
+          type: ["string", "null"]
+          format: date-time
+
+    # ---- review -------------------------------------------------------------
+    MergeCandidateStatus:
+      type: string
+      enum: [pending, approved, rejected, deferred]
+
+    MergeCandidate:
+      type: object
+      required: [id, build_id, left_entity_id, right_entity_id, score, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project:
+          type: string
+        build_id:
+          type: string
+          format: uuid
+        left_entity_id:
+          type: string
+          format: uuid
+        right_entity_id:
+          type: string
+          format: uuid
+        score:
+          type: number
+        features:
+          type: object
+          additionalProperties: true
+        status:
+          $ref: "#/components/schemas/MergeCandidateStatus"
+        decision:
+          type: ["string", "null"]
+          enum: [approve, reject, defer, null]
+        decided_by:
+          type: ["string", "null"]
+        decided_at:
+          type: ["string", "null"]
+          format: date-time
+        reason:
+          type: ["string", "null"]
+        impact:
+          type: ["object", "null"]
+          additionalProperties: true
+          description: Blast-radius info used to rank the review queue.
+        left_snapshot:
+          type: ["object", "null"]
+          additionalProperties: true
+        right_snapshot:
+          type: ["object", "null"]
+          additionalProperties: true
+
+    ReviewDecisionRequest:
+      type: object
+      properties:
+        reason:
+          type: ["string", "null"]
+
+    # ---- graph ----------------------------------------------------------------
+    GraphNode:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: ["string", "null"]
+        label:
+          type: ["string", "null"]
+        properties:
+          type: object
+          additionalProperties: true
+
+    GraphEdge:
+      type: object
+      required: [id, src, dst, type]
+      properties:
+        id:
+          type: string
+          format: uuid
+        src:
+          type: string
+          format: uuid
+        dst:
+          type: string
+          format: uuid
+        type:
+          type: string
+        confidence:
+          type: ["number", "null"]
+        properties:
+          type: object
+          additionalProperties: true
+
+    GraphPath:
+      type: object
+      required: [nodes, edges]
+      properties:
+        nodes:
+          type: array
+          items:
+            type: string
+            format: uuid
+        edges:
+          type: array
+          items:
+            type: string
+            format: uuid
+
+    GraphContext:
+      type: object
+      required: [nodes, edges]
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphNode"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphEdge"
+        paths:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphPath"
+
+    # ---- query ------------------------------------------------------------------
+    QueryMode:
+      type: string
+      enum: [semantic, graph, sql, global, hybrid]
+
+    QueryRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          minLength: 1
+          description: Natural-language question.
+        top_k:
+          type: ["integer", "null"]
+          minimum: 1
+          description: Capped by `query_policy.max_top_k`.
+        filters:
+          type: object
+          additionalProperties: true
+          description: Store-level filters (e.g. entity type, document metadata).
+        options:
+          type: object
+          additionalProperties: true
+          description: "Mode-specific options (e.g. graph: max_hops; capped by query_policy)."
+
+    SourceRefType:
+      type: string
+      enum: [document, chunk, entity, relation, row]
+
+    SourceRef:
+      type: object
+      required: [source_type, id]
+      properties:
+        source_type:
+          $ref: "#/components/schemas/SourceRefType"
+        id:
+          type: string
+        source_uri:
+          type: ["string", "null"]
+        metadata:
+          type: object
+          additionalProperties: true
+
+    ResultType:
+      type: string
+      enum: [chunk, entity, relation, path, row, community_report]
+
+    RetrievalResult:
+      type: object
+      description: |
+        One retrieval hit. `source_refs` is mandatory and non-empty (`require_sources`,
+        DESIGN §16/§27.2) — every answer must be traceable to sources. Results are
+        ordered score desc, ties broken by id.
+      required: [result_type, id, score, source_refs]
+      properties:
+        result_type:
+          $ref: "#/components/schemas/ResultType"
+        id:
+          type: string
+        title:
+          type: ["string", "null"]
+        text:
+          type: ["string", "null"]
+        score:
+          type: number
+        confidence:
+          type: ["number", "null"]
+          minimum: 0
+          maximum: 1
+        source_refs:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/SourceRef"
+
+    RoutingDecision:
+      type: object
+      description: Router trace (§16) — which modes ran and why.
+      required: [selected, skipped]
+      properties:
+        selected:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryMode"
+        skipped:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryMode"
+        reason:
+          type: ["string", "null"]
+        confidence:
+          type: ["number", "null"]
+          minimum: 0
+          maximum: 1
+
+    QueryDebug:
+      type: object
+      description: Typed debug block (§16); evolution is additive.
+      required: [stores_used, retrieval_plan, routing_decision, latency_ms]
+      properties:
+        stores_used:
+          type: array
+          items:
+            type: string
+        retrieval_plan:
+          type: array
+          items:
+            type: string
+        routing_decision:
+          description: Null for single-mode queries that bypass the router.
+          anyOf:
+            - $ref: "#/components/schemas/RoutingDecision"
+            - type: "null"
+        latency_ms:
+          type: integer
+          minimum: 0
+
+    QueryResult:
+      type: object
+      required: [mode, build_id, results, warnings]
+      properties:
+        mode:
+          $ref: "#/components/schemas/QueryMode"
+        build_id:
+          type: string
+          format: uuid
+          description: Active build the query ran against (DR-001).
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/RetrievalResult"
+        graph_context:
+          anyOf:
+            - $ref: "#/components/schemas/GraphContext"
+            - type: "null"
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/Warning"
+        debug:
+          description: |
+            Emitted only when `query_policy.expose_debug` and the caller's role allow
+            it (§16/§21); null otherwise.
+          anyOf:
+            - $ref: "#/components/schemas/QueryDebug"
+            - type: "null"
+
+    # ---- health / eval ---------------------------------------------------------
+    HealthStatus:
+      type: string
+      description: Project status light (DESIGN §19).
+      enum: [healthy, needs_review, build_failed, index_drift, eval_regression]
+
+    HealthReport:
+      type: object
+      required: [status]
+      additionalProperties: true
+      properties:
+        status:
+          $ref: "#/components/schemas/HealthStatus"
+        active_build_id:
+          type: ["string", "null"]
+          format: uuid
+        counts:
+          type: object
+          additionalProperties:
+            type: integer
+          description: sources/documents/chunks/entities/relations counts.
+        pending_review:
+          type: integer
+        drift:
+          type: ["object", "null"]
+          additionalProperties: true
+          description: Per-store build_id count reconciliation (PG vs Neo4j/Qdrant).
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/Warning"
+
+    EvalReport:
+      type: object
+      additionalProperties: true
+      properties:
+        build_id:
+          type: ["string", "null"]
+          format: uuid
+        passed:
+          type: ["boolean", "null"]
+        regression:
+          type: ["boolean", "null"]
+        metrics:
+          type: object
+          additionalProperties:
+            type: number
+          description: |
+            Includes GraphRAG metrics `path_validity`, `relation_hit_rate`,
+            `groundedness` (DESIGN §27.5) plus recall/similarity/citation coverage.
+
+    # ---- response envelopes ------------------------------------------------------
+    ProjectResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/Project"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    ProjectListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+
+    SourceResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/Source"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    SourceListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Source"
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+
+    BuildResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/Build"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    BuildListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Build"
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+
+    JobResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/Job"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    JobAcceptedResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/JobAccepted"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    DocumentResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/Document"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    DocumentListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Document"
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+
+    ChunkResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/Chunk"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    ChunkListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Chunk"
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+
+    EntityResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/Entity"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    EntityListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Entity"
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+
+    RelationResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/Relation"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    RelationListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Relation"
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+
+    MergeCandidateResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/MergeCandidate"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    MergeCandidateListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/MergeCandidate"
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+
+    SubgraphResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/GraphContext"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    QueryResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/QueryResult"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    HealthResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/HealthReport"
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    MetricsResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: object
+          additionalProperties: true
+        meta:
+          $ref: "#/components/schemas/Meta"
+
+    EvalResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/EvalReport"
+        meta:
+          $ref: "#/components/schemas/Meta"
