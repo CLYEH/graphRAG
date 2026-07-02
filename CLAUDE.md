@@ -13,6 +13,9 @@ A task is done only when it passes **four gates** and its PR merges (full flow i
    👀 = still reviewing (wait); no reaction & no comment = poke it with `@codex review`; a new
    Codex comment = changes wanted → back to step 3. Unresolved Codex threads block merge
    (GitHub `required_conversation_resolution`); resolve them before merging.
+   **No merge without `+1` — no exceptions.** CI green + resolved threads do **not** substitute
+   for it. Enforced mechanically by a PreToolUse hook
+   (`.claude/hooks/require-codex-approval.ps1`) that blocks `gh pr merge` until Codex `+1`.
 A failure at gate 2, 3, or 4 sends you back to implementation. Never loosen
 `ruff`/`mypy`/`tsconfig`/test configs to pass — fix the code. Push is per-task to a
 `task/<id>` branch → PR; never commit straight to `main`.
