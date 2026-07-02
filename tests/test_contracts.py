@@ -239,7 +239,10 @@ def test_list_endpoints_use_cursor_pagination(spec: dict[str, Any]) -> None:
         refs = _param_refs(op)
         assert {"Limit", "Cursor", "Sort", "Filter"} <= refs, path
         meta = _deref(spec, cast(dict[str, Any], schema["properties"]["meta"]))
+        # next_cursor is required (null on the last page) so clients can always
+        # distinguish "no more pages" from a non-conforming response.
         assert "next_cursor" in meta["properties"], path
+        assert "next_cursor" in meta["required"], path
     assert seen == _LIST_PATHS
 
 
@@ -271,7 +274,9 @@ def test_sse_job_event_contract(spec: dict[str, Any]) -> None:
         cast(dict[str, Any], op["responses"]["200"]["content"]["text/event-stream"]["schema"]),
     )
     assert set(schema["properties"]) == {"job_id", "status", "step", "progress", "message", "ts"}
-    assert set(schema["required"]) >= {"job_id", "status", "progress", "ts"}
+    # The whole frozen shape is required — step/message are null rather than absent,
+    # so SSE consumers never branch on missing fields.
+    assert set(schema["required"]) == set(schema["properties"])
     progress = schema["properties"]["progress"]
     assert progress["minimum"] == 0 and progress["maximum"] == 1
     status = _deref(spec, cast(dict[str, Any], schema["properties"]["status"]))
@@ -297,6 +302,19 @@ def test_query_result_is_build_scoped_and_warns_typed(spec: dict[str, Any]) -> N
     warning_items = _deref(spec, cast(dict[str, Any], result["properties"]["warnings"]["items"]))
     code = _deref(spec, cast(dict[str, Any], warning_items["properties"]["code"]))
     assert set(code["enum"]) == _FROZEN_WARNING_CODES
+    # debug is typed (not free-form) so generated clients can rely on
+    # debug.routing_decision when query_policy.expose_debug allows it.
+    debug = _deref(spec, cast(dict[str, Any], result["properties"]["debug"]["anyOf"][0]))
+    assert set(debug["required"]) == {
+        "stores_used",
+        "retrieval_plan",
+        "routing_decision",
+        "latency_ms",
+    }
+    routing = _deref(
+        spec, cast(dict[str, Any], debug["properties"]["routing_decision"]["anyOf"][0])
+    )
+    assert set(routing["required"]) == {"selected", "skipped"}
 
 
 def test_auth_placeholder_guards_every_endpoint(spec: dict[str, Any]) -> None:

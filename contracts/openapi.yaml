@@ -1062,8 +1062,26 @@ components:
         elapsed_ms:
           type: integer
           minimum: 0
+
+    PageMeta:
+      type: object
+      description: |
+        Envelope metadata for paginated lists — next_cursor is required so clients can
+        always distinguish the last page (null) from a non-conforming response.
+      required: [request_id, build_id, elapsed_ms, next_cursor]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        build_id:
+          description: Build that served the request; null when no build was involved.
+          type: ["string", "null"]
+          format: uuid
+        elapsed_ms:
+          type: integer
+          minimum: 0
         next_cursor:
-          description: Only on paginated list responses; null on the last page.
+          description: Opaque cursor for the next page; null on the last page.
           type: ["string", "null"]
 
     ErrorCode:
@@ -1313,8 +1331,11 @@ components:
 
     JobEvent:
       type: object
-      description: SSE `data:` payload; event names are job.update|job.done|job.failed (DESIGN §27.2).
-      required: [job_id, status, progress, ts]
+      description: |
+        SSE `data:` payload; event names are job.update|job.done|job.failed (DESIGN
+        §27.2). The full frozen shape is always present — step/message are null rather
+        than absent, so SSE consumers never branch on missing fields.
+      required: [job_id, status, step, progress, message, ts]
       properties:
         job_id:
           type: string
@@ -1720,6 +1741,48 @@ components:
           items:
             $ref: "#/components/schemas/SourceRef"
 
+    RoutingDecision:
+      type: object
+      description: Router trace (§16) — which modes ran and why.
+      required: [selected, skipped]
+      properties:
+        selected:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryMode"
+        skipped:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryMode"
+        reason:
+          type: ["string", "null"]
+        confidence:
+          type: ["number", "null"]
+          minimum: 0
+          maximum: 1
+
+    QueryDebug:
+      type: object
+      description: Typed debug block (§16); evolution is additive.
+      required: [stores_used, retrieval_plan, routing_decision, latency_ms]
+      properties:
+        stores_used:
+          type: array
+          items:
+            type: string
+        retrieval_plan:
+          type: array
+          items:
+            type: string
+        routing_decision:
+          description: Null for single-mode queries that bypass the router.
+          anyOf:
+            - $ref: "#/components/schemas/RoutingDecision"
+            - type: "null"
+        latency_ms:
+          type: integer
+          minimum: 0
+
     QueryResult:
       type: object
       required: [mode, build_id, results, warnings]
@@ -1743,11 +1806,12 @@ components:
           items:
             $ref: "#/components/schemas/Warning"
         debug:
-          type: ["object", "null"]
-          additionalProperties: true
           description: |
-            `{stores_used, retrieval_plan, routing_decision, latency_ms}` — emitted only
-            when `query_policy.expose_debug` and the caller's role allow it.
+            Emitted only when `query_policy.expose_debug` and the caller's role allow
+            it (§16/§21); null otherwise.
+          anyOf:
+            - $ref: "#/components/schemas/QueryDebug"
+            - type: "null"
 
     # ---- health / eval ---------------------------------------------------------
     HealthStatus:
@@ -1819,7 +1883,7 @@ components:
           items:
             $ref: "#/components/schemas/Project"
         meta:
-          $ref: "#/components/schemas/Meta"
+          $ref: "#/components/schemas/PageMeta"
 
     SourceResponse:
       type: object
@@ -1839,7 +1903,7 @@ components:
           items:
             $ref: "#/components/schemas/Source"
         meta:
-          $ref: "#/components/schemas/Meta"
+          $ref: "#/components/schemas/PageMeta"
 
     BuildResponse:
       type: object
@@ -1859,7 +1923,7 @@ components:
           items:
             $ref: "#/components/schemas/Build"
         meta:
-          $ref: "#/components/schemas/Meta"
+          $ref: "#/components/schemas/PageMeta"
 
     JobResponse:
       type: object
@@ -1897,7 +1961,7 @@ components:
           items:
             $ref: "#/components/schemas/Document"
         meta:
-          $ref: "#/components/schemas/Meta"
+          $ref: "#/components/schemas/PageMeta"
 
     ChunkResponse:
       type: object
@@ -1917,7 +1981,7 @@ components:
           items:
             $ref: "#/components/schemas/Chunk"
         meta:
-          $ref: "#/components/schemas/Meta"
+          $ref: "#/components/schemas/PageMeta"
 
     EntityResponse:
       type: object
@@ -1937,7 +2001,7 @@ components:
           items:
             $ref: "#/components/schemas/Entity"
         meta:
-          $ref: "#/components/schemas/Meta"
+          $ref: "#/components/schemas/PageMeta"
 
     RelationResponse:
       type: object
@@ -1957,7 +2021,7 @@ components:
           items:
             $ref: "#/components/schemas/Relation"
         meta:
-          $ref: "#/components/schemas/Meta"
+          $ref: "#/components/schemas/PageMeta"
 
     MergeCandidateResponse:
       type: object
@@ -1977,7 +2041,7 @@ components:
           items:
             $ref: "#/components/schemas/MergeCandidate"
         meta:
-          $ref: "#/components/schemas/Meta"
+          $ref: "#/components/schemas/PageMeta"
 
     SubgraphResponse:
       type: object
