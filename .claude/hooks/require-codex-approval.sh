@@ -26,28 +26,42 @@ if ! printf '%s' "$payload" | grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge|pulls/
   exit 0
 fi
 
-# --- figure out which PR gh will actually merge (number | url | branch | current branch) ---
-arg="$(printf '%s' "$payload" \
-  | grep -oE 'gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+[^"\\ ]+' \
-  | head -n1 | sed -E 's/^gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+//')"
-# A leading '-' means the token is a flag (e.g. --squash), not a PR ref.
-case "$arg" in -*) arg="" ;; esac
-if [ -z "$arg" ]; then
+# --- figure out which PR gh will actually merge: number | url | branch | current branch.
+#     Flags may precede the ref (e.g. `gh pr merge --squash 123`), and some take a value
+#     (-R/--repo, -b/--body, ...), so tokenize and skip flags plus their values. ---
+after="$(printf '%s' "$payload" \
+  | grep -oE 'gh[[:space:]]+pr[[:space:]]+merge([[:space:]][^"\\]*)?' \
+  | head -n1 | sed -E 's/^gh[[:space:]]+pr[[:space:]]+merge[[:space:]]*//')"
+ref=""
+skip=0
+# shellcheck disable=SC2086
+set -- $after
+for tok in "$@"; do
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  case "$tok" in
+    -R|--repo|-b|--body|-F|--body-file|-t|--subject|--author-email|--match-head-commit) skip=1 ;;
+    -*) : ;;                  # valueless flag (--squash/--admin/--auto/-d/...) or --flag=value
+    *) ref="$tok"; break ;;   # first bare token is the PR ref
+  esac
+done
+if [ -z "$ref" ]; then
   apinum="$(printf '%s' "$payload" | grep -oE 'pulls/[0-9]+/merge' | grep -oE '[0-9]+' | head -n1)"
-  [ -n "$apinum" ] && arg="$apinum"
+  [ -n "$apinum" ] && ref="$apinum"
 fi
 
-# Resolve the real PR + head SHA via gh (handles number/url/branch, and current branch when empty).
-if [ -n "$arg" ]; then set -- "$arg"; else set --; fi
-pr="$(gh pr view "$@" --json number --jq '.number' 2>/dev/null)"
-head="$(gh pr view "$@" --json headRefOid --jq '.headRefOid' 2>/dev/null)"
-[ -z "$pr" ] && deny "cannot resolve the PR gh would merge (ref='${arg:-<current branch>}') -> blocked."
-[ -z "$head" ] && deny "cannot resolve PR #$pr head SHA -> blocked."
-
-repo="$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)"
+# Honor an explicit -R/--repo target; otherwise infer from the current repo.
+override_repo="$(printf '%s' "$after" | grep -oE '(-R|--repo)([[:space:]]+|=)[^"\\ ]+' | head -n1 | sed -E 's/^(-R|--repo)([[:space:]]+|=)//')"
+repo="${override_repo:-$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)}"
 [ -z "$repo" ] && deny "cannot resolve the repo -> blocked."
 owner="${repo%%/*}"
 name="${repo##*/}"
+
+# Resolve the real PR + head SHA via gh (number/url/branch; current branch when no ref).
+if [ -n "$ref" ]; then set -- "$ref" -R "$repo"; else set --; fi
+pr="$(gh pr view "$@" --json number --jq '.number' 2>/dev/null)"
+head="$(gh pr view "$@" --json headRefOid --jq '.headRefOid' 2>/dev/null)"
+[ -z "$pr" ] && deny "cannot resolve the PR gh would merge (ref='${ref:-<current branch>}', repo='$repo') -> blocked."
+[ -z "$head" ] && deny "cannot resolve PR #$pr head SHA -> blocked."
 
 # --- Codex reactions (paginated). Convert timestamps with jq's fromdateiso8601 so no `date`
 #     binary is needed (GNU vs BSD differ) — portable across Windows/Linux/macOS. ---
@@ -64,7 +78,11 @@ if [ -z "$plus1_line" ]; then
 fi
 read -r plus1_at approved_epoch <<<"$plus1_line"
 
-# --- the +1 must be NEWER than the head commit (reject stale approval of unreviewed commits) ---
+# --- freshness: the +1 must be newer than the head commit's committer date. GitHub exposes
+#     no reliable way to bind a bare +1 reaction to a SHA (Commit.pushedDate is null and a
+#     clean Codex approval carries no commit_id), so committer date is the freshness proxy —
+#     sound for this honest-agent loop (commits carry real dates); it does not defend against
+#     a deliberately backdated commit. ---
 head_line="$(gh api "repos/$repo/commits/$head" --jq '.commit.committer.date as $d|"\($d) \($d|fromdateiso8601)"' 2>/dev/null)"
 [ -z "$head_line" ] && deny "cannot read head commit date -> blocked."
 read -r head_date head_epoch <<<"$head_line"
