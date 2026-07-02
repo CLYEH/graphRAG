@@ -55,12 +55,15 @@ loop back to step 3.
    - **Conversations resolved** — GitHub blocks merge (`required_conversation_resolution`)
      until every Codex thread is addressed and resolved (PR UI, or
      `gh api graphql` → `resolveReviewThread`).
-   **Only unresolved threads / a fresh change-request → back to step 3** (fix, push, resolve
-   threads, let Codex re-review). `eyes` and "not seen yet" are pending — wait/poke, never a
-   failure. (CI is GitHub-hard; Codex's *verdict wait* is loop-enforced; Codex's *unresolved
-   comments* are GitHub-hard.)
-8. **Merge & advance** — merge the PR, delete the branch, `git switch main && git pull`,
-   check off the item in `TASKS.md`, return to step 1.
+   **Merge requires Codex `+1` on the head commit — no exceptions.** `eyes` / "not seen yet"
+   are pending states (wait/poke, never a failure); unresolved threads or a fresh
+   change-request → back to step 3. **CI green + resolved conversations do NOT substitute for
+   `+1`.** This is enforced mechanically: `.claude/hooks/require-codex-approval.ps1`
+   (PreToolUse) blocks any `gh pr merge` until Codex has reacted `+1`. If Codex never `+1`s,
+   **stop and ask** — never merge around it.
+8. **Merge & advance** — only after Codex `+1` on the head commit (the hook enforces it):
+   merge the PR, delete the branch, `git switch main && git pull`, check off the item in
+   `TASKS.md`, return to step 1.
 
 ## Testing tiers (what runs when)
 | Tier | Runs | Marker / location | In fast loop? |
@@ -84,8 +87,10 @@ Two options — both use the same protocol above:
   > Do the next unchecked task in TASKS.md following docs/LOOP.md's 8-step protocol:
   > branch `task/<id>`, implement with tests, run `uv run poe check-all` until green,
   > then run the `code-reviewer` subagent — if it FAILs, fix and re-review. Then commit,
-  > push, and `gh pr create`. Wait for CI + the bound Codex review to pass; if either
-  > fails, fix on the same branch. When both are green, merge, check the task off, next.
+  > push, and `gh pr create`. Wait for CI green **and** Codex to react `+1` (no exceptions —
+  > a hook blocks merge otherwise); if Codex comments, fix on the same branch and re-review.
+  > Only once CI is green and Codex has `+1`'d, merge, check the task off, next. If Codex
+  > never `+1`s, stop and ask — don't merge around it.
   > If a task is ambiguous or conflicts with DESIGN.md, stop and ask instead of guessing.
 
 - **ralph-loop plugin** — for continuous autonomous iteration; point it at the same prompt.
