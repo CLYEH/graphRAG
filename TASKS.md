@@ -21,7 +21,7 @@ Mark `[x]` when merged & green. Keep items small enough to finish in one loop.
 > the bound Codex review are green (see [`docs/LOOP.md`](docs/LOOP.md)).
 
 ## Track 0 — Contracts & Governance  *(freeze BEFORE parallel work — DR-002)*
-- [ ] P0 `contracts/openapi.yaml`: response envelope, error-code enum, cursor pagination, SSE event, idempotency (§15/§27.2)
+- [x] P0 `contracts/openapi.yaml`: response envelope, error-code enum, cursor pagination, SSE event, idempotency (§15/§27.2)
 - [ ] P1 `contracts/mcp_response.schema.json`: unified retrieval result + source_refs + debug (§16/§27.2)
 - [ ] P2 Build/activation model spec + Postgres migrations for `builds` + partial unique index (§14/§27.1)
 - [ ] P3 Review state machine + `review_ledger` + fingerprint spec + `fingerprint_version` (§17/§27.3)
