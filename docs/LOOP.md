@@ -27,10 +27,31 @@ loop back to step 3.
    git push -u origin task/<id>
    gh pr create --fill --base main
    ```
-7. **Wait for GitHub gates** on the PR — **both** must go green:
-   - CI pipeline (`.github/workflows/ci.yml`)
-   - the bound **Codex** review approves
-   **Either fails → back to step 3** (fix on the same branch, push, checks re-run).
+7. **Wait for GitHub gates** on the PR — all must be satisfied:
+   - **CI** green — required checks `backend` / `frontend` / `integration` (GitHub-enforced).
+   - **Codex review** — after a PR opens, poll `chatgpt-codex-connector[bot]`'s reaction
+     **and** comments. Only these states occur:
+
+     | signal on the PR | meaning | loop action |
+     |---|---|---|
+     | 👀 `eye` reaction | Codex is reviewing | **wait** |
+     | 👍 `+1` reaction | reviewed, no comments | **PASS** |
+     | no reaction **and** no Codex comment | hasn't seen it yet | comment `@codex review` to poke it, then wait |
+     | a new Codex comment / suggestion | wants changes | **back to step 3** |
+
+     ```bash
+     # verdict = Codex reaction (+1 = pass, eye = wait); also check for new codex comments
+     gh api repos/CLYEH/graphRAG/issues/<pr>/reactions \
+       --jq '[.[]|select(.user.login=="chatgpt-codex-connector[bot]")|.content]'
+     gh api repos/CLYEH/graphRAG/pulls/<pr>/comments \
+       --jq '[.[]|select(.user.login=="chatgpt-codex-connector[bot]")]|length'
+     ```
+   - **Conversations resolved** — GitHub blocks merge (`required_conversation_resolution`)
+     until every Codex suggestion thread is addressed and resolved (PR UI, or
+     `gh api graphql` → `resolveReviewThread`).
+   **Codex leaves suggestions / no 👍 → back to step 3.** Fix on the same branch, push,
+   resolve threads, let Codex re-review. (CI is GitHub-hard; Codex's *verdict wait* is
+   loop-enforced; Codex's *unresolved comments* are GitHub-hard.)
 8. **Merge & advance** — merge the PR, delete the branch, `git switch main && git pull`,
    check off the item in `TASKS.md`, return to step 1.
 
