@@ -40,11 +40,15 @@ loop back to step 3.
      | a new Codex comment / suggestion | wants changes | **back to step 3** |
 
      ```bash
-     # verdict = Codex reaction (+1 = pass, eye = wait); also check for new codex comments
+     # verdict = Codex reaction (+1 = pass, eyes = reviewing)
      gh api repos/CLYEH/graphRAG/issues/<pr>/reactions \
        --jq '[.[]|select(.user.login=="chatgpt-codex-connector[bot]")|.content]'
+     # "has comments?" must check BOTH streams — Codex may leave inline review comments
+     # OR a top-level PR comment; /pulls/.../comments returns only the former.
      gh api repos/CLYEH/graphRAG/pulls/<pr>/comments \
-       --jq '[.[]|select(.user.login=="chatgpt-codex-connector[bot]")]|length'
+       --jq '[.[]|select(.user.login=="chatgpt-codex-connector[bot]")]|length'   # inline review comments
+     gh api repos/CLYEH/graphRAG/issues/<pr>/comments \
+       --jq '[.[]|select(.user.login=="chatgpt-codex-connector[bot]")]|length'   # top-level PR comments
      ```
    - **Conversations resolved** — GitHub blocks merge (`required_conversation_resolution`)
      until every Codex suggestion thread is addressed and resolved (PR UI, or
