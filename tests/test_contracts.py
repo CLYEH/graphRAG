@@ -217,7 +217,9 @@ def test_every_error_body_uses_the_error_envelope(spec: dict[str, Any]) -> None:
             assert schema is not None, f"{where} {status}"
             assert schema.get("required") == ["error"], f"{where} {status}"
             error = _deref(spec, cast(dict[str, Any], schema["properties"]["error"]))
-            assert set(error["required"]) >= {"code", "message", "request_id"}, where
+            # The whole frozen shape is required — details is null rather than
+            # absent, so error consumers never branch on missing fields.
+            assert set(error["required"]) == {"code", "message", "details", "request_id"}, where
             code = _deref(spec, cast(dict[str, Any], error["properties"]["code"]))
             assert set(code["enum"]) == _FROZEN_ERROR_CODES, where
 

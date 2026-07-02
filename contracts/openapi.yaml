@@ -1104,7 +1104,10 @@ components:
 
     Error:
       type: object
-      required: [code, message, request_id]
+      description: |
+        The full frozen shape is always present — details is null rather than absent,
+        so error consumers never branch on missing fields.
+      required: [code, message, details, request_id]
       properties:
         code:
           $ref: "#/components/schemas/ErrorCode"
