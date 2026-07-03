@@ -131,12 +131,7 @@ loop back to step 3.
    if they touch only `*.md` (catalog entries, reviewer-checklist sharpening, LOOP/CLAUDE
    clarifications), take the **doc-only fast lane**: no PR, no Codex review requested.
    Only mechanical enforcement (hooks / CI / scripts — any non-`.md` file) becomes an
-   `H<n>` task through the full PR + Codex lane.
-
-   **Compact before the next task (owner rule, 2026-07-03):** once the retro is done,
-   compact the session context (`/compact`) so every task starts on a fresh, small
-   context — the agent asks the owner to run it when it cannot itself. Then return
-   to step 1.
+   `H<n>` task through the full PR + Codex lane. Then return to step 1.
 
 ## Doc-only fast lane (no PR, no Codex)
 Codex auto-reviews every PR the moment it opens, so doc-only work in a PR burns review
@@ -189,8 +184,8 @@ Two options — both use the same protocol above:
   > (must-fix → fix on the same branch and re-review; else reply-and-resolve with the
   > step-7 checkable rationale).
   > Only once CI is green and Codex has `+1`'d, merge (the checkoff rode in the PR), run
-  > the step-8 post-merge retro, compact the session (`/compact`), then take the next
-  > task. If Codex never `+1`s, stop and ask — don't merge around it.
+  > the step-8 post-merge retro, then take the next task. If Codex never `+1`s, stop and
+  > ask — don't merge around it.
   > If a task is ambiguous or conflicts with DESIGN.md, stop and ask instead of guessing.
 
 - **ralph-loop plugin** — for continuous autonomous iteration; point it at the same prompt.
