@@ -46,3 +46,19 @@ jobs:
           node-version: 22
       - run: npm ci
       - run: npm run check
+
+  governance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Loop-protocol invariants (deterministic; PR only)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+          BRANCH: ${{ github.head_ref }}
+        run: bash scripts/governance-check.sh
+      - name: No-op on branch pushes
+        if: github.event_name != 'pull_request'
+        run: echo "push event — governance checks apply to PRs only (keeps this required context green for the doc lane)"
