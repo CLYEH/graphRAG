@@ -332,6 +332,14 @@ def _chunk_ref_without_offsets(p: dict[str, Any]) -> None:
     del p["results"][0]["source_refs"][0]["metadata"]["start_offset"]
 
 
+def _chunk_ref_with_non_numeric_offsets(p: dict[str, Any]) -> None:
+    p["results"][0]["source_refs"][0]["metadata"] = {"start_offset": None, "end_offset": "abc"}
+
+
+def _chunk_ref_with_negative_offset(p: dict[str, Any]) -> None:
+    p["results"][0]["source_refs"][0]["metadata"]["start_offset"] = -1
+
+
 def _chunk_ref_without_uri(p: dict[str, Any]) -> None:
     del p["results"][0]["source_refs"][0]["source_uri"]
 
@@ -386,6 +394,8 @@ def _malformed_build_id(p: dict[str, Any]) -> None:
         _drop_result_source_refs,
         _empty_source_refs,
         _chunk_ref_without_offsets,
+        _chunk_ref_with_non_numeric_offsets,
+        _chunk_ref_with_negative_offset,
         _chunk_ref_without_uri,
         _entity_without_mention,
         _relation_without_evidence,
