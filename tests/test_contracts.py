@@ -392,6 +392,25 @@ def _relation_chunk_ref_without_offsets(p: dict[str, Any]) -> None:
     del p["results"][2]["source_refs"][0]["metadata"]["start_offset"]
 
 
+def _relation_quote_over_512(p: dict[str, Any]) -> None:
+    p["results"][2]["source_refs"][0]["metadata"]["quote"] = "x" * 513
+
+
+def _relation_document_quote_over_512(p: dict[str, Any]) -> None:
+    p["results"][2]["source_refs"] = [
+        {
+            "source_type": "document",
+            "id": "d1",
+            "source_uri": "s3://acme/docs/onboarding.md",
+            "metadata": {"quote": "x" * 513},
+        }
+    ]
+
+
+def _chunk_ref_with_empty_uri(p: dict[str, Any]) -> None:
+    p["results"][0]["source_refs"][0]["source_uri"] = ""
+
+
 def _path_without_relation_ref(p: dict[str, Any]) -> None:
     p["results"][3]["source_refs"] = [{"source_type": "chunk", "id": "c"}]
 
@@ -467,6 +486,9 @@ def _malformed_build_id(p: dict[str, Any]) -> None:
         _relation_ref_without_quote,
         _relation_row_ref_without_pk,
         _relation_chunk_ref_without_offsets,
+        _relation_quote_over_512,
+        _relation_document_quote_over_512,
+        _chunk_ref_with_empty_uri,
         _path_without_relation_ref,
         _row_without_table_pk,
         _row_with_null_table_pk,
