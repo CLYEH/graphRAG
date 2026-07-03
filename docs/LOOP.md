@@ -16,7 +16,7 @@ loop back to step 3.
 4. **Verify (local gates)** — run until green (tier that matches the change):
    ```bash
    uv run poe check-all        # fast: fmt/lint/type + unit/contract (py) + component (web)
-   uv run poe check-full       # + integration (first: docker compose up -d)
+   uv run poe check-full       # + integration (first: docker compose up -d --wait)
    cd web && npm run test:e2e  # UI flows (first: npx playwright install)
    ```
 5. **Agent review (local gate)** — run the `code-reviewer` subagent on the diff.
@@ -58,9 +58,16 @@ loop back to step 3.
    **Merge requires Codex `+1` on the head commit — no exceptions.** `eyes` / "not seen yet"
    are pending states (wait/poke, never a failure); unresolved threads or a fresh
    change-request → back to step 3. **CI green + resolved conversations do NOT substitute for
-   `+1`.** This is enforced mechanically: `.claude/hooks/require-codex-approval.ps1`
-   (PreToolUse) blocks any `gh pr merge` until Codex has reacted `+1`. If Codex never `+1`s,
-   **stop and ask** — never merge around it.
+   `+1`.** This is enforced mechanically: `.claude/hooks/require-codex-approval.sh`
+   (PreToolUse) blocks any `gh pr merge` until Codex has reacted `+1`. (The hook is local,
+   honest-agent enforcement — it guards merges issued from this repo's agent sessions;
+   GitHub itself does not check the Codex reaction, so the web UI could bypass it. Known,
+   accepted tradeoff.) If Codex never `+1`s, **stop and ask** — never merge around it.
+
+   **Don't idle while gates run:** while a PR waits on CI/Codex, you may pick the next
+   task whose dependencies are already met and start it on its own branch **off latest
+   `main`** (never off the waiting branch). Each PR still merges only when its own gates
+   clear; if the waiting PR gets Codex feedback, finishing it takes priority over new work.
 8. **Merge & advance** — only after Codex `+1` on the head commit (the hook enforces it):
    merge the PR, delete the branch, `git switch main && git pull`, check off the item in
    `TASKS.md`, return to step 1.
@@ -78,7 +85,7 @@ loop back to step 3.
 Every task lands with the tests for its tier. Keep the fast loop fast — don't put
 service-dependent or browser tests in `check-all`; use the markers.
 
-Never weaken `ruff`/`mypy`/`tsconfig`/tests to go green. Push is manual (not part of the loop).
+Never weaken `ruff`/`mypy`/`tsconfig`/tests to go green.
 
 ## Running the loop autonomously
 Two options — both use the same protocol above:

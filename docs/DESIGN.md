@@ -1,6 +1,6 @@
 # graphRAG — 設計規格 (DESIGN.md)
 
-> 狀態：**v0.5（實作凍結版 / implementation-freeze）** · 最後更新 2026-07-02
+> 狀態：**v0.5（實作凍結版 / implementation-freeze）** · 最後更新 2026-07-03
 > 🔧 = 預設值/可調整，🟡 = 待決事項。開發模式：agent 驅動 100% 開發，規格以「完整、可維運、可驗收」為目標。
 > v0.5 依 ChatGPT 三輪 review 收尾「實作契約凍結」：active build 強制注入、契約凍到 enum 級、fingerprint 語意 + 版本化、eval 補圖檢索指標、Cypher 驗證策略。細節見 **§27**，決策見 §26。
 
@@ -53,7 +53,7 @@ raw data → 清洗 → 建圖(混合 schema + 實體解析) → 索引(三庫) 
 | 圖視覺化 | 🔧 react-force-graph / Cytoscape.js | 互動探索 |
 | 部署 | Docker Compose | PG + Qdrant + Neo4j + Redis + api + worker |
 
-LLM 預設 🔧：抽取/推理 **OpenAI**（預設 🔧 `gpt-4o`，可設定）；embedding OpenAI `text-embedding-3-large`；經抽象層可切換（仍支援 Claude）。
+LLM 預設 🔧：抽取/推理 **OpenAI**（預設 🔧 `gpt-5.4-nano`，可設定）；embedding OpenAI `text-embedding-3-large`；經抽象層可切換（仍支援 Claude）。
 
 ## 4. 資料模型（Postgres = SoR）
 每專案一個 schema。**所有核心物件帶 `build_id` + 狀態欄；跨 build 穩定身分用 fingerprint（見 §17）。**
@@ -159,7 +159,7 @@ graphRAG/
 依賴方向：`api`/`cli`/`projects/*/mcp` → `core`；`web` → `api` 契約；`core` 不反向依賴門面。
 
 ## 13. 工作分解（四軌，契約先行）
-**Track 0 — 契約與治理（最先，凍結後才開工，DR-002）**：P0 OpenAPI 規範 · P1 Build/activation model · P2 審核狀態機 + carry-forward · P3 MCP response contract · P4 Eval contract · P5 Query safety policy · P6 可觀測性 schema。
+**Track 0 — 契約與治理（最先，凍結後才開工，DR-002）**：P0 OpenAPI 規範 · P1 MCP response contract · P2 Build/activation model · P3 審核狀態機 + carry-forward · P4 Eval contract · P5 Query safety policy · P6 可觀測性 schema。（編號以 `TASKS.md` 佇列為準）
 **Track 1 — 核心引擎**：C0 骨架 → C1 儲存&SoR&投影(build_id) → (C2 攝取清洗 ‖ C3 建圖) → C4 實體解析+ledger → C5 索引 → C6 檢索 → C7 全域摘要 → C8 MCP → C9 builds/activate/rollback → C10 eval → C11 observability。
 **Track 2 — Console 後端**：BA0 骨架+契約 → BA1 專案/來源 → BA2 arq/jobs/SSE → BA3 檢視 → BA4 清洗 → BA5 審核 → BA6 playground → BA7 health → BA8 builds/activate。
 **Track 3 — Console 前端**：FE0 骨架+codegen → FE7 health → FE8 儀表板 → FE5 審核 → FE6 playground →（v2）FE1 匯入 → FE2 清洗 → FE3 檢視 → FE4 圖譜探索。
