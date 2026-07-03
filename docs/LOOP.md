@@ -123,7 +123,9 @@ Two options — both use the same protocol above:
   > branch `task/<id>`, implement with tests, run `uv run poe check-all` until green,
   > then run the `code-reviewer` subagent — if it FAILs, fix and re-review. Then commit,
   > push, and `gh pr create`. Wait for CI green **and** Codex to react `+1` (no exceptions —
-  > a hook blocks merge otherwise); if Codex comments, fix on the same branch and re-review.
+  > a hook blocks merge otherwise); if Codex comments, triage each suggestion per step 7
+  > (must-fix → fix on the same branch and re-review; else reply-and-resolve citing the
+  > justifying DESIGN §/DR).
   > Only once CI is green and Codex has `+1`'d, merge, check the task off, next. If Codex
   > never `+1`s, stop and ask — don't merge around it.
   > If a task is ambiguous or conflicts with DESIGN.md, stop and ask instead of guessing.
