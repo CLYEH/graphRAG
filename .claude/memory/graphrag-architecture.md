@@ -55,7 +55,7 @@ graphRAG（GitHub: CLYEH/graphRAG，預設 branch main）是一套「多專案 h
 
 **v0.3 由來**：使用者把 v0.2 丟給 ChatGPT 做 review，Claude 對其建議做「第二意見」後採納高價值項目寫成 v0.3。
 
-**待決（見 DESIGN §25 分級）**：Neo4j 投影隔離最終做法、OpenAPI error code 列舉、split 是否允許、多人 auth、guardrail 實測、eval 門檻、ontology 採納政策、ER 門檻、embedding、Leiden 層級、chunking。
+**待決（見 DESIGN §25 分級）**：split 是否允許、多人 auth、guardrail 實測（對抗測試 corpus，非策略本身——策略已於 §27.6 凍結）、eval 門檻、ontology 採納政策、ER 門檻、embedding、Leiden 層級、chunking。（Neo4j 投影隔離做法已由 DR-004 定案、OpenAPI error code 列舉已於 §27.2 凍結，故從待決移除）
 
 **環境/Harness（已建置 2026-07-02，`uv run poe check-all` 全綠）**：uv+ruff+mypy(strict)+pytest+poe（後端）；React19/Vite8/TS6+oxlint+prettier+vitest（web/）；docker-compose（pg/neo4j/qdrant/redis）；GitHub Actions CI；CLAUDE.md/AGENTS.md 護欄、TASKS.md 佇列、docs/LOOP.md 迴圈協定。**DoD = `uv run poe check-all`**（快 gate）。web-check 用 poe shell 任務（Windows npm=npm.cmd，不能用 poe cmd）。
 - **測試分層**：pytest marker（integration[需服務,自動 skip]／contract[schema 驗證,合約未凍前 skip]／eval／e2e／slow）；`poe test`=快(單元+contract)、`test-int`、`test-cov`(fail-under 85)、`check-full`=check-all+整合；前端 vitest(元件,只收 src)+Playwright(e2e,`npm run test:e2e`,不在 fast gate)。原則：service/browser 測試不進 fast loop，用 marker 分流。
