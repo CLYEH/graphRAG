@@ -252,7 +252,11 @@ def _valid_mcp_response() -> dict[str, Any]:
                         "source_type": "chunk",
                         "id": chunk_id,
                         "source_uri": chunk_uri,
-                        "metadata": {"quote": "People Ops owns onboarding."},
+                        "metadata": {
+                            "quote": "People Ops owns onboarding.",
+                            "start_offset": 1204,
+                            "end_offset": 1231,
+                        },
                     }
                 ],
             },
@@ -320,6 +324,24 @@ def test_mcp_valid_response_passes(mcp_validator: jsonschema.Draft202012Validato
     mcp_validator.validate(_valid_mcp_response())
 
 
+def test_mcp_relation_document_evidence_needs_no_offsets(
+    mcp_validator: jsonschema.Draft202012Validator,
+) -> None:
+    """§4 evidence_type includes `manual`: document-level citations have no source
+    span, so only chunk-derived relation evidence must carry offsets (§27.4).
+    Requiring offsets on document refs would make manual evidence unrepresentable."""
+    payload = _valid_mcp_response()
+    payload["results"][2]["source_refs"] = [
+        {
+            "source_type": "document",
+            "id": "d1",
+            "source_uri": "s3://acme/docs/onboarding.md",
+            "metadata": {"quote": "People Ops owns onboarding."},
+        }
+    ]
+    mcp_validator.validate(payload)
+
+
 def _drop_result_source_refs(p: dict[str, Any]) -> None:
     del p["results"][0]["source_refs"]
 
@@ -364,6 +386,10 @@ def _relation_row_ref_without_pk(p: dict[str, Any]) -> None:
     p["results"][2]["source_refs"] = [
         {"source_type": "row", "id": "42", "metadata": {"table": "employees"}}
     ]
+
+
+def _relation_chunk_ref_without_offsets(p: dict[str, Any]) -> None:
+    del p["results"][2]["source_refs"][0]["metadata"]["start_offset"]
 
 
 def _path_without_relation_ref(p: dict[str, Any]) -> None:
@@ -440,6 +466,7 @@ def _malformed_build_id(p: dict[str, Any]) -> None:
         _relation_ref_bare_document,
         _relation_ref_without_quote,
         _relation_row_ref_without_pk,
+        _relation_chunk_ref_without_offsets,
         _path_without_relation_ref,
         _row_without_table_pk,
         _row_with_null_table_pk,

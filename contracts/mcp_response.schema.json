@@ -265,15 +265,50 @@
             "properties": {
               "source_refs": {
                 "contains": {
-                  "description": "§27.2/§27.4: relation → ≥1 relation_evidence-backed ref that stays auditable after prune: text evidence (chunk/document) carries quote + source_uri; row evidence carries table + pk.",
+                  "description": "§27.2/§27.4: relation → ≥1 relation_evidence-backed ref that stays auditable after prune. Chunk evidence carries quote + source_uri + offsets (the extraction span is always known); document evidence carries quote + source_uri only (it backs manual/document-level citations — §4 evidence_type includes `manual`, which has no span); row evidence carries table + pk.",
                   "anyOf": [
                     {
                       "properties": {
                         "source_type": {
-                          "enum": [
-                            "chunk",
-                            "document"
-                          ]
+                          "const": "chunk"
+                        },
+                        "source_uri": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "metadata": {
+                          "type": "object",
+                          "required": [
+                            "quote",
+                            "start_offset",
+                            "end_offset"
+                          ],
+                          "properties": {
+                            "quote": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "start_offset": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "end_offset": {
+                              "type": "integer",
+                              "minimum": 0
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "source_type",
+                        "source_uri",
+                        "metadata"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "source_type": {
+                          "const": "document"
                         },
                         "source_uri": {
                           "type": "string",
