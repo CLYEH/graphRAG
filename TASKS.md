@@ -4,7 +4,8 @@ The loop consumes the **top unchecked** item (respecting dependencies). One task
 iteration; definition of done = `uv run poe check-all` green, then commit. Protocol:
 [`docs/LOOP.md`](docs/LOOP.md). Design: [`docs/DESIGN.md`](docs/DESIGN.md).
 
-Mark `[x]` when merged & green. Keep items small enough to finish in one loop.
+Check an item off `[x]` inside its own task PR — the checkoff lands when that PR merges.
+Keep items small enough to finish in one loop.
 
 ---
 
@@ -15,6 +16,7 @@ Mark `[x]` when merged & green. Keep items small enough to finish in one loop.
 - [x] `docker-compose.yml` (postgres/neo4j/qdrant/redis)
 - [x] Test tiers: unit/contract/integration/eval/e2e markers, `test-cov` (85%), conftest service-gating, Playwright scaffold
 - [x] CI (`.github/workflows/ci.yml`: backend + coverage + integration + frontend), CLAUDE.md/AGENTS.md, `.env.example`
+- [x] H1 harness fixes: fail-loud CI integration gate (`--wait` + CI fail-not-skip), doc-drift cleanup (hook filename, push wording, P-numbering, checkoff rule), gate-wait pipelining in LOOP.md, reviewer model → opus, LLM default → `gpt-5.4-nano`, C1/C6 split, `gh`/`git` allowlist, CI dedupe/concurrency + qdrant pin, DR-008 (Alembic) recorded
 
 > **Per-task rule:** one task = one `task/<id>` branch = one PR. It lands with tests for its
 > tier, passes local gates + the `code-reviewer` subagent, then merges only after CI **and**
@@ -23,19 +25,26 @@ Mark `[x]` when merged & green. Keep items small enough to finish in one loop.
 ## Track 0 — Contracts & Governance  *(freeze BEFORE parallel work — DR-002)*
 - [x] P0 `contracts/openapi.yaml`: response envelope, error-code enum, cursor pagination, SSE event, idempotency (§15/§27.2)
 - [ ] P1 `contracts/mcp_response.schema.json`: unified retrieval result + source_refs + debug (§16/§27.2)
-- [ ] P2 Build/activation model spec + Postgres migrations for `builds` + partial unique index (§14/§27.1)
+- [ ] P2 Build/activation model spec + Postgres migrations for `builds` + partial unique index (§14/§27.1) · Alembic setup (DR-008)
 - [ ] P3 Review state machine + `review_ledger` + fingerprint spec + `fingerprint_version` (§17/§27.3)
 - [ ] P4 Eval contract: `golden.yaml` schema + metrics incl. path_validity/relation_hit_rate/groundedness (§20/§27.5)
 - [ ] P5 Query safety policy schema (`query_policy`) + SQL(sqlglot)/Cypher strategy (§21/§27.6)
 - [ ] P6 Observability schema: pipeline_runs/steps/items + item_ref rules (§18/§27.7)
 
 ## Track 1 — Core engine  *(depends on Track 0)*
-- [ ] C1 Store adapters + **BuildScopedRepo** (build_id injection, DR-006) + PG migrations for all core tables
+- [ ] C1a PG migrations for core tables (documents/chunks/entities/relations/evidence/reports/review/observability; `builds` itself lands with P2)
+- [ ] C1b **BuildScopedRepo** over Postgres (active-build lookup + build_id injection, DR-006)
+- [ ] C1c Neo4j adapter + projection repo (build_id-filtered, DR-004)
+- [ ] C1d Qdrant adapter + projection repo (build_id payload filter)
 - [ ] C2 Ingest (structured + document connectors) + clean/chunking
 - [ ] C3 Graph build (hybrid ontology extraction → entities/relations)
 - [ ] C4 Entity resolution + apply `review_ledger`
 - [ ] C5 Index: embeddings → Qdrant; project entities/relations → Neo4j
-- [ ] C6 Retrieval: semantic / graph / sql / global + hybrid router (§8, §16 contract)
+- [ ] C6a Retrieval: semantic (Qdrant kNN, §16 contract)
+- [ ] C6b Retrieval: sql (NLSQL + sqlglot guardrail per P5, §27.6)
+- [ ] C6c Retrieval: graph (parameterized Cypher templates + guardrail per P5, §27.6)
+- [ ] C6d Retrieval: global (community_reports — needs C7)
+- [ ] C6e Hybrid router + fusion + routing trace (§8, §16 debug)
 - [ ] C7 Global summary (Leiden communities + reports)
 - [ ] C8 MCP server (per project) exposing the tool set
 - [ ] C9 builds/activate/rollback/diff/prune (CLI + core)

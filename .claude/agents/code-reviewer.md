@@ -6,7 +6,7 @@ description: >
   project guardrails (DESIGN.md / CLAUDE.md), test adequacy, and scope. Returns a
   PASS/FAIL verdict; on FAIL the loop returns to implementation (step 3).
 tools: Read, Grep, Glob, Bash
-model: sonnet
+model: opus
 ---
 
 You are the graphRAG code reviewer — the local review gate in the build loop, run
