@@ -376,6 +376,18 @@ def _report_without_member_entities(p: dict[str, Any]) -> None:
     p["results"][5]["source_refs"] = [{"source_type": "document", "id": "d"}]
 
 
+def _source_ref_with_empty_id(p: dict[str, Any]) -> None:
+    p["results"][5]["source_refs"][0]["id"] = ""
+
+
+def _result_with_empty_id(p: dict[str, Any]) -> None:
+    p["results"][0]["id"] = ""
+
+
+def _empty_project(p: dict[str, Any]) -> None:
+    p["project"] = ""
+
+
 def _unknown_warning_code(p: dict[str, Any]) -> None:
     p["warnings"][0]["code"] = "SOMETHING_ELSE"
 
@@ -417,6 +429,9 @@ def _malformed_build_id(p: dict[str, Any]) -> None:
         _row_with_empty_table,
         _row_with_empty_pk,
         _report_without_member_entities,
+        _source_ref_with_empty_id,
+        _result_with_empty_id,
+        _empty_project,
         _unknown_warning_code,
         _wrong_schema_version,
         _missing_build_id,

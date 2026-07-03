@@ -32,7 +32,8 @@
       ]
     },
     "project": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "build_id": {
       "type": "string",
@@ -96,7 +97,8 @@
           "$ref": "#/$defs/SourceRefType"
         },
         "id": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "source_uri": {
           "type": [
@@ -130,7 +132,8 @@
           ]
         },
         "id": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "title": {
           "type": [
