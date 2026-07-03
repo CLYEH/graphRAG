@@ -73,7 +73,7 @@ async def test_active_repo_reads_only_the_active_build(migrated: None) -> None:
 
             repo = await BuildScopedRepo.for_active_build(conn, project)
             assert repo.build_id == active
-            rows = (await conn.execute(repo.select(documents))).fetchall()
+            rows = await repo.fetch_all(documents)
             assert [row.build_id for row in rows] == [active]
             await trans.rollback()
     finally:
@@ -108,16 +108,14 @@ async def test_pipeline_writes_land_in_the_bound_building_build(migrated: None) 
             active = await _insert_build(conn, project, "active")
             building = await _insert_build(conn, project, "building")
 
-            writer = BuildScopedRepo(conn=conn, project=project, build_id=building)
-            await conn.execute(
-                writer.insert_values(documents, source_uri="s3://new", content_hash="c-new")
-            )
+            writer = BuildScopedRepo(conn, project, building)
+            await writer.insert(documents, source_uri="s3://new", content_hash="c-new")
 
-            written = (await conn.execute(writer.select(documents))).fetchall()
+            written = await writer.fetch_all(documents)
             assert [row.build_id for row in written] == [building]
             reader = await BuildScopedRepo.for_active_build(conn, project)
             assert reader.build_id == active
-            assert (await conn.execute(reader.select(documents))).fetchall() == []
+            assert await reader.fetch_all(documents) == []
             await trans.rollback()
     finally:
         await engine.dispose()
@@ -137,11 +135,9 @@ async def test_scoped_select_composes_with_caller_predicates(migrated: None) -> 
             await _insert_document(conn, project, stale)
 
             repo = await BuildScopedRepo.for_active_build(conn, project)
-            narrowed = repo.select(documents).where(
-                documents.c.source_uri == f"s3://bucket/{stale}"
-            )
             # the stale build's uri exists in the table, but outside the scope
-            assert (await conn.execute(narrowed)).fetchall() == []
+            rows = await repo.fetch_all(documents, documents.c.source_uri == f"s3://bucket/{stale}")
+            assert rows == []
             await trans.rollback()
     finally:
         await engine.dispose()

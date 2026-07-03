@@ -10,10 +10,13 @@ versions. This module is that structure for Postgres:
   API layer maps to the frozen ``NO_ACTIVE_BUILD`` error code (§15).
 - ``BuildScopedRepo`` — binds ``(project, build_id)`` once at construction
   (§27.1: read the active id once per request and cache it — the bound repo
-  IS that cache) and injects them into every read and write. Reads via
-  :meth:`select` return a ``Select`` already filtered; writes via
-  :meth:`insert_values` get the scope columns injected, so a caller cannot
-  write another build's rows.
+  IS that cache; no setters, so the scope cannot drift mid-request) and
+  injects them into every read and write. The repo EXECUTES internally
+  (:meth:`fetch_all`, :meth:`insert`): consumers are never handed the raw
+  connection, because a repo that only built statements would force callers
+  to hold a connection to run them — making the DR-006 bypass the normal
+  path instead of a fenced-off one. The connection attribute is name-mangled
+  private; reaching it is a deliberate act, not a convenience.
 - The scope column map is explicit: tables that are deliberately NOT
   build-scoped (``builds`` itself, ``review_ledger`` per DR-003, the
   observability tables with their own §27.7 binding rules) and tables scoped
@@ -21,6 +24,8 @@ versions. This module is that structure for Postgres:
   build_id) are rejected loudly — silently "scoping" them would fake the
   guarantee this layer exists to give.
 
+The read/write surface is deliberately minimal (filtered fetch, scoped
+insert); C4/C6/BA3 extend it additively as their access patterns land.
 Neo4j/Qdrant projections get the same treatment in C1c/C1d (DR-004's
 ``WHERE n.build_id`` / payload filter); this module is Postgres-only.
 """
@@ -28,7 +33,7 @@ Neo4j/Qdrant projections get the same treatment in C1c/C1d (DR-004's
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any
 
 import sqlalchemy as sa
@@ -102,26 +107,39 @@ async def active_build_id(conn: AsyncConnection, project: str) -> uuid.UUID:
     return build
 
 
-@dataclass(frozen=True)
 class BuildScopedRepo:
     """Postgres access bound to one ``(project, build_id)`` (DR-006).
 
-    Frozen on purpose: the binding is the §27.1 per-request cache, and a repo
-    whose scope could be mutated mid-request would reintroduce exactly the
-    mixed-version reads this layer exists to prevent. Construct via
-    :meth:`for_active_build` for queries (scope = the active build) or bind a
-    ``building`` build's id explicitly for pipeline writes (§27.1: 寫入一律指定
-    building 的 build_id).
+    Construct via :meth:`for_active_build` for queries (scope = the active
+    build) or bind a ``building`` build's id explicitly for pipeline writes
+    (§27.1: 寫入一律指定 building 的 build_id). The scope is read-only after
+    construction, and execution happens inside the repo — a consumer holding
+    a repo holds no raw connection to escape through.
     """
 
-    conn: AsyncConnection
-    project: str
-    build_id: uuid.UUID
+    __slots__ = ("__conn", "__project", "__build_id")
+
+    def __init__(self, conn: AsyncConnection, project: str, build_id: uuid.UUID) -> None:
+        # name-mangled: reaching the connection from outside is a deliberate
+        # bypass (visible in review), never an accident of convenience
+        self.__conn = conn
+        self.__project = project
+        self.__build_id = build_id
+
+    @property
+    def project(self) -> str:
+        return self.__project
+
+    @property
+    def build_id(self) -> uuid.UUID:
+        return self.__build_id
 
     @classmethod
     async def for_active_build(cls, conn: AsyncConnection, project: str) -> BuildScopedRepo:
         """Bind to the project's active build (one lookup, then cached here)."""
-        return cls(conn=conn, project=project, build_id=await active_build_id(conn, project))
+        return cls(conn, project, await active_build_id(conn, project))
+
+    # -- scope plumbing (single-underscore: shared with the SQL-shape tests) --
 
     def _scope_columns(self, table: sa.Table) -> tuple[str, ...]:
         try:
@@ -133,28 +151,18 @@ class BuildScopedRepo:
             ) from None
 
     def _scope_values(self, table: sa.Table) -> dict[str, Any]:
-        values: dict[str, Any] = {"build_id": self.build_id}
+        values: dict[str, Any] = {"build_id": self.__build_id}
         if "project" in self._scope_columns(table):
-            values["project"] = self.project
+            values["project"] = self.__project
         return values
 
-    def select(self, table: sa.Table) -> sa.Select[Any]:
-        """A ``SELECT`` with the scope filters already injected.
-
-        Callers add their own predicates on top; they cannot remove these.
-        """
+    def _select(self, table: sa.Table) -> sa.Select[Any]:
         query = sa.select(table)
         for column, value in self._scope_values(table).items():
             query = query.where(table.c[column] == value)
         return query
 
-    def insert_values(self, table: sa.Table, /, **values: Any) -> sa.Insert:
-        """An ``INSERT`` with the scope columns injected.
-
-        A caller-supplied conflicting scope value is a bug by definition —
-        rejected loudly rather than silently overwritten (either direction
-        would hide a cross-build write).
-        """
+    def _insert_values(self, table: sa.Table, values: dict[str, Any]) -> sa.Insert:
         scope = self._scope_values(table)
         conflicts = {
             key: values[key] for key in scope.keys() & values.keys() if values[key] != scope[key]
@@ -162,6 +170,30 @@ class BuildScopedRepo:
         if conflicts:
             raise ValueError(
                 f"scope columns {sorted(conflicts)} conflict with this repo's binding "
-                f"(project={self.project!r}, build_id={self.build_id!r})"
+                f"(project={self.__project!r}, build_id={self.__build_id!r})"
             )
         return table.insert().values({**values, **scope})
+
+    # -- the public, executing surface ----------------------------------------
+
+    async def fetch_all(
+        self, table: sa.Table, *where: sa.ColumnExpressionArgument[bool]
+    ) -> Sequence[sa.Row[Any]]:
+        """Read the scoped rows, optionally narrowed by caller predicates.
+
+        Predicates can only narrow — the scope filters are already in the
+        query and nothing the caller passes can remove them.
+        """
+        query = self._select(table)
+        for predicate in where:
+            query = query.where(predicate)
+        return (await self.__conn.execute(query)).fetchall()
+
+    async def insert(self, table: sa.Table, /, **values: Any) -> None:
+        """Insert a row with the scope columns injected.
+
+        A caller-supplied conflicting scope value is a bug by definition —
+        rejected loudly rather than silently overwritten (either direction
+        would hide a cross-build write).
+        """
+        await self.__conn.execute(self._insert_values(table, values))
