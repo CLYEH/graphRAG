@@ -23,7 +23,8 @@
       "description": "Bumped only on breaking changes (DR-002)."
     },
     "default_mode": {
-      "$ref": "#/$defs/QueryMode"
+      "$ref": "#/$defs/QueryMode",
+      "description": "Mode used when the caller doesn't pick one. sql requires text_to_sql.enabled: true (root allOf below) — defaulting to a mode this same policy disables would make every default query dead on arrival. graph is always a legal default regardless of text_to_cypher.enabled: the graph mode's default path is parameterized templates (§27.6); that flag only governs the optional free NL→Cypher add-on."
     },
     "max_top_k": {
       "type": "integer",
@@ -61,6 +62,34 @@
       "$ref": "#/$defs/TextToCypher"
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "default_mode": {
+            "const": "sql"
+          }
+        },
+        "required": [
+          "default_mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "text_to_sql": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "QueryMode": {
       "description": "Kept identical to QueryMode in contracts/openapi.yaml, mcp_response.schema.json and golden.schema.json.",

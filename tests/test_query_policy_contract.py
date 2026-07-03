@@ -147,6 +147,30 @@ def test_disabled_sql_may_have_empty_whitelist(
     policy_validator.validate(policy)
 
 
+def test_sql_default_mode_requires_sql_enabled(
+    policy_validator: jsonschema.Draft202012Validator,
+) -> None:
+    """default_mode: sql is legal exactly when the sql mode can actually run —
+    with it enabled the same policy validates; with it disabled every default
+    query would be rejected by this very contract (see the reject mutation)."""
+    policy = _valid_policy()
+    policy["default_mode"] = "sql"
+    policy_validator.validate(policy)
+
+
+def test_graph_default_with_cypher_disabled_passes(
+    policy_validator: jsonschema.Draft202012Validator,
+) -> None:
+    """Deliberately NOT the sql contradiction: graph's default path is
+    parameterized templates (§27.6) — text_to_cypher.enabled only gates the
+    optional free NL→Cypher add-on, so graph as default_mode must stay legal
+    while that flag is false, or the template path becomes unconfigurable."""
+    policy = _valid_policy()
+    policy["default_mode"] = "graph"
+    assert policy["text_to_cypher"]["enabled"] is False
+    policy_validator.validate(policy)
+
+
 def test_extended_blocklists_pass(policy_validator: jsonschema.Draft202012Validator) -> None:
     """§21 lists are frozen *minimums* — projects may extend them (additive),
     only shrinking is illegal."""
@@ -201,6 +225,15 @@ def _cypher_readonly_false(p: dict[str, Any]) -> None:
 
 def _enabled_sql_with_empty_whitelist(p: dict[str, Any]) -> None:
     """enabled + empty whitelist is a contradiction, not deny-all."""
+    p["text_to_sql"]["allowed_tables"] = []
+
+
+def _sql_default_mode_while_disabled(p: dict[str, Any]) -> None:
+    """Defaulting to a mode this same policy disables would make every
+    default query dead on arrival — same contradiction class as
+    enabled_sql_with_empty_whitelist, caught at authoring time."""
+    p["default_mode"] = "sql"
+    p["text_to_sql"]["enabled"] = False
     p["text_to_sql"]["allowed_tables"] = []
 
 
@@ -281,6 +314,7 @@ def _missing_schema_version(p: dict[str, Any]) -> None:
         _sql_readonly_false,
         _cypher_readonly_false,
         _enabled_sql_with_empty_whitelist,
+        _sql_default_mode_while_disabled,
         _blank_table_name,
         _duplicate_table,
         _shrunken_sql_blocklist,
