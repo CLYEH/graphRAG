@@ -16,7 +16,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="GRAPHRAG_", extra="ignore")
 
     # Stores (see DESIGN.md §2 — three-engine polyglot, Postgres = SoR)
-    postgres_dsn: str = "postgresql://graphrag:graphrag@localhost:5432/graphrag"
+    # host port 15432: the compose mapping avoids natively installed PostgreSQL on 5432
+    postgres_dsn: str = "postgresql://graphrag:graphrag@localhost:15432/graphrag"
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "graphrag-dev"

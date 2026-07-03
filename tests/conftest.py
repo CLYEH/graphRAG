@@ -21,9 +21,12 @@ def _reachable(host: str, port: int, timeout: float = 0.5) -> bool:
 
 def _services_up() -> bool:
     settings = get_settings()
+    postgres = urlparse(settings.postgres_dsn)
     qdrant = urlparse(settings.qdrant_url)
     targets: list[tuple[str, int]] = [
-        ("localhost", 5432),  # postgres
+        # port fallback = the DRIVER's default (5432): a port-less DSN connects there,
+        # not to the compose host mapping (15432, always explicit in our DSNs)
+        (postgres.hostname or "localhost", postgres.port or 5432),  # postgres
         ("localhost", 7687),  # neo4j bolt
         (qdrant.hostname or "localhost", qdrant.port or 6333),  # qdrant
         ("localhost", 6379),  # redis
