@@ -360,6 +360,18 @@ def _row_without_table_pk(p: dict[str, Any]) -> None:
     del p["results"][4]["source_refs"][0]["metadata"]["table"]
 
 
+def _row_with_null_table_pk(p: dict[str, Any]) -> None:
+    p["results"][4]["source_refs"][0]["metadata"] = {"table": None, "pk": None}
+
+
+def _row_with_empty_table(p: dict[str, Any]) -> None:
+    p["results"][4]["source_refs"][0]["metadata"]["table"] = ""
+
+
+def _row_with_empty_pk(p: dict[str, Any]) -> None:
+    p["results"][4]["source_refs"][0]["metadata"]["pk"] = ""
+
+
 def _report_without_member_entities(p: dict[str, Any]) -> None:
     p["results"][5]["source_refs"] = [{"source_type": "document", "id": "d"}]
 
@@ -401,6 +413,9 @@ def _malformed_build_id(p: dict[str, Any]) -> None:
         _relation_without_evidence,
         _path_without_relation_ref,
         _row_without_table_pk,
+        _row_with_null_table_pk,
+        _row_with_empty_table,
+        _row_with_empty_pk,
         _report_without_member_entities,
         _unknown_warning_code,
         _wrong_schema_version,
