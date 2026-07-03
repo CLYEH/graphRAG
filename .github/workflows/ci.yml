@@ -1,7 +1,8 @@
 name: CI
 on:
   push:
-    branches: [main]
+    # docs/** = doc-only fast lane: per-SHA statuses let the branch fast-forward into main without a PR
+    branches: [main, "docs/**"]
   pull_request:
 
 concurrency:

@@ -111,6 +111,29 @@ loop back to step 3.
    merge the PR, delete the branch, `git switch main && git pull`, check off the item in
    `TASKS.md`, return to step 1.
 
+## Doc-only fast lane (no PR, no Codex)
+Codex auto-reviews every PR the moment it opens, so doc-only work in a PR burns review
+quota against zero code risk. Owner decision (2026-07-03): a change where **every changed
+file is `*.md`** skips the PR entirely:
+
+1. Branch `docs/<id>` off latest `main`.
+2. Local gates as usual (`uv run poe check-all` — cheap; nothing executes Markdown).
+3. Run the **`doc-reviewer`** subagent (not `code-reviewer`). `VERDICT: PASS` stamps the
+   review receipt the push gate requires.
+4. Push the branch — CI runs on `docs/**` pushes — wait for green, then fast-forward main:
+   `git push origin docs/<id>:main`.
+
+Enforcement is mechanical, not honor-based:
+- `.claude/hooks/require-push-gates.sh` (PreToolUse) blocks any direct-to-main push that
+  contains a non-`*.md` file, and any push whose content doesn't match a reviewer receipt.
+- Branch protection still requires green required checks on the pushed SHA (statuses are
+  per-SHA, so the `docs/**` CI run satisfies them). "Require a pull request" was lifted to
+  enable this lane — code changes still go through PRs because the push gate refuses them
+  here.
+
+Anything touching code/config/contracts/workflows/hooks — any non-`.md` file — takes the
+full lane: task branch → PR → CI + Codex `+1`.
+
 ## Testing tiers (what runs when)
 | Tier | Runs | Marker / location | In fast loop? |
 |---|---|---|---|
