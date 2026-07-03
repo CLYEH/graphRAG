@@ -110,11 +110,11 @@ pipeline_runs = sa.Table(
     # §27.7: nullable on purpose — pure source-validation jobs carry no build.
     # Deliberately NOT an FK to builds: build retention/prune (C9) isn't frozen
     # yet and every ondelete choice would pre-decide it (SET NULL would even
-    # break the ingest CHECK below). Revisit with C9.
+    # break the build-binding CHECK below). Revisit with C9.
     sa.Column("build_id", postgresql.UUID(as_uuid=True)),
-    # Open vocabulary — the frozen §15 contract keeps Job.kind a free string
-    # ("e.g. ingest, build, reproject"), so only the one kind §27.7 names is
-    # CHECK-frozen below.
+    # Open vocabulary otherwise — the frozen §15 contract keeps Job.kind a
+    # free string ("e.g. ingest, build, reproject"); only the build binding
+    # below constrains it.
     sa.Column("kind", sa.Text, nullable=False),
     sa.Column("status", sa.Text, nullable=False, server_default=sa.text("'queued'")),
     sa.Column("config_hash", sa.Text),
@@ -131,13 +131,15 @@ pipeline_runs = sa.Table(
         "status IN ('queued','running','done','failed','cancelled')",
         name="pipeline_runs_status_valid",
     ),
-    # §27.7 verbatim: ingest runs always attach to the building build. Other
-    # kinds' build binding is the writers' contract (kind is open vocabulary,
-    # so it cannot be CHECK-enumerated without inventing names DESIGN doesn't
-    # freeze).
+    # §27.7: only the pure source-validation job is build-unbound — every
+    # other kind (ingest, build, reproject, …) must carry the building
+    # build's id, or the row could never be tied back to a build for §18
+    # observability or retry-failed-only merging. Single-sourced as
+    # core.observability.spec.SOURCE_VALIDATION_RUN_KIND (lockstep-tested);
+    # a future build-unbound kind extends this by migration.
     sa.CheckConstraint(
-        "kind <> 'ingest' OR build_id IS NOT NULL",
-        name="pipeline_runs_ingest_has_build",
+        "build_id IS NOT NULL OR kind = 'source_validation'",
+        name="pipeline_runs_build_binding",
     ),
 )
 

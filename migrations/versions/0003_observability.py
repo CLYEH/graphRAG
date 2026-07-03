@@ -4,8 +4,8 @@ DESIGN §18/§27.7: one run per pipeline execution, one row per step, item rows
 per work item (default verbosity: failed/skipped only). item_ref is a stable
 key (document=content_hash, entity=entity_key — core.observability.spec), so
 reruns line up; the per-step unique index makes item dedup a DB invariant.
-§27.7 build binding: ingest runs must carry the building build's id; only
-pure source-validation jobs may leave build_id null.
+§27.7 build binding: only the pure source-validation job kind may leave
+build_id null; every other run kind must carry the building build's id.
 """
 
 from __future__ import annotations
@@ -46,8 +46,8 @@ def upgrade() -> None:
             name="pipeline_runs_status_valid",
         ),
         sa.CheckConstraint(
-            "kind <> 'ingest' OR build_id IS NOT NULL",
-            name="pipeline_runs_ingest_has_build",
+            "build_id IS NOT NULL OR kind = 'source_validation'",
+            name="pipeline_runs_build_binding",
         ),
     )
     op.create_table(

@@ -19,12 +19,14 @@ identifies work items the same way. This module freezes that identification:
    run's failed item set, deduped by (item_kind, item_ref); the output merges
    back into the *same* build_id. ``retry_failed_only`` is that rule as code.
 
-§27.7's other rule — ingest runs always carry the building build's id, only
-pure source-validation jobs may have ``build_id = NULL`` — is enforced for
-the one kind §27.7 names by the ``pipeline_runs_ingest_has_build`` CHECK
-(``INGEST_RUN_KIND`` is its single source); run kinds are otherwise open
-vocabulary (the frozen §15 contract keeps ``Job.kind`` a free string), so the
-general binding stays a writers' contract (C2/BA1/BA2).
+§27.7's other rule — ingest runs always carry the building build's id, and
+**only** pure source-validation jobs may have ``build_id = NULL`` — is
+enforced by the ``pipeline_runs_build_binding`` CHECK: a null build_id is
+admitted solely for ``SOURCE_VALIDATION_RUN_KIND`` (this module is its single
+source). Run kinds are otherwise open vocabulary (the frozen §15 contract
+keeps ``Job.kind`` a free string); if a future kind is ever defined as
+build-unbound, the CHECK extends by migration — additive, like every frozen
+minimum here.
 """
 
 from __future__ import annotations
@@ -51,10 +53,12 @@ ITEM_STATUS_FAILED = "failed"
 #: exactly these). Extend, never rename.
 ITEM_STATUSES_MIN = (ITEM_STATUS_FAILED, "skipped")
 
-#: §27.7 verbatim: the one run kind whose build binding is frozen (ingest
-#: always attaches to the building build). Mirrored by the
-#: ``pipeline_runs_ingest_has_build`` CHECK; a schema test pins the lockstep.
-INGEST_RUN_KIND = "ingest"
+#: §27.7: the one run kind defined as build-unbound (純來源驗證 — pure source
+#: validation). Every other kind must carry the building build's id, or its
+#: rows could never be tied back to a build for §18 observability or
+#: retry-failed-only merging. Mirrored by the ``pipeline_runs_build_binding``
+#: CHECK; a schema test pins the lockstep.
+SOURCE_VALIDATION_RUN_KIND = "source_validation"
 
 
 @dataclass(frozen=True)

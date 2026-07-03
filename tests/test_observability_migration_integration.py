@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
+from core.observability.spec import SOURCE_VALIDATION_RUN_KIND
 from core.stores.tables import pipeline_runs, pipeline_step_items, pipeline_steps
 
 pytestmark = pytest.mark.integration
@@ -56,15 +57,20 @@ async def _insert_run_step(conn: AsyncConnection, project: str) -> tuple[uuid.UU
     return run_id, step_id
 
 
-async def test_ingest_run_without_a_build_is_impossible(migrated: None) -> None:
+@pytest.mark.parametrize("kind", ["ingest", "build", "reproject"])
+async def test_build_bound_run_without_a_build_is_impossible(migrated: None, kind: str) -> None:
+    """§27.7's null boundary is exhaustive: not just ingest — ANY kind other
+    than pure source validation missing its build_id would be an orphan row
+    that observability and retry-failed-only merging could never tie back to
+    a build."""
     engine = _engine()
     try:
         async with engine.connect() as conn:
             trans = await conn.begin()
-            with pytest.raises(IntegrityError, match="pipeline_runs_ingest_has_build"):
+            with pytest.raises(IntegrityError, match="pipeline_runs_build_binding"):
                 await conn.execute(
                     pipeline_runs.insert().values(
-                        project="itest-x", kind="ingest", status="queued", build_id=None
+                        project="itest-x", kind=kind, status="queued", build_id=None
                     )
                 )
             await trans.rollback()
@@ -72,7 +78,7 @@ async def test_ingest_run_without_a_build_is_impossible(migrated: None) -> None:
         await engine.dispose()
 
 
-async def test_source_validation_style_runs_may_omit_the_build(migrated: None) -> None:
+async def test_source_validation_runs_may_omit_the_build(migrated: None) -> None:
     """The other half of §27.7: a NOT NULL (or an over-wide CHECK) would make
     the pure source-validation job unrepresentable."""
     engine = _engine()
@@ -81,7 +87,10 @@ async def test_source_validation_style_runs_may_omit_the_build(migrated: None) -
             trans = await conn.begin()
             await conn.execute(
                 pipeline_runs.insert().values(
-                    project="itest-x", kind="source_validation", status="queued", build_id=None
+                    project="itest-x",
+                    kind=SOURCE_VALIDATION_RUN_KIND,
+                    status="queued",
+                    build_id=None,
                 )
             )
             await trans.rollback()

@@ -8,10 +8,10 @@ stable-key mapping and the retry boundary semantics.
 from __future__ import annotations
 
 from core.observability.spec import (
-    INGEST_RUN_KIND,
     ITEM_REF_STABLE_KEYS_MIN,
     ITEM_STATUS_FAILED,
     ITEM_STATUSES_MIN,
+    SOURCE_VALIDATION_RUN_KIND,
     ItemOutcome,
     retry_failed_only,
 )
@@ -35,8 +35,10 @@ def test_minimum_item_statuses_freeze_design() -> None:
     assert ITEM_STATUS_FAILED in ITEM_STATUSES_MIN
 
 
-def test_ingest_kind_matches_design_wording() -> None:
-    assert INGEST_RUN_KIND == "ingest"
+def test_source_validation_is_the_only_build_unbound_kind() -> None:
+    """§27.7: renaming this constant would strand the CHECK constraint's
+    literal (they're lockstep-tested) and silently re-bind validation jobs."""
+    assert SOURCE_VALIDATION_RUN_KIND == "source_validation"
 
 
 # --- retry boundary (§27.7) -----------------------------------------------------

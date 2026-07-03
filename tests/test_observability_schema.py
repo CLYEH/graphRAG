@@ -14,7 +14,7 @@ import pytest
 import sqlalchemy as sa
 import yaml
 
-from core.observability.spec import INGEST_RUN_KIND
+from core.observability.spec import SOURCE_VALIDATION_RUN_KIND
 from core.stores.tables import (
     pipeline_runs,
     pipeline_step_items,
@@ -60,13 +60,14 @@ def test_run_build_id_stays_nullable_for_source_validation_jobs() -> None:
     assert pipeline_runs.c.build_id.nullable
 
 
-def test_ingest_runs_must_carry_a_build_id() -> None:
-    """§27.7 verbatim: ingest always attaches to the building build — as a
-    CHECK, so no writer can record an orphan ingest run that the retry
-    boundary could never merge back into a build."""
-    sqltext = _checks(pipeline_runs)["pipeline_runs_ingest_has_build"]
-    assert f"'{INGEST_RUN_KIND}'" in sqltext  # single-sourced from the spec
-    assert "build_id" in sqltext
+def test_null_build_id_is_reserved_for_source_validation() -> None:
+    """§27.7 is exhaustive about the null boundary: the pure source-validation
+    job is the ONLY build-unbound kind — a CHECK that merely special-cased
+    ingest would admit e.g. a build/reproject run missing its build_id, an
+    orphan row the retry boundary could never merge back into a build."""
+    sqltext = _checks(pipeline_runs)["pipeline_runs_build_binding"]
+    assert "build_id IS NOT NULL" in sqltext
+    assert f"'{SOURCE_VALIDATION_RUN_KIND}'" in sqltext  # single-sourced from the spec
 
 
 def test_pipeline_steps_columns_match_design_spec() -> None:
