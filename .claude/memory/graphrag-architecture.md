@@ -14,7 +14,7 @@ graphRAG（C:\graphRAG，GitHub: CLYEH/graphRAG，預設 branch main）是一套
 **定案（截至 2026-07-02）**：
 - 語言：Python
 - 骨幹框架：LlamaIndex（PropertyGraph 建圖、實體解析、text-to-SQL、向量、router、LLM/embedding 抽象已含 OpenAI+Claude）
-- LLM：抽象層，至少支援 OpenAI + Claude（用 LlamaIndex 內建抽象，可能就不需另疊 LiteLLM）。**預設用 OpenAI**（抽取/推理預設 gpt-4o，可設定；embedding text-embedding-3-large），仍可切換 Claude
+- LLM：抽象層，至少支援 OpenAI + Claude（用 LlamaIndex 內建抽象，可能就不需另疊 LiteLLM）。**預設用 OpenAI**（抽取/推理預設 gpt-5.4-nano，可設定；embedding text-embedding-3-large），仍可切換 Claude
 - 儲存：polyglot 三引擎 — Postgres（SQL/結構化）+ Qdrant（向量）+ Neo4j（圖）
 - 架構：monorepo，一專案一資料夾一 MCP server process（隔離最清楚）
 - 資料型態：結構化 + 非結構化混合
