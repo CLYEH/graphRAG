@@ -32,19 +32,22 @@ echo "watching PR #$PR on $repo since $START (interval ${INTERVAL}s, max $MAX_PO
 
 for i in $(seq 1 "$MAX_POLLS"); do
   sleep "$INTERVAL"
-  reactions="$(gh api "repos/$repo/issues/$PR/reactions" \
-    --jq "[.[]|select(.user.login==\"$BOT\")|.content]|join(\",\")" 2>/dev/null)"
-  newrev="$(gh api "repos/$repo/pulls/$PR/reviews" \
-    --jq "[.[]|select((.user.login|startswith(\"$BOT_PREFIX\")) and .submitted_at > \"$START\")]|length" 2>/dev/null)"
-  newc="$(gh api "repos/$repo/issues/$PR/comments" \
-    --jq "[.[]|select((.user.login|startswith(\"$BOT_PREFIX\")) and .created_at > \"$START\")]|length" 2>/dev/null)"
+  # --paginate everywhere: list endpoints return oldest-first pages of 30, so an
+  # unpaginated call on a long PR would miss the fresh response and fake a timeout.
+  # jq runs per page under --paginate, so counts are summed and lists re-joined.
+  reactions="$(gh api --paginate "repos/$repo/issues/$PR/reactions" \
+    --jq "[.[]|select(.user.login==\"$BOT\")|.content]|join(\",\")" 2>/dev/null | paste -sd, - | sed 's/^,*//;s/,*$//')"
+  newrev="$(gh api --paginate "repos/$repo/pulls/$PR/reviews" \
+    --jq "[.[]|select((.user.login|startswith(\"$BOT_PREFIX\")) and .submitted_at > \"$START\")]|length" 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+  newc="$(gh api --paginate "repos/$repo/issues/$PR/comments" \
+    --jq "[.[]|select((.user.login|startswith(\"$BOT_PREFIX\")) and .created_at > \"$START\")]|length" 2>/dev/null | awk '{s+=$1} END {print s+0}')"
   unresolved="$(gh api graphql \
     -f query="{repository(owner:\"$owner\",name:\"$name\"){pullRequest(number:$PR){reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{author{login}}}}}}}}" \
     --jq "[.data.repository.pullRequest.reviewThreads.nodes[]|select(.isResolved==false and (.comments.nodes[0].author.login|startswith(\"$BOT_PREFIX\")))]|length" 2>/dev/null)"
   echo "[poll $i] PR#$PR reactions=[$reactions] new_reviews=${newrev:-?} new_comments=${newc:-?} unresolved_threads=${unresolved:-?}"
   if printf '%s' "$reactions" | grep -q '+1'; then
-    plus1_at="$(gh api "repos/$repo/issues/$PR/reactions" \
-      --jq "[.[]|select(.user.login==\"$BOT\" and .content==\"+1\")|.created_at]|max" 2>/dev/null)"
+    plus1_at="$(gh api --paginate "repos/$repo/issues/$PR/reactions" \
+      --jq "[.[]|select(.user.login==\"$BOT\" and .content==\"+1\")|.created_at]|max // empty" 2>/dev/null | sort | tail -n1)"
     echo "RESULT: +1 — approved (reacted at ${plus1_at:-unknown}; the merge hook still verifies it is newer than the head commit)."
     exit 0
   fi
