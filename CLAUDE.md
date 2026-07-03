@@ -11,7 +11,8 @@ A task is done only when it passes **four gates** and its PR merges (full flow i
 3. **CI green** on the PR (`.github/workflows/ci.yml`).
 4. **Codex review** — `chatgpt-codex-connector[bot]` reacts 👍 (`+1`) with no open suggestions.
    👀 = still reviewing (wait); no reaction & no comment = poke it with `@codex review`; a new
-   Codex comment = changes wanted → back to step 3. Unresolved Codex threads block merge
+   Codex comment = **triage it** per LOOP.md step 7 (must-fix → back to step 3; else
+   reply-and-resolve with step 7's checkable rationale). Unresolved Codex threads block merge
    (GitHub `required_conversation_resolution`); resolve them before merging.
    **No merge without `+1` — no exceptions.** CI green + resolved threads do **not** substitute
    for it. Enforced mechanically by a PreToolUse hook
