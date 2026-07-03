@@ -31,7 +31,7 @@ Keep items small enough to finish in one loop.
 - [x] P2 Build/activation model spec + Postgres migrations for `builds` + partial unique index (§14/§27.1) · Alembic setup (DR-008)
 - [x] P3 Review state machine + `review_ledger` + fingerprint spec + `fingerprint_version` (§17/§27.3)
 - [x] P4 Eval contract: `golden.yaml` schema + metrics incl. path_validity/relation_hit_rate/groundedness (§20/§27.5)
-- [ ] P5 Query safety policy schema (`query_policy`) + SQL(sqlglot)/Cypher strategy (§21/§27.6)
+- [x] P5 Query safety policy schema (`query_policy`) + SQL(sqlglot)/Cypher strategy (§21/§27.6)
 - [ ] P6 Observability schema: pipeline_runs/steps/items + item_ref rules (§18/§27.7)
 
 ## Track 1 — Core engine  *(depends on Track 0)*

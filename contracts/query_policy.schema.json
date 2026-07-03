@@ -1,0 +1,294 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/CLYEH/graphRAG/blob/main/contracts/query_policy.schema.json",
+  "title": "graphRAG query safety policy (config.query_policy)",
+  "description": "Frozen contract (Track 0 P5, DESIGN §21/§27.6, DR-002) for the query_policy block of a project's config. Human-authored, so unknown keys are rejected everywhere (additionalProperties: false) and every field is required: a typo'd or omitted limit silently falling back to a consumer-chosen default would fork the guardrail between query/MCP/Console consumers. Violations at query time are rejected with the typed GUARDRAIL_BLOCKED warning (§21), never executed. Evolution is additive; a breaking change bumps schema_version and adds a DESIGN §26 entry.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "default_mode",
+    "max_top_k",
+    "max_graph_hops",
+    "max_sql_rows",
+    "max_latency_ms",
+    "require_sources",
+    "expose_debug",
+    "text_to_sql",
+    "text_to_cypher"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "description": "Bumped only on breaking changes (DR-002)."
+    },
+    "default_mode": {
+      "$ref": "#/$defs/QueryMode",
+      "description": "Mode used when the caller doesn't pick one. sql requires text_to_sql.enabled: true (root allOf below) — defaulting to a mode this same policy disables would make every default query dead on arrival. graph is always a legal default regardless of text_to_cypher.enabled: the graph mode's default path is parameterized templates (§27.6); that flag only governs the optional free NL→Cypher add-on."
+    },
+    "max_top_k": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Upper bound on QueryRequest.top_k (§15). A cap of 0 would silently blank every retrieval — nonsense config, rejected."
+    },
+    "max_graph_hops": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Hop ceiling for graph traversals — the single source for Cypher hop caps too (§21 text_to_cypher hop 上限 references this; it is deliberately not duplicated inside text_to_cypher, so the two can never disagree)."
+    },
+    "max_sql_rows": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Row ceiling for the sql mode's result sets (§21)."
+    },
+    "max_latency_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Query deadline; on timeout partial results + QUERY_TIMEOUT/PARTIAL_RESULTS semantics apply (§22), never a 500."
+    },
+    "require_sources": {
+      "type": "boolean",
+      "const": true,
+      "description": "Frozen true: both response contracts structurally mandate non-empty source_refs on every result (§16/§27.2, openapi.yaml + mcp_response.schema.json minItems 1), so a false here would promise payloads the frozen contracts reject. The field stays explicit rather than implied so the policy block reads complete against §21."
+    },
+    "expose_debug": {
+      "type": "boolean",
+      "description": "Whether the typed debug block (routing trace etc.) may be emitted to allowed callers (§16/§21); false → debug is null."
+    },
+    "text_to_sql": {
+      "$ref": "#/$defs/TextToSql"
+    },
+    "text_to_cypher": {
+      "$ref": "#/$defs/TextToCypher"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "default_mode": {
+            "const": "sql"
+          }
+        },
+        "required": [
+          "default_mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "text_to_sql": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "QueryMode": {
+      "description": "Kept identical to QueryMode in contracts/openapi.yaml, mcp_response.schema.json and golden.schema.json.",
+      "enum": [
+        "semantic",
+        "graph",
+        "sql",
+        "global",
+        "hybrid"
+      ]
+    },
+    "TextToSql": {
+      "type": "object",
+      "description": "NL→SQL guardrail (§21/§27.6): dedicated read-only DB role, sqlglot AST validation before execution (never string matching alone), single statement, table whitelist, DDL/DML rejected; parse failure = reject.",
+      "required": [
+        "enabled",
+        "readonly",
+        "allowed_tables",
+        "blocked_keywords",
+        "max_rows",
+        "timeout_ms"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Master switch for the sql mode. Disabled → sql queries are rejected/skipped with a typed warning (MODE_SKIPPED/GUARDRAIL_BLOCKED)."
+        },
+        "readonly": {
+          "type": "boolean",
+          "const": true,
+          "description": "Frozen true (§21: 專用 DB 唯讀角色; §27.6: 唯讀角色) — a writable NL→SQL path violates the frozen guardrail, so it is unrepresentable. Explicit rather than implied so the block reads complete against §21."
+        },
+        "allowed_tables": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Table whitelist — queries touching anything else are rejected. May only be empty while enabled is false (see the enclosing if/then): an enabled sql mode with an empty whitelist is a config contradiction, not a deny-all switch (use enabled: false for that)."
+        },
+        "blocked_keywords": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z_]+$"
+          },
+          "allOf": [
+            {
+              "contains": {
+                "const": "insert"
+              }
+            },
+            {
+              "contains": {
+                "const": "update"
+              }
+            },
+            {
+              "contains": {
+                "const": "delete"
+              }
+            },
+            {
+              "contains": {
+                "const": "drop"
+              }
+            },
+            {
+              "contains": {
+                "const": "alter"
+              }
+            },
+            {
+              "contains": {
+                "const": "truncate"
+              }
+            }
+          ],
+          "description": "Defense-in-depth keyword list on top of the AST validation (lowercase canonical; matching is case-insensitive). §21 freezes the six-item minimum [insert, update, delete, drop, alter, truncate] — projects may extend the list, never shrink it below the frozen core (the contains clauses enforce this)."
+        },
+        "max_rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "if": {
+        "properties": {
+          "enabled": {
+            "const": true
+          }
+        },
+        "required": [
+          "enabled"
+        ]
+      },
+      "then": {
+        "properties": {
+          "allowed_tables": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    "TextToCypher": {
+      "type": "object",
+      "description": "NL→Cypher guardrail (§21/§27.6). Strategy: MCP graph tools default to parameterized query templates (neighbors/path/subgraph) — free NL→Cypher is an optional add-on (§27.6 選配), disabled unless enabled here, and even then restricted by a Cypher parser to the allowed clauses below. Procedure calls (CALL, and thus all of APOC) are blocked. Hop caps come from the top-level max_graph_hops.",
+      "required": [
+        "enabled",
+        "readonly",
+        "allowed_clauses",
+        "blocked",
+        "max_rows",
+        "timeout_ms"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether free NL→Cypher is available at all (§27.6: optional; parameterized templates remain the default graph path either way)."
+        },
+        "readonly": {
+          "type": "boolean",
+          "const": true,
+          "description": "Frozen true (§21) — write clauses are additionally in the blocked list; a writable NL→Cypher path is unrepresentable."
+        },
+        "allowed_clauses": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "MATCH",
+              "WHERE",
+              "RETURN",
+              "LIMIT"
+            ]
+          },
+          "description": "Clause whitelist. §21 freezes the universe to MATCH/WHERE/RETURN/LIMIT — a project may restrict further but can never whitelist anything outside the frozen four (the items enum enforces this), so CALL/APOC can never be allowed in."
+        },
+        "blocked": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[A-Z_]+$"
+          },
+          "allOf": [
+            {
+              "contains": {
+                "const": "CREATE"
+              }
+            },
+            {
+              "contains": {
+                "const": "MERGE"
+              }
+            },
+            {
+              "contains": {
+                "const": "DELETE"
+              }
+            },
+            {
+              "contains": {
+                "const": "SET"
+              }
+            },
+            {
+              "contains": {
+                "const": "REMOVE"
+              }
+            },
+            {
+              "contains": {
+                "const": "CALL"
+              }
+            }
+          ],
+          "description": "Blocklist on top of the whitelist (defense in depth; uppercase canonical — Cypher keywords are conventionally uppercase, matching is case-insensitive). §21 freezes the six-item minimum [CREATE, MERGE, DELETE, SET, REMOVE, CALL]; CALL covers every procedure including APOC. Extend, never shrink."
+        },
+        "max_rows": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Row ceiling for Cypher results (§21 row 上限; named to mirror text_to_sql.max_rows)."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}
