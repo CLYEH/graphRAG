@@ -48,10 +48,10 @@ graphRAG（GitHub: CLYEH/graphRAG，預設 branch main）是一套「多專案 h
 
 **v0.3 新增定案**：
 - 任務佇列 arq（定案，非 Celery）
-- 採納 build versioning：所有核心表帶 build_id；builds 表；activate=原子切換（Qdrant collection alias + Neo4j multi-database，Postgres 記 active 指標）；rollback=activate 舊版
+- 採納 build versioning：所有核心表帶 build_id；builds 表；~~activate=原子切換（Qdrant collection alias + Neo4j multi-database，Postgres 記 active 指標）~~（**切換機制已被 DR-001/DR-004 取代**：單一 Postgres tx + 三庫 build_id 過濾，不用 alias/multi-db）；rollback=activate 舊版
 - observability：pipeline_runs/steps/step_items 三層；item 級預設只記 failed/skipped（verbosity 可調），避免寫入放大
 - entities/relations 加 status/review_status/created_by；relation_evidence 獨立表；merge_candidates 加 snapshot/decision 欄位
-- 審核 build-scoped，可帶入下個 build
+- ~~審核 build-scoped，可帶入下個 build~~（**已被 DR-003 取代**：審核決策存**非 build-scoped** 的 `review_ledger`，以穩定 fingerprint 為鍵跨 build 延續——P3 實作以 DR-003/§27.3 為準）
 
 **v0.3 由來**：使用者把 v0.2 丟給 ChatGPT 做 review，Claude 對其建議做「第二意見」後採納高價值項目寫成 v0.3。
 
@@ -59,7 +59,7 @@ graphRAG（GitHub: CLYEH/graphRAG，預設 branch main）是一套「多專案 h
 
 **環境/Harness（已建置 2026-07-02，`uv run poe check-all` 全綠）**：uv+ruff+mypy(strict)+pytest+poe（後端）；React19/Vite8/TS6+oxlint+prettier+vitest（web/）；docker-compose（pg/neo4j/qdrant/redis）；GitHub Actions CI；CLAUDE.md/AGENTS.md 護欄、TASKS.md 佇列、docs/LOOP.md 迴圈協定。**DoD = `uv run poe check-all`**（快 gate）。web-check 用 poe shell 任務（Windows npm=npm.cmd，不能用 poe cmd）。
 - **測試分層**：pytest marker（integration[需服務,自動 skip]／contract[schema 驗證,合約未凍前 skip]／eval／e2e／slow）；`poe test`=快(單元+contract)、`test-int`、`test-cov`(fail-under 85)、`check-full`=check-all+整合；前端 vitest(元件,只收 src)+Playwright(e2e,`npm run test:e2e`,不在 fast gate)。原則：service/browser 測試不進 fast loop，用 marker 分流。
-- `.claude/settings.json` 權限 allowlist（uv/npm/docker compose/git 免提示）已由使用者授權套用。
+- `.claude/settings.json` 權限 allowlist（uv/npm/docker compose/git + gh pr 操作 + `gh api`（可寫入，merge 路徑仍被 hook 攔）免提示；H1 擴充）已由使用者授權套用。
 - **Loop 流程（8 步，雙 review 閘門，一任務=一分支=一 PR）**：取任務+開 task/<id> 分支 → 界定 → 實作 → 驗證(本地 check) → **code-reviewer subagent**(`.claude/agents/code-reviewer.md`，FAIL 退回步驟3) → commit+push+`gh pr create` → **等 GitHub 硬門檻:CI 綠 + 綁定 Codex review 通過**(任一失敗退回步驟3) → 合併+打勾。DoD = 四道閘門(本地 check → agent review → CI → Codex)。
 - **GitHub 硬門檻（已設 2026-07-02）**：scaffold 已 push 到 main（commit 81aae65 + CI badge PR #1）；`main` branch protection 開啟：enforce_admins、required status checks = backend/frontend/integration（strict）、要 PR 才能併、禁 force-push/刪除、linear history、0 human approvals。CI(.github/workflows/ci.yml) 三 job 皆綠；流程已用 PR #1 驗證（CI 綠→squash 合併）。**Codex 已裝並綁定**（bot: `chatgpt-codex-connector[bot]`）。PR #1 上 Codex 反應 👀→👍(+1)=通過。**重點：Codex 用 reaction/留言表態，不發 status check、也不發正式 review**（實測 pulls/1/reviews 空、commits/check-runs 只有 github-actions 三個）。→ GitHub branch protection 無法直接把 Codex 綁成 required check。**Codex 硬門檻定案 = A（loop-enforced + required_conversation_resolution，已在 main 開啟）**。
 **Codex PR 反應狀態機（使用者實測）**：發 PR 後只會發生——(1) 👀 eye=審核中→等；(2) 👍 +1=已審完無意見→PASS；(3) 無反應：3-1 且無其他留言=Codex 還沒看到→`@codex review` 催它；3-2 有 Codex 新留言=有意見→退回步驟3。未解決的 Codex 留言由 GitHub required_conversation_resolution 硬擋合併。輪詢：`gh api repos/CLYEH/graphRAG/issues/<pr>/reactions`（找 chatgpt-codex-connector[bot] 的 content=+1）。
