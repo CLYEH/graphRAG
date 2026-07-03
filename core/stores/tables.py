@@ -259,6 +259,13 @@ documents = sa.Table(
     sa.Column("metadata", postgresql.JSONB),
     sa.Column("status", sa.Text),
     sa.Column("ingested_at", sa.TIMESTAMP(timezone=True)),
+    # chunk refs inherit their source_uri from the document, and the frozen
+    # MCP contract requires it non-empty (minLength 1) — a blank here would
+    # strand every chunk under this document without a valid citation
+    sa.CheckConstraint("source_uri <> ''", name="documents_source_uri_nonempty"),
+    # content_hash is the frozen §18 stable item_ref key for documents
+    # (core.observability.spec) — an empty identifier identifies nothing
+    sa.CheckConstraint("content_hash <> ''", name="documents_content_hash_nonempty"),
     # FK target for the composite child FKs below (DR-006 build alignment)
     sa.UniqueConstraint("id", "build_id", name="documents_id_build_unique"),
 )
@@ -575,8 +582,19 @@ community_reports = sa.Table(
     sa.Column("level", sa.Integer, nullable=False),
     sa.Column("title", sa.Text),
     sa.Column("summary", sa.Text),
-    sa.Column("member_entity_ids", postgresql.ARRAY(postgresql.UUID(as_uuid=True))),
+    # §27.2: community_report results must cite member entity refs — a report
+    # with no members (or NULL placeholders) has nothing to build the
+    # contract-required refs from
+    sa.Column(
+        "member_entity_ids",
+        postgresql.ARRAY(postgresql.UUID(as_uuid=True)),
+        nullable=False,
+    ),
     sa.Column("rating", sa.REAL),
+    sa.CheckConstraint(
+        "cardinality(member_entity_ids) > 0 AND array_position(member_entity_ids, NULL) IS NULL",
+        name="community_reports_members_citeable",
+    ),
 )
 
 community_reports_by_build = sa.Index(

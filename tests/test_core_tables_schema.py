@@ -69,6 +69,11 @@ def test_documents_columns_match_design_spec() -> None:
     }
     for required in ("project", "build_id", "source_uri", "content_hash"):
         assert not documents.c[required].nullable, required
+    # chunk refs inherit source_uri from the document (contract minLength 1);
+    # content_hash is the frozen §18 document item_ref key — blank = no identity
+    checks = _checks(documents)
+    assert "source_uri <> ''" in checks["documents_source_uri_nonempty"]
+    assert "content_hash <> ''" in checks["documents_content_hash_nonempty"]
 
 
 def test_chunks_columns_match_design_spec() -> None:
@@ -177,6 +182,17 @@ def test_community_reports_columns_match_design_spec() -> None:
         "member_entity_ids",
         "rating",
     }
+
+
+def test_community_reports_must_have_citeable_members() -> None:
+    """§27.2: community_report results must cite member entity refs — a
+    NULL/empty member array (or NULL placeholder elements) leaves nothing to
+    build the contract-required refs from, so such reports are unqueryable
+    by construction and rejected at write."""
+    assert not community_reports.c.member_entity_ids.nullable
+    sqltext = _checks(community_reports)["community_reports_members_citeable"]
+    assert "cardinality" in sqltext
+    assert "array_position" in sqltext
 
 
 def test_merge_candidates_columns_match_design_spec() -> None:

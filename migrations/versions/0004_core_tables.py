@@ -43,6 +43,8 @@ def upgrade() -> None:
         sa.Column("metadata", postgresql.JSONB),
         sa.Column("status", sa.Text),
         sa.Column("ingested_at", sa.TIMESTAMP(timezone=True)),
+        sa.CheckConstraint("source_uri <> ''", name="documents_source_uri_nonempty"),
+        sa.CheckConstraint("content_hash <> ''", name="documents_content_hash_nonempty"),
         sa.UniqueConstraint("id", "build_id", name="documents_id_build_unique"),
     )
     op.create_index("documents_by_build", "documents", ["project", "build_id"])
@@ -264,8 +266,17 @@ def upgrade() -> None:
         sa.Column("level", sa.Integer, nullable=False),
         sa.Column("title", sa.Text),
         sa.Column("summary", sa.Text),
-        sa.Column("member_entity_ids", postgresql.ARRAY(postgresql.UUID(as_uuid=True))),
+        sa.Column(
+            "member_entity_ids",
+            postgresql.ARRAY(postgresql.UUID(as_uuid=True)),
+            nullable=False,
+        ),
         sa.Column("rating", sa.REAL),
+        sa.CheckConstraint(
+            "cardinality(member_entity_ids) > 0 "
+            "AND array_position(member_entity_ids, NULL) IS NULL",
+            name="community_reports_members_citeable",
+        ),
     )
     op.create_index("community_reports_by_build", "community_reports", ["project", "build_id"])
 

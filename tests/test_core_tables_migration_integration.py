@@ -20,6 +20,7 @@ from sqlalchemy.pool import NullPool
 from core.config import get_settings
 from core.stores.tables import (
     chunks,
+    community_reports,
     documents,
     entities,
     entity_mentions,
@@ -483,6 +484,27 @@ async def test_swapped_merge_pair_is_the_same_candidate(migrated: None) -> None:
                         right_entity_id=a,
                         score=0.8,
                         status="pending",
+                    )
+                )
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_empty_member_report_is_impossible(migrated: None) -> None:
+    """§27.2: a community report with no members could never emit the
+    contract-required member entity refs."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            with pytest.raises(IntegrityError, match="community_reports_members_citeable"):
+                await conn.execute(
+                    community_reports.insert().values(
+                        project="itest-x",
+                        build_id=uuid.uuid4(),
+                        level=0,
+                        member_entity_ids=[],
                     )
                 )
             await trans.rollback()
