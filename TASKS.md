@@ -16,7 +16,7 @@ Keep items small enough to finish in one loop.
 - [x] `docker-compose.yml` (postgres/neo4j/qdrant/redis)
 - [x] Test tiers: unit/contract/integration/eval/e2e markers, `test-cov` (85%), conftest service-gating, Playwright scaffold
 - [x] CI (`.github/workflows/ci.yml`: backend + coverage + integration + frontend), CLAUDE.md/AGENTS.md, `.env.example`
-- [x] H1 harness fixes: fail-loud CI integration gate (`--wait` + CI fail-not-skip), doc-drift cleanup (hook filename, push wording, P-numbering, checkoff rule), gate-wait pipelining in LOOP.md, reviewer model → opus, LLM default → `gpt-5.4-nano`, C1/C6 split (`gh`/`git` allowlist deferred — blocked by permission classifier; owner applies manually)
+- [x] H1 harness fixes: fail-loud CI integration gate (`--wait` + CI fail-not-skip), doc-drift cleanup (hook filename, push wording, P-numbering, checkoff rule), gate-wait pipelining in LOOP.md, reviewer model → opus, LLM default → `gpt-5.4-nano`, C1/C6 split, `gh`/`git` allowlist, CI dedupe/concurrency + qdrant pin, DR-008 (Alembic) recorded
 
 > **Per-task rule:** one task = one `task/<id>` branch = one PR. It lands with tests for its
 > tier, passes local gates + the `code-reviewer` subagent, then merges only after CI **and**
@@ -25,7 +25,7 @@ Keep items small enough to finish in one loop.
 ## Track 0 — Contracts & Governance  *(freeze BEFORE parallel work — DR-002)*
 - [x] P0 `contracts/openapi.yaml`: response envelope, error-code enum, cursor pagination, SSE event, idempotency (§15/§27.2)
 - [ ] P1 `contracts/mcp_response.schema.json`: unified retrieval result + source_refs + debug (§16/§27.2)
-- [ ] P2 Build/activation model spec + Postgres migrations for `builds` + partial unique index (§14/§27.1)
+- [ ] P2 Build/activation model spec + Postgres migrations for `builds` + partial unique index (§14/§27.1) · Alembic setup (DR-008)
 - [ ] P3 Review state machine + `review_ledger` + fingerprint spec + `fingerprint_version` (§17/§27.3)
 - [ ] P4 Eval contract: `golden.yaml` schema + metrics incl. path_validity/relation_hit_rate/groundedness (§20/§27.5)
 - [ ] P5 Query safety policy schema (`query_policy`) + SQL(sqlglot)/Cypher strategy (§21/§27.6)

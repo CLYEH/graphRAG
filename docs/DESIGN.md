@@ -45,6 +45,7 @@ raw data → 清洗 → 建圖(混合 schema + 實體解析) → 索引(三庫) 
 | 骨幹框架 | **LlamaIndex** | PropertyGraphIndex、text-to-SQL、向量、router、LLM/embedding 抽象 |
 | LLM 抽象 | LlamaIndex 內建 | OpenAI + Claude 切換 |
 | SQL / 結構化 / SoR | **Postgres** | 成熟、text-to-SQL 友善、activation 單一真相 |
+| Schema migrations | **Alembic + SQLAlchemy (core)** | autogenerate、asyncpg 相容、生態標準（DR-008） |
 | 向量 | **Qdrant** | 效能、payload filter（以 build_id 過濾） |
 | 圖 | **Neo4j** | Cypher、演算法；**單一 DB + build_id property 過濾（Community 相容，不用 multi-db）** |
 | Console 後端 | **FastAPI** | async、自動 OpenAPI |
@@ -255,6 +256,7 @@ graphRAG/
 **DR-005 佇列 arq**：採 arq + Redis（async-native），非 Celery。
 **DR-006 Active Build 強制注入**：唯一 active build 以 Postgres partial unique index 保證；所有 store 存取一律經 build-scoped repository 層自動注入 `build_id`，query/MCP 層不得直接拿裸 client → 結構上杜絕「忘了帶 build_id 混到舊版」。
 **DR-007 Fingerprint 版本化**：review ledger 的 entity_key/relation_signature/merge_key 帶 `fingerprint_version`；正規化或 ontology 規則變更即升版，升版觸發 migration 或標記重審，不得靜默誤套。
+**DR-008 Migration 工具 = Alembic + SQLAlchemy (core)**：Postgres schema 變更一律以 Alembic 管理（表以 SQLAlchemy core 定義、autogenerate 產生 migration、asyncpg 相容）；migration scripts 為版本化交付物，自 P2（`builds` 表 + partial unique index）起隨各任務落地。
 
 ---
 

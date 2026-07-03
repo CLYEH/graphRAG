@@ -4,6 +4,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   backend:
     runs-on: ubuntu-latest
@@ -12,8 +16,10 @@ jobs:
       - uses: astral-sh/setup-uv@v3
       - run: uv python install 3.12
       - run: uv sync
-      - run: uv run poe check # fmt, lint, types, fast tests (unit + contract)
-      - run: uv run poe test-cov # coverage gate (fail-under 85)
+      - run: uv run poe fmt-check
+      - run: uv run poe lint
+      - run: uv run poe typecheck
+      - run: uv run poe test-cov # fast tests (unit + contract) under the coverage gate (fail-under 85)
 
   integration:
     runs-on: ubuntu-latest
