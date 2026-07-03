@@ -155,7 +155,7 @@ graphRAG/
 ├── web/   src/pages/ src/components/ src/api/(codegen)
 ├── projects/<name>/  config.yaml sources/ mcp_entrypoint.py
 ├── cli/   graphrag
-├── contracts/  openapi.yaml  mcp_response.schema.json   ← 契約凍結交付物 (§15/§16, DR-002)
+├── contracts/  openapi.yaml  mcp_response.schema.json  golden.schema.json   ← 契約凍結交付物 (§15/§16/§20, DR-002)
 ├── docs/DESIGN.md   docker-compose.yml   pyproject.toml
 ```
 依賴方向：`api`/`cli`/`projects/*/mcp` → `core`；`web` → `api` 契約；`core` 不反向依賴門面。
@@ -251,7 +251,7 @@ graphRAG/
 
 ## 26. 決策紀錄 (ADR)
 **DR-001 Build Activation 一致性**：三庫皆以 `build_id` 標記並共存多版本；**active build 的唯一真相在 Postgres `builds.status`**；activation = 單一 Postgres transaction（天生原子）；查詢啟動讀一次 active build_id，三庫照它過濾；rollback 同理。→ 取代 v0.3 的 alias/multi-db 切換，消除跨庫原子性問題。
-**DR-002 契約凍結先行**：`openapi.yaml` 與 `mcp_response.schema.json` 為版本化交付物，Track 0 先凍結，core/api/web/agent 共用；之後才平行開工。
+**DR-002 契約凍結先行**：`openapi.yaml`、`mcp_response.schema.json` 與 `golden.schema.json` 為版本化交付物，Track 0 先凍結，core/api/web/agent 共用；之後才平行開工。
 **DR-003 審核跨 build 延續**：審核決策存非 build-scoped `review_ledger`，鍵為穩定 fingerprint（entity_key/relation_signature/merge_key）；每次 build 套用，reject 者排除出投影 → 不重複重審。
 **DR-004 Neo4j 單庫過濾**：採單一 Neo4j database + `build_id` property 過濾（Community 相容、輕量），不用 multi-database。
 **DR-005 佇列 arq**：採 arq + Redis（async-native），非 Celery。

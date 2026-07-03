@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/CLYEH/graphRAG/blob/main/contracts/golden.schema.json",
+  "title": "graphRAG golden eval set (eval/golden.yaml)",
+  "description": "Frozen contract (Track 0 P4, DESIGN §20/§27.5, DR-002) for each project's eval/golden.yaml — the input the eval runner (C10) scores builds against and the activation preflight (§14) gates on. Unlike the response contracts, this file is human-authored, so unknown keys are rejected everywhere (additionalProperties: false): a typo'd expectation that silently never runs would turn the eval gate false-green. Evolution is additive (add a property to the schema); a breaking change bumps schema_version and adds a DESIGN §26 entry.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "cases"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "description": "Bumped only on breaking changes (DR-002)."
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/GoldenCase"
+      },
+      "description": "At least one case: a present-but-empty golden set would make the eval gate pass vacuously."
+    }
+  },
+  "$defs": {
+    "QueryMode": {
+      "description": "Kept identical to QueryMode in contracts/openapi.yaml and contracts/mcp_response.schema.json — a golden case exercises one of the five frozen retrieval modes.",
+      "enum": [
+        "semantic",
+        "graph",
+        "sql",
+        "global",
+        "hybrid"
+      ]
+    },
+    "RelationExpectation": {
+      "type": "object",
+      "description": "One expected relation, as canonical entity names plus relation type. Direction matters: relation signatures are directional (§27.3), so src→dst is not dst→src.",
+      "required": [
+        "src",
+        "type",
+        "dst"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "src": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dst": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "Expects": {
+      "type": "object",
+      "description": "Assertions the answer must satisfy (§20, extended by §27.5). At least one: a case with nothing to check cannot fail and would inflate the eval score.",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "must_contain_entities": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Canonical entity names the results must contain — drives entity_recall (§20)."
+        },
+        "must_cite_sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "source_uris the answer's source_refs must cover — drives source_recall / citation coverage (§20)."
+        },
+        "answer_regex": {
+          "type": "string",
+          "format": "regex",
+          "minLength": 1,
+          "description": "Pattern the answer text must match (§20)."
+        },
+        "must_include_relations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/RelationExpectation"
+          },
+          "description": "Expected relations the results must hit — drives relation_hit_rate (§27.5)."
+        },
+        "must_have_valid_paths": {
+          "type": "boolean",
+          "description": "When true, every returned path must be a real path on the active build's graph — drives path_validity (§27.5). false disables the check explicitly (same as absent)."
+        },
+        "groundedness_min": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Minimum groundedness: the share of answer claims backed by cited sources (§27.5)."
+        }
+      }
+    },
+    "GoldenCase": {
+      "type": "object",
+      "description": "One golden question (§20): question + mode + expects + min_score. The question text is the case's stable identity across builds.",
+      "required": [
+        "question",
+        "mode",
+        "expects",
+        "min_score"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "question": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mode": {
+          "$ref": "#/$defs/QueryMode"
+        },
+        "expects": {
+          "$ref": "#/$defs/Expects"
+        },
+        "min_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Per-case pass threshold on the case score (scores are 0..1, like every score/confidence in the frozen contracts)."
+        }
+      }
+    }
+  }
+}

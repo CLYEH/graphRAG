@@ -69,8 +69,8 @@ automatic on checkout**; it needs a one-time local setup per checkout/worktree:
 - **DR-006 — never touch a raw store client** from query/MCP/api layers. All store access goes through the
   build-scoped repository layer, which injects `build_id = active`. This is how "never mix old-version data" is enforced structurally.
 - **DR-001 — active build** is decided solely by Postgres `builds.status='active'` (a partial unique index guarantees one).
-- **DR-002 — `contracts/` is frozen.** Don't change `openapi.yaml` / `mcp_response.schema.json` without bumping
-  `schema_version` and recording it in DESIGN §26.
+- **DR-002 — `contracts/` is frozen.** Don't change `openapi.yaml` / `mcp_response.schema.json` /
+  `golden.schema.json` without bumping `schema_version` and recording it in DESIGN §26.
 - **DR-003 — review decisions live in the non-build-scoped `review_ledger`**, keyed by stable fingerprints.
 - **Dependency direction:** `api`/`cli`/`projects/*/mcp` → `core`; `web` → `api` OpenAPI contract only; `core`
   has no HTTP/UI dependency. Don't import upward.
