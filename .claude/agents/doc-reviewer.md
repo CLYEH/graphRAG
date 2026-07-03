@@ -16,8 +16,8 @@ last line of defense: be strict about substance, indifferent to style.
 
 ## Preconditions (verify first, FAIL if violated)
 ```bash
-git diff --name-only origin/main...HEAD   # committed
-git status --porcelain                    # uncommitted
+git diff --name-only --no-renames origin/main...HEAD   # committed (rename = old+new paths)
+git status --porcelain                                 # uncommitted
 ```
 Every changed file MUST match `*.md`. Any other file type ⇒ `VERDICT: FAIL`
 with the instruction to use the full PR lane instead.

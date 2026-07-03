@@ -37,7 +37,9 @@ else
   lane=task
 fi
 
-outgoing="$(git diff --name-only origin/main...HEAD 2>/dev/null)"
+# --no-renames: a rename must surface its OLD path too, or `git mv core/x.py docs/x.md`
+# would look all-.md and smuggle a code deletion through the doc lane
+outgoing="$(git diff --name-only --no-renames origin/main...HEAD 2>/dev/null)"
 if [ -z "$outgoing" ] && [ -z "$(git status --porcelain)" ]; then
   exit 0 # nothing new — plain sync push
 fi

@@ -29,6 +29,11 @@ version_of() { # version_of <ref> <file> — emits empty (never aborts) when the
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   git cat-file -e "$base:$f" 2>/dev/null || continue # newly added = the freeze itself, exempt
+  if ! git cat-file -e "HEAD:$f" 2>/dev/null; then
+    echo "::error file=$f::DR-002: frozen contract $f was deleted/renamed — contracts are frozen artifacts; restore it or land a versioned replacement recorded in DESIGN §26"
+    fail=1
+    continue
+  fi
   base_v="$(version_of "$base" "$f")"
   head_v="$(version_of HEAD "$f")"
   if [ -z "$head_v" ]; then
@@ -39,7 +44,7 @@ while IFS= read -r f; do
     fail=1
   fi
 done <<EOF
-$(git diff --name-only "$base"...HEAD | grep '^contracts/' || true)
+$(git diff --name-only --no-renames "$base"...HEAD | grep '^contracts/' || true)
 EOF
 
 # --- TASKS.md checkoff: a task/<id> PR must check off exactly its own item ---
