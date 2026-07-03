@@ -121,6 +121,15 @@ def test_item_dedup_is_a_database_invariant() -> None:
     ]
 
 
+def test_item_identifiers_reject_the_empty_string() -> None:
+    """H6 (the identifier rule, applied retroactively to this P6 table): ''
+    is a no-op identity — such rows would collide under the dedup index and
+    the §27.7 retry set could never name the work they stand for."""
+    checks = _checks(pipeline_step_items)
+    assert "item_kind <> ''" in checks["pipeline_step_items_kind_nonempty"]
+    assert "item_ref <> ''" in checks["pipeline_step_items_ref_nonempty"]
+
+
 @pytest.mark.contract
 def test_run_status_enum_is_in_lockstep_with_the_frozen_jobs_contract() -> None:
     """Runs surface through the jobs API (§15/BA2): every status the table can

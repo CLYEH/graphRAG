@@ -168,3 +168,22 @@ async def test_deleting_a_run_prunes_its_layers_as_a_unit(migrated: None) -> Non
             await trans.rollback()
     finally:
         await engine.dispose()
+
+
+async def test_empty_item_ref_is_impossible(migrated: None) -> None:
+    """H6: '' is a no-op identity — the migration must reject it at the
+    database, not rely on writer discipline (identifier rule)."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            _, step_id = await _insert_run_step(conn, f"itest-{uuid.uuid4().hex[:10]}")
+            with pytest.raises(IntegrityError, match="pipeline_step_items_ref_nonempty"):
+                await conn.execute(
+                    pipeline_step_items.insert().values(
+                        step_id=step_id, item_kind="document", item_ref="", status="failed"
+                    )
+                )
+            await trans.rollback()
+    finally:
+        await engine.dispose()

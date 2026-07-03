@@ -212,7 +212,9 @@ pipeline_step_items = sa.Table(
     ),
     # §18: item_ref is a *stable key* per item_kind (document=content_hash,
     # entity=entity_key — core.observability.spec.ITEM_REF_STABLE_KEYS_MIN),
-    # so reruns line up across runs.
+    # so reruns line up across runs. Non-empty (H6): an empty identifier is a
+    # no-op identity — '' rows would collide under the dedup index and the
+    # §27.7 retry set could never name the work they stand for.
     sa.Column("item_kind", sa.Text, nullable=False),
     sa.Column("item_ref", sa.Text, nullable=False),
     # No CHECK: 'failed'/'skipped' are the frozen *minimum* statuses (§4/§18
@@ -222,6 +224,8 @@ pipeline_step_items = sa.Table(
     sa.Column("status", sa.Text, nullable=False),
     sa.Column("message", sa.Text),
     sa.Column("error", postgresql.JSONB),
+    sa.CheckConstraint("item_kind <> ''", name="pipeline_step_items_kind_nonempty"),
+    sa.CheckConstraint("item_ref <> ''", name="pipeline_step_items_ref_nonempty"),
 )
 
 # §27.7: retry-failed-only is idempotent by item_ref dedup — within one step
