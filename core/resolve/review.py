@@ -35,7 +35,12 @@ AUTO_DECIDER = "auto"
 
 _ENTITY_RELATION_REVIEW: Mapping[str, frozenset[str]] = MappingProxyType(
     {
+        # §4/§17 expose the pending state under two vocabularies: the lifecycle
+        # `status` field says `needs_review`, the `review_status` field starts
+        # at `unreviewed`. Both name the same pending state, so both are legal
+        # from-states — a caller validating either field gets the same answer.
         "unreviewed": frozenset({"approved", "rejected"}),
+        "needs_review": frozenset({"approved", "rejected"}),
         "approved": frozenset(),
         "rejected": frozenset(),
     }

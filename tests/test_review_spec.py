@@ -60,6 +60,15 @@ def test_disambiguator_is_trimmed_but_case_sensitive() -> None:
     assert with_id != entity_key("Team", "People Ops", "hr-42")  # external ids stay literal
 
 
+def test_blank_disambiguator_counts_as_absent() -> None:
+    """Connectors encode "no external id" as None, "" or whitespace
+    interchangeably — all three must mint the same key, or the same entity
+    re-opens for review whenever a source changes its missing-value style."""
+    absent = entity_key("Team", "People Ops")
+    assert entity_key("Team", "People Ops", "") == absent
+    assert entity_key("Team", "People Ops", "   ") == absent
+
+
 def test_relation_signature_is_directional() -> None:
     a = entity_key("Team", "People Ops")
     b = entity_key("Process", "Onboarding")
@@ -81,6 +90,9 @@ def test_merge_key_is_symmetric() -> None:
     [
         ("entity_review", "unreviewed", "approved", True),
         ("entity_review", "unreviewed", "rejected", True),
+        ("entity_review", "needs_review", "approved", True),  # §17's lifecycle-side name
+        ("entity_review", "needs_review", "rejected", True),
+        ("entity_review", "needs_review", "deferred", False),
         ("entity_review", "approved", "rejected", False),  # re-decisions go via the ledger
         ("relation_review", "unreviewed", "approved", True),
         ("merge_candidate", "pending", "deferred", True),

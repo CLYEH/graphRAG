@@ -276,7 +276,7 @@ graphRAG/
 - **source_refs 最低要求**（`require_sources` 強制，依 result_type）：chunk→≥1 chunk ref（source_uri+offsets）；entity→≥1 mention（chunk/row）；relation→≥1 relation_evidence；path→每條 edge 皆有 ref；row→table+pk；community_report→member entity refs。
 
 ### 27.3 Review Fingerprint & Ledger 語意（DR-003/007）
-- `entity_key = fpv{N}( norm(type) | norm(canonical_name) | disambiguator )`（disambiguator＝有穩定外部 id 時採用，**僅去頭尾空白、保留大小寫** — 外部 id 可能區分大小寫）。
+- `entity_key = fpv{N}( norm(type) | norm(canonical_name) | disambiguator )`（disambiguator＝有穩定外部 id 時採用，**僅去頭尾空白、保留大小寫** — 外部 id 可能區分大小寫；**去空白後為空＝視同未提供**，None／空字串／純空白鑄出同一把鍵）。
 - `relation_signature = fpv{N}( src_entity_key | norm(type) | dst_entity_key )`；`merge_key = fpv{N}( sorted(left_key, right_key) )`。
 - `norm` 凍結定義＝NFKC → casefold → 摺疊連續空白；hash 輸入以長度前綴編碼組合（杜絕分隔符歧義）。實作＝`core/resolve/fingerprints.py`，與本節逐字對應；任何變更即升 `fingerprint_version`。
 - **fingerprint_version**：隨正規化/ontology 變更升版；ledger 僅套用同版（或經 migration 對映）之鍵，否則標記**重審**而非誤套。

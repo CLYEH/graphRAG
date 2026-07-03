@@ -38,10 +38,15 @@ def _fpv(*parts: str) -> str:
 def entity_key(entity_type: str, canonical_name: str, disambiguator: str | None = None) -> str:
     """Cross-build identity of an entity. ``disambiguator`` is a stable
     external id when one exists (§27.3) — trimmed but NOT case-normalized,
-    since external ids may be case-sensitive."""
+    since external ids may be case-sensitive. Blank after trimming counts as
+    absent: connectors represent "no id" as None, "" or whitespace
+    interchangeably, and all three must mint the SAME key or carry-forward
+    breaks across sources."""
     parts = [_norm(entity_type), _norm(canonical_name)]
     if disambiguator is not None:
-        parts.append(disambiguator.strip())
+        trimmed = disambiguator.strip()
+        if trimmed:
+            parts.append(trimmed)
     return _fpv(*parts)
 
 
