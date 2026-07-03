@@ -130,8 +130,9 @@ file is `*.md`** skips the PR entirely:
    `git push origin docs/<id>:main`.
 
 Enforcement is mechanical, not honor-based:
-- `.claude/hooks/require-push-gates.sh` (PreToolUse) blocks any direct-to-main push that
-  contains a non-`*.md` file, and any push whose content doesn't match a reviewer receipt.
+- `.claude/hooks/require-push-gates.sh` (PreToolUse) treats `docs/*` branch pushes and any
+  direct-to-main push as this lane: it blocks them when a non-`*.md` file is outgoing, or
+  when the content doesn't match a reviewer receipt.
 - Branch protection still requires green required checks on the pushed SHA (statuses are
   per-SHA, so the `docs/**` CI run satisfies them). "Require a pull request" was lifted to
   enable this lane — code changes still go through PRs because the push gate refuses them

@@ -12,7 +12,11 @@ reviewer="${1:?usage: write-review-receipt.sh <code-reviewer|doc-reviewer>}"
 case "$reviewer" in code-reviewer|doc-reviewer) : ;; *) echo "unknown reviewer '$reviewer'" >&2; exit 1 ;; esac
 cd "${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}"
 
+# git refuses a zero-byte index file, so reserve a name and DELETE it — git then
+# creates a fresh index at that path (mktemp -u would be racy-in-theory; this isn't).
 tmp_index="$(mktemp)"
+[ -n "$tmp_index" ] || { echo "mktemp failed — refusing to touch the real index" >&2; exit 1; }
+rm -f "$tmp_index"
 trap 'rm -f "$tmp_index"' EXIT
 GIT_INDEX_FILE="$tmp_index" git add -A >/dev/null 2>&1
 tree="$(GIT_INDEX_FILE="$tmp_index" git write-tree)"

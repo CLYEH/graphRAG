@@ -43,7 +43,9 @@ for i in $(seq 1 "$MAX_POLLS"); do
     --jq "[.data.repository.pullRequest.reviewThreads.nodes[]|select(.isResolved==false and (.comments.nodes[0].author.login|startswith(\"$BOT_PREFIX\")))]|length" 2>/dev/null)"
   echo "[poll $i] PR#$PR reactions=[$reactions] new_reviews=${newrev:-?} new_comments=${newc:-?} unresolved_threads=${unresolved:-?}"
   if printf '%s' "$reactions" | grep -q '+1'; then
-    echo "RESULT: +1 — approved."
+    plus1_at="$(gh api "repos/$repo/issues/$PR/reactions" \
+      --jq "[.[]|select(.user.login==\"$BOT\" and .content==\"+1\")|.created_at]|max" 2>/dev/null)"
+    echo "RESULT: +1 — approved (reacted at ${plus1_at:-unknown}; the merge hook still verifies it is newer than the head commit)."
     exit 0
   fi
   if [ "${newrev:-0}" -gt 0 ] || [ "${newc:-0}" -gt 0 ]; then

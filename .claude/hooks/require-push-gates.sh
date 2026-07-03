@@ -19,15 +19,19 @@ set -o pipefail
 deny() { printf 'push-gate: %s\n' "$1" >&2; exit 2; }
 
 payload="$(cat)"
-printf '%s' "$payload" | grep -Eq 'git[[:space:]]+push' || exit 0
+# engage on `git [flags] push` incl. `git -C <path> push` and `git --git-dir=<p> push`;
+# must not engage on e.g. `git log push-fix`
+printf '%s' "$payload" | grep -Eq 'git([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*[[:space:]]+push\b' || exit 0
 cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."
 
 git fetch -q origin main 2>/dev/null
 current="$(git branch --show-current)"
 [ -z "$current" ] && deny "detached HEAD — push from a branch."
 
-# lane: an explicit ':main' refspec or pushing while on main = doc-only fast lane
-if printf '%s' "$payload" | grep -Eq ":main([[:space:]\"']|$)" || [ "$current" = "main" ]; then
+# lane: a ':main' / ':refs/heads/main' refspec, pushing while on main, or a docs/* branch
+# (whose whole purpose is the fast lane, incl. its own branch push) = doc-only lane
+if printf '%s' "$payload" | grep -Eq ":(refs/heads/)?main([[:space:]\"']|$)" \
+  || [ "$current" = "main" ] || [[ "$current" == docs/* ]]; then
   lane=doc
 else
   lane=task
@@ -40,10 +44,12 @@ fi
 
 snapshot_tree() {
   local tmp tree
-  tmp="$(mktemp)"
+  tmp="$(mktemp)" && [ -n "$tmp" ] || deny "mktemp failed -> blocked (would touch the real index)."
+  rm -f "$tmp" # git refuses a zero-byte index; a fresh path makes it create one
   GIT_INDEX_FILE="$tmp" git add -A >/dev/null 2>&1
   tree="$(GIT_INDEX_FILE="$tmp" git write-tree)"
   rm -f "$tmp"
+  [ -n "$tree" ] || deny "snapshot tree computation failed -> blocked."
   printf '%s' "$tree"
 }
 
@@ -61,7 +67,7 @@ require_receipt() {
 
 if [ "$lane" = doc ]; then
   nonmd="$(printf '%s\n' "$outgoing" | grep -v '\.md$' || true)"
-  [ -n "$nonmd" ] && deny "direct-to-main is the DOC-ONLY lane; non-.md outgoing: $(printf '%s' "$nonmd" | tr '\n' ' ')— use a task branch + PR."
+  [ -n "$nonmd" ] && deny "the doc lane (docs/* branch or direct-to-main) is *.md-only; non-.md outgoing: $(printf '%s' "$nonmd" | tr '\n' ' ')— use a task branch + PR."
   require_receipt
 else
   require_receipt
