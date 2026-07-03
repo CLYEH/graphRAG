@@ -41,6 +41,28 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
    no dead code, no debug leftovers.
 5. **Design alignment** — matches the relevant DESIGN.md section; if it diverges,
    DESIGN.md must be updated in the same change (or it's a FAIL).
+6. **DB-constraint sweep** (when the diff touches `core/stores/tables.py` or
+   `migrations/` — PR #17 burned 9 Codex rounds on cells of this grid; run it
+   BEFORE the first push, cell by cell, and FAIL on any unjustified gap):
+   - **Per column**: NOT NULL matches the frozen contract's required lists; enum
+     CHECKs match frozen vocabularies (lockstep-tested both ways); identifiers,
+     hash inputs, and contract-`minLength` fields ban `''`; contract minimums
+     become range CHECKs; definitional sanity holds (end ≥ start, positions ≥ 0).
+   - **Per table**: every frozen identity key gets a UNIQUE (entity_key,
+     relation_signature once minted → partial, merge_key → LEAST/GREATEST
+     expression index, position keys like (document_id, ordinal), dedup hashes).
+   - **Cross-table**: child FKs are composite over scope columns (build_id, and
+     project where both sides have it — DR-006 makes mixing unrepresentable);
+     parents expose matching UNIQUE FK targets; EVERY child FK has a supporting
+     index (Postgres doesn't auto-index FKs).
+   - **Conditional**: every (type, per-type required fields) pair is CHECKed
+     both directions (must-have AND must-not-have).
+   - **Emission path**: for each result_type, walk the frozen source_ref
+     requirements back to stored columns — every required field must be
+     derivable from NOT NULL data (denormalized where prune survival demands).
+   - A deliberate gap needs a stated, distinguishing rationale ("no frozen text"
+     must survive the exception-side rewrite test); a universal-sounding test
+     must enumerate ALL instances or it is false-green (FAIL).
 
 ## Output (exactly this shape)
 ```
