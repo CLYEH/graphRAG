@@ -163,6 +163,18 @@ def _groundedness_min_above_one(g: dict[str, Any]) -> None:
     g["cases"][0]["expects"]["groundedness_min"] = 1.2
 
 
+def _groundedness_min_zero(g: dict[str, Any]) -> None:
+    """A floor of 0 is trivially satisfied — a no-op that could stand as a
+    case's only 'assertion' (same vacuous class as valid_paths_false)."""
+    g["cases"][0]["expects"]["groundedness_min"] = 0
+
+
+def _valid_paths_false(g: dict[str, Any]) -> None:
+    """false ≡ 'check disabled' — allowing it would let a lone no-op satisfy
+    the at-least-one-assertion floor and turn the eval gate false-green."""
+    g["cases"][0]["expects"]["must_have_valid_paths"] = False
+
+
 def _empty_entities_list(g: dict[str, Any]) -> None:
     g["cases"][0]["expects"]["must_contain_entities"] = []
 
@@ -227,6 +239,8 @@ def _missing_cases(g: dict[str, Any]) -> None:
         _min_score_above_one,
         _min_score_negative,
         _groundedness_min_above_one,
+        _groundedness_min_zero,
+        _valid_paths_false,
         _empty_entities_list,
         _blank_entity_name,
         _empty_sources_list,

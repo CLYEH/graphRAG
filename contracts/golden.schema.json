@@ -98,13 +98,14 @@
         },
         "must_have_valid_paths": {
           "type": "boolean",
-          "description": "When true, every returned path must be a real path on the active build's graph — drives path_validity (§27.5). false disables the check explicitly (same as absent)."
+          "const": true,
+          "description": "Every returned path must be a real path on the active build's graph — drives path_validity (§27.5). Presence enables the check; omit the field to skip it. An explicit false would be a no-op that could stand as a case's only 'assertion' and satisfy minProperties vacuously, so it is rejected."
         },
         "groundedness_min": {
           "type": "number",
-          "minimum": 0,
+          "exclusiveMinimum": 0,
           "maximum": 1,
-          "description": "Minimum groundedness: the share of answer claims backed by cited sources (§27.5)."
+          "description": "Minimum groundedness: the share of answer claims backed by cited sources (§27.5). Must be > 0 — a floor of 0 is trivially satisfied (groundedness is never negative) and would be a no-op assertion; omit the field instead."
         }
       }
     },

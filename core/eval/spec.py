@@ -40,14 +40,22 @@ EXPECTS_FIELDS = (
 )
 
 
+#: Scores live in [0, 1], so an absolute tolerance is meaningful. Float
+#: subtraction of decimal fractions is inexact (0.8 - 0.5 > 0.3), and without
+#: slack an exactly-at-threshold drop — which the contract tolerates — would
+#: read as a regression for the unlucky combinations.
+_SCORE_TOLERANCE = 1e-9
+
+
 def is_eval_regression(candidate: float, active: float, threshold: float) -> bool:
     """§20: does ``candidate``'s eval score regress against ``active``'s?
 
     True iff the candidate falls below the active build's score by more than
     ``threshold`` — dropping by exactly the threshold is still within
-    tolerance. A regression blocks auto-activate (§14 preflight) and lights
-    ``Eval regression`` on Health (§19).
+    tolerance (up to float slack, ``_SCORE_TOLERANCE``). A regression blocks
+    auto-activate (§14 preflight) and lights ``Eval regression`` on Health
+    (§19).
     """
     if threshold < 0:
         raise ValueError(f"regression threshold must be >= 0, got {threshold!r}")
-    return candidate < active - threshold
+    return (active - candidate) > threshold + _SCORE_TOLERANCE
