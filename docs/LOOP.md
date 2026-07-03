@@ -19,8 +19,14 @@ loop back to step 3.
    uv run poe check-full       # + integration (first: docker compose up -d --wait)
    cd web && npm run test:e2e  # UI flows (first: npx playwright install)
    ```
-5. **Agent review (local gate)** — run the `code-reviewer` subagent on the diff.
+5. **Agent review (local gate)** — run the `code-reviewer` subagent on the diff
+   (`doc-reviewer` for doc-only changes taking the fast lane).
    **VERDICT: FAIL → back to step 3** (fix, then re-verify + re-review).
+   A PASS stamps a **receipt** binding the verdict to a content hash
+   (`.claude/hooks/write-review-receipt.sh`); the push gate
+   (`.claude/hooks/require-push-gates.sh`) recomputes the hash and blocks the push if
+   anything changed after the PASS — and re-runs `poe check` itself. Steps 4–5 are
+   therefore CPU-verified at push time, not taken on faith.
 6. **Commit → push → open PR** (one task, one PR):
    ```bash
    git commit -m "<id>: <summary>"

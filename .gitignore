@@ -26,6 +26,9 @@ web/coverage/
 # Claude Code — agent worktrees (created for isolated/parallel agent work)
 .claude/worktrees/
 
+# Claude Code — local gate receipts (review PASS bound to a content hash)
+.claude/receipts/
+
 # Local discussion scratch (not shipped)
 .discuss/
 

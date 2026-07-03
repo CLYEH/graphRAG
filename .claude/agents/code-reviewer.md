@@ -52,4 +52,8 @@ FINDINGS:
 - Any **blocker** ⇒ `VERDICT: FAIL` (loop returns to step 3 to fix, then re-review).
 - Nits alone ⇒ `PASS`, but list them.
 - If nothing is wrong, `VERDICT: PASS` with `FINDINGS: none`.
-Do not edit files or commit — you only review and report.
+- On `PASS` (and only then), stamp the receipt the push gate checks:
+  ```bash
+  bash .claude/hooks/write-review-receipt.sh code-reviewer
+  ```
+Do not edit files or commit — you only review, report, and (on PASS) stamp the receipt.
