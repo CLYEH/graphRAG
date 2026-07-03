@@ -84,7 +84,7 @@ def test_chunks_columns_match_design_spec() -> None:
         "metadata",
         "status",
     }
-    for required in ("document_id", "build_id", "ordinal", "text"):
+    for required in ("document_id", "build_id", "ordinal", "text", "start_offset", "end_offset"):
         assert not chunks.c[required].nullable, required
 
 
@@ -312,6 +312,17 @@ def test_chunk_evidence_span_must_be_sane() -> None:
     denormalized span is the only auditable citation left — a negative or
     inverted range could never be emitted as a valid ref."""
     sqltext = _checks(relation_evidence)["relation_evidence_chunk_span_sane"]
+    assert "start_offset >= 0" in sqltext
+    assert "end_offset >= start_offset" in sqltext
+
+
+def test_stored_chunks_must_carry_a_citable_span() -> None:
+    """The frozen MCP chunk-result contract requires every chunk ref to emit
+    non-negative offsets — a chunk stored span-less (or inverted) could never
+    be returned by C6 retrieval, so the SoR refuses it at write time."""
+    assert not chunks.c.start_offset.nullable
+    assert not chunks.c.end_offset.nullable
+    sqltext = _checks(chunks)["chunks_span_sane"]
     assert "start_offset >= 0" in sqltext
     assert "end_offset >= start_offset" in sqltext
 

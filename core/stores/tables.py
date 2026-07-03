@@ -283,11 +283,19 @@ chunks = sa.Table(
     sa.Column("ordinal", sa.Integer, nullable=False),
     sa.Column("text", sa.Text, nullable=False),
     sa.Column("token_count", sa.Integer),
-    sa.Column("start_offset", sa.Integer),
-    sa.Column("end_offset", sa.Integer),
+    # NOT NULL + sane: the frozen MCP chunk-result contract requires every
+    # chunk ref to carry non-negative offsets — a chunk stored without a
+    # citable span could never be returned by C6. Chunking (C2) always knows
+    # the span it cut.
+    sa.Column("start_offset", sa.Integer, nullable=False),
+    sa.Column("end_offset", sa.Integer, nullable=False),
     sa.Column("vector_point_id", postgresql.UUID(as_uuid=True)),
     sa.Column("metadata", postgresql.JSONB),
     sa.Column("status", sa.Text),
+    sa.CheckConstraint(
+        "start_offset >= 0 AND end_offset >= start_offset",
+        name="chunks_span_sane",
+    ),
     sa.ForeignKeyConstraint(
         ["document_id", "build_id"],
         ["documents.id", "documents.build_id"],

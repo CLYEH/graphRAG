@@ -379,6 +379,8 @@ async def test_cross_build_child_rows_are_impossible(migrated: None) -> None:
                         build_id=uuid.uuid4(),  # NOT the document's build
                         ordinal=0,
                         text="t",
+                        start_offset=0,
+                        end_offset=1,
                     )
                 )
             await trans.rollback()
