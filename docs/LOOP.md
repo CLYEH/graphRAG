@@ -75,17 +75,21 @@ loop back to step 3.
      3. Freezing a 🔧 tunable with no interoperability rationale.
      4. Would make a case DESIGN defines as legitimate unrepresentable (over-tightening).
 
-     **Hard rules:** a resolve-without-change reply MUST cite the DESIGN §/DR that
-     justifies it — if you can't cite one, treat the suggestion as must-fix. If the
-     call is genuinely ambiguous, stop and ask the user. And whichever way a suggestion
+     **Hard rules:** a resolve-without-change reply MUST name the criterion it invokes
+     and give a checkable rationale — cite the DESIGN §/DR the suggestion conflicts
+     with (criteria 3–4), or state explicitly that no frozen § mandates the suggested
+     guarantee (criterion 1) or that behavior/rendering is identical (criterion 2). An
+     unreasoned "resolved" is banned — if you can't articulate the rationale, treat the
+     suggestion as must-fix. If the call is genuinely ambiguous, stop and ask the user.
+     And whichever way a suggestion
      is triaged, sweep the whole diff for the same class of issue and settle it in one
      round. This triage changes nothing about the `+1` gate below — resolving threads
      never substitutes for a fresh `+1` on the head commit.
 
    **Merge requires Codex `+1` on the head commit — no exceptions.** `eyes` / "not seen yet"
    are pending states (wait/poke, never a failure); unresolved threads or a fresh
-   change-request → triage above (must-fix → step 3, else reply-and-resolve with a DESIGN
-   citation). **CI green + resolved conversations do NOT substitute for
+   change-request → triage above (must-fix → step 3, else reply-and-resolve with a
+   checkable rationale). **CI green + resolved conversations do NOT substitute for
    `+1`.** This is enforced mechanically: `.claude/hooks/require-codex-approval.sh`
    (PreToolUse) blocks any `gh pr merge` until Codex has reacted `+1`. (The hook is local,
    honest-agent enforcement — it guards merges issued from this repo's agent sessions;
@@ -124,8 +128,8 @@ Two options — both use the same protocol above:
   > then run the `code-reviewer` subagent — if it FAILs, fix and re-review. Then commit,
   > push, and `gh pr create`. Wait for CI green **and** Codex to react `+1` (no exceptions —
   > a hook blocks merge otherwise); if Codex comments, triage each suggestion per step 7
-  > (must-fix → fix on the same branch and re-review; else reply-and-resolve citing the
-  > justifying DESIGN §/DR).
+  > (must-fix → fix on the same branch and re-review; else reply-and-resolve with the
+  > step-7 checkable rationale).
   > Only once CI is green and Codex has `+1`'d, merge, check the task off, next. If Codex
   > never `+1`s, stop and ask — don't merge around it.
   > If a task is ambiguous or conflicts with DESIGN.md, stop and ask instead of guessing.
