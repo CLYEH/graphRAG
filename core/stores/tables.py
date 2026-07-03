@@ -484,7 +484,13 @@ relation_evidence = sa.Table(
     sa.Column("relation_id", postgresql.UUID(as_uuid=True), nullable=False),
     sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
     sa.Column("evidence_type", sa.Text, nullable=False),
-    sa.Column("evidence_ref", sa.Text),
+    # NOT NULL for every type: the §27.4 hash formula
+    # sha256(relation_signature | evidence_ref | norm(quote)) takes
+    # evidence_ref as its source-distinguishing component — without it two
+    # same-quote evidences from different sources collide under the dedup
+    # index and one audit source is silently lost. (row: table+pk; chunk/
+    # manual: the writer's source ref — encoding unfrozen, existence isn't.)
+    sa.Column("evidence_ref", sa.Text, nullable=False),
     # Deliberately NOT an FK: §27.4 prune survival — evidence outlives the
     # chunk it quotes (quote/offsets/source_uri are denormalized below), so the
     # id must be allowed to dangle after the old chunk is pruned.
@@ -542,10 +548,9 @@ relation_evidence = sa.Table(
         "(quote IS NOT NULL AND quote <> '' AND source_uri IS NOT NULL AND source_uri <> '')",
         name="relation_evidence_manual_provenance",
     ),
-    sa.CheckConstraint(
-        "evidence_type <> 'row' OR (evidence_ref IS NOT NULL AND evidence_ref <> '')",
-        name="relation_evidence_row_provenance",
-    ),
+    # subsumes the earlier row-only rule: every type's ref must exist (hash
+    # identity input) and be non-empty (identifier rule)
+    sa.CheckConstraint("evidence_ref <> ''", name="relation_evidence_ref_nonempty"),
     # frozen MCP contract: offsets are non-negative (minimum 0) and after
     # prune they are the only auditable span left — an inverted range could
     # never be a valid citation

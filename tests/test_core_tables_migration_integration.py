@@ -122,6 +122,7 @@ async def test_chunk_evidence_without_a_span_is_impossible(migrated: None) -> No
                         chunk_id=uuid.uuid4(),
                         quote="q",
                         source_uri="s3://bucket/doc",
+                        evidence_ref="s3://bucket/doc#span",
                         evidence_hash="h-spanless-chunk",
                     )
                 )
@@ -149,6 +150,7 @@ async def test_manual_evidence_with_a_span_is_impossible(migrated: None) -> None
                         source_uri="s3://bucket/doc",
                         start_offset=0,
                         end_offset=1,
+                        evidence_ref="s3://bucket/doc",
                         evidence_hash="h-spanned-manual",
                     )
                 )
@@ -173,6 +175,7 @@ async def test_duplicate_evidence_hash_is_impossible_within_a_build(migrated: No
                 "end_offset": 9,
                 "quote": "q",
                 "source_uri": "s3://bucket/doc",
+                "evidence_ref": "s3://bucket/doc#0-9",
                 "evidence_hash": "h1",
             }
             await conn.execute(relation_evidence.insert().values(**row))
@@ -215,6 +218,7 @@ async def test_evidence_survives_chunk_deletion(migrated: None) -> None:
                     end_offset=9,
                     quote="the quote outlives the chunk",
                     source_uri="s3://bucket/doc",
+                    evidence_ref="s3://bucket/doc#0-9",
                     evidence_hash="h-survives",
                 )
             )
@@ -323,14 +327,16 @@ async def test_evidence_missing_its_provenance_is_impossible(migrated: None) -> 
                 "start_offset": 0,
                 "end_offset": 9,
                 "quote": "q",
+                "evidence_ref": "s3://bucket/doc#0-9",
                 "evidence_hash": "h-no-uri",
             },
         ),
-        # no table+pk in evidence_ref
+        # a '' ref cannot distinguish sources in the hash identity
         (
-            "relation_evidence_row_provenance",
+            "relation_evidence_ref_nonempty",
             {
                 "evidence_type": "row",
+                "evidence_ref": "",
                 "evidence_hash": "h-no-ref",
             },
         ),
@@ -410,6 +416,7 @@ async def test_inverted_chunk_evidence_span_is_impossible(migrated: None) -> Non
                         end_offset=0,  # inverted
                         quote="q",
                         source_uri="s3://bucket/doc",
+                        evidence_ref="s3://bucket/doc#9-0",
                         evidence_hash="h-inverted",
                     )
                 )

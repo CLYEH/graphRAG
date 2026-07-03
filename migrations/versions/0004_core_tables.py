@@ -198,7 +198,8 @@ def upgrade() -> None:
         sa.Column("relation_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("evidence_type", sa.Text, nullable=False),
-        sa.Column("evidence_ref", sa.Text),
+        # §27.4 hash identity input for every type — see tables.py
+        sa.Column("evidence_ref", sa.Text, nullable=False),
         # no FK: §27.4 prune survival — may dangle after the old chunk is pruned
         sa.Column("chunk_id", postgresql.UUID(as_uuid=True)),
         sa.Column("start_offset", sa.Integer),
@@ -236,10 +237,7 @@ def upgrade() -> None:
             "(quote IS NOT NULL AND quote <> '' AND source_uri IS NOT NULL AND source_uri <> '')",
             name="relation_evidence_manual_provenance",
         ),
-        sa.CheckConstraint(
-            "evidence_type <> 'row' OR (evidence_ref IS NOT NULL AND evidence_ref <> '')",
-            name="relation_evidence_row_provenance",
-        ),
+        sa.CheckConstraint("evidence_ref <> ''", name="relation_evidence_ref_nonempty"),
         sa.CheckConstraint(
             "evidence_type <> 'chunk' OR (start_offset >= 0 AND end_offset >= start_offset)",
             name="relation_evidence_chunk_span_sane",

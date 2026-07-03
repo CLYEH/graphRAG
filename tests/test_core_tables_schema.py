@@ -167,7 +167,7 @@ def test_relation_evidence_columns_match_design_spec() -> None:
         "confidence",
         "created_at",
     }
-    for required in ("relation_id", "build_id", "evidence_type", "evidence_hash"):
+    for required in ("relation_id", "build_id", "evidence_type", "evidence_ref", "evidence_hash"):
         assert not relation_evidence.c[required].nullable, required
 
 
@@ -286,7 +286,11 @@ def test_each_evidence_type_must_carry_its_provenance() -> None:
         assert "quote IS NOT NULL" in checks[name]
         assert "source_uri IS NOT NULL" in checks[name]
         assert "<> ''" in checks[name]  # contract minLength 1 — empty ≠ provided
-    assert "evidence_ref IS NOT NULL" in checks["relation_evidence_row_provenance"]
+    # every type: evidence_ref is the §27.4 hash formula's source-distinguishing
+    # input (row: table+pk; chunk/manual: the writer's source ref) — NULL/''
+    # would make same-quote evidences from different sources collide
+    assert not relation_evidence.c.evidence_ref.nullable
+    assert "evidence_ref <> ''" in checks["relation_evidence_ref_nonempty"]
 
 
 def test_quote_respects_the_frozen_contract_cap() -> None:
