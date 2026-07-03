@@ -118,6 +118,7 @@ async def test_chunk_evidence_without_a_span_is_impossible(migrated: None) -> No
                         evidence_type="chunk",
                         chunk_id=uuid.uuid4(),
                         quote="q",
+                        source_uri="s3://bucket/doc",
                         evidence_hash="h-spanless-chunk",
                     )
                 )
@@ -142,6 +143,7 @@ async def test_manual_evidence_with_a_span_is_impossible(migrated: None) -> None
                         build_id=build,
                         evidence_type="manual",
                         quote="q",
+                        source_uri="s3://bucket/doc",
                         start_offset=0,
                         end_offset=1,
                         evidence_hash="h-spanned-manual",
@@ -167,6 +169,7 @@ async def test_duplicate_evidence_hash_is_impossible_within_a_build(migrated: No
                 "start_offset": 0,
                 "end_offset": 9,
                 "quote": "q",
+                "source_uri": "s3://bucket/doc",
                 "evidence_hash": "h1",
             }
             await conn.execute(relation_evidence.insert().values(**row))
@@ -242,7 +245,10 @@ async def test_deleting_an_entity_cascades_through_the_graph(migrated: None) -> 
             ).scalar_one()
             await conn.execute(
                 entity_mentions.insert().values(
-                    entity_id=src, source_kind="text", surface_form="Ada"
+                    entity_id=src,
+                    source_kind="text",
+                    source_ref="chunk:abc",
+                    surface_form="Ada",
                 )
             )
             await conn.execute(
@@ -271,5 +277,74 @@ async def test_deleting_an_entity_cascades_through_the_graph(migrated: None) -> 
             ).scalar_one()
             assert mentions_left == 0
             await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_duplicate_entity_key_within_a_build_is_impossible(migrated: None) -> None:
+    """§17/§27.3: entity_key is THE canonical identity — a second row for the
+    same key in the same build would fork ledger application."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            build = uuid.uuid4()
+            values = {
+                "project": "itest-x",
+                "build_id": build,
+                "type": "person",
+                "canonical_name": "Ada",
+                "entity_key": "fpv1:same-key",
+                "status": "active",
+            }
+            await conn.execute(entities.insert().values(**values))
+            with pytest.raises(IntegrityError, match="entities_by_key"):
+                await conn.execute(entities.insert().values(**values))
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_evidence_missing_its_provenance_is_impossible(migrated: None) -> None:
+    """The frozen MCP source-ref contract: chunk refs need quote+source_uri,
+    row refs need table+pk (evidence_ref) — rows that can't produce a valid
+    ref are rejected at write time, not discovered after the chunk is pruned."""
+    engine = _engine()
+    cases: list[tuple[str, dict[str, object]]] = [
+        # source_uri missing -> chunk ref unciteable after prune
+        (
+            "relation_evidence_chunk_provenance",
+            {
+                "evidence_type": "chunk",
+                "chunk_id": uuid.uuid4(),
+                "start_offset": 0,
+                "end_offset": 9,
+                "quote": "q",
+                "evidence_hash": "h-no-uri",
+            },
+        ),
+        # no table+pk in evidence_ref
+        (
+            "relation_evidence_row_provenance",
+            {
+                "evidence_type": "row",
+                "evidence_hash": "h-no-ref",
+            },
+        ),
+    ]
+    try:
+        async with engine.connect() as conn:
+            # one transaction per case: the rejected insert aborts its transaction
+            for constraint, values in cases:
+                trans = await conn.begin()
+                build = uuid.uuid4()
+                relation_id = await _insert_relation(conn, build)
+                with pytest.raises(IntegrityError, match=constraint):
+                    await conn.execute(
+                        relation_evidence.insert().values(
+                            relation_id=relation_id, build_id=build, **values
+                        )
+                    )
+                await trans.rollback()
     finally:
         await engine.dispose()

@@ -305,6 +305,7 @@ entities = sa.Table(
     sa.Column("type", sa.Text, nullable=False),
     sa.Column("canonical_name", sa.Text, nullable=False),
     # §27.3: cross-build stable identity, minted by core.resolve.fingerprints
+    # (non-empty by construction — fpv{N}: prefix; the CHECK pins it)
     sa.Column("entity_key", sa.Text, nullable=False),
     sa.Column("attributes", postgresql.JSONB),
     sa.Column("embedding_point_id", postgresql.UUID(as_uuid=True)),
@@ -326,11 +327,19 @@ entities = sa.Table(
         "created_by IN ('rule','llm','manual')",
         name="entities_created_by_valid",
     ),
+    sa.CheckConstraint("entity_key <> ''", name="entities_key_nonempty"),
 )
 
-# C4 applies review_ledger decisions by stable key within the building build (§27.3 套用)
+# §17/§27.3: entity_key IS the canonical identity — one canonical entity per
+# key per build, as a UNIQUE index, or a single review_ledger decision would
+# apply to several rows and projections would carry duplicate identities.
+# C4 applies ledger decisions through this same path (§27.3 套用).
 entities_by_key = sa.Index(
-    "entities_by_key", entities.c.project, entities.c.build_id, entities.c.entity_key
+    "entities_by_key",
+    entities.c.project,
+    entities.c.build_id,
+    entities.c.entity_key,
+    unique=True,
 )
 
 entity_mentions = sa.Table(
@@ -349,13 +358,16 @@ entity_mentions = sa.Table(
         nullable=False,
     ),
     sa.Column("source_kind", sa.Text, nullable=False),
-    sa.Column("source_ref", sa.Text),
+    # §27.2: entity source_refs are mention-backed and the frozen SourceRef.id
+    # has minLength 1 — a ref-less mention could never be cited.
+    sa.Column("source_ref", sa.Text, nullable=False),
     sa.Column("surface_form", sa.Text),
     sa.Column("confidence", sa.REAL),
     sa.CheckConstraint(
         "source_kind IN ('structured','text')",
         name="entity_mentions_source_kind_valid",
     ),
+    sa.CheckConstraint("source_ref <> ''", name="entity_mentions_source_ref_nonempty"),
 )
 
 entity_mentions_by_entity = sa.Index("entity_mentions_by_entity", entity_mentions.c.entity_id)
@@ -385,7 +397,9 @@ relations = sa.Table(
     ),
     sa.Column("type", sa.Text, nullable=False),
     sa.Column("attributes", postgresql.JSONB),
-    # §27.3: fpv{N}(src_key|norm(type)|dst_key), minted by core.resolve.fingerprints
+    # §27.3: fpv{N}(src_key|norm(type)|dst_key), minted by core.resolve.fingerprints.
+    # Nullable: C3 writes extracted relations before C4 mints signatures; once
+    # minted, identity is unique per build (partial index below).
     sa.Column("relation_signature", sa.Text),
     sa.Column("status", sa.Text, nullable=False),
     sa.Column("review_status", sa.Text, nullable=False, server_default=sa.text("'unreviewed'")),
@@ -405,10 +419,22 @@ relations = sa.Table(
         "created_by IN ('rule','llm','manual')",
         name="relations_created_by_valid",
     ),
+    sa.CheckConstraint("relation_signature <> ''", name="relations_signature_nonempty"),
 )
 
 relations_by_src = sa.Index("relations_by_src", relations.c.src_entity_id)
 relations_by_dst = sa.Index("relations_by_dst", relations.c.dst_entity_id)
+
+# §17/§27.3: same identity invariant as entities_by_key, for the minted state —
+# partial because pre-resolve rows legitimately carry no signature yet.
+relations_by_signature = sa.Index(
+    "relations_by_signature",
+    relations.c.project,
+    relations.c.build_id,
+    relations.c.relation_signature,
+    unique=True,
+    postgresql_where=sa.text("relation_signature IS NOT NULL"),
+)
 
 relation_evidence = sa.Table(
     "relation_evidence",
@@ -466,6 +492,25 @@ relation_evidence = sa.Table(
     sa.CheckConstraint(
         "evidence_type <> 'manual' OR (start_offset IS NULL AND end_offset IS NULL)",
         name="relation_evidence_manual_spanless",
+    ),
+    # §27.4 + the frozen MCP relation source-ref contract
+    # (mcp_response.schema.json): chunk refs emit source_uri + quote + offsets,
+    # document/manual refs emit source_uri + quote, row refs emit table+pk
+    # (carried in evidence_ref). A row missing its type's provenance could
+    # never produce a contract-valid, prune-surviving ref — reject at write.
+    sa.CheckConstraint(
+        "evidence_type <> 'chunk' OR "
+        "(quote IS NOT NULL AND quote <> '' AND source_uri IS NOT NULL AND source_uri <> '')",
+        name="relation_evidence_chunk_provenance",
+    ),
+    sa.CheckConstraint(
+        "evidence_type <> 'manual' OR "
+        "(quote IS NOT NULL AND quote <> '' AND source_uri IS NOT NULL AND source_uri <> '')",
+        name="relation_evidence_manual_provenance",
+    ),
+    sa.CheckConstraint(
+        "evidence_type <> 'row' OR (evidence_ref IS NOT NULL AND evidence_ref <> '')",
+        name="relation_evidence_row_provenance",
     ),
 )
 

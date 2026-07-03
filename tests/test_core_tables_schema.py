@@ -26,11 +26,13 @@ from core.stores.tables import (
     community_reports,
     documents,
     entities,
+    entities_by_key,
     entity_mentions,
     merge_candidates,
     relation_evidence,
     relation_evidence_dedup,
     relations,
+    relations_by_signature,
 )
 
 _OPENAPI = Path(__file__).resolve().parent.parent / "contracts" / "openapi.yaml"
@@ -115,6 +117,8 @@ def test_entity_mentions_columns_match_design_spec() -> None:
         "surface_form",
         "confidence",
     }
+    for required in ("entity_id", "source_kind", "source_ref"):
+        assert not entity_mentions.c[required].nullable, required
 
 
 def test_relations_columns_match_design_spec() -> None:
@@ -196,6 +200,26 @@ def test_merge_candidates_columns_match_design_spec() -> None:
         assert not merge_candidates.c[required].nullable, required
 
 
+# --- §17/§27.3 identity invariants -------------------------------------------------
+
+
+def test_entity_key_is_unique_per_build() -> None:
+    """§17/§27.3: entity_key IS the canonical identity — two rows sharing a
+    key in one build would make the review ledger apply a single decision to
+    several entities and projections carry duplicate identities."""
+    assert entities_by_key.unique
+    assert list(entities_by_key.columns.keys()) == ["project", "build_id", "entity_key"]
+
+
+def test_minted_relation_signature_is_unique_per_build() -> None:
+    """Same invariant for relations, partial on purpose: C3 stages extracted
+    rows before C4 mints signatures (NULL allowed), but once minted the
+    identity must be unique or ledger application forks."""
+    assert relations_by_signature.unique
+    where = relations_by_signature.dialect_options["postgresql"]["where"]
+    assert "IS NOT NULL" in str(where)
+
+
 # --- §27.4 evidence rules as database invariants ---------------------------------
 
 
@@ -205,6 +229,21 @@ def test_chunk_evidence_must_carry_its_span() -> None:
     checks = _checks(relation_evidence)
     assert "start_offset IS NOT NULL" in checks["relation_evidence_chunk_has_span"]
     assert "start_offset IS NULL" in checks["relation_evidence_manual_spanless"]
+
+
+def test_each_evidence_type_must_carry_its_provenance() -> None:
+    """The frozen MCP relation source-ref contract (mcp_response.schema.json)
+    requires chunk refs to emit source_uri+quote+offsets, document/manual refs
+    source_uri+quote, and row refs table+pk (evidence_ref) — all with
+    minLength 1. A stored row missing (or blanking) its type's provenance
+    could never produce a contract-valid ref once the source chunk is pruned
+    (§27.4), so the SoR rejects it at write time."""
+    checks = _checks(relation_evidence)
+    for name in ("relation_evidence_chunk_provenance", "relation_evidence_manual_provenance"):
+        assert "quote IS NOT NULL" in checks[name]
+        assert "source_uri IS NOT NULL" in checks[name]
+        assert "<> ''" in checks[name]  # contract minLength 1 — empty ≠ provided
+    assert "evidence_ref IS NOT NULL" in checks["relation_evidence_row_provenance"]
 
 
 def test_evidence_chunk_id_is_not_a_foreign_key() -> None:

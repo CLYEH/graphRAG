@@ -94,8 +94,12 @@ def upgrade() -> None:
             "created_by IN ('rule','llm','manual')",
             name="entities_created_by_valid",
         ),
+        sa.CheckConstraint("entity_key <> ''", name="entities_key_nonempty"),
     )
-    op.create_index("entities_by_key", "entities", ["project", "build_id", "entity_key"])
+    # §17/§27.3: one canonical entity per key per build
+    op.create_index(
+        "entities_by_key", "entities", ["project", "build_id", "entity_key"], unique=True
+    )
 
     op.create_table(
         "entity_mentions",
@@ -107,13 +111,14 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("source_kind", sa.Text, nullable=False),
-        sa.Column("source_ref", sa.Text),
+        sa.Column("source_ref", sa.Text, nullable=False),
         sa.Column("surface_form", sa.Text),
         sa.Column("confidence", sa.REAL),
         sa.CheckConstraint(
             "source_kind IN ('structured','text')",
             name="entity_mentions_source_kind_valid",
         ),
+        sa.CheckConstraint("source_ref <> ''", name="entity_mentions_source_ref_nonempty"),
     )
     op.create_index("entity_mentions_by_entity", "entity_mentions", ["entity_id"])
 
@@ -155,9 +160,19 @@ def upgrade() -> None:
             "created_by IN ('rule','llm','manual')",
             name="relations_created_by_valid",
         ),
+        sa.CheckConstraint("relation_signature <> ''", name="relations_signature_nonempty"),
     )
     op.create_index("relations_by_src", "relations", ["src_entity_id"])
     op.create_index("relations_by_dst", "relations", ["dst_entity_id"])
+    # §17/§27.3: minted signatures are unique per build (partial — C3 stages
+    # rows before C4 mints)
+    op.create_index(
+        "relations_by_signature",
+        "relations",
+        ["project", "build_id", "relation_signature"],
+        unique=True,
+        postgresql_where=sa.text("relation_signature IS NOT NULL"),
+    )
 
     op.create_table(
         "relation_evidence",
@@ -197,6 +212,20 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "evidence_type <> 'manual' OR (start_offset IS NULL AND end_offset IS NULL)",
             name="relation_evidence_manual_spanless",
+        ),
+        sa.CheckConstraint(
+            "evidence_type <> 'chunk' OR "
+            "(quote IS NOT NULL AND quote <> '' AND source_uri IS NOT NULL AND source_uri <> '')",
+            name="relation_evidence_chunk_provenance",
+        ),
+        sa.CheckConstraint(
+            "evidence_type <> 'manual' OR "
+            "(quote IS NOT NULL AND quote <> '' AND source_uri IS NOT NULL AND source_uri <> '')",
+            name="relation_evidence_manual_provenance",
+        ),
+        sa.CheckConstraint(
+            "evidence_type <> 'row' OR (evidence_ref IS NOT NULL AND evidence_ref <> '')",
+            name="relation_evidence_row_provenance",
         ),
     )
     op.create_index(
@@ -267,6 +296,7 @@ def downgrade() -> None:
     op.drop_table("community_reports")
     op.drop_index("relation_evidence_dedup", table_name="relation_evidence")
     op.drop_table("relation_evidence")
+    op.drop_index("relations_by_signature", table_name="relations")
     op.drop_index("relations_by_dst", table_name="relations")
     op.drop_index("relations_by_src", table_name="relations")
     op.drop_table("relations")
