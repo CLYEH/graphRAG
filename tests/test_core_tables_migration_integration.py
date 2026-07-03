@@ -118,6 +118,7 @@ async def test_chunk_evidence_without_a_span_is_impossible(migrated: None) -> No
                         evidence_type="chunk",
                         chunk_id=uuid.uuid4(),
                         quote="q",
+                        evidence_hash="h-spanless-chunk",
                     )
                 )
             await trans.rollback()
@@ -143,6 +144,7 @@ async def test_manual_evidence_with_a_span_is_impossible(migrated: None) -> None
                         quote="q",
                         start_offset=0,
                         end_offset=1,
+                        evidence_hash="h-spanned-manual",
                     )
                 )
             await trans.rollback()
@@ -249,6 +251,7 @@ async def test_deleting_an_entity_cascades_through_the_graph(migrated: None) -> 
                     build_id=build,
                     evidence_type="row",
                     evidence_ref="people:42",
+                    evidence_hash="h-row",
                 )
             )
             await conn.execute(entities.delete().where(entities.c.id == src))

@@ -177,7 +177,8 @@ def upgrade() -> None:
         sa.Column("end_offset", sa.Integer),
         sa.Column("quote", sa.Text),
         sa.Column("source_uri", sa.Text),
-        sa.Column("evidence_hash", sa.Text),
+        # NOT NULL: a NULL hash would vacuously escape the dedup unique index
+        sa.Column("evidence_hash", sa.Text, nullable=False),
         sa.Column("confidence", sa.REAL),
         sa.Column(
             "created_at",

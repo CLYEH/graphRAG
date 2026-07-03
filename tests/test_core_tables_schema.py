@@ -157,7 +157,7 @@ def test_relation_evidence_columns_match_design_spec() -> None:
         "confidence",
         "created_at",
     }
-    for required in ("relation_id", "build_id", "evidence_type"):
+    for required in ("relation_id", "build_id", "evidence_type", "evidence_hash"):
         assert not relation_evidence.c[required].nullable, required
 
 
@@ -218,9 +218,13 @@ def test_evidence_chunk_id_is_not_a_foreign_key() -> None:
 def test_evidence_dedup_is_a_database_invariant() -> None:
     """§27.4: evidence_hash exists for dedup — the hash embeds
     relation_signature, so per-build uniqueness = one row per distinct
-    evidence, enforced like one_active_build."""
+    evidence, enforced like one_active_build. NOT NULL is part of the
+    invariant: Postgres unique indexes treat NULLs as distinct, so a nullable
+    hash would let hashless rows duplicate freely (the no-op-value escape,
+    lesson class 1)."""
     assert relation_evidence_dedup.unique
     assert list(relation_evidence_dedup.columns.keys()) == ["build_id", "evidence_hash"]
+    assert not relation_evidence.c.evidence_hash.nullable
 
 
 # --- referential topology ---------------------------------------------------------

@@ -443,8 +443,10 @@ relation_evidence = sa.Table(
     # in this change).
     sa.Column("source_uri", sa.Text),
     # §27.4: sha256(relation_signature | evidence_ref | norm(quote)) — dedup +
-    # stable identity
-    sa.Column("evidence_hash", sa.Text),
+    # stable identity. NOT NULL: the formula is computable for every row, and
+    # a NULL would vacuously escape the dedup index below (Postgres treats
+    # NULLs as distinct), quietly voiding the §27.4 invariant.
+    sa.Column("evidence_hash", sa.Text, nullable=False),
     sa.Column("confidence", sa.REAL),
     sa.Column(
         "created_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
@@ -468,7 +470,7 @@ relation_evidence = sa.Table(
 )
 
 # §27.4 dedup: the hash already embeds relation_signature, so per-build
-# uniqueness = one row per distinct evidence (NULL hashes stay distinct)
+# uniqueness = one row per distinct evidence
 relation_evidence_dedup = sa.Index(
     "relation_evidence_dedup",
     relation_evidence.c.build_id,
