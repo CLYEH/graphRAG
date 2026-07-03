@@ -244,6 +244,11 @@ def upgrade() -> None:
             "evidence_type <> 'chunk' OR (start_offset >= 0 AND end_offset >= start_offset)",
             name="relation_evidence_chunk_span_sane",
         ),
+        sa.CheckConstraint(
+            "quote IS NULL OR char_length(quote) <= 512",
+            name="relation_evidence_quote_within_cap",
+        ),
+        sa.CheckConstraint("evidence_hash <> ''", name="relation_evidence_hash_nonempty"),
         sa.ForeignKeyConstraint(
             ["relation_id", "build_id"],
             ["relations.id", "relations.build_id"],

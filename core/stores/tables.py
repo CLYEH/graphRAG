@@ -491,8 +491,11 @@ relation_evidence = sa.Table(
     sa.Column("chunk_id", postgresql.UUID(as_uuid=True)),
     sa.Column("start_offset", sa.Integer),
     sa.Column("end_offset", sa.Integer),
-    # §27.4: keep the excerpt, not the whole chunk (length cap 🔧 512 — tunable,
-    # so no DB CHECK)
+    # §27.4: keep the excerpt, not the whole chunk. DESIGN marks the 512 cap
+    # 🔧 tunable, but the frozen P1/MCP schemas already pin maxLength 512 —
+    # the contract governs (an overlong stored quote could only be emitted by
+    # silently truncating the audit excerpt). Retuning means a contract
+    # version bump anyway (DR-002), which is when this CHECK moves too.
     sa.Column("quote", sa.Text),
     # §27.4 + P1 contract: denormalized provenance so evidence survives pruning.
     # §4's terse column list omits it; §27.4 and the frozen RelationEvidence
@@ -550,6 +553,13 @@ relation_evidence = sa.Table(
         "evidence_type <> 'chunk' OR (start_offset >= 0 AND end_offset >= start_offset)",
         name="relation_evidence_chunk_span_sane",
     ),
+    sa.CheckConstraint(
+        "quote IS NULL OR char_length(quote) <= 512",
+        name="relation_evidence_quote_within_cap",
+    ),
+    # the §27.4 stable identity — a '' placeholder identifies nothing and
+    # would make all later placeholder rows collide under the dedup index
+    sa.CheckConstraint("evidence_hash <> ''", name="relation_evidence_hash_nonempty"),
     # DR-006: evidence lives in its relation's build
     sa.ForeignKeyConstraint(
         ["relation_id", "build_id"],

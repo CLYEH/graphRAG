@@ -289,6 +289,22 @@ def test_each_evidence_type_must_carry_its_provenance() -> None:
     assert "evidence_ref IS NOT NULL" in checks["relation_evidence_row_provenance"]
 
 
+def test_quote_respects_the_frozen_contract_cap() -> None:
+    """DESIGN marks the 512 cap 🔧 tunable, but the frozen P1/MCP schemas pin
+    maxLength 512 — the contract governs: an overlong stored quote could only
+    be emitted by silently truncating the audit excerpt. Retuning implies a
+    contract version bump (DR-002), which is when this moves too."""
+    sqltext = _checks(relation_evidence)["relation_evidence_quote_within_cap"]
+    assert "512" in sqltext
+    assert "char_length" in sqltext
+
+
+def test_evidence_hash_placeholder_is_rejected() -> None:
+    """A '' hash identifies nothing and would make every later placeholder
+    row collide under the dedup index — same identifier rule as entity_key."""
+    assert "evidence_hash <> ''" in _checks(relation_evidence)["relation_evidence_hash_nonempty"]
+
+
 def test_evidence_chunk_id_is_not_a_foreign_key() -> None:
     """§27.4 prune survival: evidence outlives the chunk it quotes (the quote/
     offsets/source_uri are denormalized), so chunk_id must be allowed to
