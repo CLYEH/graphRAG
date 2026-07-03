@@ -8,7 +8,11 @@ Health, or a build one side calls regressed the other calls fine.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
+from hypothesis import assume, given
+from hypothesis import strategies as st
 
 from core.eval.spec import (
     CORE_METRICS,
@@ -86,3 +90,72 @@ def test_negative_threshold_fails_loud() -> None:
     that's a config bug, not a tolerance, so it must not be silently applied."""
     with pytest.raises(ValueError):
         is_eval_regression(candidate=0.90, active=0.90, threshold=-0.01)
+
+
+# --- property-based boundary tests (H4, lesson class 8) -------------------------
+#
+# PR #12's must-fix: the "drop of exactly the threshold is tolerated" contract
+# was broken by float subtraction for combinations nobody hand-picked
+# (0.8 - 0.5 > 0.3), and example-based review had only verified a lucky combo.
+# These properties sweep the whole grid of humanly-configured values —
+# scores/thresholds with up to 3 decimal places, which binary floats mostly
+# cannot represent exactly — so the boundary holds by construction, not by
+# sampling luck. On that grid the smallest true exceedance is 1e-3, while
+# float error (~1e-16) plus the implementation's slack (1e-9) is orders of
+# magnitude smaller, so exact-Decimal arithmetic is a sound oracle: any
+# disagreement is an implementation bug, never grid noise.
+
+_grid_scores = st.decimals(min_value=0, max_value=1, places=3)
+
+
+@given(candidate=_grid_scores, active=_grid_scores, threshold=_grid_scores)
+def test_float_rule_matches_exact_decimal_semantics(
+    candidate: Decimal, active: Decimal, threshold: Decimal
+) -> None:
+    """§20 in exact arithmetic: regression ⟺ (active − candidate) > threshold.
+    The float implementation must agree with the Decimal oracle everywhere on
+    the grid — this is the total-correctness form of the boundary rule."""
+    exact = (active - candidate) > threshold
+    assert is_eval_regression(float(candidate), float(active), float(threshold)) is exact
+
+
+@given(active=_grid_scores, threshold=_grid_scores)
+def test_exact_threshold_drop_is_tolerated_for_every_combination(
+    active: Decimal, threshold: Decimal
+) -> None:
+    """The #12 bug, generalized: construct the exactly-at-threshold drop for
+    *every* (active, threshold) pair instead of two hand-picked ones. §20's
+    threshold is the allowed slack — if any combination flips this, the
+    tunable silently means 'threshold minus epsilon' for unlucky configs."""
+    candidate = active - threshold
+    assume(candidate >= 0)  # scores live in [0, 1]
+    assert not is_eval_regression(float(candidate), float(active), float(threshold))
+
+
+@given(active=_grid_scores, threshold=_grid_scores)
+def test_drop_one_grid_step_beyond_threshold_always_regresses(
+    active: Decimal, threshold: Decimal
+) -> None:
+    """The boundary pinned from the other side: one grid quantum (0.001)
+    beyond the threshold must regress for every combination — so the float
+    slack that saves exact-threshold drops can never grow wide enough to
+    wave real regressions through."""
+    candidate = active - threshold - Decimal("0.001")
+    assume(candidate >= 0)
+    assert is_eval_regression(float(candidate), float(active), float(threshold))
+
+
+@given(
+    active=st.floats(min_value=0, max_value=1),
+    improvement=st.floats(min_value=0, max_value=1),
+    threshold=st.floats(min_value=0, max_value=1),
+)
+def test_equal_or_improved_score_never_regresses_anywhere(
+    active: float, improvement: float, threshold: float
+) -> None:
+    """Off the decimal grid too (runner-computed scores are arbitrary floats):
+    a candidate at or above active is never a regression, whatever the
+    threshold — otherwise preflight (§14) could block a build that got
+    *better*."""
+    candidate = min(1.0, active + improvement)
+    assert not is_eval_regression(candidate, active, threshold)
