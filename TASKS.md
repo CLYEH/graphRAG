@@ -19,7 +19,7 @@ Keep items small enough to finish in one loop.
 - [x] H1 harness fixes: fail-loud CI integration gate (`--wait` + CI fail-not-skip), doc-drift cleanup (hook filename, push wording, P-numbering, checkoff rule), gate-wait pipelining in LOOP.md, reviewer model → opus, LLM default → `gpt-5.4-nano`, C1/C6 split, `gh`/`git` allowlist, CI dedupe/concurrency + qdrant pin, DR-008 (Alembic) recorded
 - [x] H2 LOOP.md: Codex suggestion triage rules in step 7 (must-fix vs reply-and-resolve criteria, checkable rationale required for every resolve-without-change, same-class sweep per round; `+1` gate unchanged) + entry points aligned (CLAUDE.md gate 4, /loop prompt, memory)
 - [x] H3 harness enforcement & efficiency: `scripts/watch-codex.sh` (standard 3-channel watcher) · doc-only fast lane (`docs/**` direct push, no PR/Codex — owner-approved; doc-reviewer subagent + push-gate hook + branch-protection relax) · CPU push gates (review receipts hash-bound + re-run checks) · CI `governance` job (DR-002 version-bump guard, TASKS.md checkoff lint)
-- [ ] H4 property-based boundary tests: add `hypothesis` (dev dep) + property tests for frozen numeric/boundary rules (`is_eval_regression` first; P5 guardrail limits and C10 scoring as they land) — retro of PR #12's float-boundary must-fix (lesson class 8: 邊界語意 × 表示誤差)
+- [x] H4 property-based boundary tests: add `hypothesis` (dev dep) + property tests for frozen numeric/boundary rules (`is_eval_regression` first; P5 guardrail limits and C10 scoring as they land) — retro of PR #12's float-boundary must-fix (lesson class 8: 邊界語意 × 表示誤差)
 
 > **Per-task rule:** one task = one `task/<id>` branch = one PR. It lands with tests for its
 > tier, passes local gates + the `code-reviewer` subagent, then merges only after CI **and**
