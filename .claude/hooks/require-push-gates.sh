@@ -56,11 +56,13 @@ snapshot_tree() {
 }
 
 require_receipt() {
-  [ -f .claude/receipts/review ] || deny "no review receipt — a reviewer subagent must PASS this content first (it stamps .claude/receipts/review)."
+  # receipts are content-addressed (H5): .claude/receipts/<tree>, one per
+  # reviewed state — parallel branches don't clobber each other's stamps
   local tree reviewer rest now
-  read -r tree reviewer rest < .claude/receipts/review
   now="$(snapshot_tree)"
-  [ "$tree" = "$now" ] || deny "review receipt is stale — content changed since $reviewer's PASS. Re-run the reviewer."
+  [ -f ".claude/receipts/$now" ] || deny "no review receipt for this content — a reviewer subagent must PASS this exact state (it stamps .claude/receipts/<tree>); anything edited after its PASS needs a re-review."
+  read -r tree reviewer rest < ".claude/receipts/$now"
+  [ "$tree" = "$now" ] || deny "receipt .claude/receipts/$now is corrupt (names tree '$tree') — re-run the reviewer."
   case "$lane:$reviewer" in
     task:code-reviewer | doc:doc-reviewer | doc:code-reviewer) : ;;
     *) deny "receipt from '$reviewer' does not satisfy the $lane lane (task lane needs code-reviewer)." ;;

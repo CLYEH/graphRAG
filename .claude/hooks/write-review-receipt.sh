@@ -7,6 +7,11 @@
 # throwaway index — the real index is untouched. The push gate
 # (require-push-gates.sh) recomputes the same hash and refuses to push anything
 # that no longer matches, so "edited after review" is mechanically unpushable.
+#
+# Receipts are content-addressed (H5): one file per reviewed tree,
+# .claude/receipts/<tree>, so parallel branches (task/* + docs/*) never
+# clobber each other's stamps. Identical content = identical review subject,
+# so a receipt legitimately survives switching away and back.
 set -e
 reviewer="${1:?usage: write-review-receipt.sh <code-reviewer|doc-reviewer>}"
 case "$reviewer" in code-reviewer|doc-reviewer) : ;; *) echo "unknown reviewer '$reviewer'" >&2; exit 1 ;; esac
@@ -22,5 +27,5 @@ GIT_INDEX_FILE="$tmp_index" git add -A >/dev/null 2>&1
 tree="$(GIT_INDEX_FILE="$tmp_index" git write-tree)"
 
 mkdir -p .claude/receipts
-printf '%s %s %s\n' "$tree" "$reviewer" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > .claude/receipts/review
+printf '%s %s %s\n' "$tree" "$reviewer" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > ".claude/receipts/$tree"
 echo "review receipt stamped: tree=$tree by=$reviewer"
