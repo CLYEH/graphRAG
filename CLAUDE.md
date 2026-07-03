@@ -15,7 +15,7 @@ A task is done only when it passes **four gates** and its PR merges (full flow i
    (GitHub `required_conversation_resolution`); resolve them before merging.
    **No merge without `+1` — no exceptions.** CI green + resolved threads do **not** substitute
    for it. Enforced mechanically by a PreToolUse hook
-   (`.claude/hooks/require-codex-approval.ps1`) that blocks `gh pr merge` until Codex `+1`.
+   (`.claude/hooks/require-codex-approval.sh`) that blocks `gh pr merge` until Codex `+1`.
 A failure at gate 2, 3, or 4 sends you back to implementation. Never loosen
 `ruff`/`mypy`/`tsconfig`/test configs to pass — fix the code. Push is per-task to a
 `task/<id>` branch → PR; never commit straight to `main`.
@@ -50,10 +50,10 @@ Tooling: uv · ruff · mypy (strict) · pytest · poe (backend); oxlint · prett
 - **DR-003 — review decisions live in the non-build-scoped `review_ledger`**, keyed by stable fingerprints.
 - **Dependency direction:** `api`/`cli`/`projects/*/mcp` → `core`; `web` → `api` OpenAPI contract only; `core`
   has no HTTP/UI dependency. Don't import upward.
-- **LLM default is OpenAI** (`gpt-4o`), behind the abstraction layer — never read `os.environ` directly; use `core.config`.
+- **LLM default is OpenAI** (`gpt-5.4-nano`), behind the abstraction layer — never read `os.environ` directly; use `core.config`.
 
 ## Conventions
 - Surgical changes: every changed line should trace to the task. Don't refactor unrelated code.
 - Match existing style. Add types (mypy strict). Tests encode *why*, not just *what*.
-- Secrets never committed; `.env` is gitignored. Push is manual (not part of the loop).
+- Secrets never committed; `.env` is gitignored.
 - If a task is ambiguous or conflicts with DESIGN, **stop and ask** — don't guess.

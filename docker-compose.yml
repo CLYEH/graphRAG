@@ -33,12 +33,18 @@ services:
       retries: 10
 
   qdrant:
-    image: qdrant/qdrant
+    image: qdrant/qdrant:v1.18.2
     ports:
       - "6333:6333"
       - "6334:6334"
     volumes:
       - qdrantdata:/qdrant/storage
+    healthcheck:
+      # qdrant image ships no curl/wget — bash /dev/tcp probe instead
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/localhost/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   redis:
     image: redis:7-alpine

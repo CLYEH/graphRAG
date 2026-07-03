@@ -13,7 +13,18 @@
       "Bash(git diff:*)",
       "Bash(git log:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(git switch:*)",
+      "Bash(git pull:*)",
+      "Bash(git push:*)",
+      "Bash(git branch:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr comment:*)",
+      "Bash(gh api:*)"
     ]
   },
   "hooks": {

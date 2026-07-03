@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 from urllib.parse import urlparse
 
@@ -30,8 +31,21 @@ def _services_up() -> bool:
     return all(_reachable(host, port) for host, port in targets)
 
 
+def _gate_on_services() -> None:
+    """Skip locally when the stack is down; FAIL in CI (fail loud).
+
+    In CI the `integration` job is a required check — if unreachable services
+    merely skipped, the check would go green having tested nothing.
+    """
+    if _services_up():
+        return
+    msg = "docker compose services not reachable — run: docker compose up -d"
+    if os.environ.get("CI"):
+        pytest.fail(f"{msg} (CI must not silently skip integration tests)")
+    pytest.skip(msg)
+
+
 @pytest.fixture(scope="session")
 def require_services() -> None:
     """Skip an integration test unless the docker compose stack is reachable."""
-    if not _services_up():
-        pytest.skip("docker compose services not reachable — run: docker compose up -d")
+    _gate_on_services()

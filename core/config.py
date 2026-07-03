@@ -25,7 +25,7 @@ class Settings(BaseSettings):
 
     # LLM (default provider: OpenAI — DESIGN.md §3, DR-005)
     llm_provider: str = "openai"
-    llm_model: str = "gpt-4o"
+    llm_model: str = "gpt-5.4-nano"
     embedding_model: str = Field(default="text-embedding-3-large")
 
 
