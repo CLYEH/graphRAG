@@ -11,7 +11,7 @@ metadata:
 
 - **教訓(監聽 Codex)**:Codex 的「changes wanted」走 **`pulls/N/reviews`(PR review + inline threads)**,不是 issue comment;+1 走 issue reaction。watcher 必須同時輪詢 reactions、reviews、comments 三個管道。
 - **教訓(merge)**:auto-mode 分類器會擋 agent 自己 `gh pr merge`(即使 +1 已確認);由使用者跑 merge 指令即可(hook 會驗證)。
-- **Codex P2/P3 意見判讀政策(使用者 2026-07-03 定案;已由 H2 寫入 LOOP.md step 7,以該文為準)**:P2/P3 級意見先判讀必要性——**必要**=違反 DESIGN 凍結保證/契約或文件內部矛盾/會誤導未來實作/真 bug;**非必要**=超出 DESIGN 文字的假設性強化、風格偏好、無互通性依據的凍結要求 → 回覆給出**可查核理由**(條文衝突引 DESIGN §/DR;無條文要求/無行為差異則明述)後 resolve 不修;講不出理由=該修。判讀模糊時 stop and ask。+1 門檻不變。
+- **Codex P2/P3 意見判讀政策(使用者 2026-07-03 定案;已由 H2 寫入 LOOP.md step 7,以該文為準)**:P2/P3 級意見先判讀必要性——**必要**=違反 DESIGN 凍結保證/契約或文件內部矛盾/會誤導未來實作/真 bug;**非必要**=超出 DESIGN 文字的假設性強化、風格偏好、無互通性依據的凍結要求 → 回覆給出**該準則對應的可查核理由**(LOOP step 7 逐條列出:無條文要求/無行為差異則明述;可調項引 🔧 條文並指出無互通性依據;過度收緊引定義該合法情境的 §/DR)後 resolve 不修;講不出理由=該修。判讀模糊時 stop and ask。+1 門檻不變。
 - **教訓(壓 review 輪次)**:Codex 傾向一輪只給一條;收到意見後要**主動掃整個 diff 的同類問題**一次修完,否則會一輪一條擠牙膏(P1 因此走了 7 輪)。
 - **教訓(review race)**:push 後 Codex 可能仍對「舊 head」留 thread、隨後才對新 head +1;判讀 thread 前先確認它評的內容是否已被現 head 修掉,是則回覆指向修正 commit 後 resolve。
 - 慣例備忘:TASKS.md 勾選一律含在該任務 PR 內;PR 等 gates 期間可從 main 開下一個獨立 task 分支(LOOP.md 已明文)。

@@ -76,11 +76,13 @@ loop back to step 3.
      4. Would make a case DESIGN defines as legitimate unrepresentable (over-tightening).
 
      **Hard rules:** a resolve-without-change reply MUST name the criterion it invokes
-     and give a checkable rationale — cite the DESIGN §/DR the suggestion conflicts
-     with (criteria 3–4), or state explicitly that no frozen § mandates the suggested
-     guarantee (criterion 1) or that behavior/rendering is identical (criterion 2). An
-     unreasoned "resolved" is banned — if you can't articulate the rationale, treat the
-     suggestion as must-fix. If the call is genuinely ambiguous, stop and ask the user.
+     and give that criterion's checkable rationale — 1: state that no frozen § mandates
+     the suggested guarantee; 2: state that behavior/rendering is identical; 3: cite
+     the § marking the value 🔧 tunable and note the suggestion offers no
+     interoperability rationale for freezing it; 4: cite the §/DR defining the case the
+     suggestion would make unrepresentable. An unreasoned "resolved" is banned — if you
+     can't articulate the rationale, treat the suggestion as must-fix. If the call is
+     genuinely ambiguous, stop and ask the user.
      And whichever way a suggestion
      is triaged, sweep the whole diff for the same class of issue and settle it in one
      round. This triage changes nothing about the `+1` gate below — resolving threads
