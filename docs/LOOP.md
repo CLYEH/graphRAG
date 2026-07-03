@@ -114,8 +114,19 @@ loop back to step 3.
    `main`** (never off the waiting branch). Each PR still merges only when its own gates
    clear; if the waiting PR gets Codex feedback, finishing it takes priority over new work.
 8. **Merge & advance** — only after Codex `+1` on the head commit (the hook enforces it):
-   merge the PR, delete the branch, `git switch main && git pull`, check off the item in
-   `TASKS.md`, return to step 1.
+   merge the PR (its TASKS.md checkoff rode in it), delete the branch,
+   `git switch main && git pull`.
+
+   **Post-merge retro (owner rule, 2026-07-03):** before returning to step 1, sweep the
+   merged PR's review findings — every Codex thread AND every local-reviewer blocker —
+   and classify each against the **lesson classes** catalogued in
+   `.claude/memory/graphrag-loop-paused-pr5.md`:
+   - **Repeated class** ⇒ the existing prevention isn't biting — strengthen it (sharpen
+     the reviewer checklist / hook / CI check that should have caught it).
+   - **New class** ⇒ add it to the catalog (doc lane, minutes), and when it is
+     mechanically preventable, file an `H<n>` harness task in TASKS.md.
+   - Nothing new ⇒ note nothing and move on; the retro is a sweep, not a ceremony.
+   Then return to step 1.
 
 ## Doc-only fast lane (no PR, no Codex)
 Codex auto-reviews every PR the moment it opens, so doc-only work in a PR burns review
