@@ -40,6 +40,23 @@ cp .env.example .env       # secrets (OPENAI_API_KEY, ...)
 ```
 Tooling: uv · ruff · mypy (strict) · pytest · poe (backend); oxlint · prettier · tsc · vitest (frontend, in `web/`).
 
+## Agent memory (portable across machines)
+Claude Code's auto memory (its own persistent notes — distinct from this CLAUDE.md, which you
+write) defaults to a machine-local path under `~/.claude/projects/...`. In this repo it's
+redirected into `.claude/memory/` instead, so it travels with the repo via git rather than
+staying stuck on one machine.
+- `.claude/memory/*.md` (incl. `MEMORY.md`) are regular tracked files, committed like any other
+  file. Memory updates from a session will show up in `git status` — commit them (with the
+  task's commit, or standalone) so other machines/worktrees pick them up on their next pull.
+- The redirect itself (`autoMemoryDirectory`) needs an **absolute path**, so it can't live in the
+  shared `.claude/settings.json`. Each checkout/worktree needs its own one-time local setup:
+  create `.claude/settings.local.json` (gitignored) with:
+  ```json
+  { "autoMemoryDirectory": "<absolute-path-to-this-checkout>/.claude/memory" }
+  ```
+- Every worktree needs this set independently (pointing at its own `.claude/memory`) — there's no
+  cross-worktree sharing of the override. Content still converges normally through git.
+
 ## Architecture guardrails (from DESIGN — do not violate)
 - **Postgres is the single source of truth.** Neo4j & Qdrant are *derived projections*, tagged with `build_id`.
 - **DR-006 — never touch a raw store client** from query/MCP/api layers. All store access goes through the

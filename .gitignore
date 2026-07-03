@@ -20,6 +20,9 @@ web/coverage/
 .env
 .env.local
 
+# Claude Code — per-machine local config (e.g. autoMemoryDirectory abs path)
+.claude/settings.local.json
+
 # Local discussion scratch (not shipped)
 .discuss/
 
