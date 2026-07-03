@@ -15,6 +15,7 @@ metadata:
 - **教訓(壓 review 輪次)**:Codex 傾向一輪只給一條;收到意見後要**主動掃整個 diff 的同類問題**一次修完,否則會一輪一條擠牙膏(P1 因此走了 7 輪)。
 - **教訓(review race)**:push 後 Codex 可能仍對「舊 head」留 thread、隨後才對新 head +1;判讀 thread 前先確認它評的內容是否已被現 head 修掉,是則回覆指向修正 commit 後 resolve。
 - 慣例備忘:TASKS.md 勾選一律含在該任務 PR 內;PR 等 gates 期間可從 main 開下一個獨立 task 分支(LOOP.md 已明文)。
+- **doc-only fast lane(H3 起)**:純 `*.md` 變更不開 PR、不經 Codex —— `docs/<id>` 分支 → doc-reviewer(sonnet)PASS → CI 綠 → fast-forward 進 main;push-gate hook 機械擋非 .md。等 Codex 用 `scripts/watch-codex.sh <pr>`(exit 0=+1/10=有意見/20=timeout),不要手寫 watcher。
 
 歷史脈絡(2026-07-03 撰寫時的快照,僅供追溯,不代表現況):當時 P0(PR #4)、H1(PR #6)已 merge,P1(PR #5)正在等 fresh Codex +1。
 

@@ -17,6 +17,10 @@ A task is done only when it passes **four gates** and its PR merges (full flow i
    **No merge without `+1` — no exceptions.** CI green + resolved threads do **not** substitute
    for it. Enforced mechanically by a PreToolUse hook
    (`.claude/hooks/require-codex-approval.sh`) that blocks `gh pr merge` until Codex `+1`.
+**Doc-only fast lane** (owner-approved): if every changed file is `*.md`, skip the PR and
+Codex entirely — local gates → `doc-reviewer` subagent PASS → push `docs/<id>`, CI green →
+fast-forward to `main`. Mechanically enforced by the push-gate hook; see LOOP.md
+"Doc-only fast lane". Any non-`.md` file ⇒ full lane above.
 A failure at gate 2, 3, or 4 sends you back to implementation. Never loosen
 `ruff`/`mypy`/`tsconfig`/test configs to pass — fix the code. Push is per-task to a
 `task/<id>` branch → PR; never commit straight to `main`.

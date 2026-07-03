@@ -19,8 +19,14 @@ loop back to step 3.
    uv run poe check-full       # + integration (first: docker compose up -d --wait)
    cd web && npm run test:e2e  # UI flows (first: npx playwright install)
    ```
-5. **Agent review (local gate)** — run the `code-reviewer` subagent on the diff.
+5. **Agent review (local gate)** — run the `code-reviewer` subagent on the diff
+   (`doc-reviewer` for doc-only changes taking the fast lane).
    **VERDICT: FAIL → back to step 3** (fix, then re-verify + re-review).
+   A PASS stamps a **receipt** binding the verdict to a content hash
+   (`.claude/hooks/write-review-receipt.sh`); the push gate
+   (`.claude/hooks/require-push-gates.sh`) recomputes the hash and blocks the push if
+   anything changed after the PASS — and re-runs `poe check` itself. Steps 4–5 are
+   therefore CPU-verified at push time, not taken on faith.
 6. **Commit → push → open PR** (one task, one PR):
    ```bash
    git commit -m "<id>: <summary>"
@@ -52,6 +58,11 @@ loop back to step 3.
        --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
               |select(.isResolved==false and .comments.nodes[0].author.login=="chatgpt-codex-connector")]|length'
      ```
+     **Waiting is standardized:** run `bash scripts/watch-codex.sh <pr>` (background it) —
+     it polls all three Codex channels (reactions / PR reviews / comments; a review-only
+     "changes wanted" is invisible to the other two) and exits `0`=+1 approved,
+     `10`=new response to triage, `20`=timeout (poke `@codex review`). Don't hand-roll
+     one-off watchers.
    - **Conversations resolved** — GitHub blocks merge (`required_conversation_resolution`)
      until every Codex thread is addressed and resolved (PR UI, or
      `gh api graphql` → `resolveReviewThread`).
@@ -105,6 +116,30 @@ loop back to step 3.
 8. **Merge & advance** — only after Codex `+1` on the head commit (the hook enforces it):
    merge the PR, delete the branch, `git switch main && git pull`, check off the item in
    `TASKS.md`, return to step 1.
+
+## Doc-only fast lane (no PR, no Codex)
+Codex auto-reviews every PR the moment it opens, so doc-only work in a PR burns review
+quota against zero code risk. Owner decision (2026-07-03): a change where **every changed
+file is `*.md`** skips the PR entirely:
+
+1. Branch `docs/<id>` off latest `main`.
+2. Local gates as usual (`uv run poe check-all` — cheap; nothing executes Markdown).
+3. Run the **`doc-reviewer`** subagent (not `code-reviewer`). `VERDICT: PASS` stamps the
+   review receipt the push gate requires.
+4. Push the branch — CI runs on `docs/**` pushes — wait for green, then fast-forward main:
+   `git push origin docs/<id>:main`.
+
+Enforcement is mechanical, not honor-based:
+- `.claude/hooks/require-push-gates.sh` (PreToolUse) treats `docs/*` branch pushes and any
+  direct-to-main push as this lane: it blocks them when a non-`*.md` file is outgoing, or
+  when the content doesn't match a reviewer receipt.
+- Branch protection still requires green required checks on the pushed SHA (statuses are
+  per-SHA, so the `docs/**` CI run satisfies them). "Require a pull request" was lifted to
+  enable this lane — code changes still go through PRs because the push gate refuses them
+  here.
+
+Anything touching code/config/contracts/workflows/hooks — any non-`.md` file — takes the
+full lane: task branch → PR → CI + Codex `+1`.
 
 ## Testing tiers (what runs when)
 | Tier | Runs | Marker / location | In fast loop? |
