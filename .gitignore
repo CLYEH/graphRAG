@@ -20,6 +20,12 @@ web/coverage/
 .env
 .env.local
 
+# Claude Code — per-machine local config (e.g. autoMemoryDirectory abs path)
+.claude/settings.local.json
+
+# Claude Code — agent worktrees (created for isolated/parallel agent work)
+.claude/worktrees/
+
 # Local discussion scratch (not shipped)
 .discuss/
 
