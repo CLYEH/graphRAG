@@ -49,3 +49,45 @@ one_active_build = sa.Index(
     unique=True,
     postgresql_where=sa.text("status = 'active'"),
 )
+
+# §17 / DR-003: review decisions are deliberately NOT build-scoped — they carry
+# forward across rebuilds, keyed by stable fingerprints (core.resolve.fingerprints)
+# plus the fingerprint_version they were minted under (§27.3 / DR-007).
+review_ledger = sa.Table(
+    "review_ledger",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column("project", sa.Text, nullable=False),
+    sa.Column("target_kind", sa.Text, nullable=False),
+    sa.Column("target_key", sa.Text, nullable=False),
+    sa.Column("fingerprint_version", sa.Integer, nullable=False),
+    sa.Column("decision", sa.Text, nullable=False),
+    sa.Column("decided_by", sa.Text, nullable=False),
+    sa.Column(
+        "decided_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    ),
+    sa.Column("reason", sa.Text),
+    sa.CheckConstraint(
+        "target_kind IN ('entity','relation','merge')",
+        name="review_ledger_kind_valid",
+    ),
+    sa.CheckConstraint(
+        "decision IN ('approve','reject','defer','merge','split')",
+        name="review_ledger_decision_valid",
+    ),
+)
+
+# resolve-time application scans all entries for a key (precedence is computed
+# in core.resolve.review.effective_decision, not in SQL)
+review_ledger_lookup = sa.Index(
+    "review_ledger_lookup",
+    review_ledger.c.project,
+    review_ledger.c.target_kind,
+    review_ledger.c.target_key,
+    review_ledger.c.fingerprint_version,
+)

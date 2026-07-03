@@ -28,13 +28,13 @@ Keep items small enough to finish in one loop.
 - [x] P0 `contracts/openapi.yaml`: response envelope, error-code enum, cursor pagination, SSE event, idempotency (§15/§27.2)
 - [x] P1 `contracts/mcp_response.schema.json`: unified retrieval result + source_refs + debug (§16/§27.2)
 - [x] P2 Build/activation model spec + Postgres migrations for `builds` + partial unique index (§14/§27.1) · Alembic setup (DR-008)
-- [ ] P3 Review state machine + `review_ledger` + fingerprint spec + `fingerprint_version` (§17/§27.3)
+- [x] P3 Review state machine + `review_ledger` + fingerprint spec + `fingerprint_version` (§17/§27.3)
 - [ ] P4 Eval contract: `golden.yaml` schema + metrics incl. path_validity/relation_hit_rate/groundedness (§20/§27.5)
 - [ ] P5 Query safety policy schema (`query_policy`) + SQL(sqlglot)/Cypher strategy (§21/§27.6)
 - [ ] P6 Observability schema: pipeline_runs/steps/items + item_ref rules (§18/§27.7)
 
 ## Track 1 — Core engine  *(depends on Track 0)*
-- [ ] C1a PG migrations for core tables (documents/chunks/entities/relations/evidence/reports/review/observability; `builds` itself lands with P2)
+- [ ] C1a PG migrations for core tables (documents/chunks/entities/relations/evidence/reports/merge_candidates/observability; `builds` landed with P2, `review_ledger` with P3)
 - [ ] C1b **BuildScopedRepo** over Postgres (active-build lookup + build_id injection, DR-006)
 - [ ] C1c Neo4j adapter + projection repo (build_id-filtered, DR-004)
 - [ ] C1d Qdrant adapter + projection repo (build_id payload filter)
