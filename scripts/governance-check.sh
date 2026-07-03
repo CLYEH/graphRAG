@@ -20,9 +20,11 @@ version_of() { # version_of <ref> <file> — emits empty (never aborts) when the
         | jq -r '(.properties.schema_version.const // .info.version // .version // empty)' 2>/dev/null || true
       ;;
     *.yaml | *.yml)
+      # strip trailing comments/whitespace too: comparing raw line text would let a
+      # cosmetic edit of the version line fake a "bump" without changing the value
       { git show "$ref:$f" 2>/dev/null || true; } \
         | { grep -E '^[[:space:]]*version:[[:space:]]*' || true; } | head -n1 \
-        | sed -E 's/^[[:space:]]*version:[[:space:]]*//; s/["'"'"']//g'
+        | sed -E 's/^[[:space:]]*version:[[:space:]]*//; s/[[:space:]]+#.*$//; s/["'"'"']//g; s/[[:space:]]+$//'
       ;;
   esac
 }
@@ -53,8 +55,15 @@ case "$BRANCH" in
     id="${BRANCH#task/}"
     # capture first: grep -q would SIGPIPE the diff under pipefail on early match
     tasks_diff="$(git diff "$base"...HEAD -- TASKS.md)"
-    if ! printf '%s' "$tasks_diff" | grep -qE "^\+- \[x\] $id[[:space:]]"; then
+    added_checkoffs="$(printf '%s' "$tasks_diff" | grep -E '^\+- \[x\] ' || true)"
+    if ! printf '%s' "$added_checkoffs" | grep -qE "^\+- \[x\] $id[[:space:]]"; then
       echo "::error file=TASKS.md::branch $BRANCH must check off item '$id' in TASKS.md (the checkoff rides in the task PR)"
+      fail=1
+    fi
+    # "exactly its own item": no smuggled checkoffs of other items
+    extra="$(printf '%s' "$added_checkoffs" | grep -vE "^\+- \[x\] $id[[:space:]]" || true)"
+    if [ -n "$extra" ]; then
+      echo "::error file=TASKS.md::branch $BRANCH adds checkoffs other than its own item '$id': $(printf '%s' "$extra" | tr '\n' ' ')"
       fail=1
     fi
     ;;
