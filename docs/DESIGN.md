@@ -70,7 +70,7 @@ chunks(id uuid pk, document_id uuid, build_id uuid, ordinal int, text text,
        vector_point_id uuid, metadata jsonb, status text)
 
 entities(id uuid pk, project text, build_id uuid, type text, canonical_name text,
-         entity_key text,      -- 跨 build 穩定身分：normalize(type + name + disambiguator)
+         entity_key text,      -- 跨 build 穩定身分：fpv{N}(norm(type)|norm(name)|disambiguator)，見 §27.3
          attributes jsonb, embedding_point_id uuid,
          status text,          -- active|deprecated|merged|rejected|needs_review
          review_status text,   -- unreviewed|approved|rejected
@@ -80,7 +80,7 @@ entity_mentions(id uuid pk, entity_id uuid, source_kind text,  -- structured|tex
                 source_ref text, surface_form text, confidence real)
 
 relations(id uuid pk, project text, build_id uuid, src_entity_id uuid, dst_entity_id uuid,
-          type text, attributes jsonb, relation_signature text,  -- src_key + type + dst_key
+          type text, attributes jsonb, relation_signature text,  -- fpv{N}(src_key|norm(type)|dst_key)，見 §27.3
           status text, review_status text, created_by text, confidence real,
           created_at, updated_at timestamptz)
 relation_evidence(id uuid pk, relation_id uuid, build_id uuid, evidence_type text, -- chunk|row|manual
@@ -98,6 +98,7 @@ merge_candidates(id uuid pk, project text, build_id uuid, left_entity_id uuid, r
 -- 跨 build 延續：非 build-scoped，以 fingerprint 為鍵（§17 / DR-003）
 review_ledger(id uuid pk, project text, target_kind text,   -- entity|relation|merge
               target_key text,                              -- entity_key / relation_signature / merge_key
+              fingerprint_version int,                      -- 鍵的鑄造版本（§27.3 / DR-007，僅套用同版）
               decision text,                                -- approve|reject|defer|merge|split
               decided_by text, decided_at timestamptz, reason text)
 
@@ -275,8 +276,9 @@ graphRAG/
 - **source_refs 最低要求**（`require_sources` 強制，依 result_type）：chunk→≥1 chunk ref（source_uri+offsets）；entity→≥1 mention（chunk/row）；relation→≥1 relation_evidence；path→每條 edge 皆有 ref；row→table+pk；community_report→member entity refs。
 
 ### 27.3 Review Fingerprint & Ledger 語意（DR-003/007）
-- `entity_key = fpv{N}( norm(type) | norm(canonical_name) | disambiguator )`（disambiguator＝有穩定外部 id 時採用）。
-- `relation_signature = fpv{N}( src_entity_key | type | dst_entity_key )`；`merge_key = fpv{N}( sorted(left_key, right_key) )`。
+- `entity_key = fpv{N}( norm(type) | norm(canonical_name) | disambiguator )`（disambiguator＝有穩定外部 id 時採用，**僅去頭尾空白、保留大小寫** — 外部 id 可能區分大小寫）。
+- `relation_signature = fpv{N}( src_entity_key | norm(type) | dst_entity_key )`；`merge_key = fpv{N}( sorted(left_key, right_key) )`。
+- `norm` 凍結定義＝NFKC → casefold → 摺疊連續空白；hash 輸入以長度前綴編碼組合（杜絕分隔符歧義）。實作＝`core/resolve/fingerprints.py`，與本節逐字對應；任何變更即升 `fingerprint_version`。
 - **fingerprint_version**：隨正規化/ontology 變更升版；ledger 僅套用同版（或經 migration 對映）之鍵，否則標記**重審**而非誤套。
 - **precedence**：同鍵多筆以 `decided_at` 最新為準；manual(curator) 優先於 auto。
 - **套用**：resolve/index 時 reject→排除出投影；approve/merge→採納；defer→留待審。
