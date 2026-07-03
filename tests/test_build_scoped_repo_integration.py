@@ -1,0 +1,165 @@
+"""Why: DR-006 is only real if a repo bound via for_active_build actually
+reads the active build's rows AND NOTHING ELSE on live Postgres — two builds
+coexisting in the same tables is the §14 normal state, not an edge case. The
+unit tests pin the SQL shape; these prove the isolation and the DR-001 lookup
+against the real partial-index-guarded builds table.
+"""
+
+from __future__ import annotations
+
+import uuid
+from pathlib import Path
+
+import pytest
+from alembic import command
+from alembic.config import Config
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
+
+from core.config import get_settings
+from core.stores.repo import BuildScopedRepo, NoActiveBuildError, active_build_id
+from core.stores.tables import builds, documents
+
+pytestmark = pytest.mark.integration
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture()
+def migrated(require_services: None) -> None:
+    """Apply migrations (idempotent). Sync fixture: alembic's env.py drives its
+    own asyncio.run, which must not happen inside a running event loop."""
+    command.upgrade(Config(str(REPO_ROOT / "alembic.ini")), "head")
+
+
+def _engine() -> AsyncEngine:
+    dsn = get_settings().postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return create_async_engine(dsn, poolclass=NullPool)
+
+
+async def _insert_build(conn: AsyncConnection, project: str, status: str) -> uuid.UUID:
+    build_id: uuid.UUID = (
+        await conn.execute(
+            builds.insert().values(project=project, status=status).returning(builds.c.id)
+        )
+    ).scalar_one()
+    return build_id
+
+
+async def _insert_document(conn: AsyncConnection, project: str, build: uuid.UUID) -> None:
+    await conn.execute(
+        documents.insert().values(
+            project=project,
+            build_id=build,
+            source_uri=f"s3://bucket/{build}",
+            content_hash=f"c-{build}",
+        )
+    )
+
+
+async def test_active_repo_reads_only_the_active_build(migrated: None) -> None:
+    """Two builds' rows coexist in the same table (§14); the repo bound via
+    for_active_build must return the active build's rows and nothing else —
+    the exact "mixed old-version data" DR-006 exists to make impossible."""
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            active = await _insert_build(conn, project, "active")
+            stale = await _insert_build(conn, project, "ready")
+            await _insert_document(conn, project, active)
+            await _insert_document(conn, project, stale)
+
+            repo = await BuildScopedRepo.for_active_build(conn, project)
+            assert repo.build_id == active
+            rows = (await conn.execute(repo.select(documents))).fetchall()
+            assert [row.build_id for row in rows] == [active]
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_no_active_build_raises_the_typed_error(migrated: None) -> None:
+    """§15's NO_ACTIVE_BUILD is a defined condition, not a crash — core must
+    surface it as the typed error the API layer maps onto the frozen code."""
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await _insert_build(conn, project, "ready")  # exists, but not active
+            with pytest.raises(NoActiveBuildError) as excinfo:
+                await active_build_id(conn, project)
+            assert excinfo.value.project == project
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_pipeline_writes_land_in_the_bound_building_build(migrated: None) -> None:
+    """§27.1: 寫入一律指定 building 的 build_id — a repo bound to the building
+    build writes there, and the active-bound repo doesn't see those rows."""
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            active = await _insert_build(conn, project, "active")
+            building = await _insert_build(conn, project, "building")
+
+            writer = BuildScopedRepo(conn=conn, project=project, build_id=building)
+            await conn.execute(
+                writer.insert_values(documents, source_uri="s3://new", content_hash="c-new")
+            )
+
+            written = (await conn.execute(writer.select(documents))).fetchall()
+            assert [row.build_id for row in written] == [building]
+            reader = await BuildScopedRepo.for_active_build(conn, project)
+            assert reader.build_id == active
+            assert (await conn.execute(reader.select(documents))).fetchall() == []
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_scoped_select_composes_with_caller_predicates(migrated: None) -> None:
+    """Callers layer their own filters ON TOP of the scope — adding a WHERE
+    must never widen the read back across builds."""
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            active = await _insert_build(conn, project, "active")
+            stale = await _insert_build(conn, project, "ready")
+            await _insert_document(conn, project, active)
+            await _insert_document(conn, project, stale)
+
+            repo = await BuildScopedRepo.for_active_build(conn, project)
+            narrowed = repo.select(documents).where(
+                documents.c.source_uri == f"s3://bucket/{stale}"
+            )
+            # the stale build's uri exists in the table, but outside the scope
+            assert (await conn.execute(narrowed)).fetchall() == []
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_active_lookup_is_a_single_query_over_the_guarded_index(migrated: None) -> None:
+    """DR-001: the lookup trusts the one_active_build partial unique index —
+    scalar_one_or_none() would blow up on duplicates, which the database
+    already makes impossible (proven in test_builds_migration_integration)."""
+    engine = _engine()
+    p1 = f"itest-{uuid.uuid4().hex[:10]}"
+    p2 = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            b1 = await _insert_build(conn, p1, "active")
+            await _insert_build(conn, p2, "active")  # other project's active
+            assert await active_build_id(conn, p1) == b1
+            await trans.rollback()
+    finally:
+        await engine.dispose()
