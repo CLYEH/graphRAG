@@ -43,18 +43,17 @@ def upgrade() -> None:
         sa.Column("metadata", postgresql.JSONB),
         sa.Column("status", sa.Text),
         sa.Column("ingested_at", sa.TIMESTAMP(timezone=True)),
+        sa.UniqueConstraint("id", "build_id", name="documents_id_build_unique"),
     )
     op.create_index("documents_by_build", "documents", ["project", "build_id"])
 
+    # DR-006: composite child FKs — a child row provably lives in its parent's
+    # build (and project where both sides carry it); cross-build mixing is
+    # unrepresentable, not writer discipline
     op.create_table(
         "chunks",
         _uuid_pk(),
-        sa.Column(
-            "document_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("documents.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
+        sa.Column("document_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("ordinal", sa.Integer, nullable=False),
         sa.Column("text", sa.Text, nullable=False),
@@ -64,6 +63,12 @@ def upgrade() -> None:
         sa.Column("vector_point_id", postgresql.UUID(as_uuid=True)),
         sa.Column("metadata", postgresql.JSONB),
         sa.Column("status", sa.Text),
+        sa.ForeignKeyConstraint(
+            ["document_id", "build_id"],
+            ["documents.id", "documents.build_id"],
+            ondelete="CASCADE",
+            name="chunks_document_build_fk",
+        ),
     )
     op.create_index("chunks_by_document", "chunks", ["document_id"])
 
@@ -95,6 +100,7 @@ def upgrade() -> None:
             name="entities_created_by_valid",
         ),
         sa.CheckConstraint("entity_key <> ''", name="entities_key_nonempty"),
+        sa.UniqueConstraint("id", "project", "build_id", name="entities_id_project_build_unique"),
     )
     # §17/§27.3: one canonical entity per key per build
     op.create_index(
@@ -127,18 +133,8 @@ def upgrade() -> None:
         _uuid_pk(),
         sa.Column("project", sa.Text, nullable=False),
         sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column(
-            "src_entity_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("entities.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-        sa.Column(
-            "dst_entity_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("entities.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
+        sa.Column("src_entity_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("dst_entity_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("type", sa.Text, nullable=False),
         sa.Column("attributes", postgresql.JSONB),
         sa.Column("relation_signature", sa.Text),
@@ -161,6 +157,19 @@ def upgrade() -> None:
             name="relations_created_by_valid",
         ),
         sa.CheckConstraint("relation_signature <> ''", name="relations_signature_nonempty"),
+        sa.ForeignKeyConstraint(
+            ["src_entity_id", "project", "build_id"],
+            ["entities.id", "entities.project", "entities.build_id"],
+            ondelete="CASCADE",
+            name="relations_src_entity_fk",
+        ),
+        sa.ForeignKeyConstraint(
+            ["dst_entity_id", "project", "build_id"],
+            ["entities.id", "entities.project", "entities.build_id"],
+            ondelete="CASCADE",
+            name="relations_dst_entity_fk",
+        ),
+        sa.UniqueConstraint("id", "build_id", name="relations_id_build_unique"),
     )
     op.create_index("relations_by_src", "relations", ["src_entity_id"])
     op.create_index("relations_by_dst", "relations", ["dst_entity_id"])
@@ -177,12 +186,7 @@ def upgrade() -> None:
     op.create_table(
         "relation_evidence",
         _uuid_pk(),
-        sa.Column(
-            "relation_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("relations.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
+        sa.Column("relation_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("evidence_type", sa.Text, nullable=False),
         sa.Column("evidence_ref", sa.Text),
@@ -227,6 +231,16 @@ def upgrade() -> None:
             "evidence_type <> 'row' OR (evidence_ref IS NOT NULL AND evidence_ref <> '')",
             name="relation_evidence_row_provenance",
         ),
+        sa.CheckConstraint(
+            "evidence_type <> 'chunk' OR (start_offset >= 0 AND end_offset >= start_offset)",
+            name="relation_evidence_chunk_span_sane",
+        ),
+        sa.ForeignKeyConstraint(
+            ["relation_id", "build_id"],
+            ["relations.id", "relations.build_id"],
+            ondelete="CASCADE",
+            name="relation_evidence_relation_fk",
+        ),
     )
     op.create_index(
         "relation_evidence_dedup",
@@ -253,18 +267,8 @@ def upgrade() -> None:
         _uuid_pk(),
         sa.Column("project", sa.Text, nullable=False),
         sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column(
-            "left_entity_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("entities.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-        sa.Column(
-            "right_entity_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("entities.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
+        sa.Column("left_entity_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("right_entity_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("score", sa.REAL, nullable=False),
         sa.Column("features", postgresql.JSONB),
         sa.Column("status", sa.Text, nullable=False, server_default=sa.text("'pending'")),
@@ -282,6 +286,18 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "decision IN ('approve','reject','defer')",
             name="merge_candidates_decision_valid",
+        ),
+        sa.ForeignKeyConstraint(
+            ["left_entity_id", "project", "build_id"],
+            ["entities.id", "entities.project", "entities.build_id"],
+            ondelete="CASCADE",
+            name="merge_candidates_left_entity_fk",
+        ),
+        sa.ForeignKeyConstraint(
+            ["right_entity_id", "project", "build_id"],
+            ["entities.id", "entities.project", "entities.build_id"],
+            ondelete="CASCADE",
+            name="merge_candidates_right_entity_fk",
         ),
     )
     op.create_index(

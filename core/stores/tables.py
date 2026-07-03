@@ -259,10 +259,16 @@ documents = sa.Table(
     sa.Column("metadata", postgresql.JSONB),
     sa.Column("status", sa.Text),
     sa.Column("ingested_at", sa.TIMESTAMP(timezone=True)),
+    # FK target for the composite child FKs below (DR-006 build alignment)
+    sa.UniqueConstraint("id", "build_id", name="documents_id_build_unique"),
 )
 
 documents_by_build = sa.Index("documents_by_build", documents.c.project, documents.c.build_id)
 
+# DR-006: children reference their parent TOGETHER WITH build_id (composite
+# FKs), so a child row provably lives in its parent's build — cross-build
+# mixing (and cross-build cascade deletes) become unrepresentable instead of
+# writer discipline. Where both sides carry project, it joins the FK too.
 chunks = sa.Table(
     "chunks",
     metadata,
@@ -272,12 +278,7 @@ chunks = sa.Table(
         primary_key=True,
         server_default=sa.text("gen_random_uuid()"),
     ),
-    sa.Column(
-        "document_id",
-        postgresql.UUID(as_uuid=True),
-        sa.ForeignKey("documents.id", ondelete="CASCADE"),
-        nullable=False,
-    ),
+    sa.Column("document_id", postgresql.UUID(as_uuid=True), nullable=False),
     sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
     sa.Column("ordinal", sa.Integer, nullable=False),
     sa.Column("text", sa.Text, nullable=False),
@@ -287,6 +288,12 @@ chunks = sa.Table(
     sa.Column("vector_point_id", postgresql.UUID(as_uuid=True)),
     sa.Column("metadata", postgresql.JSONB),
     sa.Column("status", sa.Text),
+    sa.ForeignKeyConstraint(
+        ["document_id", "build_id"],
+        ["documents.id", "documents.build_id"],
+        ondelete="CASCADE",
+        name="chunks_document_build_fk",
+    ),
 )
 
 chunks_by_document = sa.Index("chunks_by_document", chunks.c.document_id)
@@ -328,6 +335,8 @@ entities = sa.Table(
         name="entities_created_by_valid",
     ),
     sa.CheckConstraint("entity_key <> ''", name="entities_key_nonempty"),
+    # FK target for relations/merge_candidates build+project alignment (DR-006)
+    sa.UniqueConstraint("id", "project", "build_id", name="entities_id_project_build_unique"),
 )
 
 # §17/§27.3: entity_key IS the canonical identity — one canonical entity per
@@ -383,18 +392,8 @@ relations = sa.Table(
     ),
     sa.Column("project", sa.Text, nullable=False),
     sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
-    sa.Column(
-        "src_entity_id",
-        postgresql.UUID(as_uuid=True),
-        sa.ForeignKey("entities.id", ondelete="CASCADE"),
-        nullable=False,
-    ),
-    sa.Column(
-        "dst_entity_id",
-        postgresql.UUID(as_uuid=True),
-        sa.ForeignKey("entities.id", ondelete="CASCADE"),
-        nullable=False,
-    ),
+    sa.Column("src_entity_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("dst_entity_id", postgresql.UUID(as_uuid=True), nullable=False),
     sa.Column("type", sa.Text, nullable=False),
     sa.Column("attributes", postgresql.JSONB),
     # §27.3: fpv{N}(src_key|norm(type)|dst_key), minted by core.resolve.fingerprints.
@@ -420,6 +419,21 @@ relations = sa.Table(
         name="relations_created_by_valid",
     ),
     sa.CheckConstraint("relation_signature <> ''", name="relations_signature_nonempty"),
+    # DR-006: endpoints must live in the same project AND build as the relation
+    sa.ForeignKeyConstraint(
+        ["src_entity_id", "project", "build_id"],
+        ["entities.id", "entities.project", "entities.build_id"],
+        ondelete="CASCADE",
+        name="relations_src_entity_fk",
+    ),
+    sa.ForeignKeyConstraint(
+        ["dst_entity_id", "project", "build_id"],
+        ["entities.id", "entities.project", "entities.build_id"],
+        ondelete="CASCADE",
+        name="relations_dst_entity_fk",
+    ),
+    # FK target for relation_evidence build alignment
+    sa.UniqueConstraint("id", "build_id", name="relations_id_build_unique"),
 )
 
 relations_by_src = sa.Index("relations_by_src", relations.c.src_entity_id)
@@ -445,12 +459,7 @@ relation_evidence = sa.Table(
         primary_key=True,
         server_default=sa.text("gen_random_uuid()"),
     ),
-    sa.Column(
-        "relation_id",
-        postgresql.UUID(as_uuid=True),
-        sa.ForeignKey("relations.id", ondelete="CASCADE"),
-        nullable=False,
-    ),
+    sa.Column("relation_id", postgresql.UUID(as_uuid=True), nullable=False),
     sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
     sa.Column("evidence_type", sa.Text, nullable=False),
     sa.Column("evidence_ref", sa.Text),
@@ -512,6 +521,20 @@ relation_evidence = sa.Table(
         "evidence_type <> 'row' OR (evidence_ref IS NOT NULL AND evidence_ref <> '')",
         name="relation_evidence_row_provenance",
     ),
+    # frozen MCP contract: offsets are non-negative (minimum 0) and after
+    # prune they are the only auditable span left — an inverted range could
+    # never be a valid citation
+    sa.CheckConstraint(
+        "evidence_type <> 'chunk' OR (start_offset >= 0 AND end_offset >= start_offset)",
+        name="relation_evidence_chunk_span_sane",
+    ),
+    # DR-006: evidence lives in its relation's build
+    sa.ForeignKeyConstraint(
+        ["relation_id", "build_id"],
+        ["relations.id", "relations.build_id"],
+        ondelete="CASCADE",
+        name="relation_evidence_relation_fk",
+    ),
 )
 
 # §27.4 dedup: the hash already embeds relation_signature, so per-build
@@ -556,18 +579,8 @@ merge_candidates = sa.Table(
     ),
     sa.Column("project", sa.Text, nullable=False),
     sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
-    sa.Column(
-        "left_entity_id",
-        postgresql.UUID(as_uuid=True),
-        sa.ForeignKey("entities.id", ondelete="CASCADE"),
-        nullable=False,
-    ),
-    sa.Column(
-        "right_entity_id",
-        postgresql.UUID(as_uuid=True),
-        sa.ForeignKey("entities.id", ondelete="CASCADE"),
-        nullable=False,
-    ),
+    sa.Column("left_entity_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("right_entity_id", postgresql.UUID(as_uuid=True), nullable=False),
     sa.Column("score", sa.REAL, nullable=False),
     sa.Column("features", postgresql.JSONB),
     # §17: pending → approved|rejected|deferred (core.resolve.review state machine)
@@ -588,6 +601,19 @@ merge_candidates = sa.Table(
     sa.CheckConstraint(
         "decision IN ('approve','reject','defer')",
         name="merge_candidates_decision_valid",
+    ),
+    # DR-006: both candidates live in the same project AND build as the pair
+    sa.ForeignKeyConstraint(
+        ["left_entity_id", "project", "build_id"],
+        ["entities.id", "entities.project", "entities.build_id"],
+        ondelete="CASCADE",
+        name="merge_candidates_left_entity_fk",
+    ),
+    sa.ForeignKeyConstraint(
+        ["right_entity_id", "project", "build_id"],
+        ["entities.id", "entities.project", "entities.build_id"],
+        ondelete="CASCADE",
+        name="merge_candidates_right_entity_fk",
     ),
 )
 

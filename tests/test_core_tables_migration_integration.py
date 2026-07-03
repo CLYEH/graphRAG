@@ -19,6 +19,7 @@ from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
 from core.stores.tables import (
+    chunks,
     documents,
     entities,
     entity_mentions,
@@ -346,5 +347,68 @@ async def test_evidence_missing_its_provenance_is_impossible(migrated: None) -> 
                         )
                     )
                 await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_cross_build_child_rows_are_impossible(migrated: None) -> None:
+    """DR-006 executed: a chunk claiming a different build than its document
+    is rejected by the composite FK — the no-cross-build-mixing invariant is
+    structural, not writer discipline."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            build = uuid.uuid4()
+            document_id = (
+                await conn.execute(
+                    documents.insert()
+                    .values(
+                        project="itest-x",
+                        build_id=build,
+                        source_uri="s3://bucket/doc",
+                        content_hash="c1",
+                    )
+                    .returning(documents.c.id)
+                )
+            ).scalar_one()
+            with pytest.raises(IntegrityError, match="chunks_document_build_fk"):
+                await conn.execute(
+                    chunks.insert().values(
+                        document_id=document_id,
+                        build_id=uuid.uuid4(),  # NOT the document's build
+                        ordinal=0,
+                        text="t",
+                    )
+                )
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_inverted_chunk_evidence_span_is_impossible(migrated: None) -> None:
+    """The denormalized span is the only citation left after prune — an
+    inverted range can never satisfy the frozen contract's offsets."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            build = uuid.uuid4()
+            relation_id = await _insert_relation(conn, build)
+            with pytest.raises(IntegrityError, match="relation_evidence_chunk_span_sane"):
+                await conn.execute(
+                    relation_evidence.insert().values(
+                        relation_id=relation_id,
+                        build_id=build,
+                        evidence_type="chunk",
+                        chunk_id=uuid.uuid4(),
+                        start_offset=9,
+                        end_offset=0,  # inverted
+                        quote="q",
+                        source_uri="s3://bucket/doc",
+                        evidence_hash="h-inverted",
+                    )
+                )
+            await trans.rollback()
     finally:
         await engine.dispose()

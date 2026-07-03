@@ -269,19 +269,26 @@ def test_evidence_dedup_is_a_database_invariant() -> None:
 # --- referential topology ---------------------------------------------------------
 
 
-def test_build_scoped_graph_cascades_as_a_unit() -> None:
-    """chunks→documents, mentions/relations/candidates→entities,
-    evidence→relations: ON DELETE CASCADE keeps build pruning (C9) a plain
-    DELETE with no orphan sweep. relation_evidence.chunk_id is the deliberate
-    exception (§27.4, tested above)."""
-    expected = {
-        ("chunks", "document_id"): documents,
-        ("entity_mentions", "entity_id"): entities,
-        ("relations", "src_entity_id"): entities,
-        ("relations", "dst_entity_id"): entities,
-        ("relation_evidence", "relation_id"): relations,
-        ("merge_candidates", "left_entity_id"): entities,
-        ("merge_candidates", "right_entity_id"): entities,
+def test_child_fks_are_build_aligned_and_cascade() -> None:
+    """DR-006: a child row must provably live in its parent's build (and
+    project where both sides carry it) — the FKs are COMPOSITE on build_id/
+    project, so cross-build mixing and cross-build cascade deletes are
+    unrepresentable. ON DELETE CASCADE keeps build pruning (C9) a plain
+    DELETE. relation_evidence.chunk_id is the deliberate FK exception
+    (§27.4, tested above); entity_mentions carry no build/project columns,
+    so their FK is plain id."""
+    expected: dict[str, list[tuple[list[str], sa.Table]]] = {
+        "chunks": [(["document_id", "build_id"], documents)],
+        "entity_mentions": [(["entity_id"], entities)],
+        "relations": [
+            (["src_entity_id", "project", "build_id"], entities),
+            (["dst_entity_id", "project", "build_id"], entities),
+        ],
+        "relation_evidence": [(["relation_id", "build_id"], relations)],
+        "merge_candidates": [
+            (["left_entity_id", "project", "build_id"], entities),
+            (["right_entity_id", "project", "build_id"], entities),
+        ],
     }
     tables = {
         "chunks": chunks,
@@ -290,10 +297,23 @@ def test_build_scoped_graph_cascades_as_a_unit() -> None:
         "relation_evidence": relation_evidence,
         "merge_candidates": merge_candidates,
     }
-    for (table_name, column), parent in expected.items():
-        (fk,) = tables[table_name].c[column].foreign_keys
-        assert fk.column.table is parent, (table_name, column)
-        assert fk.ondelete == "CASCADE", (table_name, column)
+    for table_name, fk_specs in expected.items():
+        constraints = list(tables[table_name].foreign_key_constraints)
+        assert len(constraints) == len(fk_specs), table_name
+        actual = {
+            (tuple(fkc.column_keys), fkc.referred_table.name, fkc.ondelete) for fkc in constraints
+        }
+        for columns, parent in fk_specs:
+            assert (tuple(columns), parent.name, "CASCADE") in actual, (table_name, columns)
+
+
+def test_chunk_evidence_span_must_be_sane() -> None:
+    """The frozen MCP contract pins offsets at minimum 0, and after prune the
+    denormalized span is the only auditable citation left — a negative or
+    inverted range could never be emitted as a valid ref."""
+    sqltext = _checks(relation_evidence)["relation_evidence_chunk_span_sane"]
+    assert "start_offset >= 0" in sqltext
+    assert "end_offset >= start_offset" in sqltext
 
 
 # --- enum lockstep with the frozen contract (DR-002) ------------------------------
