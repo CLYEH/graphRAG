@@ -26,7 +26,7 @@ graphRAG（C:\graphRAG，GitHub: CLYEH/graphRAG，預設 branch main）是一套
 - Source of truth：Postgres 為 SoR（canonical entity registry + 文件/chunks/結構化表）；Neo4j、Qdrant 為 pipeline 單向建置的衍生投影，共用同一 canonical UUID
 - MCP 介面：分開工具（semantic_search / graph_query / global_summary / sql_query）+ 一個 hybrid_query router
 - **兩個門面共用 core**：(1) agent → 每專案 MCP server；(2) 人 → Web Console。前後端邊界 = OpenAPI 契約（FastAPI 產出 → 前端 codegen typed client），可平行開發
-- Web Console 後端：Python / FastAPI；非同步任務用正式佇列 arq（或 Celery）+ Redis
+- Web Console 後端：Python / FastAPI；非同步任務用正式佇列 arq + Redis（非 Celery，見 DR-005）
 - Web Console 前端：React + Vite + TypeScript；範圍含 匯入/清洗/檢視 + 實體解析審核 + 互動圖譜探索(react-force-graph/Cytoscape) + 查詢測試 playground + Pipeline 狀態儀表板
 - 基礎設施：docker-compose = Postgres + Qdrant + Neo4j + Redis
 
@@ -64,4 +64,3 @@ graphRAG（C:\graphRAG，GitHub: CLYEH/graphRAG，預設 branch main）是一套
 - **GitHub 硬門檻（已設 2026-07-02）**：scaffold 已 push 到 main（commit 81aae65 + CI badge PR #1）；`main` branch protection 開啟：enforce_admins、required status checks = backend/frontend/integration（strict）、要 PR 才能併、禁 force-push/刪除、linear history、0 human approvals。CI(.github/workflows/ci.yml) 三 job 皆綠；流程已用 PR #1 驗證（CI 綠→squash 合併）。**Codex 已裝並綁定**（bot: `chatgpt-codex-connector[bot]`）。PR #1 上 Codex 反應 👀→👍(+1)=通過。**重點：Codex 用 reaction/留言表態，不發 status check、也不發正式 review**（實測 pulls/1/reviews 空、commits/check-runs 只有 github-actions 三個）。→ GitHub branch protection 無法直接把 Codex 綁成 required check。**Codex 硬門檻定案 = A（loop-enforced + required_conversation_resolution，已在 main 開啟）**。
 **Codex PR 反應狀態機（使用者實測）**：發 PR 後只會發生——(1) 👀 eye=審核中→等；(2) 👍 +1=已審完無意見→PASS；(3) 無反應：3-1 且無其他留言=Codex 還沒看到→`@codex review` 催它；3-2 有 Codex 新留言=有意見→退回步驟3。未解決的 Codex 留言由 GitHub required_conversation_resolution 硬擋合併。輪詢：`gh api repos/CLYEH/graphRAG/issues/<pr>/reactions`（找 chatgpt-codex-connector[bot] 的 content=+1）。
 - **Codex 判斷改良（PR #2 實作進 LOOP.md）**：verdict 依「**未解決 review thread**」（GraphQL `reviewThreads` isResolved=false）而非留言 count——已解決/歷史留言仍會被 list endpoint 回傳，用 count 會永遠卡在 changes-wanted。**等待態（eyes / 尚未看到）不是失敗**，只有未解決 thread 或新變更請求才退回步驟3。留言要同時看 inline(`/pulls/<pr>/comments`) 與頂層(`/issues/<pr>/comments`)。Codex 不一定 PR open 就自動審（PR #2 需 `@codex review` 催才動）。解決 thread 用 GraphQL `resolveReviewThread` 才能過 required_conversation_resolution。實測：Codex 審「如何審查」的 meta 文件會連環找 nit，收斂靠「硬門檻滿足即合併」而非等到永遠沒意見。
-- 下一步：Track 0 契約凍結（contracts/openapi.yaml + mcp_response.schema.json）。
