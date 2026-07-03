@@ -574,6 +574,15 @@ relation_evidence = sa.Table(
     ),
 )
 
+# FK support (like chunks_by_document etc.): the composite FK cascades and
+# relation-detail lookups probe by (relation_id, build_id) — the dedup index
+# below leads with build_id and cannot serve them
+relation_evidence_by_relation = sa.Index(
+    "relation_evidence_by_relation",
+    relation_evidence.c.relation_id,
+    relation_evidence.c.build_id,
+)
+
 # §27.4 dedup: the hash already embeds relation_signature, so per-build
 # uniqueness = one row per distinct evidence
 relation_evidence_dedup = sa.Index(
@@ -675,6 +684,21 @@ merge_candidates_by_build = sa.Index(
     merge_candidates.c.project,
     merge_candidates.c.build_id,
     merge_candidates.c.status,
+)
+
+# FK support — both existing merge_candidates indexes lead with project and
+# cannot serve entity-id cascade/lookup probes
+merge_candidates_by_left = sa.Index(
+    "merge_candidates_by_left",
+    merge_candidates.c.left_entity_id,
+    merge_candidates.c.project,
+    merge_candidates.c.build_id,
+)
+merge_candidates_by_right = sa.Index(
+    "merge_candidates_by_right",
+    merge_candidates.c.right_entity_id,
+    merge_candidates.c.project,
+    merge_candidates.c.build_id,
 )
 
 # §17/§27.3: merge review identity is the SYMMETRIC pair — merge_key =

@@ -317,6 +317,25 @@ def test_evidence_chunk_id_is_not_a_foreign_key() -> None:
     assert not relation_evidence.c.chunk_id.foreign_keys
 
 
+def test_every_child_fk_has_a_supporting_index() -> None:
+    """Postgres doesn't auto-index FK columns: without these, every CASCADE
+    delete (and child-by-parent lookup) scans the child table. Covers ALL six
+    child FK groups — a universal claim with omitted counterexamples is a
+    false-green test."""
+    expected: list[tuple[sa.Table, tuple[str, ...]]] = [
+        (chunks, ("document_id",)),
+        (entity_mentions, ("entity_id",)),
+        (relations, ("src_entity_id",)),
+        (relations, ("dst_entity_id",)),
+        (relation_evidence, ("relation_id", "build_id")),
+        (merge_candidates, ("left_entity_id",)),
+        (merge_candidates, ("right_entity_id",)),
+    ]
+    for table, leading in expected:
+        indexed = {tuple(ix.columns.keys())[: len(leading)] for ix in table.indexes}
+        assert leading in indexed, (table.name, leading)
+
+
 def test_evidence_dedup_is_a_database_invariant() -> None:
     """§27.4: evidence_hash exists for dedup — the hash embeds
     relation_signature, so per-build uniqueness = one row per distinct

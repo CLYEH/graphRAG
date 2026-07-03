@@ -255,6 +255,9 @@ def upgrade() -> None:
         ),
     )
     op.create_index(
+        "relation_evidence_by_relation", "relation_evidence", ["relation_id", "build_id"]
+    )
+    op.create_index(
         "relation_evidence_dedup",
         "relation_evidence",
         ["build_id", "evidence_hash"],
@@ -328,6 +331,16 @@ def upgrade() -> None:
     op.create_index(
         "merge_candidates_by_build", "merge_candidates", ["project", "build_id", "status"]
     )
+    op.create_index(
+        "merge_candidates_by_left",
+        "merge_candidates",
+        ["left_entity_id", "project", "build_id"],
+    )
+    op.create_index(
+        "merge_candidates_by_right",
+        "merge_candidates",
+        ["right_entity_id", "project", "build_id"],
+    )
     # §17/§27.3 merge_key symmetry: (A,B) ≡ (B,A) — one candidate per pair per build
     op.create_index(
         "merge_candidates_pair_unique",
@@ -344,11 +357,14 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_index("merge_candidates_pair_unique", table_name="merge_candidates")
+    op.drop_index("merge_candidates_by_right", table_name="merge_candidates")
+    op.drop_index("merge_candidates_by_left", table_name="merge_candidates")
     op.drop_index("merge_candidates_by_build", table_name="merge_candidates")
     op.drop_table("merge_candidates")
     op.drop_index("community_reports_by_build", table_name="community_reports")
     op.drop_table("community_reports")
     op.drop_index("relation_evidence_dedup", table_name="relation_evidence")
+    op.drop_index("relation_evidence_by_relation", table_name="relation_evidence")
     op.drop_table("relation_evidence")
     op.drop_index("relations_by_signature", table_name="relations")
     op.drop_index("relations_by_dst", table_name="relations")
