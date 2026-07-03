@@ -286,6 +286,7 @@ graphRAG/
 - `quote` 長度上限 🔧 512 字（存摘句非整段 chunk）。
 - `evidence_hash = sha256( relation_signature | evidence_ref | norm(quote) )`（去重 + 穩定身分）。
 - **prune 存活**：evidence 反正規化保留 `quote/offsets/source_uri`，即使舊 chunk 被 prune 仍保有出處。
+- **offsets 語意（依 evidence_type 分流）**：`chunk` 證據**必有** `start/end offsets`（抽取 span 已知）；`manual`（在 MCP contract 中以 document ref 表示，SourceRefType 無 `manual`）為**刻意無 span** — 人工/文件層級引用只保 `quote + source_uri`；`row` 證據以 `table + pk` 溯源。§16 contract 據此分流強制。
 
 ### 27.5 Eval 指標補強（延伸 §20）
 新增 GraphRAG 專屬：`path_validity`（回傳路徑為圖上真實路徑）、`relation_hit_rate`（期望關係命中率）、`groundedness`（答案主張是否有引用來源支撐）。`golden.yaml` 的 `expects` 增 `must_include_relations / must_have_valid_paths / groundedness_min`。

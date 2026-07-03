@@ -7,8 +7,9 @@ change (bump the contract version + record it in DESIGN §26), never an accident
 
 from __future__ import annotations
 
+import copy
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -150,11 +151,373 @@ def _json_body_schema(spec: dict[str, Any], response: dict[str, Any]) -> dict[st
     return _deref(spec, cast(dict[str, Any], content["application/json"]["schema"]))
 
 
-def test_mcp_response_schema_is_valid() -> None:
-    if not _MCP_SCHEMA.exists():
-        pytest.skip("contract not frozen yet (Track 0 P1)")
-    schema = json.loads(_MCP_SCHEMA.read_text(encoding="utf-8"))
-    jsonschema.Draft202012Validator.check_schema(schema)
+@pytest.fixture(scope="module")
+def mcp_schema() -> dict[str, Any]:
+    assert _MCP_SCHEMA.exists(), (
+        "contracts/mcp_response.schema.json is the frozen Track 0 P1 deliverable"
+    )
+    return cast(dict[str, Any], json.loads(_MCP_SCHEMA.read_text(encoding="utf-8")))
+
+
+@pytest.fixture(scope="module")
+def mcp_validator(mcp_schema: dict[str, Any]) -> jsonschema.Draft202012Validator:
+    # format_checker makes "format": "uuid" enforcing — without it the build_id
+    # scoping guarantee (DR-001) would be decorative.
+    return jsonschema.Draft202012Validator(
+        mcp_schema, format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER
+    )
+
+
+def test_mcp_response_schema_is_valid(mcp_schema: dict[str, Any]) -> None:
+    """The frozen deliverable must be a valid Draft 2020-12 schema."""
+    jsonschema.Draft202012Validator.check_schema(mcp_schema)
+
+
+def test_mcp_schema_version_is_frozen(mcp_schema: dict[str, Any]) -> None:
+    """DR-002: schema_version pins the contract; only a breaking change bumps it."""
+    assert mcp_schema["properties"]["schema_version"]["const"] == "1.0"
+    assert "schema_version" in mcp_schema["required"]
+
+
+def test_mcp_response_is_build_scoped(mcp_schema: dict[str, Any]) -> None:
+    """DR-001: every MCP answer names the build it read — build_id is required, so
+    old-version data can never sneak into a response unnoticed."""
+    assert "build_id" in mcp_schema["required"]
+
+
+def test_mcp_enums_stay_in_lockstep_with_openapi(
+    spec: dict[str, Any], mcp_schema: dict[str, Any]
+) -> None:
+    """The Console playground (openapi.yaml) and the MCP tools expose the same
+    retrieval surface — enum drift between the two frozen artifacts would fork
+    the contract for web vs agent consumers."""
+    api = spec["components"]["schemas"]
+    defs = mcp_schema["$defs"]
+    assert set(defs["WarningCode"]["enum"]) == set(api["WarningCode"]["enum"])
+    assert set(defs["WarningCode"]["enum"]) == _FROZEN_WARNING_CODES
+    result_type = defs["RetrievalResult"]["properties"]["result_type"]
+    assert set(result_type["enum"]) == set(api["ResultType"]["enum"])
+    assert set(defs["SourceRefType"]["enum"]) == set(api["SourceRefType"]["enum"])
+    assert set(defs["QueryMode"]["enum"]) == set(api["QueryMode"]["enum"])
+
+
+def _valid_mcp_response() -> dict[str, Any]:
+    """A §16-shaped response exercising all six result_types and their §27.2 minimums."""
+    n1 = "0a4b1d2e-3f40-4a51-8b62-c73d84e95fa6"
+    n2 = "1b5c2e3f-4a51-4b62-9c73-d84e95fa6b07"
+    e1 = "2c6d3f4a-5b62-4c73-ad84-e95fa6b07c18"
+    chunk_id = "3d7e4a5b-6c73-4d84-be95-fa6b07c18d29"
+    chunk_uri = "s3://acme/docs/onboarding.md"
+    return {
+        "schema_version": "1.0",
+        "query": "who owns onboarding?",
+        "tool": "hybrid_query",
+        "project": "acme",
+        "build_id": "7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+        "results": [
+            {
+                "result_type": "chunk",
+                "id": chunk_id,
+                "title": "onboarding.md#3",
+                "text": "People Ops owns onboarding.",
+                "score": 0.93,
+                "confidence": 0.9,
+                "source_refs": [
+                    {
+                        "source_type": "chunk",
+                        "id": chunk_id,
+                        "source_uri": chunk_uri,
+                        "metadata": {"start_offset": 1204, "end_offset": 1490},
+                    }
+                ],
+            },
+            {
+                "result_type": "entity",
+                "id": n1,
+                "title": "People Ops",
+                "text": None,
+                "score": 0.88,
+                "confidence": 0.95,
+                "source_refs": [{"source_type": "chunk", "id": chunk_id, "source_uri": chunk_uri}],
+            },
+            {
+                "result_type": "relation",
+                "id": e1,
+                "title": "People Ops -[OWNS]-> Onboarding",
+                "text": None,
+                "score": 0.85,
+                "confidence": 0.8,
+                "source_refs": [
+                    {
+                        "source_type": "chunk",
+                        "id": chunk_id,
+                        "source_uri": chunk_uri,
+                        "metadata": {
+                            "quote": "People Ops owns onboarding.",
+                            "start_offset": 1204,
+                            "end_offset": 1231,
+                        },
+                    }
+                ],
+            },
+            {
+                "result_type": "path",
+                "id": "path-1",
+                "title": None,
+                "text": None,
+                "score": 0.8,
+                "confidence": None,
+                "source_refs": [{"source_type": "relation", "id": e1}],
+            },
+            {
+                "result_type": "row",
+                "id": "employees:42",
+                "title": None,
+                "text": None,
+                "score": 0.7,
+                "confidence": None,
+                "source_refs": [
+                    {
+                        "source_type": "row",
+                        "id": "42",
+                        "metadata": {"table": "employees", "pk": "42"},
+                    }
+                ],
+            },
+            {
+                "result_type": "community_report",
+                "id": "5f9a6b7c-8d95-4ea6-bf07-a1b2c3d4e5f6",
+                "title": "HR cluster",
+                "text": "Summary of the HR-related community.",
+                "score": 0.6,
+                "confidence": 0.7,
+                "source_refs": [{"source_type": "entity", "id": n1}],
+            },
+        ],
+        "graph_context": {
+            "nodes": [
+                {"id": n1, "type": "Team", "label": "People Ops", "properties": {}},
+                {"id": n2, "type": "Process", "label": "Onboarding", "properties": {}},
+            ],
+            "edges": [{"id": e1, "src": n1, "dst": n2, "type": "OWNS", "confidence": 0.8}],
+            "paths": [{"nodes": [n1, n2], "edges": [e1]}],
+        },
+        "warnings": [{"code": "MODE_SKIPPED", "message": "sql skipped: low router confidence"}],
+        "debug": {
+            "stores_used": ["qdrant", "neo4j"],
+            "retrieval_plan": ["semantic", "graph"],
+            "routing_decision": {
+                "selected": ["semantic", "graph"],
+                "skipped": ["sql", "global"],
+                "reason": "entity-centric question",
+                "confidence": 0.83,
+            },
+            "latency_ms": 412,
+        },
+    }
+
+
+def test_mcp_valid_response_passes(mcp_validator: jsonschema.Draft202012Validator) -> None:
+    """The canonical §16 payload (all six result_types, each meeting its §27.2
+    source_refs minimum) must validate — otherwise the schema is stricter than
+    the design and would reject conforming servers."""
+    mcp_validator.validate(_valid_mcp_response())
+
+
+def test_mcp_relation_document_evidence_needs_no_offsets(
+    mcp_validator: jsonschema.Draft202012Validator,
+) -> None:
+    """§4 evidence_type includes `manual`: document-level citations have no source
+    span, so only chunk-derived relation evidence must carry offsets (§27.4).
+    Requiring offsets on document refs would make manual evidence unrepresentable."""
+    payload = _valid_mcp_response()
+    payload["results"][2]["source_refs"] = [
+        {
+            "source_type": "document",
+            "id": "d1",
+            "source_uri": "s3://acme/docs/onboarding.md",
+            "metadata": {"quote": "People Ops owns onboarding."},
+        }
+    ]
+    mcp_validator.validate(payload)
+
+
+def _drop_result_source_refs(p: dict[str, Any]) -> None:
+    del p["results"][0]["source_refs"]
+
+
+def _empty_source_refs(p: dict[str, Any]) -> None:
+    p["results"][0]["source_refs"] = []
+
+
+def _chunk_ref_without_offsets(p: dict[str, Any]) -> None:
+    del p["results"][0]["source_refs"][0]["metadata"]["start_offset"]
+
+
+def _chunk_ref_with_non_numeric_offsets(p: dict[str, Any]) -> None:
+    p["results"][0]["source_refs"][0]["metadata"] = {"start_offset": None, "end_offset": "abc"}
+
+
+def _chunk_ref_with_negative_offset(p: dict[str, Any]) -> None:
+    p["results"][0]["source_refs"][0]["metadata"]["start_offset"] = -1
+
+
+def _chunk_ref_without_uri(p: dict[str, Any]) -> None:
+    del p["results"][0]["source_refs"][0]["source_uri"]
+
+
+def _entity_without_mention(p: dict[str, Any]) -> None:
+    p["results"][1]["source_refs"] = [{"source_type": "entity", "id": "self"}]
+
+
+def _relation_without_evidence(p: dict[str, Any]) -> None:
+    p["results"][2]["source_refs"] = [{"source_type": "relation", "id": "self"}]
+
+
+def _relation_ref_bare_document(p: dict[str, Any]) -> None:
+    p["results"][2]["source_refs"] = [{"source_type": "document", "id": "d"}]
+
+
+def _relation_ref_without_quote(p: dict[str, Any]) -> None:
+    del p["results"][2]["source_refs"][0]["metadata"]["quote"]
+
+
+def _relation_row_ref_without_pk(p: dict[str, Any]) -> None:
+    p["results"][2]["source_refs"] = [
+        {"source_type": "row", "id": "42", "metadata": {"table": "employees"}}
+    ]
+
+
+def _relation_chunk_ref_without_offsets(p: dict[str, Any]) -> None:
+    del p["results"][2]["source_refs"][0]["metadata"]["start_offset"]
+
+
+def _relation_quote_over_512(p: dict[str, Any]) -> None:
+    p["results"][2]["source_refs"][0]["metadata"]["quote"] = "x" * 513
+
+
+def _relation_document_quote_over_512(p: dict[str, Any]) -> None:
+    p["results"][2]["source_refs"] = [
+        {
+            "source_type": "document",
+            "id": "d1",
+            "source_uri": "s3://acme/docs/onboarding.md",
+            "metadata": {"quote": "x" * 513},
+        }
+    ]
+
+
+def _chunk_ref_with_empty_uri(p: dict[str, Any]) -> None:
+    p["results"][0]["source_refs"][0]["source_uri"] = ""
+
+
+def _path_without_relation_ref(p: dict[str, Any]) -> None:
+    p["results"][3]["source_refs"] = [{"source_type": "chunk", "id": "c"}]
+
+
+def _row_without_table_pk(p: dict[str, Any]) -> None:
+    del p["results"][4]["source_refs"][0]["metadata"]["table"]
+
+
+def _row_with_null_table_pk(p: dict[str, Any]) -> None:
+    p["results"][4]["source_refs"][0]["metadata"] = {"table": None, "pk": None}
+
+
+def _row_with_empty_table(p: dict[str, Any]) -> None:
+    p["results"][4]["source_refs"][0]["metadata"]["table"] = ""
+
+
+def _row_with_empty_pk(p: dict[str, Any]) -> None:
+    p["results"][4]["source_refs"][0]["metadata"]["pk"] = ""
+
+
+def _report_without_member_entities(p: dict[str, Any]) -> None:
+    p["results"][5]["source_refs"] = [{"source_type": "document", "id": "d"}]
+
+
+def _source_ref_with_empty_id(p: dict[str, Any]) -> None:
+    p["results"][5]["source_refs"][0]["id"] = ""
+
+
+def _result_with_empty_id(p: dict[str, Any]) -> None:
+    p["results"][0]["id"] = ""
+
+
+def _empty_project(p: dict[str, Any]) -> None:
+    p["project"] = ""
+
+
+def _unknown_warning_code(p: dict[str, Any]) -> None:
+    p["warnings"][0]["code"] = "SOMETHING_ELSE"
+
+
+def _wrong_schema_version(p: dict[str, Any]) -> None:
+    p["schema_version"] = "2.0"
+
+
+def _missing_build_id(p: dict[str, Any]) -> None:
+    del p["build_id"]
+
+
+def _non_retrieval_tool(p: dict[str, Any]) -> None:
+    p["tool"] = "list_schema"
+
+
+def _confidence_out_of_range(p: dict[str, Any]) -> None:
+    p["results"][0]["confidence"] = 1.5
+
+
+def _malformed_build_id(p: dict[str, Any]) -> None:
+    p["build_id"] = "not-a-uuid"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _drop_result_source_refs,
+        _empty_source_refs,
+        _chunk_ref_without_offsets,
+        _chunk_ref_with_non_numeric_offsets,
+        _chunk_ref_with_negative_offset,
+        _chunk_ref_without_uri,
+        _entity_without_mention,
+        _relation_without_evidence,
+        _relation_ref_bare_document,
+        _relation_ref_without_quote,
+        _relation_row_ref_without_pk,
+        _relation_chunk_ref_without_offsets,
+        _relation_quote_over_512,
+        _relation_document_quote_over_512,
+        _chunk_ref_with_empty_uri,
+        _path_without_relation_ref,
+        _row_without_table_pk,
+        _row_with_null_table_pk,
+        _row_with_empty_table,
+        _row_with_empty_pk,
+        _report_without_member_entities,
+        _source_ref_with_empty_id,
+        _result_with_empty_id,
+        _empty_project,
+        _unknown_warning_code,
+        _wrong_schema_version,
+        _missing_build_id,
+        _non_retrieval_tool,
+        _confidence_out_of_range,
+        _malformed_build_id,
+    ],
+    ids=lambda f: f.__name__.lstrip("_"),
+)
+def test_mcp_schema_rejects_contract_violations(
+    mcp_validator: jsonschema.Draft202012Validator,
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    """require_sources and the §27.2 per-result_type minimums must *bite*: an
+    answer nobody can trace (or a payload outside the frozen enums/version) is
+    rejected by the schema, not silently accepted."""
+    payload = copy.deepcopy(_valid_mcp_response())
+    mutate(payload)
+    with pytest.raises(jsonschema.ValidationError):
+        mcp_validator.validate(payload)
 
 
 def test_openapi_document_is_valid(spec: dict[str, Any]) -> None:
