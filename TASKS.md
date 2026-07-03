@@ -17,6 +17,7 @@ Keep items small enough to finish in one loop.
 - [x] Test tiers: unit/contract/integration/eval/e2e markers, `test-cov` (85%), conftest service-gating, Playwright scaffold
 - [x] CI (`.github/workflows/ci.yml`: backend + coverage + integration + frontend), CLAUDE.md/AGENTS.md, `.env.example`
 - [x] H1 harness fixes: fail-loud CI integration gate (`--wait` + CI fail-not-skip), doc-drift cleanup (hook filename, push wording, P-numbering, checkoff rule), gate-wait pipelining in LOOP.md, reviewer model → opus, LLM default → `gpt-5.4-nano`, C1/C6 split, `gh`/`git` allowlist, CI dedupe/concurrency + qdrant pin, DR-008 (Alembic) recorded
+- [x] H2 LOOP.md: Codex suggestion triage rules in step 7 (must-fix vs reply-and-resolve criteria, DESIGN-citation required for every resolve-without-change, same-class sweep per round; `+1` gate unchanged)
 
 > **Per-task rule:** one task = one `task/<id>` branch = one PR. It lands with tests for its
 > tier, passes local gates + the `code-reviewer` subagent, then merges only after CI **and**

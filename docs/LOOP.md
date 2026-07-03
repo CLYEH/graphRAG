@@ -40,7 +40,7 @@ loop back to step 3.
      | reviewing | 👀 `eyes` reaction, no unresolved threads | **wait** (pending — not a failure) |
      | not seen yet | no reaction, no Codex comment/thread | comment `@codex review`, then **wait** |
      | approved | 👍 `+1` reaction | **PASS** |
-     | changes wanted | ≥1 **unresolved** Codex review thread (or a top-level change-request comment) | **back to step 3** |
+     | changes wanted | ≥1 **unresolved** Codex review thread (or a top-level change-request comment) | **triage each suggestion** (below): must-fix → step 3; else reply-and-resolve |
 
      ```bash
      # reaction verdict: +1 = approved, eyes = still reviewing
@@ -55,9 +55,32 @@ loop back to step 3.
    - **Conversations resolved** — GitHub blocks merge (`required_conversation_resolution`)
      until every Codex thread is addressed and resolved (PR UI, or
      `gh api graphql` → `resolveReviewThread`).
+   - **Codex suggestion triage** — when Codex leaves inline suggestions, classify each
+     one BEFORE acting. Do not blanket-accept (P1 took 7 one-comment rounds that way)
+     and do not blanket-resolve. **Must fix (back to step 3)** if ANY of:
+     1. P0/P1 badge, or an un-badged explicit change request.
+     2. Violates a guarantee DESIGN freezes — you can cite the exact §/DR it breaks
+        (e.g. §27.2 provenance minimums, §27.4 audit/prune survival, DR-001…008).
+     3. Internal inconsistency — the same concept constrained/stated differently in two
+        places (incl. docs/memory contradicting a frozen DR).
+     4. Breaks a real producer/consumer — accepts payloads consumers can't process, or
+        rejects payloads the design says are legitimate.
+     5. A genuine bug (wrong logic, false-green test).
+     **Reply-and-resolve without changing (P2/P3 only)** if ANY of:
+     1. Hardening beyond what DESIGN's text guarantees (no violated § can be cited).
+     2. Style preference with no behavioral difference.
+     3. Freezing a 🔧 tunable with no interoperability rationale.
+     4. Would make a case DESIGN defines as legitimate unrepresentable (over-tightening).
+     **Hard rules:** a resolve-without-change reply MUST cite the DESIGN §/DR that
+     justifies it — if you can't cite one, treat the suggestion as must-fix. If the
+     call is genuinely ambiguous, stop and ask the user. And whichever way a suggestion
+     is triaged, sweep the whole diff for the same class of issue and settle it in one
+     round. This triage changes nothing about the `+1` gate below — resolving threads
+     never substitutes for a fresh `+1` on the head commit.
    **Merge requires Codex `+1` on the head commit — no exceptions.** `eyes` / "not seen yet"
    are pending states (wait/poke, never a failure); unresolved threads or a fresh
-   change-request → back to step 3. **CI green + resolved conversations do NOT substitute for
+   change-request → triage above (must-fix → step 3, else reply-and-resolve with a DESIGN
+   citation). **CI green + resolved conversations do NOT substitute for
    `+1`.** This is enforced mechanically: `.claude/hooks/require-codex-approval.sh`
    (PreToolUse) blocks any `gh pr merge` until Codex has reacted `+1`. (The hook is local,
    honest-agent enforcement — it guards merges issued from this repo's agent sessions;
