@@ -36,7 +36,7 @@ Keep items small enough to finish in one loop.
 - [x] P6 Observability schema: pipeline_runs/steps/items + item_ref rules (§18/§27.7)
 
 ## Track 1 — Core engine  *(depends on Track 0)*
-- [ ] C1a PG migrations for core tables (documents/chunks/entities/relations/evidence/reports/merge_candidates/observability; `builds` landed with P2, `review_ledger` with P3)
+- [x] C1a PG migrations for core tables (documents/chunks/entities/relations/evidence/reports/merge_candidates; `builds` landed with P2, `review_ledger` with P3, observability with P6)
 - [ ] C1b **BuildScopedRepo** over Postgres (active-build lookup + build_id injection, DR-006)
 - [ ] C1c Neo4j adapter + projection repo (build_id-filtered, DR-004)
 - [ ] C1d Qdrant adapter + projection repo (build_id payload filter)
