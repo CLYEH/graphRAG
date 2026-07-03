@@ -20,12 +20,12 @@ metadata:
 - **doc-only fast lane(H3 起)**:純 `*.md` 變更不開 PR、不經 Codex —— `docs/<id>` 分支 → doc-reviewer(sonnet)PASS → CI 綠 → fast-forward 進 main;push-gate hook 機械擋非 .md。等 Codex 用 `scripts/watch-codex.sh <pr>`(exit 0=+1/10=有意見/20=timeout),不要手寫 watcher。
 
 ## 審查發現的 lesson classes(LOOP step 8 post-merge retro 的比對目錄;首次盤點=PR #2–#11,#11 當時尚未合併、僅計入其本地審查發現)
-1. **契約驗值**(P1 七輪):schema 只驗結構不驗值 —— 每個 required 欄位都要有型別/範圍/長度約束;識別子禁空字串;各 result 型別有內容最低要求。防線:contract 測試必含 rejection cases(mutator 模式)。
-2. **入口一致性**(#7/#8 多輪):規則改了但舊敘述殘留在其他入口(CLAUDE/LOOP/memory/索引)——改規則時 **grep 全部 tracked *.md** 掃同款措辭。防線:doc-reviewer checklist 第 2 條。
+1. **契約驗值**(P1 七輪;**#11 再犯**:空白 disambiguator 鑄出不同鍵):schema 只驗結構不驗值 —— 每個 required 欄位都要有型別/範圍/長度約束;識別子禁空字串;各 result 型別有內容最低要求;**每個 optional 字串參數都要明定空值語意**(None／""／純空白必須同義,否則跨來源身分分裂)。防線:contract 測試必含 rejection cases(mutator 模式)+ optional 參數的空白等價測試。
+2. **入口一致性**(#7/#8 多輪;**#11 再犯**:§17 的 `needs_review` vs `review_status` 的 `unreviewed` 詞彙分家):規則改了但舊敘述殘留在其他入口(CLAUDE/LOOP/memory/索引)——改規則時 **grep 全部 tracked *.md** 掃同款措辭;**DESIGN 對同一概念給了兩套詞彙時,實作要同時接受/映射兩者並註明**。防線:doc-reviewer checklist 第 2 條。
 3. **規則自洽**(#8 兩輪):meta 規則自身矛盾(要求提出不可能存在的證據=實質改寫分類)。防線:寫規則時逐分支驗證「每個允許情境都給得出所要求的證據」。
 4. **工具語意**(#9 兩輪 + alembic cp950):CLI/API 輸出語意陷阱 —— rename 摺疊(`--no-renames`)、分頁預設 30 筆(`--paginate`)、文字比對≠值比對、locale 編碼。防線:凡依賴工具輸出做判斷,先實測該工具的邊緣行為。
 5. **檢查者/消費者分岔**(#10 + H1 CI-skip):探測器檢查的目標與實際消費者的行為不一致(probe port ≠ driver port;skip 造成綠燈)。防線:checker 的參數一律從消費者同一來源導出。
-6. **spec/實作逐字對齊**(P3 本地 blocker):凍結規格(fingerprint、契約)在 DESIGN 與程式要逐字一致並互相引用;凡「版本化凍結物」變更即升版。防線:code-reviewer checklist 第 5 條 + DR-007 模式。
+6. **spec/實作逐字對齊**(P3 本地 blocker,同 PR 兩例:relation `norm(type)`、disambiguator 空白語意):凍結規格(fingerprint、契約)在 DESIGN 與程式要逐字一致並互相引用;凡「版本化凍結物」變更即升版。防線:code-reviewer checklist 第 5 條 + DR-007 模式;**審凍結規格模組時,先把 DESIGN 條文和 docstring 並排 diff**。
 7. **執行級驗證**(H3 mktemp 死鎖):見上方「執行級審查」教訓 —— 基礎設施腳本要跑過才算審過。
 
 歷史脈絡(2026-07-03 更新的快照,僅供追溯,不代表現況):P0/P1 契約與 H1–H3 harness(fail-loud gates、triage 規則、watcher/doc lane/收據/governance)皆已 merge;當時正要開工 P2(build/activation + Alembic)。
