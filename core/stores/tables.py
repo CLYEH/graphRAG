@@ -7,6 +7,17 @@ partial unique index that makes "at most one active build per project" a
 database invariant rather than an application promise (DR-001/DR-006, §27.1).
 P6 freezes the three-layer observability schema (§18/§27.7) — see
 `core.observability.spec` for the item_ref rules the tables encode.
+C1a adds the remaining §4 core tables (documents → community_reports +
+merge_candidates), all build-scoped per DR-006.
+
+Constraint policy (per-column): NOT NULL is a superset of the frozen
+contract's required lists (every contract-required field is NOT NULL, plus
+scoping/lifecycle-init columns like project and the review_status default);
+CHECK constraints exist exactly where §4's comments or the frozen contract
+enums name the vocabulary (LifecycleStatus / ReviewStatus / CreatedBy /
+MergeCandidateStatus / evidence_type / decision) — contract tests pin the
+lockstep. Columns the contract leaves as free strings (documents.status,
+chunks.status) get no CHECK.
 """
 
 from __future__ import annotations
@@ -15,6 +26,15 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 metadata = sa.MetaData()
+
+# §4/§17 + contract LifecycleStatus/ReviewStatus/CreatedBy — frozen enums
+# shared by entities and relations (contract tests pin them to openapi.yaml).
+LIFECYCLE_STATUSES = ("active", "deprecated", "merged", "rejected", "needs_review")
+REVIEW_STATUSES = ("unreviewed", "approved", "rejected")
+CREATED_BY = ("rule", "llm", "manual")
+EVIDENCE_TYPES = ("chunk", "row", "manual")
+MERGE_CANDIDATE_STATUSES = ("pending", "approved", "rejected", "deferred")
+MERGE_CANDIDATE_DECISIONS = ("approve", "reject", "defer")
 
 # DESIGN §4: builds.status lifecycle — frozen enum, enforced by CHECK constraint.
 BUILD_STATUSES = ("building", "ready", "active", "failed", "archived")
@@ -215,4 +235,318 @@ pipeline_step_items_dedup = sa.Index(
     pipeline_step_items.c.item_kind,
     pipeline_step_items.c.item_ref,
     unique=True,
+)
+
+# --- C1a: §4 core tables (all build-scoped, DR-006) ---------------------------
+
+documents = sa.Table(
+    "documents",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column("project", sa.Text, nullable=False),
+    sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("source_uri", sa.Text, nullable=False),
+    sa.Column("raw", sa.Text),
+    # §5: content_hash drives skip/rerun decisions and is the stable item_ref
+    # for document items (§18 / core.observability.spec)
+    sa.Column("content_hash", sa.Text, nullable=False),
+    sa.Column("mime", sa.Text),
+    sa.Column("metadata", postgresql.JSONB),
+    sa.Column("status", sa.Text),
+    sa.Column("ingested_at", sa.TIMESTAMP(timezone=True)),
+)
+
+documents_by_build = sa.Index("documents_by_build", documents.c.project, documents.c.build_id)
+
+chunks = sa.Table(
+    "chunks",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column(
+        "document_id",
+        postgresql.UUID(as_uuid=True),
+        sa.ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("ordinal", sa.Integer, nullable=False),
+    sa.Column("text", sa.Text, nullable=False),
+    sa.Column("token_count", sa.Integer),
+    sa.Column("start_offset", sa.Integer),
+    sa.Column("end_offset", sa.Integer),
+    sa.Column("vector_point_id", postgresql.UUID(as_uuid=True)),
+    sa.Column("metadata", postgresql.JSONB),
+    sa.Column("status", sa.Text),
+)
+
+chunks_by_document = sa.Index("chunks_by_document", chunks.c.document_id)
+
+entities = sa.Table(
+    "entities",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column("project", sa.Text, nullable=False),
+    sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("type", sa.Text, nullable=False),
+    sa.Column("canonical_name", sa.Text, nullable=False),
+    # §27.3: cross-build stable identity, minted by core.resolve.fingerprints
+    sa.Column("entity_key", sa.Text, nullable=False),
+    sa.Column("attributes", postgresql.JSONB),
+    sa.Column("embedding_point_id", postgresql.UUID(as_uuid=True)),
+    sa.Column("status", sa.Text, nullable=False),
+    # §17: review lifecycle starts unreviewed (core.resolve.review state machine)
+    sa.Column("review_status", sa.Text, nullable=False, server_default=sa.text("'unreviewed'")),
+    sa.Column("created_by", sa.Text),
+    sa.Column("created_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("updated_at", sa.TIMESTAMP(timezone=True)),
+    sa.CheckConstraint(
+        "status IN ('active','deprecated','merged','rejected','needs_review')",
+        name="entities_status_valid",
+    ),
+    sa.CheckConstraint(
+        "review_status IN ('unreviewed','approved','rejected')",
+        name="entities_review_status_valid",
+    ),
+    sa.CheckConstraint(
+        "created_by IN ('rule','llm','manual')",
+        name="entities_created_by_valid",
+    ),
+)
+
+# C4 applies review_ledger decisions by stable key within the building build (§27.3 套用)
+entities_by_key = sa.Index(
+    "entities_by_key", entities.c.project, entities.c.build_id, entities.c.entity_key
+)
+
+entity_mentions = sa.Table(
+    "entity_mentions",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column(
+        "entity_id",
+        postgresql.UUID(as_uuid=True),
+        sa.ForeignKey("entities.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("source_kind", sa.Text, nullable=False),
+    sa.Column("source_ref", sa.Text),
+    sa.Column("surface_form", sa.Text),
+    sa.Column("confidence", sa.REAL),
+    sa.CheckConstraint(
+        "source_kind IN ('structured','text')",
+        name="entity_mentions_source_kind_valid",
+    ),
+)
+
+entity_mentions_by_entity = sa.Index("entity_mentions_by_entity", entity_mentions.c.entity_id)
+
+relations = sa.Table(
+    "relations",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column("project", sa.Text, nullable=False),
+    sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column(
+        "src_entity_id",
+        postgresql.UUID(as_uuid=True),
+        sa.ForeignKey("entities.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "dst_entity_id",
+        postgresql.UUID(as_uuid=True),
+        sa.ForeignKey("entities.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("type", sa.Text, nullable=False),
+    sa.Column("attributes", postgresql.JSONB),
+    # §27.3: fpv{N}(src_key|norm(type)|dst_key), minted by core.resolve.fingerprints
+    sa.Column("relation_signature", sa.Text),
+    sa.Column("status", sa.Text, nullable=False),
+    sa.Column("review_status", sa.Text, nullable=False, server_default=sa.text("'unreviewed'")),
+    sa.Column("created_by", sa.Text),
+    sa.Column("confidence", sa.REAL),
+    sa.Column("created_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("updated_at", sa.TIMESTAMP(timezone=True)),
+    sa.CheckConstraint(
+        "status IN ('active','deprecated','merged','rejected','needs_review')",
+        name="relations_status_valid",
+    ),
+    sa.CheckConstraint(
+        "review_status IN ('unreviewed','approved','rejected')",
+        name="relations_review_status_valid",
+    ),
+    sa.CheckConstraint(
+        "created_by IN ('rule','llm','manual')",
+        name="relations_created_by_valid",
+    ),
+)
+
+relations_by_src = sa.Index("relations_by_src", relations.c.src_entity_id)
+relations_by_dst = sa.Index("relations_by_dst", relations.c.dst_entity_id)
+
+relation_evidence = sa.Table(
+    "relation_evidence",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column(
+        "relation_id",
+        postgresql.UUID(as_uuid=True),
+        sa.ForeignKey("relations.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("evidence_type", sa.Text, nullable=False),
+    sa.Column("evidence_ref", sa.Text),
+    # Deliberately NOT an FK: §27.4 prune survival — evidence outlives the
+    # chunk it quotes (quote/offsets/source_uri are denormalized below), so the
+    # id must be allowed to dangle after the old chunk is pruned.
+    sa.Column("chunk_id", postgresql.UUID(as_uuid=True)),
+    sa.Column("start_offset", sa.Integer),
+    sa.Column("end_offset", sa.Integer),
+    # §27.4: keep the excerpt, not the whole chunk (length cap 🔧 512 — tunable,
+    # so no DB CHECK)
+    sa.Column("quote", sa.Text),
+    # §27.4 + P1 contract: denormalized provenance so evidence survives pruning.
+    # §4's terse column list omits it; §27.4 and the frozen RelationEvidence
+    # contract field are explicit, so the table follows them (DESIGN §4 synced
+    # in this change).
+    sa.Column("source_uri", sa.Text),
+    # §27.4: sha256(relation_signature | evidence_ref | norm(quote)) — dedup +
+    # stable identity
+    sa.Column("evidence_hash", sa.Text),
+    sa.Column("confidence", sa.REAL),
+    sa.Column(
+        "created_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    ),
+    sa.CheckConstraint(
+        "evidence_type IN ('chunk','row','manual')",
+        name="relation_evidence_type_valid",
+    ),
+    # §27.4 offsets semantics by evidence_type: chunk evidence MUST carry its
+    # extraction span; manual evidence is DELIBERATELY span-less (document-level
+    # citation keeps quote + source_uri only). row evidence has no frozen
+    # offsets rule.
+    sa.CheckConstraint(
+        "evidence_type <> 'chunk' OR (start_offset IS NOT NULL AND end_offset IS NOT NULL)",
+        name="relation_evidence_chunk_has_span",
+    ),
+    sa.CheckConstraint(
+        "evidence_type <> 'manual' OR (start_offset IS NULL AND end_offset IS NULL)",
+        name="relation_evidence_manual_spanless",
+    ),
+)
+
+# §27.4 dedup: the hash already embeds relation_signature, so per-build
+# uniqueness = one row per distinct evidence (NULL hashes stay distinct)
+relation_evidence_dedup = sa.Index(
+    "relation_evidence_dedup",
+    relation_evidence.c.build_id,
+    relation_evidence.c.evidence_hash,
+    unique=True,
+)
+
+community_reports = sa.Table(
+    "community_reports",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column("project", sa.Text, nullable=False),
+    sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("level", sa.Integer, nullable=False),
+    sa.Column("title", sa.Text),
+    sa.Column("summary", sa.Text),
+    sa.Column("member_entity_ids", postgresql.ARRAY(postgresql.UUID(as_uuid=True))),
+    sa.Column("rating", sa.REAL),
+)
+
+community_reports_by_build = sa.Index(
+    "community_reports_by_build", community_reports.c.project, community_reports.c.build_id
+)
+
+merge_candidates = sa.Table(
+    "merge_candidates",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column("project", sa.Text, nullable=False),
+    sa.Column("build_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column(
+        "left_entity_id",
+        postgresql.UUID(as_uuid=True),
+        sa.ForeignKey("entities.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column(
+        "right_entity_id",
+        postgresql.UUID(as_uuid=True),
+        sa.ForeignKey("entities.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("score", sa.REAL, nullable=False),
+    sa.Column("features", postgresql.JSONB),
+    # §17: pending → approved|rejected|deferred (core.resolve.review state machine)
+    sa.Column("status", sa.Text, nullable=False, server_default=sa.text("'pending'")),
+    sa.Column("decision", sa.Text),
+    sa.Column("decided_by", sa.Text),
+    sa.Column("decided_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("reason", sa.Text),
+    # §17: impact preview + snapshots make review decisions auditable/undoable
+    sa.Column("impact", postgresql.JSONB),
+    sa.Column("left_snapshot", postgresql.JSONB),
+    sa.Column("right_snapshot", postgresql.JSONB),
+    sa.CheckConstraint(
+        "status IN ('pending','approved','rejected','deferred')",
+        name="merge_candidates_status_valid",
+    ),
+    # P0 contract MergeCandidate.decision enum: approve|reject|defer
+    sa.CheckConstraint(
+        "decision IN ('approve','reject','defer')",
+        name="merge_candidates_decision_valid",
+    ),
+)
+
+merge_candidates_by_build = sa.Index(
+    "merge_candidates_by_build",
+    merge_candidates.c.project,
+    merge_candidates.c.build_id,
+    merge_candidates.c.status,
 )

@@ -85,7 +85,8 @@ relations(id uuid pk, project text, build_id uuid, src_entity_id uuid, dst_entit
           created_at, updated_at timestamptz)
 relation_evidence(id uuid pk, relation_id uuid, build_id uuid, evidence_type text, -- chunk|row|manual
                   evidence_ref text, chunk_id uuid, start_offset int, end_offset int,
-                  quote text, evidence_hash text, confidence real, created_at timestamptz)
+                  quote text, source_uri text,  -- 反正規化出處，§27.4 prune 存活（P1 contract 同欄位）
+                  evidence_hash text, confidence real, created_at timestamptz)
 
 community_reports(id uuid pk, project text, build_id uuid, level int,
                   title text, summary text, member_entity_ids uuid[], rating real)
