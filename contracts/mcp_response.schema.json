@@ -265,18 +265,78 @@
             "properties": {
               "source_refs": {
                 "contains": {
-                  "description": "§27.2: relation → ≥1 relation_evidence-backed ref (chunk/row/document; manual evidence cites its provenance, §27.4).",
-                  "properties": {
-                    "source_type": {
-                      "enum": [
-                        "chunk",
-                        "row",
-                        "document"
+                  "description": "§27.2/§27.4: relation → ≥1 relation_evidence-backed ref that stays auditable after prune: text evidence (chunk/document) carries quote + source_uri; row evidence carries table + pk.",
+                  "anyOf": [
+                    {
+                      "properties": {
+                        "source_type": {
+                          "enum": [
+                            "chunk",
+                            "document"
+                          ]
+                        },
+                        "source_uri": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "metadata": {
+                          "type": "object",
+                          "required": [
+                            "quote"
+                          ],
+                          "properties": {
+                            "quote": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "source_type",
+                        "source_uri",
+                        "metadata"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "source_type": {
+                          "const": "row"
+                        },
+                        "metadata": {
+                          "type": "object",
+                          "required": [
+                            "table",
+                            "pk"
+                          ],
+                          "properties": {
+                            "table": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "pk": {
+                              "oneOf": [
+                                {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                {
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "object",
+                                  "minProperties": 1
+                                }
+                              ]
+                            }
+                          }
+                        }
+                      },
+                      "required": [
+                        "source_type",
+                        "metadata"
                       ]
                     }
-                  },
-                  "required": [
-                    "source_type"
                   ]
                 }
               }

@@ -352,6 +352,20 @@ def _relation_without_evidence(p: dict[str, Any]) -> None:
     p["results"][2]["source_refs"] = [{"source_type": "relation", "id": "self"}]
 
 
+def _relation_ref_bare_document(p: dict[str, Any]) -> None:
+    p["results"][2]["source_refs"] = [{"source_type": "document", "id": "d"}]
+
+
+def _relation_ref_without_quote(p: dict[str, Any]) -> None:
+    del p["results"][2]["source_refs"][0]["metadata"]["quote"]
+
+
+def _relation_row_ref_without_pk(p: dict[str, Any]) -> None:
+    p["results"][2]["source_refs"] = [
+        {"source_type": "row", "id": "42", "metadata": {"table": "employees"}}
+    ]
+
+
 def _path_without_relation_ref(p: dict[str, Any]) -> None:
     p["results"][3]["source_refs"] = [{"source_type": "chunk", "id": "c"}]
 
@@ -423,6 +437,9 @@ def _malformed_build_id(p: dict[str, Any]) -> None:
         _chunk_ref_without_uri,
         _entity_without_mention,
         _relation_without_evidence,
+        _relation_ref_bare_document,
+        _relation_ref_without_quote,
+        _relation_row_ref_without_pk,
         _path_without_relation_ref,
         _row_without_table_pk,
         _row_with_null_table_pk,
