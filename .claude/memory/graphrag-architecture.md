@@ -7,7 +7,7 @@ metadata:
   originSessionId: 28bf50a0-6391-4a8c-823c-0c81abc2da4a
 ---
 
-graphRAG（C:\graphRAG，GitHub: CLYEH/graphRAG，預設 branch main）是一套「多專案 hybrid RAG 平台」。
+graphRAG（GitHub: CLYEH/graphRAG，預設 branch main）是一套「多專案 hybrid RAG 平台」。
 
 **願景**：共用核心引擎 + 每個專案獨立資料/設定，各自暴露一個 MCP server（Project A → MCP-A，可再加 B/C/D）。Pipeline：raw data → 清洗 → 建圖 → 索引 → 透過 MCP 提供查詢工具給 agent。
 
@@ -30,7 +30,7 @@ graphRAG（C:\graphRAG，GitHub: CLYEH/graphRAG，預設 branch main）是一套
 - Web Console 前端：React + Vite + TypeScript；範圍含 匯入/清洗/檢視 + 實體解析審核 + 互動圖譜探索(react-force-graph/Cytoscape) + 查詢測試 playground + Pipeline 狀態儀表板
 - 基礎設施：docker-compose = Postgres + Qdrant + Neo4j + Redis
 
-**規格文件**：C:\graphRAG\docs\DESIGN.md，目前為 **v0.5（實作凍結版）**。含治理層 + 決策紀錄 (ADR) §26 + 實作契約凍結 §27。
+**規格文件**：`docs/DESIGN.md`（repo 根目錄相對路徑），目前為 **v0.5（實作凍結版）**。含治理層 + 決策紀錄 (ADR) §26 + 實作契約凍結 §27。
 
 **v0.5 新增（ChatGPT 三輪 review 收尾）**：
 - DR-006 Active build 強制注入：Postgres partial unique index 保證唯一 active build；所有 store 存取經 build-scoped repository 自動注入 build_id，禁裸 client
