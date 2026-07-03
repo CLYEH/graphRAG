@@ -296,12 +296,19 @@ chunks = sa.Table(
         "start_offset >= 0 AND end_offset >= start_offset",
         name="chunks_span_sane",
     ),
+    # ordinal is §4's chunk position within its document — a position index
+    # has no negative interpretation
+    sa.CheckConstraint("ordinal >= 0", name="chunks_ordinal_nonnegative"),
     sa.ForeignKeyConstraint(
         ["document_id", "build_id"],
         ["documents.id", "documents.build_id"],
         ondelete="CASCADE",
         name="chunks_document_build_fk",
     ),
+    # position identity: one chunk per slot per document — a C2 retry/replay
+    # writing a second row for the same position would make reconstruction
+    # and indexing ambiguous (same invariant family as entity_key/evidence_hash)
+    sa.UniqueConstraint("document_id", "ordinal", name="chunks_document_ordinal_unique"),
 )
 
 chunks_by_document = sa.Index("chunks_by_document", chunks.c.document_id)
@@ -610,6 +617,11 @@ merge_candidates = sa.Table(
         "decision IN ('approve','reject','defer')",
         name="merge_candidates_decision_valid",
     ),
+    # a pair is two DISTINCT entities — sorted(k, k) merge identity is void
+    sa.CheckConstraint(
+        "left_entity_id <> right_entity_id",
+        name="merge_candidates_distinct_pair",
+    ),
     # DR-006: both candidates live in the same project AND build as the pair
     sa.ForeignKeyConstraint(
         ["left_entity_id", "project", "build_id"],
@@ -630,4 +642,19 @@ merge_candidates_by_build = sa.Index(
     merge_candidates.c.project,
     merge_candidates.c.build_id,
     merge_candidates.c.status,
+)
+
+# §17/§27.3: merge review identity is the SYMMETRIC pair — merge_key =
+# fpv(sorted(left_key, right_key)). Within a build, entity id ↔ entity_key is
+# 1:1 (entities_id_project_build_unique + entities_by_key), so LEAST/GREATEST
+# over the ids enforces the same sorted-pair identity: (A,B) and (B,A) are one
+# candidate, and a duplicate would leave a decided pair coexisting with a
+# still-pending twin.
+merge_candidates_pair_unique = sa.Index(
+    "merge_candidates_pair_unique",
+    merge_candidates.c.project,
+    merge_candidates.c.build_id,
+    sa.text("LEAST(left_entity_id, right_entity_id)"),
+    sa.text("GREATEST(left_entity_id, right_entity_id)"),
+    unique=True,
 )

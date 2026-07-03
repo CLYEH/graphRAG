@@ -29,6 +29,7 @@ from core.stores.tables import (
     entities_by_key,
     entity_mentions,
     merge_candidates,
+    merge_candidates_pair_unique,
     relation_evidence,
     relation_evidence_dedup,
     relations,
@@ -218,6 +219,32 @@ def test_minted_relation_signature_is_unique_per_build() -> None:
     assert relations_by_signature.unique
     where = relations_by_signature.dialect_options["postgresql"]["where"]
     assert "IS NOT NULL" in str(where)
+
+
+def test_chunk_position_is_unique_per_document() -> None:
+    """ordinal is §4's position identity within a document — a C2 retry that
+    wrote a second row for the same slot would make document reconstruction
+    and indexing ambiguous. Negative positions have no §4 interpretation."""
+    unique_cols = {
+        tuple(c.columns.keys()) for c in chunks.constraints if isinstance(c, sa.UniqueConstraint)
+    }
+    assert ("document_id", "ordinal") in unique_cols
+    assert "ordinal >= 0" in _checks(chunks)["chunks_ordinal_nonnegative"]
+
+
+def test_merge_pair_identity_is_symmetric_and_distinct() -> None:
+    """§17/§27.3: merge_key = fpv(sorted(left_key, right_key)) — the review
+    identity is the SYMMETRIC pair, so (A,B) and (B,A) must be one candidate
+    (entity id ↔ entity_key is 1:1 per build, so LEAST/GREATEST over ids
+    enforces the sorted-key identity), and a self-pair is definitionally
+    void."""
+    assert merge_candidates_pair_unique.unique
+    rendered = [str(expr) for expr in merge_candidates_pair_unique.expressions]
+    assert any("LEAST" in e for e in rendered)
+    assert any("GREATEST" in e for e in rendered)
+    assert "left_entity_id <> right_entity_id" in _checks(merge_candidates).get(
+        "merge_candidates_distinct_pair", ""
+    )
 
 
 # --- §27.4 evidence rules as database invariants ---------------------------------

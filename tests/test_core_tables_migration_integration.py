@@ -23,6 +23,7 @@ from core.stores.tables import (
     documents,
     entities,
     entity_mentions,
+    merge_candidates,
     relation_evidence,
     relations,
 )
@@ -409,6 +410,79 @@ async def test_inverted_chunk_evidence_span_is_impossible(migrated: None) -> Non
                         quote="q",
                         source_uri="s3://bucket/doc",
                         evidence_hash="h-inverted",
+                    )
+                )
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_duplicate_chunk_position_is_impossible(migrated: None) -> None:
+    """A C2 retry writing the same document slot twice is rejected — position
+    identity keeps reconstruction and indexing unambiguous."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            build = uuid.uuid4()
+            document_id = (
+                await conn.execute(
+                    documents.insert()
+                    .values(
+                        project="itest-x",
+                        build_id=build,
+                        source_uri="s3://bucket/doc",
+                        content_hash="c1",
+                    )
+                    .returning(documents.c.id)
+                )
+            ).scalar_one()
+            row = {
+                "document_id": document_id,
+                "build_id": build,
+                "ordinal": 0,
+                "text": "t",
+                "start_offset": 0,
+                "end_offset": 1,
+            }
+            await conn.execute(chunks.insert().values(**row))
+            with pytest.raises(IntegrityError, match="chunks_document_ordinal_unique"):
+                await conn.execute(chunks.insert().values(**row))
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_swapped_merge_pair_is_the_same_candidate(migrated: None) -> None:
+    """§17/§27.3: merge identity is the symmetric sorted pair — (A,B) then
+    (B,A) must collide, or one decided pair could coexist with a still-pending
+    twin under the opposite orientation."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            build = uuid.uuid4()
+            a = await _insert_entity(conn, build)
+            b = await _insert_entity(conn, build)
+            await conn.execute(
+                merge_candidates.insert().values(
+                    project="itest-x",
+                    build_id=build,
+                    left_entity_id=a,
+                    right_entity_id=b,
+                    score=0.9,
+                    status="pending",
+                )
+            )
+            with pytest.raises(IntegrityError, match="merge_candidates_pair_unique"):
+                await conn.execute(
+                    merge_candidates.insert().values(
+                        project="itest-x",
+                        build_id=build,
+                        left_entity_id=b,  # swapped orientation
+                        right_entity_id=a,
+                        score=0.8,
+                        status="pending",
                     )
                 )
             await trans.rollback()

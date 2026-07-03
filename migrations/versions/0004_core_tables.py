@@ -68,12 +68,14 @@ def upgrade() -> None:
             "start_offset >= 0 AND end_offset >= start_offset",
             name="chunks_span_sane",
         ),
+        sa.CheckConstraint("ordinal >= 0", name="chunks_ordinal_nonnegative"),
         sa.ForeignKeyConstraint(
             ["document_id", "build_id"],
             ["documents.id", "documents.build_id"],
             ondelete="CASCADE",
             name="chunks_document_build_fk",
         ),
+        sa.UniqueConstraint("document_id", "ordinal", name="chunks_document_ordinal_unique"),
     )
     op.create_index("chunks_by_document", "chunks", ["document_id"])
 
@@ -292,6 +294,10 @@ def upgrade() -> None:
             "decision IN ('approve','reject','defer')",
             name="merge_candidates_decision_valid",
         ),
+        sa.CheckConstraint(
+            "left_entity_id <> right_entity_id",
+            name="merge_candidates_distinct_pair",
+        ),
         sa.ForeignKeyConstraint(
             ["left_entity_id", "project", "build_id"],
             ["entities.id", "entities.project", "entities.build_id"],
@@ -308,9 +314,22 @@ def upgrade() -> None:
     op.create_index(
         "merge_candidates_by_build", "merge_candidates", ["project", "build_id", "status"]
     )
+    # §17/§27.3 merge_key symmetry: (A,B) ≡ (B,A) — one candidate per pair per build
+    op.create_index(
+        "merge_candidates_pair_unique",
+        "merge_candidates",
+        [
+            "project",
+            "build_id",
+            sa.text("LEAST(left_entity_id, right_entity_id)"),
+            sa.text("GREATEST(left_entity_id, right_entity_id)"),
+        ],
+        unique=True,
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("merge_candidates_pair_unique", table_name="merge_candidates")
     op.drop_index("merge_candidates_by_build", table_name="merge_candidates")
     op.drop_table("merge_candidates")
     op.drop_index("community_reports_by_build", table_name="community_reports")
