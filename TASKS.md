@@ -41,7 +41,7 @@ Keep items small enough to finish in one loop.
 - [x] C1b **BuildScopedRepo** over Postgres (active-build lookup + build_id injection, DR-006)
 - [x] C1c Neo4j adapter + projection repo (build_id-filtered, DR-004)
 - [x] C1d Qdrant adapter + projection repo (build_id payload filter)
-- [ ] C2 Ingest (structured + document connectors) + clean/chunking
+- [x] C2 Ingest (structured + document connectors) + clean/chunking
 - [ ] C3 Graph build (hybrid ontology extraction → entities/relations)
 - [ ] C4 Entity resolution + apply `review_ledger`
 - [ ] C5 Index: embeddings → Qdrant; project entities/relations → Neo4j
