@@ -33,39 +33,60 @@ name="${repo##*/}"
 START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "watching PR #$PR on $repo since $START (interval ${INTERVAL}s, max $MAX_POLLS polls)"
 
-# Poke->watch race (H8): Codex often answers a poke within SECONDS, so a
-# quota-limits reply can land before this script's START and be invisible to
-# every created_at > START filter — the watch would poll a dead quota to
-# timeout. Bootstrap: look BACKWARD (absolute timestamps) for the latest
-# quota message; it GOVERNS unless something newer supersedes it — a +1
-# reaction, a bot review, or a newer human "@codex review" poke (after a
-# quota reset the next poke supersedes the stale message; if nobody poked
-# since it, waiting is pointless no matter how old it is).
+# Poke->watch race (H8): Codex often answers a poke within SECONDS, so ANY
+# response — a quota-limits reply, a review, a plain feedback comment, even
+# the +1 — can land before this script's START and be invisible to every
+# created_at > START filter below. Bootstrap: anything the bot did AFTER the
+# last human "@codex review" poke is an UNPROCESSED response; classify the
+# NEWEST such event exactly like the poll loop would have (+1 -> 0,
+# quota-limits comment -> 30, review/plain comment -> 10). With no poke on
+# record, NOTHING was ever triage-acknowledged (pokes are the ack), so the
+# empty anchor means epoch: every bot event is unprocessed — this covers a
+# PR whose FIRST auto-review hits a quota outage before any poke exists.
 # gh's EMBEDDED --jq only (no standalone jq on the host); per-page maxes fold
-# through sort — ISO-8601 timestamps sort lexically
+# through sort — ISO-8601 timestamps sort lexically.
+boot_poke="$(gh api --paginate "repos/$repo/issues/$PR/comments" \
+  --jq "[.[]|select(((.user.login|startswith(\"$BOT_PREFIX\"))|not) and (.body|test(\"@codex review\")))|.created_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
 boot_quota="$(gh api --paginate "repos/$repo/issues/$PR/comments" \
   --jq "[.[]|select((.user.login|startswith(\"$BOT_PREFIX\")) and (.body|test(\"reached your Codex usage limits\";\"i\")))|.created_at]|max // empty" 2>/dev/null \
   | grep -v '^null$' | sort | tail -n1)"
-if [ -n "$boot_quota" ]; then
-  boot_react="$(gh api --paginate "repos/$repo/issues/$PR/reactions" \
-    --jq "[.[]|select(.user.login==\"$BOT\" and .content==\"+1\")|.created_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
-  boot_review="$(gh api --paginate "repos/$repo/pulls/$PR/reviews" \
-    --jq "[.[]|select(.user.login|startswith(\"$BOT_PREFIX\"))|.submitted_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
-  boot_poke="$(gh api --paginate "repos/$repo/issues/$PR/comments" \
-    --jq "[.[]|select(((.user.login|startswith(\"$BOT_PREFIX\"))|not) and (.body|test(\"@codex review\")))|.created_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
-  # a newer NON-quota bot comment supersedes too: actionable feedback can
-  # arrive as a plain comment (the three-channel lesson) — hiding it behind
-  # an older limits message would make the probe loop sleep past real triage
-  boot_botc="$(gh api --paginate "repos/$repo/issues/$PR/comments" \
-    --jq "[.[]|select((.user.login|startswith(\"$BOT_PREFIX\")) and ((.body|test(\"reached your Codex usage limits\";\"i\"))|not))|.created_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
-  if { [ -z "$boot_react" ] || [[ "$boot_quota" > "$boot_react" ]]; } \
-    && { [ -z "$boot_review" ] || [[ "$boot_quota" > "$boot_review" ]]; } \
-    && { [ -z "$boot_botc" ] || [[ "$boot_quota" > "$boot_botc" ]]; } \
-    && { [ -z "$boot_poke" ] || [[ "$boot_quota" > "$boot_poke" ]]; }; then
-    echo "RESULT: Codex is OUT OF QUOTA (limits message at $boot_quota supersedes every poke/review/+1) — stop waiting; re-poke '@codex review' after the quota window resets."
-    exit 30
-  fi
+boot_botc="$(gh api --paginate "repos/$repo/issues/$PR/comments" \
+  --jq "[.[]|select((.user.login|startswith(\"$BOT_PREFIX\")) and ((.body|test(\"reached your Codex usage limits\";\"i\"))|not))|.created_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
+boot_review="$(gh api --paginate "repos/$repo/pulls/$PR/reviews" \
+  --jq "[.[]|select(.user.login|startswith(\"$BOT_PREFIX\"))|.submitted_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
+boot_react="$(gh api --paginate "repos/$repo/issues/$PR/reactions" \
+  --jq "[.[]|select(.user.login==\"$BOT\" and .content==\"+1\")|.created_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
+# +1 takes PRECEDENCE over same-burst events: Codex's approval arrives with
+# its own "no major issues" comment seconds apart, and classifying that
+# comment as triage work would misread an approval as findings. The merge
+# hook still independently verifies the +1 is newer than the head commit.
+if [ -n "$boot_react" ] && [[ "$boot_react" > "$boot_poke" ]]; then
+  echo "RESULT: +1 — approved (reacted at $boot_react, before this watch started; the merge hook still verifies it is newer than the head commit)."
+  exit 0
 fi
+newest=""
+verdict=""
+# verdict:timestamp pairs — %%:* takes the verdict, #*: keeps the full
+# timestamp (only the FIRST colon splits)
+for pair in "30:$boot_quota" "10:$boot_botc" "10:$boot_review"; do
+  t="${pair#*:}"
+  [ -n "$t" ] || continue
+  [[ "$t" > "$boot_poke" ]] || continue
+  if [ -z "$newest" ] || [[ "$t" > "$newest" ]]; then
+    newest="$t"
+    verdict="${pair%%:*}"
+  fi
+done
+case "$verdict" in
+  10)
+    echo "RESULT: Codex responded at $newest, before this watch started — inspect and triage it (LOOP.md step 7)."
+    exit 10
+    ;;
+  30)
+    echo "RESULT: Codex is OUT OF QUOTA (limits message at $newest is its latest response to the last poke) — stop waiting; re-poke '@codex review' after the quota window resets."
+    exit 30
+    ;;
+esac
 
 for i in $(seq 1 "$MAX_POLLS"); do
   sleep "$INTERVAL"
