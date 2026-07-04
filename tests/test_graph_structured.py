@@ -17,6 +17,8 @@ import json
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
 from core.graph.ontology import EntityRule, RelationRule, StructuredMapping
 from core.graph.structured import GraphExtractReport, extract_structured, row_source_ref
 from core.resolve import fingerprints
@@ -160,6 +162,24 @@ async def test_disambiguator_splits_namesakes() -> None:
     )
     report = await _extract(writer, mapping)
     assert report.entities == 2
+
+
+async def test_mapping_key_must_agree_with_its_declared_table() -> None:
+    """The dict key routes documents (metadata['table']); mapping.table names
+    the §27.2 citation. If they disagree (typo/stale copy), employees rows get
+    cited as another table — or two keys sharing one stale table collapse to
+    the same source_ref and silently drop mentions/evidence. Contradictory
+    config is refused before any row is read (class-1 selector×field pair)."""
+    writer = _FakeWriter([_doc(_row(name="Alice"), table="employees", pk="1")])
+    mismatched = {
+        "employees": StructuredMapping(
+            table="people",  # stale/typoed — disagrees with the routing key
+            entities={"person": EntityRule("Person", "name")},
+        )
+    }
+    with pytest.raises(ValueError, match="disagrees with its StructuredMapping.table"):
+        await _extract(writer, mismatched)
+    assert writer.entities == []  # nothing written before the refusal
 
 
 async def test_unmapped_table_is_skipped_not_dropped() -> None:

@@ -105,7 +105,22 @@ async def extract_structured(
     table's mapping, and writes entities/mentions/relations/evidence — all
     deduped by fingerprint so the pass is idempotent (§5). ``mappings`` is
     keyed by table name; a document whose table has no mapping is skipped.
+
+    The key and the mapping's own ``table`` must AGREE — the key routes
+    documents by their ``metadata["table"]`` while ``mapping.table`` names the
+    citation, so a mismatch (typo, stale copy) would cite rows under the wrong
+    table, and two keys sharing one stale ``table`` would collapse to the same
+    ``source_ref`` and silently drop mentions/evidence. A contradictory config
+    is rejected before any row is read.
     """
+    for key, declared in mappings.items():
+        if key != declared.table:
+            raise ValueError(
+                f"mappings key {key!r} disagrees with its StructuredMapping.table "
+                f"{declared.table!r} — the key selects documents by metadata table, "
+                "the table names the §27.2 citation; a mismatch would cite rows "
+                "under the wrong table"
+            )
     state = _BuildState()
     await state.preload(writer)
     counts = {"entities": 0, "relations": 0, "mentions": 0, "evidence": 0}
