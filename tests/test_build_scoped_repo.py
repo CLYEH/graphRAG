@@ -16,10 +16,12 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from core.stores import repo as repo_module
 from core.stores import tables
 from core.stores.repo import (
     BUILD_ONLY_SCOPED,
     PROJECT_AND_BUILD_SCOPED,
+    BuildNotWritableError,
     BuildScopedRepo,
     NoActiveBuildError,
     NotBuildScopedError,
@@ -29,8 +31,12 @@ _BUILD = uuid.uuid4()
 
 
 def _repo() -> BuildScopedRepo:
-    # unit tests never execute SQL, so the connection is a placeholder
-    return BuildScopedRepo(cast(AsyncConnection, object()), "p1", _BUILD)
+    # unit tests never execute SQL, so the connection is a placeholder; the
+    # internal token is the documented test seam past the factory validation
+    # (which needs live Postgres and is integration-tested)
+    return BuildScopedRepo(
+        cast(AsyncConnection, object()), "p1", _BUILD, _token=repo_module._CONSTRUCTION_TOKEN
+    )
 
 
 def test_reads_inject_both_scope_columns() -> None:
@@ -102,6 +108,24 @@ def test_consumers_cannot_reach_the_connection_or_mutate_the_scope() -> None:
     # __slots__: no __dict__ to smuggle new state through either
     with pytest.raises(AttributeError):
         repo.escape_hatch = object()  # type: ignore[attr-defined]
+
+
+def test_direct_construction_is_fenced_off() -> None:
+    """The factories are the only sanctioned bindings — for_active_build
+    resolves the scope, for_building_build VALIDATES it (§27.1). A public
+    constructor accepting any UUID would reopen the bind-to-anything hole
+    the write factory exists to close."""
+    with pytest.raises(TypeError, match="for_active_build"):
+        BuildScopedRepo(cast(AsyncConnection, object()), "p1", uuid.uuid4())
+
+
+def test_build_not_writable_error_is_typed() -> None:
+    """Pipeline orchestration needs to distinguish 'wrong build' cleanly —
+    type plus fields, not string parsing; status None = no such build."""
+    build = uuid.uuid4()
+    err = BuildNotWritableError("p1", build, "active")
+    assert (err.project, err.build_id, err.status) == ("p1", build, "active")
+    assert isinstance(err, LookupError)
 
 
 def test_no_active_build_error_is_typed_and_carries_the_project() -> None:

@@ -17,7 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
-from core.stores.repo import BuildScopedRepo, NoActiveBuildError, active_build_id
+from core.stores.repo import (
+    BuildNotWritableError,
+    BuildScopedRepo,
+    NoActiveBuildError,
+    active_build_id,
+)
 from core.stores.tables import builds, documents
 
 pytestmark = pytest.mark.integration
@@ -108,7 +113,7 @@ async def test_pipeline_writes_land_in_the_bound_building_build(migrated: None) 
             active = await _insert_build(conn, project, "active")
             building = await _insert_build(conn, project, "building")
 
-            writer = BuildScopedRepo(conn, project, building)
+            writer = await BuildScopedRepo.for_building_build(conn, project, building)
             await writer.insert(documents, source_uri="s3://new", content_hash="c-new")
 
             written = await writer.fetch_all(documents)
@@ -156,6 +161,33 @@ async def test_active_lookup_is_a_single_query_over_the_guarded_index(migrated: 
             b1 = await _insert_build(conn, p1, "active")
             await _insert_build(conn, p2, "active")  # other project's active
             assert await active_build_id(conn, p1) == b1
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_writer_binding_rejects_non_building_targets(migrated: None) -> None:
+    """§27.1: 寫入一律指定 building 的 build_id — binding a writer to the
+    ACTIVE build (mutating live data), another project's build (crossing
+    scopes), or a nonexistent id must fail typed, before any insert runs."""
+    engine = _engine()
+    p1 = f"itest-{uuid.uuid4().hex[:10]}"
+    p2 = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            active = await _insert_build(conn, p1, "active")
+            other_building = await _insert_build(conn, p2, "building")
+
+            with pytest.raises(BuildNotWritableError) as excinfo:
+                await BuildScopedRepo.for_building_build(conn, p1, active)
+            assert excinfo.value.status == "active"
+            with pytest.raises(BuildNotWritableError) as cross:
+                await BuildScopedRepo.for_building_build(conn, p1, other_building)
+            assert cross.value.status is None  # invisible outside its project
+            with pytest.raises(BuildNotWritableError) as missing:
+                await BuildScopedRepo.for_building_build(conn, p1, uuid.uuid4())
+            assert missing.value.status is None
             await trans.rollback()
     finally:
         await engine.dispose()

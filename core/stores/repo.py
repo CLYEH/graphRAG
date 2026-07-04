@@ -87,6 +87,32 @@ class NoActiveBuildError(LookupError):
         self.project = project
 
 
+class BuildNotWritableError(LookupError):
+    """The requested write binding is not this project's ``building`` build.
+
+    §27.1: 寫入一律指定 building 的 build_id — every other status is an
+    immutable snapshot (writing into ``active`` would mutate live data;
+    another project's build would cross scopes). ``status`` is None when the
+    build id does not exist at all.
+    """
+
+    def __init__(self, project: str, build_id: uuid.UUID, status: str | None) -> None:
+        super().__init__(
+            f"build {build_id} is not a 'building' build of project {project!r} "
+            f"(found status: {status!r})"
+        )
+        self.project = project
+        self.build_id = build_id
+        self.status = status
+
+
+#: Module-private construction token: the factories below are the only
+#: sanctioned ways to bind a scope (the active build for reads, a VALIDATED
+#: building build for writes) — an unvalidated direct construction would
+#: reopen the bind-to-anything hole.
+_CONSTRUCTION_TOKEN = object()
+
+
 async def active_build_id(conn: AsyncConnection, project: str) -> uuid.UUID:
     """DR-001: the single-query active-build lookup (§27.1).
 
@@ -119,7 +145,20 @@ class BuildScopedRepo:
 
     __slots__ = ("__conn", "__project", "__build_id")
 
-    def __init__(self, conn: AsyncConnection, project: str, build_id: uuid.UUID) -> None:
+    def __init__(
+        self,
+        conn: AsyncConnection,
+        project: str,
+        build_id: uuid.UUID,
+        *,
+        _token: object = None,
+    ) -> None:
+        if _token is not _CONSTRUCTION_TOKEN:
+            raise TypeError(
+                "construct via BuildScopedRepo.for_active_build (reads) or "
+                "BuildScopedRepo.for_building_build (pipeline writes) — direct "
+                "construction would skip the scope validation those factories do"
+            )
         # name-mangled: reaching the connection from outside is a deliberate
         # bypass (visible in review), never an accident of convenience
         self.__conn = conn
@@ -137,7 +176,32 @@ class BuildScopedRepo:
     @classmethod
     async def for_active_build(cls, conn: AsyncConnection, project: str) -> BuildScopedRepo:
         """Bind to the project's active build (one lookup, then cached here)."""
-        return cls(conn, project, await active_build_id(conn, project))
+        build = await active_build_id(conn, project)
+        return cls(conn, project, build, _token=_CONSTRUCTION_TOKEN)
+
+    @classmethod
+    async def for_building_build(
+        cls, conn: AsyncConnection, project: str, build_id: uuid.UUID
+    ) -> BuildScopedRepo:
+        """Bind a pipeline writer to a VALIDATED ``building`` build (§27.1).
+
+        The id must name an existing build, of THIS project, in status
+        ``building`` — anything else (the active build, another project's
+        build, a finished snapshot, a typo'd id) raises the typed
+        ``BuildNotWritableError`` instead of silently landing writes where
+        they would mutate live data or cross scopes.
+        """
+        status = (
+            await conn.execute(
+                sa.select(tables.builds.c.status).where(
+                    tables.builds.c.id == build_id,
+                    tables.builds.c.project == project,
+                )
+            )
+        ).scalar_one_or_none()
+        if status != "building":
+            raise BuildNotWritableError(project, build_id, status)
+        return cls(conn, project, build_id, _token=_CONSTRUCTION_TOKEN)
 
     # -- scope plumbing (single-underscore: shared with the SQL-shape tests) --
 
