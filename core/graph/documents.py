@@ -254,7 +254,13 @@ async def _apply_chunk(
 ) -> bool:
     """Persist one chunk's accepted extractions. Returns True if any landed."""
     now = datetime.now(tz=UTC)
-    accepted_keys: dict[tuple[str, str], str] = {}  # (type, name) -> entity_key
+    # entity_keys accepted from THIS chunk. Relation endpoints are joined by
+    # the SAME frozen fingerprint the store dedups by — an exact (type, name)
+    # tuple match would diverge from entity_key()'s normalization (case,
+    # whitespace), discarding a relation whose endpoint the model spelled
+    # "acme  corp" against an accepted "Acme Corp" and losing valid verbatim
+    # evidence. One identity function, checker and consumer alike.
+    accepted_keys: set[str] = set()
 
     for item in payload["entities"]:
         if not isinstance(item, dict):
@@ -273,7 +279,7 @@ async def _apply_chunk(
             proposals.append(TypeProposal("entity", etype, name, ref))
             continue
         key = fingerprints.entity_key(etype, name)
-        accepted_keys[(etype, name)] = key
+        accepted_keys.add(key)
         if key not in state.entity_id_by_key:
             entity_id = uuid.uuid4()
             await writer.insert(
@@ -321,9 +327,9 @@ async def _apply_chunk(
         if rtype not in ontology.relation_types:
             proposals.append(TypeProposal("relation", rtype, quote or f"{src}→{dst}", ref))
             continue
-        src_key = accepted_keys.get(src)
-        dst_key = accepted_keys.get(dst)
-        if src_key is None or dst_key is None:
+        src_key = fingerprints.entity_key(src[0], src[1])
+        dst_key = fingerprints.entity_key(dst[0], dst[1])
+        if src_key not in accepted_keys or dst_key not in accepted_keys:
             discarded.append(
                 Discarded(ref, f"relation endpoint not among accepted entities: {src}→{dst}")
             )

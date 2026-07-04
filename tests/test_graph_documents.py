@@ -232,6 +232,40 @@ async def test_blank_types_and_names_are_discarded_with_reasons() -> None:
     assert sum("relation missing type" in r for r in reasons) == 1
 
 
+async def test_endpoint_spelling_variance_joins_by_identity_not_exact_match() -> None:
+    """The endpoint join uses the SAME frozen fingerprint the store dedups
+    by: a relation naming its endpoint 'acme  corp' (case/whitespace variance)
+    still joins the accepted 'Acme Corp' — an exact tuple match would discard
+    the relation and lose valid verbatim evidence (checker/consumer
+    divergence). A truly-unknown endpoint still discards."""
+    answer = _answer(
+        [
+            {"type": "Person", "name": "Alice", "confidence": 0.9},
+            {"type": "Company", "name": "Acme Corp", "confidence": 0.8},
+        ],
+        [
+            {
+                "src_type": "person",  # case variance in the type too
+                "src_name": "Alice",
+                "type": "WORKS_AT",
+                "dst_type": "Company",
+                "dst_name": "acme  corp",  # case + whitespace variance
+                "quote": "Alice works at Acme",
+                "confidence": 0.7,
+            }
+        ],
+    )
+    writer = _FakeWriter([_doc()], [_chunk(_TEXT)])
+    report = await _extract(writer, _FakeLLM({_TEXT: answer}))
+    assert report.relations == 1 and report.evidence == 1
+    sig = fingerprints.relation_signature(
+        fingerprints.entity_key("Person", "Alice"),
+        "WORKS_AT",
+        fingerprints.entity_key("Company", "Acme Corp"),
+    )
+    assert writer.relations[0]["relation_signature"] == sig  # joined the REAL identity
+
+
 async def test_blank_quotes_never_mint_evidence() -> None:
     """A whitespace-only quote is truthy, find(" ") matches almost any text,
     and " " passes the DB's quote <> '' CHECK — so without this guard a
