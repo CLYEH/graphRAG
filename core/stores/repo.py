@@ -424,6 +424,38 @@ class BuildScopedRepo:
         rows = (await self._execute(query)).fetchall()
         return {(row.entity_id, row.source_ref) for row in rows}
 
+    async def mentions_by_entity(
+        self, entity_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, list[tuple[str, str]]]:
+        """``(source_kind, source_ref)`` mentions per entity, scoped through the
+        parent entity (§4: ``entity_mentions`` has no build_id of its own).
+
+        C6a builds §27.2 entity source_refs from these — an entity result must
+        cite ≥1 mention (chunk or row), and only the ``source_kind`` tells the
+        two apart (``text`` mention → a chunk ref, ``structured`` → a row ref).
+        The ``entity_id.in_`` filter keeps it to the hits being enriched; the
+        ``entities`` join filters the bound ``(project, build_id)`` so a mention
+        of another build's entity can never leak in (DR-006).
+        """
+        if not entity_ids:
+            return {}
+        mentions = tables.entity_mentions
+        entities = tables.entities
+        query = (
+            sa.select(mentions.c.entity_id, mentions.c.source_kind, mentions.c.source_ref)
+            .select_from(mentions.join(entities, entities.c.id == mentions.c.entity_id))
+            .where(
+                entities.c.project == self.project,
+                entities.c.build_id == self.build_id,
+                mentions.c.entity_id.in_(entity_ids),
+            )
+        )
+        rows = (await self._execute(query)).fetchall()
+        grouped: dict[uuid.UUID, list[tuple[str, str]]] = {}
+        for row in rows:
+            grouped.setdefault(row.entity_id, []).append((row.source_kind, row.source_ref))
+        return grouped
+
 
 class BuildScopedWriter(BuildScopedRepo):
     """The pipeline write capability (§27.1: writes target a building build).
