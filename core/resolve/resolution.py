@@ -96,6 +96,7 @@ class ResolveReport:
     relations_rejected: int
     relations_approved: int
     relations_restored: int
+    relations_marked_rereview: int
     namesakes_skipped: int
     auto_merged: int
     ledger_merged: int
@@ -208,6 +209,7 @@ async def resolve_build(
             "relations_rejected",
             "relations_approved",
             "relations_restored",
+            "relations_marked_rereview",
             "namesakes_skipped",
             "auto_merged",
             "ledger_merged",
@@ -371,7 +373,8 @@ async def resolve_build(
         # one-sided ids never block: an id-less mention has asserted nothing,
         # and joining it onto the id-bearing entity is exactly ER's job —
         # blocking exact-name one-sided pairs was round 1's over-block.
-        if carried or score >= config.auto_merge_threshold:
+        deferred = verdict is not None and verdict.decision == "defer"
+        if carried or (not deferred and score >= config.auto_merge_threshold):
             canonical, loser = _pick_canonical(a, b)
             if a_id != b_id:
                 # exactly one side carries an external id: that key is the
@@ -397,9 +400,10 @@ async def resolve_build(
                         reason=f"auto-merge at score {score:.4f}",
                     )
                 )
-        elif score >= config.review_threshold or (
-            verdict is not None and verdict.decision == "defer"
-        ):
+        elif deferred or score >= config.review_threshold:
+            # §17: defer 仍列入待審 — a deferred pair re-lists as a pending
+            # candidate at ANY score; it must never auto-merge (manual
+            # outranks auto) nor silently vanish.
             pair = (min(a.id, b.id), max(a.id, b.id))
             if pair in existing_pairs:
                 continue  # already pending/decided in this build — converge
@@ -531,8 +535,16 @@ async def _apply_merge(
                 counts["relations_restored"] += 1
             else:
                 counts["relations_approved"] += 1
-        # no verdict on the new signature: a pre-existing rejection stays —
-        # re-labeling an identity never silently un-rejects a human decision
+        elif relation.status == "rejected" or relation.review_status != "unreviewed":
+            # no verdict for the NEW signature, but the row carries a verdict
+            # keyed to the OLD one (§27.3: decisions key to fingerprints, and
+            # this row's fingerprint just changed) — neither silently carrying
+            # the old decision NOR silently shedding it is honest. Mark for
+            # RE-REVIEW: excluded from projection like rejected rows (only
+            # 'active' projects), but visibly pending in the §17 flow.
+            values["status"] = "needs_review"
+            values["review_status"] = "unreviewed"
+            counts["relations_marked_rereview"] += 1
         await writer.update(tables.relations, relation.id, **values)
         if relation.relation_signature in signature_owner:
             del signature_owner[relation.relation_signature]

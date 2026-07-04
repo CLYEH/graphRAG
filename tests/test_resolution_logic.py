@@ -407,8 +407,9 @@ async def test_rejected_relations_still_remint_and_approve_restores_them() -> No
     """Identity is unconditional, status is not: a rejected edge touching the
     loser must still re-point/re-mint/re-hash (or a later approve would
     resurrect it aimed at a merged entity under its pre-merge signature) —
-    while staying rejected absent a new-signature verdict; an approve keyed
-    to the NEW signature restores it, correctly aimed."""
+    landing in needs_review absent a new-signature verdict (§27.3: the old
+    verdict keyed to a dead fingerprint neither carries nor sheds silently);
+    an approve keyed to the NEW signature restores it, correctly aimed."""
     from core.resolve.fingerprints import evidence_hash, relation_signature
 
     def build_store() -> tuple[_FakeStore, Any, Any, str, str]:
@@ -447,14 +448,19 @@ async def test_rejected_relations_still_remint_and_approve_restores_them() -> No
         )
         return store, keep, rid, pre_sig, post_sig
 
-    # no verdict on the new signature: re-minted but STAYS rejected
+    # no verdict on the new signature: re-minted and marked for RE-REVIEW —
+    # the old rejection was keyed to a fingerprint that no longer names this
+    # row (§27.3); it neither carries nor sheds silently, and the row stays
+    # out of projection (only 'active' projects) while visibly pending (§17)
     store, keep, rid, _pre, post_sig = build_store()
     report = await _run(store)
     assert report.auto_merged == 1 and report.relations_reminted == 1
+    assert report.relations_marked_rereview == 1
     row = {r["id"]: r for r in store.rows[tables.relations]}[rid]
     assert row["dst_entity_id"] == keep  # re-pointed at the canonical
     assert row["relation_signature"] == post_sig  # re-minted
-    assert row["status"] == "rejected"  # a human decision is never silently undone
+    assert row["status"] == "needs_review"
+    assert row["review_status"] == "unreviewed"
     ev = store.rows[tables.relation_evidence][0]
     assert ev["evidence_hash"] == evidence_hash(post_sig, "9:employees:7", None)
 
@@ -466,3 +472,54 @@ async def test_rejected_relations_still_remint_and_approve_restores_them() -> No
     row = {r["id"]: r for r in store.rows[tables.relations]}[rid]
     assert row["status"] == "active" and row["review_status"] == "approved"
     assert row["dst_entity_id"] == keep and row["relation_signature"] == post_sig
+
+
+async def test_deferred_pairs_never_auto_merge_and_relist() -> None:
+    """§17: defer 仍列入待審 — a curator's defer must hold a pair OPEN: no
+    auto-merge however high the score (manual outranks auto), and the pair
+    re-lists as a pending candidate so review can finish the job."""
+    store = _FakeStore()
+    _seed(store, "Acme Corporation", mentions=2)
+    _seed(store, "Acme Corporatio")  # scores ~0.97, above the default auto bar
+    key = merge_key(
+        entity_key("Company", "Acme Corporation"), entity_key("Company", "Acme Corporatio")
+    )
+    store.ledger.append(_ledger_row("merge", key, "defer"))
+    report = await _run(store)
+    assert report.auto_merged == 0 and report.ledger_merged == 0
+    assert report.candidates_created == 1
+    assert store.rows[tables.merge_candidates][0]["status"] == "pending"
+    # both entities still active — the graph did not change under a defer
+    assert all(r["status"] == "active" for r in store.rows[tables.entities])
+
+
+async def test_approved_old_signature_also_marks_rereview_on_remint() -> None:
+    """The carry gap is symmetric: an APPROVE keyed to the pre-merge
+    signature must not silently bless the re-minted identity either — same
+    §27.3 rule, same needs_review outcome."""
+    from core.resolve.fingerprints import relation_signature
+
+    store = _FakeStore()
+    _seed(store, "Acme Corporation", mentions=3)
+    lose = _seed(store, "Acme Corporatio", mentions=1)
+    alice = _seed(store, "Alice", etype="Person")
+    pre_sig = relation_signature(
+        entity_key("Person", "Alice"), "WORKS_AT", entity_key("Company", "Acme Corporatio")
+    )
+    rid = uuid.uuid4()
+    store.rows[tables.relations].append(
+        {
+            "id": rid,
+            "src_entity_id": alice,
+            "dst_entity_id": lose,
+            "type": "WORKS_AT",
+            "relation_signature": pre_sig,
+            "status": "active",
+            "review_status": "approved",  # blessed under the OLD identity
+            "attributes": {},
+        }
+    )
+    report = await _run(store)
+    assert report.relations_marked_rereview == 1
+    row = {r["id"]: r for r in store.rows[tables.relations]}[rid]
+    assert row["status"] == "needs_review" and row["review_status"] == "unreviewed"
