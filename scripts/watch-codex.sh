@@ -60,7 +60,10 @@ boot_react="$(gh api --paginate "repos/$repo/issues/$PR/reactions" \
 # its own "no major issues" comment seconds apart, and classifying that
 # comment as triage work would misread an approval as findings. The merge
 # hook still independently verifies the +1 is newer than the head commit.
-if [ -n "$boot_react" ] && [[ "$boot_react" > "$boot_poke" ]]; then
+# Ties count as AFTER the poke: created_at has one-second resolution, and a
+# bot reply sharing the poke's exact second can only BE the reply (triage
+# cycles take minutes — a same-second already-triaged event is not real).
+if [ -n "$boot_react" ] && [[ ! "$boot_react" < "$boot_poke" ]]; then
   echo "RESULT: +1 — approved (reacted at $boot_react, before this watch started; the merge hook still verifies it is newer than the head commit)."
   exit 0
 fi
@@ -71,7 +74,7 @@ verdict=""
 for pair in "30:$boot_quota" "10:$boot_botc" "10:$boot_review"; do
   t="${pair#*:}"
   [ -n "$t" ] || continue
-  [[ "$t" > "$boot_poke" ]] || continue
+  [[ "$t" < "$boot_poke" ]] && continue  # ties = after (second resolution)
   if [ -z "$newest" ] || [[ "$t" > "$newest" ]]; then
     newest="$t"
     verdict="${pair%%:*}"
