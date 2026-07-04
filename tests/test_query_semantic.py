@@ -264,8 +264,25 @@ async def test_malformed_or_unmappable_hits_are_dropped_not_crashed_on() -> None
     )
     chunk_without_id = SimpleNamespace(id="z", score=0.7, payload={"type": "chunk", "text": "t"})
     entity_without_id = SimpleNamespace(id="w", score=0.6, payload={"type": "entity", "text": "E"})
-    vectors = _FakeVectors([no_payload, unknown_type, chunk_without_id, entity_without_id])
+    # a corrupt projection row with a non-UUID id must DROP (not raise): one bad
+    # row cannot fail the whole query (§22) — the exact P2 Codex flagged
+    chunk_bad_uuid = SimpleNamespace(
+        id="v", score=0.5, payload={"type": "chunk", "chunk_id": "not-a-uuid", "text": "t"}
+    )
+    entity_bad_uuid = SimpleNamespace(
+        id="u", score=0.4, payload={"type": "entity", "entity_id": "also bad", "text": "E"}
+    )
+    vectors = _FakeVectors(
+        [
+            no_payload,
+            unknown_type,
+            chunk_without_id,
+            entity_without_id,
+            chunk_bad_uuid,
+            entity_bad_uuid,
+        ]
+    )
     response = await _run(_FakeRepo(), vectors)
     assert response.results == ()
     assert response.warnings[0].code == "PARTIAL_RESULTS"
-    assert "4 hit(s)" in response.warnings[0].message
+    assert "6 hit(s)" in response.warnings[0].message

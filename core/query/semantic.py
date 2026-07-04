@@ -14,9 +14,11 @@ the hit, not enough to CITE it. §27.2 require_sources demands a chunk result
 carry ``source_uri + offsets`` and an entity result carry ≥1 mention (chunk or
 row). Those live in Postgres, so each hit is enriched from the SoR through the
 same build-scoped repo. A hit that cannot be enriched to a contract-valid,
-citable result (its chunk/document row or all its mentions are gone — projection
-drift, §19) is DROPPED, not emitted uncited, and the drop is surfaced as a
-typed ``PARTIAL_RESULTS`` warning (§22) rather than silently swallowed.
+citable result — its chunk/document row or all its mentions are gone
+(projection drift, §19), its point type is one this tool doesn't map, or its
+source id is corrupt (a non-UUID payload) — is DROPPED, not emitted uncited and
+not allowed to raise, and the drop is surfaced as a typed ``PARTIAL_RESULTS``
+warning (§22 degradation-not-failure) rather than silently swallowed.
 
 Ordering and the whole envelope shape are inherited from
 :mod:`core.query.results` (score desc, ties by id; ``graph_context``/``debug``
@@ -50,6 +52,24 @@ _TOOL = "semantic_search"
 #: one from a table row). The two values are the frozen entity_mentions CHECK
 #: vocabulary, so this map is total.
 _MENTION_SOURCE_TYPE = {"text": "chunk", "structured": "row"}
+
+
+def _payload_uuid(raw: object) -> uuid.UUID | None:
+    """A payload source id as a UUID, or None if absent/blank/malformed.
+
+    The index projector only ever writes ``str(uuid)``, so in a healthy build
+    this never returns None on a present id — but a *corrupt* projection row is
+    exactly the drift this layer must survive: a non-UUID id is treated like
+    any other uncitable payload (DROPPED, counted into the PARTIAL_RESULTS
+    warning), never a ``ValueError`` that fails the whole query on one bad row
+    (§22 degradation-not-failure). One parse point for every call site.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        return None
 
 
 async def semantic_search(
@@ -126,10 +146,13 @@ def _partition_hit_source_ids(
         payload = hit.payload
         if payload is None:
             continue
-        if payload.get("type") == "chunk" and payload.get("chunk_id"):
-            chunk_ids.add(uuid.UUID(payload["chunk_id"]))
-        elif payload.get("type") == "entity" and payload.get("entity_id"):
-            entity_ids.add(uuid.UUID(payload["entity_id"]))
+        point_type = payload.get("type")
+        if point_type == "chunk" and (cid := _payload_uuid(payload.get("chunk_id"))) is not None:
+            chunk_ids.add(cid)
+        elif (
+            point_type == "entity" and (eid := _payload_uuid(payload.get("entity_id"))) is not None
+        ):
+            entity_ids.add(eid)
     return chunk_ids, entity_ids
 
 
@@ -175,10 +198,9 @@ def _chunk_result(
     chunk_by_id: dict[uuid.UUID, Any],
     source_uri_by_chunk: dict[uuid.UUID, str | None],
 ) -> RetrievalResult | None:
-    raw = payload.get("chunk_id")
-    if not raw:
+    chunk_id = _payload_uuid(payload.get("chunk_id"))
+    if chunk_id is None:
         return None
-    chunk_id = uuid.UUID(raw)
     chunk = chunk_by_id.get(chunk_id)
     source_uri = source_uri_by_chunk.get(chunk_id)
     if chunk is None or not source_uri:
@@ -203,10 +225,9 @@ def _entity_result(
     score: float,
     mentions_by_entity: dict[uuid.UUID, list[tuple[str, str]]],
 ) -> RetrievalResult | None:
-    raw = payload.get("entity_id")
-    if not raw:
+    entity_id = _payload_uuid(payload.get("entity_id"))
+    if entity_id is None:
         return None
-    entity_id = uuid.UUID(raw)
     refs = tuple(
         SourceRef(source_type=source_type, id=source_ref)
         for kind, source_ref in mentions_by_entity.get(entity_id, [])
