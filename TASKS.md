@@ -45,7 +45,7 @@ Keep items small enough to finish in one loop.
 - [x] C2 Ingest (structured + document connectors) + clean/chunking
 - [x] C3a Graph build — structured rule-mapping extraction → entities/mentions/relations/evidence (deterministic, no LLM)
 - [x] C3b Graph build — LLM document extraction (schema-guided, §27.4 quote-span evidence) + LLM factory (§3: LlamaIndex 抽象)
-- [ ] C3c Ontology proposal pool (LLM-proposed new types + `ontology.proposal_policy`)
+- [x] C3c Ontology proposal pool (LLM-proposed new types + `ontology.proposal_policy`)
 - [ ] C4 Entity resolution + apply `review_ledger`
 - [ ] C5 Index: embeddings → Qdrant; project entities/relations → Neo4j
 - [ ] C6a Retrieval: semantic (Qdrant kNN, §16 contract)
