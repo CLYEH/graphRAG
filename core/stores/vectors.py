@@ -102,6 +102,29 @@ def _source_key(point_type: str) -> str:
         ) from None
 
 
+class CollectionSchemaMismatchError(RuntimeError):
+    """The project's existing collection cannot hold this build's vectors.
+
+    The preflight must verify the property it exists to guarantee — that
+    upserts will succeed — not merely that a collection is present: an
+    earlier attempt (or a changed embedding config) may have created it with
+    a different size/distance, and without this check C5 would pass
+    preflight and then fail every single upsert with a dimension mismatch.
+    Reconciliation (recreate/migrate) is a C9 lifecycle decision; this layer
+    refuses loudly at the one point the pipeline can act on it.
+    """
+
+    def __init__(self, project: str, collection: str, expected_size: int, actual: object) -> None:
+        super().__init__(
+            f"collection {collection!r} of project {project!r} cannot hold "
+            f"{expected_size}-dim cosine vectors (existing config: {actual!r})"
+        )
+        self.project = project
+        self.collection = collection
+        self.expected_size = expected_size
+        self.actual = actual
+
+
 #: Module-private construction token — factories are the only sanctioned
 #: bindings, same fence as the Postgres and Neo4j repos.
 _CONSTRUCTION_TOKEN = object()
@@ -301,6 +324,20 @@ class BuildScopedVectorProjector(BuildScopedVectorRepo):
                     size=vector_size, distance=models.Distance.COSINE
                 ),
             )
+            return
+        # existence alone is a false-green preflight: verify the EXISTING
+        # collection can actually hold this build's vectors (an earlier
+        # attempt or a changed embedding config may have frozen a different
+        # schema — every upsert would then fail with a dimension mismatch)
+        existing = (await self._client.get_collection(self._collection)).config.params.vectors
+        if (
+            not isinstance(existing, models.VectorParams)
+            or existing.size != vector_size
+            or existing.distance != models.Distance.COSINE
+        ):
+            raise CollectionSchemaMismatchError(
+                self.project, self._collection, vector_size, existing
+            )
 
     async def upsert_point(
         self,
@@ -310,7 +347,7 @@ class BuildScopedVectorProjector(BuildScopedVectorRepo):
         canonical_id: str,
         point_type: str,
         text: str,
-        source_id: str,
+        source_id: uuid.UUID,
     ) -> None:
         """Upsert one point with the §4 payload, scope injected.
 
@@ -327,6 +364,10 @@ class BuildScopedVectorProjector(BuildScopedVectorRepo):
         is derived from ``point_type``: a point with no source id, both ids,
         or a type/key mismatch is unrepresentable rather than validated after
         the fact. Unknown point types are rejected before any Qdrant call.
+        ``source_id`` is typed ``uuid.UUID`` because the mapping-back target
+        is a Postgres ROW id (``chunks.id``/``entities.id``) — an entity-key
+        or canonical string in its place is a type error, not a silently
+        unmappable payload.
         """
         source_key = _source_key(point_type)
         await self._assert_building()
@@ -334,7 +375,7 @@ class BuildScopedVectorProjector(BuildScopedVectorRepo):
             "canonical_id": canonical_id,
             "type": point_type,
             "text": text,
-            source_key: source_id,
+            source_key: str(source_id),
             "project": self.project,
             "build_id": str(self.build_id),
         }

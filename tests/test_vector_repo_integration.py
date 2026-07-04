@@ -28,6 +28,7 @@ from core.stores.tables import builds
 from core.stores.vectors import (
     BuildScopedVectorProjector,
     BuildScopedVectorRepo,
+    CollectionSchemaMismatchError,
     collection_for,
     vector_client,
 )
@@ -102,7 +103,7 @@ async def test_reader_sees_only_the_active_builds_points(
                     canonical_id=f"c-{marker}",
                     point_type="chunk",
                     text=marker,
-                    source_id=f"c-{marker}",
+                    source_id=uuid.uuid4(),
                 )
                 await conn.commit()  # release the FOR SHARE before the next bind
 
@@ -162,13 +163,17 @@ async def test_upsert_after_activation_is_refused_typed(qdrant: AsyncQdrantClien
                 conn, qdrant, project, building
             )
             await projector.ensure_collection(_DIMS)
+            # an existing collection with different dims refuses typed (live):
+            # existence alone would be a false-green preflight
+            with pytest.raises(CollectionSchemaMismatchError):
+                await projector.ensure_collection(_DIMS + 4)
             await projector.upsert_point(
                 uuid.uuid4(),
                 [1.0, 0.0, 0.0, 0.0],
                 canonical_id="ok",
                 point_type="chunk",
                 text="ok",
-                source_id="ok",
+                source_id=uuid.uuid4(),
             )
             await conn.commit()  # release the share lock so activation can run
 
@@ -185,7 +190,7 @@ async def test_upsert_after_activation_is_refused_typed(qdrant: AsyncQdrantClien
                     canonical_id="late",
                     point_type="chunk",
                     text="late",
-                    source_id="late",
+                    source_id=uuid.uuid4(),
                 )
             assert excinfo.value.status == "active"
             # collection creation is a write too (it freezes the vector schema)
@@ -223,7 +228,7 @@ async def test_inflight_upserts_and_activation_are_mutually_exclusive(
                 canonical_id="w",
                 point_type="chunk",
                 text="w",
-                source_id="w",
+                source_id=uuid.uuid4(),
             )
             # projection txn open on Postgres -> share lock held -> activation blocks
             async with engine.connect() as activator:
@@ -245,7 +250,7 @@ async def test_inflight_upserts_and_activation_are_mutually_exclusive(
                     canonical_id="late",
                     point_type="chunk",
                     text="late",
-                    source_id="late",
+                    source_id=uuid.uuid4(),
                 )
             await conn.rollback()
     finally:

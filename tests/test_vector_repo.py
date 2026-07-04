@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import re
 import uuid
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -23,20 +24,30 @@ from core.stores.repo import BuildNotWritableError
 from core.stores.vectors import (
     BuildScopedVectorProjector,
     BuildScopedVectorRepo,
+    CollectionSchemaMismatchError,
     collection_for,
 )
 
 _BUILD = uuid.uuid4()
+_SOURCE = uuid.uuid4()
 
 
 class _FakeClient:
     """Captures every Qdrant call so the scope-injection contract can be
     pinned without a server; returns canned responses."""
 
-    def __init__(self, points: list[Any] | None = None, count: int = 0) -> None:
+    def __init__(
+        self,
+        points: list[Any] | None = None,
+        count: int = 0,
+        exists: bool = False,
+        vectors_config: Any = None,
+    ) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self._points = points or []
         self._count = count
+        self._exists = exists
+        self._vectors_config = vectors_config
 
     async def query_points(self, collection_name: str, **kwargs: Any) -> Any:
         self.calls.append(("query_points", {"collection_name": collection_name, **kwargs}))
@@ -48,7 +59,12 @@ class _FakeClient:
 
     async def collection_exists(self, collection_name: str) -> bool:
         self.calls.append(("collection_exists", {"collection_name": collection_name}))
-        return False
+        return self._exists
+
+    async def get_collection(self, collection_name: str) -> Any:
+        self.calls.append(("get_collection", {"collection_name": collection_name}))
+        params = SimpleNamespace(vectors=self._vectors_config)
+        return SimpleNamespace(config=SimpleNamespace(params=params))
 
     async def create_collection(self, collection_name: str, **kwargs: Any) -> bool:
         self.calls.append(("create_collection", {"collection_name": collection_name, **kwargs}))
@@ -179,7 +195,7 @@ async def test_upserts_stamp_the_bound_scope_into_the_payload() -> None:
         canonical_id="e-1",
         point_type="entity",
         text="Alice",
-        source_id="e-1",
+        source_id=_SOURCE,
     )
     (_, kwargs) = client.calls[-1]
     (struct,) = kwargs["points"]
@@ -200,18 +216,45 @@ async def test_the_source_key_is_derived_from_the_point_type() -> None:
     client = _FakeClient()
     projector = _projector(client)
     await projector.upsert_point(
-        uuid.uuid4(), [0.1], canonical_id="c-1", point_type="chunk", text="t", source_id="c-1"
+        uuid.uuid4(), [0.1], canonical_id="c-1", point_type="chunk", text="t", source_id=_SOURCE
     )
     await projector.upsert_point(
-        uuid.uuid4(), [0.1], canonical_id="e-1", point_type="entity", text="t", source_id="e-1"
+        uuid.uuid4(), [0.1], canonical_id="e-1", point_type="entity", text="t", source_id=_SOURCE
     )
     (_, chunk_kwargs), (_, entity_kwargs) = client.calls
     (chunk_point,) = chunk_kwargs["points"]
     (entity_point,) = entity_kwargs["points"]
-    assert chunk_point.payload["chunk_id"] == "c-1"
+    assert chunk_point.payload["chunk_id"] == str(_SOURCE)
     assert "entity_id" not in chunk_point.payload  # exactly one key, per §4
-    assert entity_point.payload["entity_id"] == "e-1"
+    assert entity_point.payload["entity_id"] == str(_SOURCE)
     assert "chunk_id" not in entity_point.payload
+
+
+async def test_ensure_collection_verifies_the_existing_schema() -> None:
+    """Existence alone is a false-green preflight (the checker/consumer
+    split): the property ensure_collection exists to guarantee is that THIS
+    build's upserts will succeed, and an earlier attempt or a changed
+    embedding config may have frozen a different size/distance — C5 would
+    then pass preflight and fail every upsert with a dimension mismatch. A
+    matching schema passes silently; any mismatch refuses typed, with no
+    create attempted."""
+    ok = _FakeClient(
+        exists=True, vectors_config=models.VectorParams(size=4, distance=models.Distance.COSINE)
+    )
+    await _projector(ok).ensure_collection(4)
+    assert [name for name, _ in ok.calls] == ["collection_exists", "get_collection"]
+
+    mismatches = (
+        models.VectorParams(size=8, distance=models.Distance.COSINE),  # wrong size
+        models.VectorParams(size=4, distance=models.Distance.EUCLID),  # wrong distance
+        {"named": models.VectorParams(size=4, distance=models.Distance.COSINE)},  # named vectors
+    )
+    for bad in mismatches:
+        client = _FakeClient(exists=True, vectors_config=bad)
+        with pytest.raises(CollectionSchemaMismatchError) as excinfo:
+            await _projector(client).ensure_collection(4)
+        assert excinfo.value.expected_size == 4
+        assert "create_collection" not in [name for name, _ in client.calls]
 
 
 async def test_unknown_point_types_are_rejected_on_every_path() -> None:
@@ -222,7 +265,12 @@ async def test_unknown_point_types_are_rejected_on_every_path() -> None:
     projector = _projector(client)
     with pytest.raises(ValueError, match="unknown point type"):
         await projector.upsert_point(
-            uuid.uuid4(), [0.1], canonical_id="x", point_type="relation", text="t", source_id="x"
+            uuid.uuid4(),
+            [0.1],
+            canonical_id="x",
+            point_type="relation",
+            text="t",
+            source_id=_SOURCE,
         )
     repo = _repo(client)
     with pytest.raises(ValueError, match="unknown point type"):
@@ -243,7 +291,7 @@ async def test_every_write_revalidates_the_building_status_first() -> None:
     stale = _projector(client, status="active")
     with pytest.raises(BuildNotWritableError) as excinfo:
         await stale.upsert_point(
-            uuid.uuid4(), [0.1], canonical_id="c", point_type="chunk", text="t", source_id="c"
+            uuid.uuid4(), [0.1], canonical_id="c", point_type="chunk", text="t", source_id=_SOURCE
         )
     assert excinfo.value.status == "active"
     with pytest.raises(BuildNotWritableError):
