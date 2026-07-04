@@ -109,6 +109,14 @@ pipeline_runs(id uuid pk, project text, build_id uuid, kind text, status text,
               started_at, finished_at timestamptz, metrics jsonb, error jsonb)
 pipeline_steps(id uuid pk, run_id uuid, step_name text, status text, started_at, finished_at timestamptz,
                input_count int, output_count int, skipped_count int, failed_count int, metrics jsonb, error jsonb)
+-- §6 待審池（C3c）：非 build-scoped 審核工件,穩定鍵 proposal_key = fpv{N}(norm(kind)|norm(type_name))（§27.3 慣例、DR-007 版本化）
+-- unique (project, proposal_key)：跨 build 再提案=upsert no-op,rejected 不重開審;決策欄位 IFF 已決(雙向 CHECK)
+ontology_proposals(id uuid pk, project text, kind text,        -- entity|relation
+                   type_name text, proposal_key text, fingerprint_version int,
+                   example text, chunk_ref text,
+                   status text,   -- proposed|accepted|rejected（§17）
+                   decided_by text, decided_at timestamptz, reason text, created_at timestamptz)
+
 pipeline_step_items(id uuid pk, step_id uuid, item_kind text, item_ref text,  -- item_ref 穩定：content_hash / entity_key
                     status text, message text, error jsonb)  -- 預設只記 failed/skipped（§18 verbosity）
 ```

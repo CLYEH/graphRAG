@@ -73,6 +73,18 @@ def merge_key(left_key: str, right_key: str) -> str:
     return _fpv(first, second)
 
 
+def proposal_key(kind: str, type_name: str) -> str:
+    """Cross-build identity of an ontology proposal (§6 待審池, C3c).
+
+    ``fpv{N}( norm(kind) | norm(type_name) )`` — the pool dedups on it, so a
+    later build re-proposing ``Spaceship`` (any casing/spacing) upserts into
+    the existing row and a rejected type never re-opens review. ``kind`` is
+    part of the identity: an entity type and a relation type may share a name
+    without being one proposal.
+    """
+    return _fpv(_norm(kind), _norm(type_name))
+
+
 def evidence_hash(relation_signature: str, evidence_ref: str, quote: str | None) -> str:
     """Dedup identity of one piece of relation evidence (§27.4).
 

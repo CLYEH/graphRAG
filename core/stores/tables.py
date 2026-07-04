@@ -721,3 +721,56 @@ merge_candidates_pair_unique = sa.Index(
     sa.text("GREATEST(left_entity_id, right_entity_id)"),
     unique=True,
 )
+
+# §6 待審池: LLM-proposed ontology types awaiting Console review (C3c).
+# Deliberately NOT build-scoped — like review_ledger, this is a REVIEW
+# artifact keyed by a stable fingerprint (proposal_key, DR-007 versioned), so
+# carry-forward is structural: a later build re-proposing the same type
+# upserts into the existing row and a rejected type never re-opens review.
+# §17 state machine: proposed → accepted|rejected (core.resolve.review).
+ontology_proposals = sa.Table(
+    "ontology_proposals",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column("project", sa.Text, nullable=False),
+    sa.Column("kind", sa.Text, nullable=False),  # what the type would type
+    sa.Column("type_name", sa.Text, nullable=False),  # as first observed
+    sa.Column("proposal_key", sa.Text, nullable=False),  # fpv(norm(kind)|norm(type_name))
+    sa.Column("fingerprint_version", sa.Integer, nullable=False),
+    sa.Column("example", sa.Text),  # first observed name/quote
+    sa.Column("chunk_ref", sa.Text),  # first observed source (content-stable string)
+    sa.Column("status", sa.Text, nullable=False, server_default=sa.text("'proposed'")),
+    sa.Column("decided_by", sa.Text),
+    sa.Column("decided_at", sa.TIMESTAMP(timezone=True)),
+    sa.Column("reason", sa.Text),
+    sa.Column(
+        "created_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    ),
+    sa.CheckConstraint("project <> ''", name="ontology_proposals_project_nonempty"),
+    sa.CheckConstraint("kind IN ('entity','relation')", name="ontology_proposals_kind_valid"),
+    sa.CheckConstraint("type_name <> ''", name="ontology_proposals_type_nonempty"),
+    sa.CheckConstraint("proposal_key <> ''", name="ontology_proposals_key_nonempty"),
+    sa.CheckConstraint(
+        "status IN ('proposed','accepted','rejected')", name="ontology_proposals_status_valid"
+    ),
+    # §17 conditional pair, both directions: a decided row must say who/when;
+    # an undecided row must not carry decision residue.
+    sa.CheckConstraint(
+        "(status = 'proposed' AND decided_by IS NULL AND decided_at IS NULL) "
+        "OR (status <> 'proposed' AND decided_by IS NOT NULL AND decided_at IS NOT NULL)",
+        name="ontology_proposals_decision_fields_iff_decided",
+    ),
+)
+
+# The stable identity: one pool row per proposed type per project.
+ontology_proposals_by_key = sa.Index(
+    "ontology_proposals_by_key",
+    ontology_proposals.c.project,
+    ontology_proposals.c.proposal_key,
+    unique=True,
+)
