@@ -334,6 +334,25 @@ async def test_wrong_shaped_fields_fail_the_document_not_the_pass() -> None:
     assert report.entities == 2  # the pass continued past the bad document
 
 
+async def test_omitted_answer_arrays_fail_the_document_not_skip_it() -> None:
+    """The prompt demands BOTH arrays ("shaped exactly"); `{}` or a single
+    field is a schema-violating answer, not "found nothing". If it read as
+    empty output the document would record `skipped` — and §27.7
+    retry-failed-only (which re-runs only `failed`) would never retry it, so
+    a degraded model run would hide as a permanently under-extracted build.
+    A model that finds nothing must say so with explicit empty lists."""
+    for bad in ("{}", json.dumps({"entities": []}), json.dumps({"relations": []})):
+        writer = _FakeWriter([_doc()], [_chunk(_TEXT)])
+        report = await _extract(writer, _FakeLLM({_TEXT: bad}))
+        assert [o.status for o in report.outcomes] == ["failed"], bad
+    # the explicit nothing-found answer is a legitimate skip, not a failure
+    writer = _FakeWriter([_doc()], [_chunk(_TEXT)])
+    report = await _extract(
+        writer, _FakeLLM({_TEXT: json.dumps({"entities": [], "relations": []})})
+    )
+    assert [o.status for o in report.outcomes] == ["skipped"]
+
+
 async def test_non_object_list_items_are_discarded_visibly() -> None:
     """A list whose items aren't objects is half-right model output — each
     bad item is a visible Discarded, and the good items still land."""

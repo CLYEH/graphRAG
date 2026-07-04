@@ -192,12 +192,15 @@ async def extract_documents(
 def _parse_answer(text: str) -> dict[str, Any]:
     """Strictly parse the model's JSON object (fenced answers unwrapped).
 
-    Shape is validated HERE, inside the caller's failure boundary: a valid
-    JSON object whose ``entities``/``relations`` is not a list (``{"entities":
-    1}``) must count as a malformed answer for THAT document — if the wrong
-    shape leaked through, iterating it would raise outside the try and one
-    bad chunk would abort the whole extraction pass instead of §22's
-    fail-the-item-and-continue.
+    Shape is validated HERE, inside the caller's failure boundary, and the
+    prompt's "shaped exactly" is enforced over the whole envelope value
+    domain — absent field, wrong-typed field, wrong-typed items are ALL ways
+    the same untrusted answer goes wrong: a non-list (``{"entities": 1}``)
+    would raise outside the try and abort the pass; an ABSENT field (``{}``)
+    would silently read as "found nothing" and record the document
+    ``skipped``, hiding a schema-violating answer from observability and
+    §27.7 retry-failed-only (which only re-runs ``failed``). A model that
+    finds nothing must say so explicitly with empty lists.
     """
     body = text.strip()
     if body.startswith("```"):
@@ -207,9 +210,8 @@ def _parse_answer(text: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("model answer is not a JSON object")
     for field in ("entities", "relations"):
-        value = parsed.get(field)
-        if value is not None and not isinstance(value, list):
-            raise ValueError(f"model answer field {field!r} is not a list")
+        if not isinstance(parsed.get(field), list):
+            raise ValueError(f"model answer field {field!r} is missing or not a list")
     return parsed
 
 
@@ -237,7 +239,7 @@ async def _apply_chunk(
     now = datetime.now(tz=UTC)
     accepted_keys: dict[tuple[str, str], str] = {}  # (type, name) -> entity_key
 
-    for item in payload.get("entities") or []:
+    for item in payload["entities"]:
         if not isinstance(item, dict):
             discarded.append(Discarded(ref, f"entity item is not an object: {item!r}"))
             continue
@@ -280,7 +282,7 @@ async def _apply_chunk(
             state.mention_refs.add((entity_id, ref))
             counts["mentions"] += 1
 
-    for item in payload.get("relations") or []:
+    for item in payload["relations"]:
         if not isinstance(item, dict):
             discarded.append(Discarded(ref, f"relation item is not an object: {item!r}"))
             continue
