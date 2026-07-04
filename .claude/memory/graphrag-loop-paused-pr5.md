@@ -36,6 +36,8 @@ metadata:
 
 **#19(C1b,7 輪 Codex + 1 輪本地 FAIL,新增 class 9/10)**:DR-006 Postgres repo 層的能力邊界硬化 —— 連線私有化(round 1–2)、writer factory 驗證(2)、讀寫型別分家(3)、raw-SQL predicate 拒絕面(4–6)、寫入 TOCTOU 原子化(7)。**上方「教訓(壓 review 輪次)」的「擠牙膏/主動掃同類」再犯**:predicate 注入面走了 4/5/6 三輪;round 4 我已主動掃 sibling(text+literal_column 一起修)卻漏了「深度」(巢狀,round 5)與「另一 sibling」(custom_op,round 6)—— 完整的首輪掃應同時涵蓋 {所有 sibling constructor} × {所有巢狀深度} × {過度阻擋的正向測試}。**本地 FAIL 一次**(round 6 blanket custom_op 過度阻擋),靠「新增正向 acceptance 測試」的要求(class 9 對偶)抓到 —— 且我與 reviewer 各自獨立抓到同一 JSONB 假陽性類。收斂良好處:round 7 TOCTOU 修法在寫 code 前先於 live PG 驗四個性質(語句被接受、building 可寫、active 拒絕、activation 阻塞),避免推理型修法再開一輪。
 
+**#20(C1c,0 輪 Codex,首輪 +1)**:class 9/10 + checklist 第 7 條在**設計期**預先套用(Cypher 面=結構性消除 splice point 而非 guard;跨庫 TOCTOU=PG row lock 錨定,live 實測)+ reviewer 唯一 actionable nit(模板掃描鍵在 clause 關鍵字會漏未來 CALL/UNWIND 模板)在 first push 前修掉 —— C1b 7 輪 → C1c 0 輪,額度經濟學與 lesson-class 目錄的預防效果首次得到量測驗證。無新 lesson class。
+
 歷史脈絡(2026-07-03 更新的快照,僅供追溯,不代表現況):P0/P1 契約與 H1–H3 harness(fail-loud gates、triage 規則、watcher/doc lane/收據/governance)皆已 merge;當時正要開工 P2(build/activation + Alembic)。
 
 相關:[[codex-plus-one-merge-gate]]、[[graphrag-architecture]]
