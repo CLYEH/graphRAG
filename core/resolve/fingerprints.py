@@ -6,11 +6,19 @@ Review decisions survive rebuilds because they are keyed by fingerprints of
 - ``entity_key      = fpv{N}( norm(type) | norm(canonical_name) | disambiguator )``
 - ``relation_signature = fpv{N}( src_entity_key | norm(type) | dst_entity_key )``
 - ``merge_key       = fpv{N}( sorted(left_key, right_key) )``
+- ``evidence_hash   = sha256( relation_signature | evidence_ref | norm(quote) )`` (§27.4)
 
-``FINGERPRINT_VERSION`` (DR-007) is baked into every key as an ``fpv{N}:``
+``FINGERPRINT_VERSION`` (DR-007) is baked into every KEY as an ``fpv{N}:``
 prefix. Any change to the normalization or composition rules below MUST bump
 it — the ledger only applies same-version keys, so a silent change would
-mis-apply past decisions.
+mis-apply past decisions. (``evidence_hash`` is NOT a ledger key and is not
+prefixed — see :func:`evidence_hash`.)
+
+The ``|`` in each formula is delimited concatenation realized as
+length-prefixed encoding (:func:`_join`), NOT a literal ``|`` byte: a ``|``
+*inside* a part must not collide two different part tuples into one digest
+(``("a|b", "c")`` vs ``("a", "b|c")``). Every function here reads the spec's
+``|`` that way — the convention `entity_key` established.
 """
 
 from __future__ import annotations
@@ -26,12 +34,15 @@ def _norm(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
 
+def _join(*parts: str) -> str:
+    """Length-prefix parts before joining so no character inside a part can
+    collide two different part tuples (see module docstring)."""
+    return "".join(f"{len(part)}:{part}" for part in parts)
+
+
 def _fpv(*parts: str) -> str:
-    """Hash parts into a versioned key. Parts are length-prefixed before
-    joining so no separator character inside a part can collide two different
-    part tuples into one digest (e.g. ("a|b", "c") vs ("a", "b|c"))."""
-    encoded = "".join(f"{len(part)}:{part}" for part in parts)
-    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    """Hash parts into a versioned key (length-prefix-safe join)."""
+    digest = hashlib.sha256(_join(*parts).encode("utf-8")).hexdigest()
     return f"fpv{FINGERPRINT_VERSION}:{digest}"
 
 
@@ -60,3 +71,20 @@ def merge_key(left_key: str, right_key: str) -> str:
     (sorted pair), so (a, b) and (b, a) name the same decision."""
     first, second = sorted((left_key, right_key))
     return _fpv(first, second)
+
+
+def evidence_hash(relation_signature: str, evidence_ref: str, quote: str | None) -> str:
+    """Dedup identity of one piece of relation evidence (§27.4).
+
+    ``sha256( relation_signature | evidence_ref | norm(quote) )``. NOT
+    ``fpv``-prefixed and NOT a ledger key: ``relation_signature`` already
+    carries the fingerprint version, and DR-007 versions only
+    entity_key/relation_signature/merge_key. ``quote`` is absent for row and
+    manual evidence (§27.4: only chunk evidence has a span/quote) → normalized
+    to ``""``, so every row/manual evidence of one (relation, ref) collapses
+    to a single dedup key, which is the intended de-duplication.
+    """
+    digest = hashlib.sha256(
+        _join(relation_signature, evidence_ref, _norm(quote or "")).encode("utf-8")
+    ).hexdigest()
+    return digest

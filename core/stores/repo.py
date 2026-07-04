@@ -82,6 +82,29 @@ class NotBuildScopedError(TypeError):
     """
 
 
+class MentionTargetNotInBuildError(LookupError):
+    """The entity an ``entity_mentions`` row targets is not in this build.
+
+    ``entity_mentions`` is scoped through its parent entity (§4). When
+    :meth:`BuildScopedWriter.insert_entity_mention` writes zero rows AND the
+    build is still ``building``, the cause is the parent, not the build: the
+    ``entity_id`` names no entity of this writer's ``(project, build_id)`` (a
+    wrong-build entity, or an unknown id), so the mention would cross scopes.
+    (If the build has stopped being ``building``, ``BuildNotWritableError`` is
+    raised instead — the two causes are told apart, never conflated into a
+    self-contradictory "not a 'building' build (found status: 'building')".)
+    """
+
+    def __init__(self, project: str, build_id: uuid.UUID, entity_id: uuid.UUID) -> None:
+        super().__init__(
+            f"entity {entity_id} is not an entity of project {project!r} "
+            f"build {build_id} — a mention cannot attach across builds"
+        )
+        self.project = project
+        self.build_id = build_id
+        self.entity_id = entity_id
+
+
 class NoActiveBuildError(LookupError):
     """No ``builds.status='active'`` row for the project (DR-001).
 
@@ -358,6 +381,28 @@ class BuildScopedRepo:
             query = query.where(predicate)
         return (await self._execute(query)).fetchall()
 
+    async def mention_refs(self) -> set[tuple[uuid.UUID, str]]:
+        """The ``(entity_id, source_ref)`` mention pairs already in this build.
+
+        ``entity_mentions`` has no ``build_id`` (§4) — it is scoped through its
+        parent entity — so this read joins to ``entities`` and filters by the
+        bound ``(project, build_id)``, staying within the DR-006 scope. Graph
+        extraction uses it to stay idempotent across re-runs (§5): a mention
+        of an existing (entity, source) is not written twice.
+        """
+        mentions = tables.entity_mentions
+        entities = tables.entities
+        query = (
+            sa.select(mentions.c.entity_id, mentions.c.source_ref)
+            .select_from(mentions.join(entities, entities.c.id == mentions.c.entity_id))
+            .where(
+                entities.c.project == self.project,
+                entities.c.build_id == self.build_id,
+            )
+        )
+        rows = (await self._execute(query)).fetchall()
+        return {(row.entity_id, row.source_ref) for row in rows}
+
 
 class BuildScopedWriter(BuildScopedRepo):
     """The pipeline write capability (§27.1: writes target a building build).
@@ -424,3 +469,79 @@ class BuildScopedWriter(BuildScopedRepo):
                 )
             ).scalar_one_or_none()
             raise BuildNotWritableError(self.project, self.build_id, status)
+
+    async def insert_entity_mention(
+        self,
+        *,
+        entity_id: uuid.UUID,
+        source_kind: str,
+        source_ref: str,
+        surface_form: str | None,
+        confidence: float | None,
+    ) -> None:
+        """Insert an ``entity_mentions`` row, scoped THROUGH its parent entity.
+
+        ``entity_mentions`` carries no ``build_id`` (§4): its scope is the
+        entity it hangs off, so it cannot go through :meth:`insert` (that would
+        try to inject a build_id column the table lacks — ``NotBuildScopedError``).
+        The scope invariant is instead enforced structurally here: the row
+        lands ONLY if the named ``entity_id`` is an entity of THIS writer's
+        ``(project, build_id)`` whose build is still ``building`` — the same
+        atomic ``INSERT .. SELECT .. WHERE EXISTS(... FOR SHARE)`` guard
+        :meth:`insert` uses, so a mention cannot attach to another build's
+        entity, an unknown id, or a build that activated after this writer was
+        bound (TOCTOU — the ``FOR SHARE`` on the build row is mutually
+        exclusive with the activation UPDATE). Zero rows has two causes, told
+        apart so the error names the real one: a build that stopped being
+        ``building`` (activated/failed) ⇒ ``BuildNotWritableError``; a build
+        still ``building`` but a parent ``entity_id`` outside this scope
+        (wrong build, unknown id) ⇒ ``MentionTargetNotInBuildError``.
+        """
+        guard = (
+            sa.select(tables.entities.c.id)
+            .select_from(
+                tables.entities.join(
+                    tables.builds, tables.builds.c.id == tables.entities.c.build_id
+                )
+            )
+            .where(
+                tables.entities.c.id == entity_id,
+                tables.entities.c.project == self.project,
+                tables.entities.c.build_id == self.build_id,
+                tables.builds.c.status == "building",
+            )
+            .with_for_update(read=True, of=tables.builds)
+        )
+        payload: dict[str, Any] = {
+            "id": uuid.uuid4(),
+            "entity_id": entity_id,
+            "source_kind": source_kind,
+            "source_ref": source_ref,
+            "surface_form": surface_form,
+            "confidence": confidence,
+        }
+        row = sa.select(
+            *[
+                sa.bindparam(key, value, type_=tables.entity_mentions.c[key].type).label(key)
+                for key, value in payload.items()
+            ]
+        ).where(sa.exists(guard))
+        result = await self._execute(
+            tables.entity_mentions.insert().from_select(list(payload), row)
+        )
+        if result.rowcount == 0:
+            # Zero rows has two distinct causes; disambiguate so the error names
+            # the real one. If the build is no longer 'building', that's the
+            # (activated/failed) writability failure; otherwise the parent
+            # entity_id is simply not in this build's scope.
+            status: str | None = (
+                await self._execute(
+                    sa.select(tables.builds.c.status).where(
+                        tables.builds.c.id == self.build_id,
+                        tables.builds.c.project == self.project,
+                    )
+                )
+            ).scalar_one_or_none()
+            if status != "building":
+                raise BuildNotWritableError(self.project, self.build_id, status)
+            raise MentionTargetNotInBuildError(self.project, self.build_id, entity_id)
