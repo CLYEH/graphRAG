@@ -129,6 +129,40 @@ def test_active_bound_repos_cannot_insert() -> None:
     assert "for_active_build" not in vars(BuildScopedWriter)
 
 
+def test_textual_predicates_are_rejected_and_structural_or_stays_grouped() -> None:
+    """SQLAlchemy splices text() into the WHERE conjunction WITHOUT parens, so
+    text("1=1 OR ...") flips precedence and reads outside the scope (verified
+    by compilation below); structural or_() self-groups. fetch_all therefore
+    rejects TextClause — the narrow-only guarantee must hold for EVERY
+    accepted input, not just polite ones."""
+    # the attack really exists: unparenthesized OR after the ANDed scope
+    attacked = _repo()._select(tables.documents).where(sa.text("1=1 OR x"))
+    assert " AND 1=1 OR x" in str(attacked.whereclause)
+    # structural or_ is parenthesized — cannot escape
+    grouped = (
+        _repo()
+        ._select(tables.documents)
+        .where(sa.or_(tables.documents.c.mime == "a", tables.documents.c.mime == "b"))
+    )
+    assert "AND (documents.mime" in str(grouped.whereclause)
+
+
+async def test_fetch_all_refuses_raw_sql_predicates() -> None:
+    """The guard lives on the public path, before any SQL is built — and it
+    covers BOTH raw-SQL vectors: text() and literal_column() compile to the
+    byte-identical unparenthesized splice (the latter is a ColumnClause with
+    is_literal=True, not a TextClause — a sibling API with the same hole)."""
+    attacked = _repo()._select(tables.documents).where(sa.literal_column("1=1 OR x"))
+    assert " AND 1=1 OR x" in str(attacked.whereclause)  # the sibling attack is real
+    attacks: tuple[sa.ColumnExpressionArgument[bool], ...] = (
+        sa.text("1=1 OR true"),
+        sa.literal_column("1=1 OR true"),
+    )
+    for attack in attacks:
+        with pytest.raises(TypeError, match="raw-SQL"):
+            await _repo().fetch_all(tables.documents, attack)
+
+
 def test_direct_construction_is_fenced_off() -> None:
     """The factories are the only sanctioned bindings — for_active_build
     resolves the scope, for_building_build VALIDATES it (§27.1). A public

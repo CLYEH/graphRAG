@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
@@ -189,6 +190,34 @@ async def test_writer_binding_rejects_non_building_targets(migrated: None) -> No
             with pytest.raises(BuildNotWritableError) as missing:
                 await BuildScopedWriter.for_building_build(conn, p1, uuid.uuid4())
             assert missing.value.status is None
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_structural_or_predicates_cannot_widen_the_scope(migrated: None) -> None:
+    """The adversarial containment case executed: a two-branch or_ naming
+    BOTH builds stays parenthesized (`AND (build_id = :stale OR build_id =
+    :active)`), so its stale branch would leak stale rows if scope
+    containment ever broke — and only active rows come back. (or_(true(), x)
+    would be useless here: SQLAlchemy simplifies it to plain `true`,
+    eliminating the adversarial branch entirely.)"""
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            active = await _insert_build(conn, project, "active")
+            stale = await _insert_build(conn, project, "ready")
+            await _insert_document(conn, project, active)
+            await _insert_document(conn, project, stale)
+
+            repo = await BuildScopedRepo.for_active_build(conn, project)
+            rows = await repo.fetch_all(
+                documents,
+                sa.or_(documents.c.build_id == stale, documents.c.build_id == active),
+            )
+            assert [row.build_id for row in rows] == [active]
             await trans.rollback()
     finally:
         await engine.dispose()

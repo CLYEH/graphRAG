@@ -237,10 +237,22 @@ class BuildScopedRepo:
         """Read the scoped rows, optionally narrowed by caller predicates.
 
         Predicates can only narrow — the scope filters are already in the
-        query and nothing the caller passes can remove them.
+        query and nothing the caller passes can remove them. Raw textual
+        predicates are rejected: SQLAlchemy splices ``text()`` into the WHERE
+        conjunction WITHOUT parenthesizing it, so ``text("1=1 OR ...")``
+        would flip boolean precedence and read outside the scope (verified
+        by compilation; structural expressions like ``or_()`` self-group and
+        cannot do this).
         """
         query = self._select(table)
         for predicate in where:
+            if isinstance(predicate, sa.TextClause) or getattr(predicate, "is_literal", False):
+                raise TypeError(
+                    "raw-SQL predicates (text()/literal_column()) are not accepted — "
+                    "their SQL is spliced unparenthesized and an OR inside would "
+                    "escape the build scope; use structural expressions "
+                    "(column comparisons, sa.or_/sa.and_)"
+                )
             query = query.where(predicate)
         return (await self._execute(query)).fetchall()
 
