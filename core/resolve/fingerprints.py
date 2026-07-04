@@ -34,6 +34,14 @@ def _norm(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
 
+def norm_text(text: str) -> str:
+    """The frozen normalization, publicly: resolution's blocking/scoring (§7)
+    must group and compare by the SAME rule the identity keys are minted with
+    — a second normalization implementation would be checker/consumer drift
+    by construction."""
+    return _norm(text)
+
+
 def _join(*parts: str) -> str:
     """Length-prefix parts before joining so no character inside a part can
     collide two different part tuples (see module docstring)."""
