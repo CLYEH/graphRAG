@@ -474,8 +474,13 @@ async def _apply_merge(
         ),
     )
     for relation in touching:
-        if relation.status in ("rejected", "merged"):
-            continue
+        if relation.status == "merged":
+            continue  # demoted duplicates are terminal; their survivor governs
+        # NOTE deliberately not skipping rejected relations: the identity
+        # cascade (endpoints, signature, evidence hashes) is UNCONDITIONAL —
+        # a rejected edge left keyed to the loser would, on a later ledger
+        # approve, resurrect pointing at a merged entity under its pre-merge
+        # signature. Only its STATUS respects the rejection (below).
         new_src = canonical.id if relation.src_entity_id == loser.id else relation.src_entity_id
         new_dst = canonical.id if relation.dst_entity_id == loser.id else relation.dst_entity_id
         new_signature = fingerprints.relation_signature(
@@ -513,12 +518,21 @@ async def _apply_merge(
         # sit active in the projection under the very signature it rejects
         verdict = _decision(ledger, "relation", new_signature)
         if verdict is not None and verdict.decision == "reject":
+            if relation.status != "rejected":
+                counts["relations_rejected"] += 1
             values["status"] = "rejected"
             values["review_status"] = "rejected"
-            counts["relations_rejected"] += 1
         elif verdict is not None and verdict.decision == "approve":
             values["review_status"] = "approved"
-            counts["relations_approved"] += 1
+            if relation.status == "rejected":
+                # the new signature's verdict governs the re-labeled identity:
+                # a curator's approve restores the edge (now correctly keyed)
+                values["status"] = "active"
+                counts["relations_restored"] += 1
+            else:
+                counts["relations_approved"] += 1
+        # no verdict on the new signature: a pre-existing rejection stays —
+        # re-labeling an identity never silently un-rejects a human decision
         await writer.update(tables.relations, relation.id, **values)
         if relation.relation_signature in signature_owner:
             del signature_owner[relation.relation_signature]

@@ -401,3 +401,68 @@ async def test_relation_ledger_reapplies_after_remint() -> None:
     assert row["relation_signature"] == post_merge_sig
     assert row["status"] == "rejected" and row["review_status"] == "rejected"
     assert keep  # canonical survived
+
+
+async def test_rejected_relations_still_remint_and_approve_restores_them() -> None:
+    """Identity is unconditional, status is not: a rejected edge touching the
+    loser must still re-point/re-mint/re-hash (or a later approve would
+    resurrect it aimed at a merged entity under its pre-merge signature) —
+    while staying rejected absent a new-signature verdict; an approve keyed
+    to the NEW signature restores it, correctly aimed."""
+    from core.resolve.fingerprints import evidence_hash, relation_signature
+
+    def build_store() -> tuple[_FakeStore, Any, Any, str, str]:
+        store = _FakeStore()
+        keep = _seed(store, "Acme Corporation", mentions=3)
+        lose = _seed(store, "Acme Corporatio", mentions=1)
+        alice = _seed(store, "Alice", etype="Person")
+        alice_key = entity_key("Person", "Alice")
+        pre_sig = relation_signature(
+            alice_key, "WORKS_AT", entity_key("Company", "Acme Corporatio")
+        )
+        post_sig = relation_signature(
+            alice_key, "WORKS_AT", entity_key("Company", "Acme Corporation")
+        )
+        rid = uuid.uuid4()
+        store.rows[tables.relations].append(
+            {
+                "id": rid,
+                "src_entity_id": alice,
+                "dst_entity_id": lose,
+                "type": "WORKS_AT",
+                "relation_signature": pre_sig,
+                "status": "rejected",  # rejected BEFORE the merge
+                "review_status": "rejected",
+                "attributes": {},
+            }
+        )
+        store.rows[tables.relation_evidence].append(
+            {
+                "id": uuid.uuid4(),
+                "relation_id": rid,
+                "evidence_ref": "9:employees:7",
+                "quote": None,
+                "evidence_hash": evidence_hash(pre_sig, "9:employees:7", None),
+            }
+        )
+        return store, keep, rid, pre_sig, post_sig
+
+    # no verdict on the new signature: re-minted but STAYS rejected
+    store, keep, rid, _pre, post_sig = build_store()
+    report = await _run(store)
+    assert report.auto_merged == 1 and report.relations_reminted == 1
+    row = {r["id"]: r for r in store.rows[tables.relations]}[rid]
+    assert row["dst_entity_id"] == keep  # re-pointed at the canonical
+    assert row["relation_signature"] == post_sig  # re-minted
+    assert row["status"] == "rejected"  # a human decision is never silently undone
+    ev = store.rows[tables.relation_evidence][0]
+    assert ev["evidence_hash"] == evidence_hash(post_sig, "9:employees:7", None)
+
+    # approve keyed to the NEW signature: restored, correctly aimed
+    store, keep, rid, _pre, post_sig = build_store()
+    store.ledger.append(_ledger_row("relation", post_sig, "approve"))
+    report = await _run(store)
+    assert report.relations_restored == 1
+    row = {r["id"]: r for r in store.rows[tables.relations]}[rid]
+    assert row["status"] == "active" and row["review_status"] == "approved"
+    assert row["dst_entity_id"] == keep and row["relation_signature"] == post_sig
