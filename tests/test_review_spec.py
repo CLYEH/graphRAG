@@ -14,6 +14,7 @@ import pytest
 from core.resolve.fingerprints import (
     FINGERPRINT_VERSION,
     entity_key,
+    evidence_hash,
     merge_key,
     relation_signature,
 )
@@ -80,6 +81,35 @@ def test_merge_key_is_symmetric() -> None:
     a = entity_key("Team", "People Ops")
     b = entity_key("Team", "PeopleOps")
     assert merge_key(a, b) == merge_key(b, a)
+
+
+def test_evidence_hash_dedups_row_evidence_and_is_not_versioned() -> None:
+    """§27.4: evidence_hash is the dedup key of one piece of evidence. Row/
+    manual evidence has no quote → normalized "", so every row evidence of one
+    (relation, ref) collapses to a single key (the relation_evidence_dedup
+    unique index de-duplicates on it). It is a plain sha256, NOT fpv-prefixed
+    (relation_signature already carries the version)."""
+    sig = relation_signature(
+        entity_key("Person", "Alice"), "WORKS_AT", entity_key("Company", "Acme")
+    )
+    digest = evidence_hash(sig, "people:7", None)
+    assert digest == evidence_hash(sig, "people:7", "")  # None and "" quote coincide
+    assert not digest.startswith("fpv")
+    assert len(digest) == 64  # bare sha256 hex
+
+
+def test_evidence_hash_separates_distinct_evidence_and_cannot_be_gamed() -> None:
+    """Different relation, ref, or quote → different key, and length-prefixed
+    parts (like every fingerprint) block the 'a|b','c' vs 'a','b|c' collision."""
+    sig = relation_signature(
+        entity_key("Person", "Alice"), "WORKS_AT", entity_key("Company", "Acme")
+    )
+    other = relation_signature(
+        entity_key("Person", "Bob"), "WORKS_AT", entity_key("Company", "Acme")
+    )
+    assert evidence_hash(sig, "people:7", None) != evidence_hash(sig, "people:8", None)
+    assert evidence_hash(sig, "people:7", None) != evidence_hash(other, "people:7", None)
+    assert evidence_hash(sig, "a", "b") != evidence_hash(sig, "a|b", "")
 
 
 # --- state machines (§17) ----------------------------------------------------

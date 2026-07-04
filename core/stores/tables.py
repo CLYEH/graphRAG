@@ -422,9 +422,11 @@ relations = sa.Table(
     sa.Column("dst_entity_id", postgresql.UUID(as_uuid=True), nullable=False),
     sa.Column("type", sa.Text, nullable=False),
     sa.Column("attributes", postgresql.JSONB),
-    # §27.3: fpv{N}(src_key|norm(type)|dst_key), minted by core.resolve.fingerprints.
-    # Nullable: C3 writes extracted relations before C4 mints signatures; once
-    # minted, identity is unique per build (partial index below).
+    # §27.3: fpv{N}(src_key|norm(type)|dst_key), minted AT EXTRACTION (C3) by
+    # core.resolve.fingerprints — the per-build relation dedup rides the partial
+    # unique index below, which excludes NULLs, so a NULL signature would let a
+    # re-run duplicate the edge (breaks §5); extraction always sets it. C4
+    # re-mints when a fuzzy merge changes an endpoint's entity_key.
     sa.Column("relation_signature", sa.Text),
     sa.Column("status", sa.Text, nullable=False),
     sa.Column("review_status", sa.Text, nullable=False, server_default=sa.text("'unreviewed'")),
