@@ -91,6 +91,32 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      fixed with `INSERT..SELECT..WHERE EXISTS(status='building' FOR SHARE)`. A
      plain recheck still races an uncommitted change — MVCC readers don't block
      writers.)
+   - **Per-surface inventory (transfer ≠ sweep)**: a boundary module's NEW
+     surfaces get their own catalog pass — C1c (surfaces 1:1 with C1b) took 0
+     Codex rounds while C1d (new surfaces) took 4, every finding a cataloged
+     class this checklist already named, missed because only the family
+     pattern was transferred. Inventory explicitly: identifiers COMPOSED from
+     contract strings (value-domain: can every contract-valid input be
+     served?); accepted vocabularies and (selector × gated-field) pairs
+     (exactly-one/at-least-one made unrepresentable, typos rejected on read
+     AND write paths); ids that map back to another store (type them as what
+     they are — a row id is a UUID, not a str); every side effect beyond
+     data writes (schema/metadata a write freezes — an expired write license
+     stops ALL of them, and a "no build-tagged data" style rationale must
+     survive naming the full effect set).
+   - **Name the threat model**: for any derived value that guards an
+     invariant (hash suffixes, dedup keys, fingerprints), state whether it
+     must resist ACCIDENTS or ADVERSARIES before judging its strength —
+     contract-valid input is attacker-influenceable, so invariants get the
+     adversarial bar. (C1d round 2: a 40-bit hash suffix passed review as
+     "negligible collision risk" under the accidental model; Codex supplied a
+     real forged collision — 40 bits falls to brute force in seconds.)
+   - **Preflight the consumer's property, not a proxy** (checker/consumer
+     divergence — the lesson catalog's 檢查者/消費者分岔 class): a precheck
+     must verify the thing the consumer actually depends on, not a cheaper
+     stand-in. (C1d round 4: `ensure_collection` checked a collection EXISTS
+     but not that its vector size/distance can hold this build's points —
+     C5 would pass preflight then fail every upsert.)
 
 ## Output (exactly this shape)
 ```
