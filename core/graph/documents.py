@@ -215,6 +215,23 @@ def _parse_answer(text: str) -> dict[str, Any]:
     return parsed
 
 
+def _strings(item: dict[str, Any], *fields: str) -> dict[str, str] | None:
+    """The named fields as ACTUAL strings, or None if any isn't one.
+
+    Leaf scalars are still untrusted model output: ``str()`` coercion would
+    turn a non-string ({"text": "Alice"}, 42) into its Python repr and MINT
+    it — a garbage canonical_name/fingerprint/quote persisted into the graph.
+    Absent counts as non-string: identity/evidence fields have no default.
+    """
+    out: dict[str, str] = {}
+    for field in fields:
+        value = item.get(field)
+        if not isinstance(value, str):
+            return None
+        out[field] = value
+    return out
+
+
 def _clamp(value: object) -> float:
     try:
         return min(1.0, max(0.0, float(value)))  # type: ignore[arg-type]
@@ -243,8 +260,12 @@ async def _apply_chunk(
         if not isinstance(item, dict):
             discarded.append(Discarded(ref, f"entity item is not an object: {item!r}"))
             continue
-        etype = str(item.get("type") or "").strip()
-        name = str(item.get("name") or "").strip()
+        strings = _strings(item, "type", "name")
+        if strings is None:
+            discarded.append(Discarded(ref, f"entity type/name is not a string: {item!r}"))
+            continue
+        etype = strings["type"].strip()
+        name = strings["name"].strip()
         if not etype or not name:
             discarded.append(Discarded(ref, f"entity missing type/name: {item!r}"))
             continue
@@ -286,10 +307,14 @@ async def _apply_chunk(
         if not isinstance(item, dict):
             discarded.append(Discarded(ref, f"relation item is not an object: {item!r}"))
             continue
-        rtype = str(item.get("type") or "").strip()
-        quote = str(item.get("quote") or "")
-        src = (str(item.get("src_type") or "").strip(), str(item.get("src_name") or "").strip())
-        dst = (str(item.get("dst_type") or "").strip(), str(item.get("dst_name") or "").strip())
+        strings = _strings(item, "src_type", "src_name", "type", "dst_type", "dst_name", "quote")
+        if strings is None:
+            discarded.append(Discarded(ref, f"relation field is not a string: {item!r}"))
+            continue
+        rtype = strings["type"].strip()
+        quote = strings["quote"]
+        src = (strings["src_type"].strip(), strings["src_name"].strip())
+        dst = (strings["dst_type"].strip(), strings["dst_name"].strip())
         if not rtype:
             discarded.append(Discarded(ref, f"relation missing type: {item!r}"))
             continue

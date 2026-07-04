@@ -353,6 +353,41 @@ async def test_omitted_answer_arrays_fail_the_document_not_skip_it() -> None:
     assert [o.status for o in report.outcomes] == ["skipped"]
 
 
+async def test_non_string_scalars_are_discarded_never_repr_minted() -> None:
+    """The untrusted boundary's leaf level: str() coercion would turn a
+    non-string name ({"text": "Alice"}) into its Python repr and PERSIST it
+    as a canonical_name + fingerprint — garbage entities polluting the graph.
+    Every identity/evidence-bearing scalar must BE a string or the item is
+    discarded visibly."""
+    answer = json.dumps(
+        {
+            "entities": [
+                {"type": "Person", "name": {"text": "Alice"}, "confidence": 0.9},
+                {"type": ["Person"], "name": "Bob", "confidence": 0.9},
+                {"type": "Person", "name": "Carol", "confidence": 0.9},
+            ],
+            "relations": [
+                {
+                    "src_type": "Person",
+                    "src_name": "Carol",
+                    "type": "WORKS_AT",
+                    "dst_type": "Person",
+                    "dst_name": "Carol",
+                    "quote": 42,  # non-string evidence
+                    "confidence": 0.5,
+                }
+            ],
+        }
+    )
+    writer = _FakeWriter([_doc()], [_chunk(_TEXT)])
+    report = await _extract(writer, _FakeLLM({_TEXT: answer}))
+    assert [e["canonical_name"] for e in writer.entities] == ["Carol"]  # no reprs minted
+    assert writer.relations == []
+    reasons = [d.reason for d in report.discarded]
+    assert sum("entity type/name is not a string" in r for r in reasons) == 2
+    assert sum("relation field is not a string" in r for r in reasons) == 1
+
+
 async def test_non_object_list_items_are_discarded_visibly() -> None:
     """A list whose items aren't objects is half-right model output — each
     bad item is a visible Discarded, and the good items still land."""
