@@ -44,7 +44,7 @@ from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
-from sqlalchemy.sql import coercions, roles, visitors
+from sqlalchemy.sql import coercions, operators, roles, visitors
 
 from core.stores import tables
 
@@ -120,36 +120,88 @@ class BuildNotWritableError(LookupError):
 _CONSTRUCTION_TOKEN = object()
 
 
+#: The characters a PostgreSQL operator name may contain (PG manual §4.1.3).
+#: SQLAlchemy renders dialect operators (JSONB ``->>``/``@>``/``?``, array
+#: ``&&`` …) as ``custom_op`` nodes whose opstring is drawn ENTIRELY from this
+#: set — and an opstring of only these characters cannot contain a space, a
+#: keyword (``OR``), a quote, or a ``)``, so it cannot restructure the boolean
+#: expression to escape the scope. An ``op("...")`` payload that could escape
+#: (``") OR true OR ("``, ``"= 'x' OR true"``) necessarily uses characters
+#: OUTSIDE this set, which is exactly what we reject.
+_PG_OPERATOR_CHARS = frozenset("+-*/<>=~!@#%^&|`?")
+
+
+def _is_unsafe_custom_op(candidate: object) -> bool:
+    """True if ``candidate`` is a ``custom_op`` with an unsafe opstring.
+
+    ``op()``/``bool_op()`` splice their operator string VERBATIM between the
+    operands. A symbol-only opstring is a genuine dialect operator and is safe
+    (see :data:`_PG_OPERATOR_CHARS`); anything with a letter, space, quote or
+    paren is attacker-controllable raw SQL and is rejected.
+    """
+    if not isinstance(candidate, operators.custom_op):
+        return False
+    return not (candidate.opstring and set(candidate.opstring) <= _PG_OPERATOR_CHARS)
+
+
+def _is_raw_sql_node(node: object) -> bool:
+    """True if ``node`` carries attacker-controllable SQL spliced VERBATIM.
+
+    Three sibling APIs splice a raw string with no parameterization and no
+    reliable parenthesization, so each can smuggle an ``OR`` / paren-closing
+    payload out of the ANDed scope:
+
+    - ``text()`` → :class:`TextClause`;
+    - ``literal_column()`` → a ``ColumnClause`` with ``is_literal=True``;
+    - ``op("<raw>")`` / ``bool_op("<raw>")`` → a ``custom_op`` (on a node's
+      ``operator`` or ``modifier``) whose opstring is NOT a pure operator
+      token — the safe dialect operators (``->>``, ``@>``, ``&&`` …) are
+      allowed so C4+ can filter JSONB/array columns (see
+      :func:`_is_unsafe_custom_op`).
+
+    (Plain ``column()`` and ``func.<name>`` are NOT here: SQLAlchemy quotes
+    those identifiers, so a payload lands inside quotes, contained.)
+    """
+    return (
+        isinstance(node, sa.TextClause)
+        or getattr(node, "is_literal", False)
+        or _is_unsafe_custom_op(getattr(node, "operator", None))
+        or _is_unsafe_custom_op(getattr(node, "modifier", None))
+    )
+
+
 def _reject_raw_sql(predicate: sa.ColumnExpressionArgument[bool]) -> None:
     """Refuse any raw-SQL node in a caller predicate — even nested (DR-006).
 
-    SQLAlchemy splices ``text()``/``literal_column()`` into the WHERE
-    conjunction VERBATIM and WITHOUT parentheses, so the scope's ANDed
-    filters and the caller's predicate share one flat boolean level. A raw
-    ``OR`` (or a ``")...--"`` payload that lexically closes an enclosing
-    ``or_`` group) flips precedence and reads outside the build scope —
-    verified by compilation:
+    SQLAlchemy splices raw SQL (``text()``/``literal_column()`` bodies, and
+    ``op()``/``bool_op()`` operator strings) into the WHERE conjunction
+    VERBATIM, so the scope's ANDed filters and the caller's predicate share
+    one flat boolean level. A raw ``OR`` (or a ``")...--"`` / ``") OR (..."``
+    payload that lexically closes an enclosing group) flips precedence and
+    reads outside the build scope — verified by compilation:
 
-        build_id = :b AND (1=1) OR documents.build_id <> :x -- OR mime = :m)
+        build_id = :b AND (documents.mime IS NOT NULL) OR (true ...)
 
-    A top-level check is not enough: ``sa.or_(sa.text(...), col == x)`` hides
-    the raw node one level down, where it still escapes. So coerce the
-    predicate exactly as ``.where()`` will (which also rejects a bare-string
-    predicate — SQLAlchemy 2.x refuses to auto-``text()`` it), then walk the
-    whole expression tree (``visitors.iterate``) and reject on the first raw
-    node. Structural expressions (column comparisons, ``sa.or_``/``sa.and_``)
-    contain zero such nodes and self-group, so they pass and cannot widen the
-    scope.
+    A top-level check is not enough: ``sa.or_(sa.text(...), col == x)`` (or a
+    ``custom_op`` deeper in the tree) hides the raw node one level down, where
+    it still escapes. So coerce the predicate exactly as ``.where()`` will
+    (which also rejects a bare-string predicate — SQLAlchemy 2.x refuses to
+    auto-``text()`` it), then walk the whole expression tree
+    (``visitors.iterate``) and reject on the first raw node (see
+    :func:`_is_raw_sql_node`). Structural expressions (column comparisons,
+    ``sa.or_``/``sa.and_``, ``in_``/``like``/``between``) contain none of
+    these and self-group, so they pass and cannot widen the scope.
     """
     element = coercions.expect(roles.WhereHavingRole, predicate)
     for node in visitors.iterate(element):
-        if isinstance(node, sa.TextClause) or getattr(node, "is_literal", False):
+        if _is_raw_sql_node(node):
             raise TypeError(
-                "raw-SQL nodes (text()/literal_column()) are not accepted, even "
-                "nested inside or_/and_ — raw SQL is spliced verbatim, so an OR "
-                "(or a grouping-closing ')...--' payload) inside would escape the "
-                "build scope; use structural expressions only (column comparisons, "
-                "sa.or_/sa.and_)"
+                "raw-SQL predicates are not accepted, even nested inside "
+                "or_/and_: text()/literal_column() bodies and op()/bool_op() "
+                "operator strings are spliced verbatim, so an OR (or a "
+                "grouping-closing ')...--' payload) inside would escape the "
+                "build scope; use structural expressions only (column "
+                "comparisons, sa.or_/sa.and_, in_/like/between)"
             )
 
 

@@ -197,6 +197,56 @@ async def test_fetch_all_refuses_raw_sql_nested_inside_structural_operators() ->
         )
 
 
+async def test_fetch_all_refuses_custom_operator_predicates() -> None:
+    """op()/bool_op() are a THIRD verbatim-splice vector: the operator string
+    is emitted raw between the operands and lives on BinaryExpression.operator
+    (a custom_op), which text()/literal_column() node checks never see. A
+    ')...' payload closes SQLAlchemy's auto-group so the OR escapes the scope
+    (proven below); the guard must inspect operators, not just node types."""
+    # the escape is real: the injected ')' closes SQLAlchemy's auto-added group
+    # right after the left operand, so the trailing OR lands OUTSIDE the scope's
+    # AND — `build_id = :b AND (documents.mime ) OR true OR ( :mime_1)`
+    escaped = (
+        _repo()
+        ._select(tables.documents)
+        .where(tables.documents.c.mime.op(") OR true OR (")("ignored"))
+    )
+    compiled = str(escaped.whereclause)
+    assert "(documents.mime ) OR true" in compiled  # group closed, OR now top-level
+
+    # every unsafe form (paren-close, keyword payload, bare letters, nested) is
+    # rejected — the operator string is what carries the injection
+    attacks: tuple[sa.ColumnExpressionArgument[bool], ...] = (
+        tables.documents.c.mime.op(") OR true OR (")("ignored"),
+        tables.documents.c.mime.bool_op("= 'x' OR true")("ignored"),
+        sa.or_(tables.documents.c.mime.op("OP")("y"), tables.documents.c.mime == "z"),
+    )
+    for attack in attacks:
+        with pytest.raises(TypeError, match="raw-SQL"):
+            await _repo().fetch_all(tables.documents, attack)
+
+
+def test_safe_dialect_custom_operators_are_accepted() -> None:
+    """The custom_op guard must NOT be a blanket ban: SQLAlchemy renders safe
+    PostgreSQL dialect operators (JSONB ->>/@>/?, array &&) as custom_op too,
+    and C4+ query adapters need them to filter JSONB/array columns. A symbol-
+    only opstring cannot contain a space, keyword, quote or ')', so it cannot
+    restructure the boolean expression — only opstrings with characters
+    OUTSIDE the PG operator set are the injection vector we reject. Regression
+    guard so hardening the boundary never silently breaks real filtering."""
+    meta = tables.documents.c.metadata  # a JSONB column on a scoped table
+    safe: tuple[sa.ColumnExpressionArgument[bool], ...] = (
+        meta["k"].astext == "v",  # ->>
+        meta.contains({"a": 1}),  # @>
+        meta.has_key("k"),  # ?
+    )
+    for predicate in safe:
+        # does not raise — and stays inside the scope when composed
+        repo_module._reject_raw_sql(predicate)
+        composed = str(_repo()._select(tables.documents).where(predicate))
+        assert "documents.build_id = " in composed
+
+
 def test_direct_construction_is_fenced_off() -> None:
     """The factories are the only sanctioned bindings — for_active_build
     resolves the scope, for_building_build VALIDATES it (§27.1). A public
