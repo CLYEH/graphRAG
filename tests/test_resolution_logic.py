@@ -523,3 +523,46 @@ async def test_approved_old_signature_also_marks_rereview_on_remint() -> None:
     assert report.relations_marked_rereview == 1
     row = {r["id"]: r for r in store.rows[tables.relations]}[rid]
     assert row["status"] == "needs_review" and row["review_status"] == "unreviewed"
+
+
+async def test_approve_restores_needs_review_rows_to_projectability() -> None:
+    """needs_review is the re-mint parking state (round 4): approve on the
+    CURRENT signature is exactly the review it was parked for — it must exit
+    the row to active, not stamp review_status while status keeps it
+    excluded from projection forever. Same rule for entities (§17 lists
+    needs_review in both lifecycles)."""
+    from core.resolve.fingerprints import relation_signature
+
+    store = _FakeStore()
+    a = _seed(store, "Acme Corporation", mentions=2)
+    alice = _seed(store, "Alice", etype="Person")
+    sig = relation_signature(
+        entity_key("Person", "Alice"), "WORKS_AT", entity_key("Company", "Acme Corporation")
+    )
+    rid = uuid.uuid4()
+    store.rows[tables.relations].append(
+        {
+            "id": rid,
+            "src_entity_id": alice,
+            "dst_entity_id": a,
+            "type": "WORKS_AT",
+            "relation_signature": sig,
+            "status": "needs_review",  # parked by an earlier re-mint
+            "review_status": "unreviewed",
+            "attributes": {},
+        }
+    )
+    store.ledger.append(_ledger_row("relation", sig, "approve"))
+    report = await _run(store)
+    assert report.relations_restored == 1
+    row = {r["id"]: r for r in store.rows[tables.relations]}[rid]
+    assert row["status"] == "active" and row["review_status"] == "approved"
+
+    # entity variant: a needs_review entity approved via its entity_key
+    estore = _FakeStore()
+    parked = _seed(estore, "Globex", status="needs_review")
+    estore.ledger.append(_ledger_row("entity", entity_key("Company", "Globex"), "approve"))
+    ereport = await _run(estore)
+    assert ereport.entities_restored == 1
+    erow = {r["id"]: r for r in estore.rows[tables.entities]}[parked]
+    assert erow["status"] == "active" and erow["review_status"] == "approved"

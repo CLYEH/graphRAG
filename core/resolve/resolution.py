@@ -247,10 +247,13 @@ async def resolve_build(
                 counts["entities_rejected"] += 1
                 continue
             if verdict.decision == "approve":
-                if status == "rejected":
+                if status in ("rejected", "needs_review"):
                     # §27.3 precedence: the latest manual decision governs — a
                     # curator's approve must RESURRECT a row an earlier pass
-                    # rejected, not be blocked by the residue it left behind
+                    # rejected (or parked as needs_review), not be blocked by
+                    # the residue it left behind. Both states are §17's
+                    # excluded-from-projection states; approve is the exit
+                    # from either.
                     await writer.update(
                         tables.entities,
                         row.id,
@@ -295,7 +298,11 @@ async def resolve_build(
             )
             counts["relations_rejected"] += 1
         elif verdict.decision == "approve":
-            if row.status == "rejected":
+            if row.status in ("rejected", "needs_review"):
+                # needs_review is round-4's re-mint parking state: approve on
+                # the (current) signature is exactly the review it was parked
+                # FOR — it must restore projectability, not just stamp
+                # review_status while status keeps the row excluded forever
                 await writer.update(
                     tables.relations,
                     row.id,
@@ -528,9 +535,10 @@ async def _apply_merge(
             values["review_status"] = "rejected"
         elif verdict is not None and verdict.decision == "approve":
             values["review_status"] = "approved"
-            if relation.status == "rejected":
+            if relation.status in ("rejected", "needs_review"):
                 # the new signature's verdict governs the re-labeled identity:
-                # a curator's approve restores the edge (now correctly keyed)
+                # a curator's approve restores the edge (now correctly keyed) —
+                # from rejection or from the needs_review parking state alike
                 values["status"] = "active"
                 counts["relations_restored"] += 1
             else:
