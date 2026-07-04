@@ -96,16 +96,25 @@ class _FakeConn:
         return iter([SimpleNamespace(entity_id=k, n=v) for k, v in counts.items()])
 
 
-def _seed(store: _FakeStore, name: str, *, etype: str = "Company", mentions: int = 1) -> Any:
+def _seed(
+    store: _FakeStore,
+    name: str,
+    *,
+    etype: str = "Company",
+    mentions: int = 1,
+    disambiguator: str | None = None,
+    status: str = "active",
+    review_status: str = "unreviewed",
+) -> Any:
     eid = uuid.uuid4()
     store.rows[tables.entities].append(
         {
             "id": eid,
             "type": etype,
             "canonical_name": name,
-            "entity_key": entity_key(etype, name),
-            "status": "active",
-            "review_status": "unreviewed",
+            "entity_key": entity_key(etype, name, disambiguator),
+            "status": status,
+            "review_status": review_status,
             "created_at": datetime.now(tz=UTC),
             "attributes": {},
         }
@@ -267,3 +276,72 @@ async def test_merge_cascade_reminting_over_fakes() -> None:
     assert by_id[duplicate]["attributes"]["merged_into"] == str(survivor)
     remaining = store.rows[tables.relation_evidence]
     assert len(remaining) == 1 and remaining[0]["relation_id"] == survivor
+
+
+async def test_disambiguated_namesakes_never_auto_merge() -> None:
+    """C3's disambiguator deliberately keeps two 'Alice' Person rows with
+    different external ids DISTINCT (§27.3). Identical normalized names with
+    different keys can only mean that distinction — a 1.0 score must not
+    destroy it, and no candidate may re-spam review every build. Only an
+    explicit ledger merge joins them."""
+    store = _FakeStore()
+    _seed(store, "Alice", etype="Person", disambiguator="hr-1")
+    _seed(store, "Alice", etype="Person", disambiguator="hr-2")
+    report = await _run(store)
+    assert report.auto_merged == 0 and report.candidates_created == 0
+    assert report.namesakes_skipped == 1
+    assert store.ledger == []  # nothing recorded — nothing decided
+
+    # an explicit human merge decision still governs
+    key = merge_key(entity_key("Person", "Alice", "hr-1"), entity_key("Person", "Alice", "hr-2"))
+    store.ledger.append(_ledger_row("merge", key, "merge"))
+    carried = await _run(store)
+    assert carried.ledger_merged == 1
+
+
+async def test_both_disambiguated_pairs_cap_at_candidate() -> None:
+    """Two entities that BOTH carry (necessarily different) external ids are
+    asserted distinct by their sources — near-identical names may propose a
+    candidate for human review but must never auto-merge."""
+    store = _FakeStore()
+    _seed(store, "Acme Corporation", disambiguator="reg-1", mentions=2)
+    _seed(store, "Acme Corporatio", disambiguator="reg-2")
+    report = await _run(store)  # score ~0.97 >= default auto threshold
+    assert report.auto_merged == 0
+    assert report.candidates_created == 1
+    row = store.rows[tables.merge_candidates][0]
+    assert row["status"] == "pending"
+
+    # one-sided ids stay mergeable: ER's job is joining the id-less mention
+    free = _FakeStore()
+    _seed(free, "Acme Corporation", disambiguator="reg-1", mentions=2)
+    _seed(free, "Acme Corporatio")  # no external id
+    merged = await _run(free)
+    assert merged.auto_merged == 1
+
+
+async def test_manual_approve_resurrects_a_rejected_row() -> None:
+    """§27.3 latest-manual-wins must work WITHIN a build: an earlier pass
+    rejected the row (status residue), a curator approves — the row comes
+    back active/approved and re-enters pairing; merged rows stay merged
+    (undo is 'split', deferred)."""
+    store = _FakeStore()
+    bad = _seed(store, "Acme Corporatio", status="rejected", review_status="rejected")
+    key = entity_key("Company", "Acme Corporatio")
+    reject = _ledger_row("entity", key, "reject")
+    reject["decided_at"] = datetime(2026, 7, 1, tzinfo=UTC)
+    approve = _ledger_row("entity", key, "approve")
+    approve["decided_at"] = datetime(2026, 7, 2, tzinfo=UTC)  # newer manual wins
+    store.ledger.extend([reject, approve])
+    report = await _run(store)
+    assert report.entities_restored == 1 and report.entities_rejected == 0
+    by_id = {r["id"]: r for r in store.rows[tables.entities]}
+    assert by_id[bad]["status"] == "active"
+    assert by_id[bad]["review_status"] == "approved"
+
+    merged_store = _FakeStore()
+    gone = _seed(merged_store, "Acme Corporatio", status="merged")
+    merged_store.ledger.append(_ledger_row("entity", key, "approve"))
+    untouched = await _run(merged_store)
+    assert untouched.entities_restored == 0
+    assert {r["id"]: r for r in merged_store.rows[tables.entities]}[gone]["status"] == "merged"

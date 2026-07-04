@@ -92,8 +92,11 @@ class ResolveReport:
 
     entities_rejected: int
     entities_approved: int
+    entities_restored: int
     relations_rejected: int
     relations_approved: int
+    relations_restored: int
+    namesakes_skipped: int
     auto_merged: int
     ledger_merged: int
     candidates_created: int
@@ -119,6 +122,13 @@ class _Entity:
 
     def __post_init__(self) -> None:
         self.norm_name = fingerprints.norm_text(self.name)
+
+
+def _has_disambiguator(entity: _Entity) -> bool:
+    """True iff the entity's stored key embeds an external id: the key minted
+    WITHOUT a disambiguator would differ (§27.3 — the formula is frozen, so
+    the comparison is exact, not heuristic)."""
+    return fingerprints.entity_key(entity.type, entity.name) != entity.entity_key
 
 
 def _string_score(a: _Entity, b: _Entity) -> float:
@@ -194,8 +204,11 @@ async def resolve_build(
         (
             "entities_rejected",
             "entities_approved",
+            "entities_restored",
             "relations_rejected",
             "relations_approved",
+            "relations_restored",
+            "namesakes_skipped",
             "auto_merged",
             "ledger_merged",
             "candidates_created",
@@ -217,8 +230,11 @@ async def resolve_build(
     for row in entity_rows:
         key_of[row.id] = row.entity_key
         verdict = _decision(ledger, "entity", row.entity_key)
-        if verdict is not None and row.status not in ("rejected", "merged"):
-            if verdict.decision == "reject" and row.status != "rejected":
+        status = row.status
+        # merged rows are exempt: undoing a merge is 'split' (deferred), not
+        # something a reject/approve on the ORIGINAL key should unwind
+        if verdict is not None and status != "merged":
+            if verdict.decision == "reject" and status != "rejected":
                 await writer.update(
                     tables.entities,
                     row.id,
@@ -228,12 +244,26 @@ async def resolve_build(
                 )
                 counts["entities_rejected"] += 1
                 continue
-            if verdict.decision == "approve" and row.review_status != "approved":
-                await writer.update(
-                    tables.entities, row.id, review_status="approved", updated_at=now
-                )
-                counts["entities_approved"] += 1
-        if row.status == "active" and (verdict is None or verdict.decision != "reject"):
+            if verdict.decision == "approve":
+                if status == "rejected":
+                    # §27.3 precedence: the latest manual decision governs — a
+                    # curator's approve must RESURRECT a row an earlier pass
+                    # rejected, not be blocked by the residue it left behind
+                    await writer.update(
+                        tables.entities,
+                        row.id,
+                        status="active",
+                        review_status="approved",
+                        updated_at=now,
+                    )
+                    counts["entities_restored"] += 1
+                    status = "active"
+                elif row.review_status != "approved":
+                    await writer.update(
+                        tables.entities, row.id, review_status="approved", updated_at=now
+                    )
+                    counts["entities_approved"] += 1
+        if status == "active" and (verdict is None or verdict.decision != "reject"):
             entities.append(
                 _Entity(
                     row.id,
@@ -251,6 +281,8 @@ async def resolve_build(
         verdict = _decision(ledger, "relation", row.relation_signature)
         if verdict is None:
             continue
+        if row.status == "merged":
+            continue  # demoted duplicates stay demoted (their survivor governs)
         if verdict.decision == "reject" and row.status != "rejected":
             await writer.update(
                 tables.relations,
@@ -260,9 +292,21 @@ async def resolve_build(
                 updated_at=now,
             )
             counts["relations_rejected"] += 1
-        elif verdict.decision == "approve" and row.review_status != "approved":
-            await writer.update(tables.relations, row.id, review_status="approved", updated_at=now)
-            counts["relations_approved"] += 1
+        elif verdict.decision == "approve":
+            if row.status == "rejected":
+                await writer.update(
+                    tables.relations,
+                    row.id,
+                    status="active",
+                    review_status="approved",
+                    updated_at=now,
+                )
+                counts["relations_restored"] += 1
+            elif row.review_status != "approved":
+                await writer.update(
+                    tables.relations, row.id, review_status="approved", updated_at=now
+                )
+                counts["relations_approved"] += 1
 
     # mention counts drive canonical selection (deterministic)
     mention_rows = await conn.execute(
@@ -307,6 +351,22 @@ async def resolve_build(
             counts["pairs_suppressed"] += 1
             continue
         carried = verdict is not None and verdict.decision in ("merge", "approve")
+        if not carried and a.norm_name == b.norm_name:
+            # identical normalized (type, name) yet DIFFERENT entity_keys can
+            # only mean a disambiguator distinction (§27.3): the sources say
+            # these are namesakes, not one thing — scoring them 1.0 and
+            # auto-merging would destroy exactly what the external id
+            # protects. Only an explicit ledger merge may join them (and a
+            # candidate would re-spam review every build — DR-003 forbids).
+            counts["namesakes_skipped"] += 1
+            continue
+        if not carried and _has_disambiguator(a) and _has_disambiguator(b):
+            # both sides carry (necessarily different) external ids — the
+            # sources assert distinct identities, so similarity alone must
+            # not auto-merge them; the review band may still propose it.
+            if score < config.review_threshold:
+                continue
+            score = min(score, config.auto_merge_threshold - 1e-9)
         if carried or score >= config.auto_merge_threshold:
             canonical, loser = _pick_canonical(a, b)
             await _apply_merge(writer, canonical, loser, key_of, counts, now)
