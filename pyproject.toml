@@ -10,6 +10,7 @@ dependencies = [
     "sqlalchemy>=2.0",
     "alembic>=1.14",
     "asyncpg>=0.30",
+    "neo4j>=5.20",
 ]
 
 [project.scripts]
