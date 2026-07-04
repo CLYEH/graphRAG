@@ -88,6 +88,11 @@ def test_csv_rows_refuse_missing_empty_or_duplicated_pk(tmp_path: Path) -> None:
     duplicated.write_text("id,name\n7,Alice\n7,Bob\n", encoding="utf-8")
     with pytest.raises(ValueError, match="repeats pk"):
         list(read_csv_rows(duplicated, table="t", pk_column="id"))
+    # the table name is the OTHER half of the §27.2 citation — same rule
+    ok = tmp_path / "ok.csv"
+    ok.write_text("id\n1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="table name"):
+        list(read_csv_rows(ok, table="  ", pk_column="id"))
 
 
 def test_payloads_default_to_empty_metadata() -> None:

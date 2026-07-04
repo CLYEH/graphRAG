@@ -82,6 +82,11 @@ def read_csv_rows(path: Path, *, table: str, pk_column: str) -> Iterator[Documen
     exist and be non-empty NOW: a row that cannot be cited later is refused
     at the door, not discovered broken at query time.
     """
+    if not table.strip():
+        raise ValueError(
+            "table name must be non-empty — §27.2 row refs cite table + pk, "
+            "and rows ingested under a blank table could never be cited"
+        )
     with path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None or pk_column not in reader.fieldnames:

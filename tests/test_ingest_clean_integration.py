@@ -145,7 +145,15 @@ async def test_reingesting_converges_instead_of_duplicating(migrated: None) -> N
                 writer, [DocumentPayload("mem://a", "same content", "text/plain")]
             )
             assert [o.status for o in second.outcomes] == ["skipped"]
-            assert second.documents == ()
+            # skipped is NOT dropped: the retry handoff carries the SAME
+            # committed document (a crash between doc commit and chunking
+            # would otherwise strand it unchunked — clean converges from here)
+            assert [d.document_id for d in second.documents] == [first.documents[0].document_id]
+            assert second.documents[0].raw == "same content"
+            chunked = await clean_document(
+                writer, second.documents[0].document_id, second.documents[0].raw
+            )
+            assert len(chunked) == 1  # the retry really can finish the clean step
             count = (
                 await conn.execute(
                     sa.select(sa.func.count())

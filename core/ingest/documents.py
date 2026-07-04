@@ -32,7 +32,7 @@ INGESTED_STATUS = "ingested"
 
 @dataclass(frozen=True)
 class IngestedDocument:
-    """What the next step (clean/chunking) needs about one written row."""
+    """What the next step (clean/chunking) needs about one document row."""
 
     document_id: uuid.UUID
     content_hash: str
@@ -41,7 +41,15 @@ class IngestedDocument:
 
 @dataclass(frozen=True)
 class IngestReport:
-    """The step result: written rows plus the §18 item outcomes."""
+    """The step result: the clean handoff plus the §18 item outcomes.
+
+    ``documents`` holds EVERY unique document this batch names — freshly
+    written AND already present. A retry that crashed between the document
+    commit and its chunks re-runs ingest, gets ``skipped`` outcomes, and
+    still receives those documents here; dropping them would strand the
+    build with unchunked documents, since this tuple is the only handoff to
+    the (idempotent-by-convergence) clean step.
+    """
 
     documents: tuple[IngestedDocument, ...]
     outcomes: tuple[ItemOutcome, ...]
@@ -61,12 +69,23 @@ async def ingest_documents(
     the repo's read surface is deliberately minimal and column projection is
     additive C4+ work; revisit when a real corpus makes this the bottleneck.
     """
-    existing = {row.content_hash for row in await writer.fetch_all(tables.documents)}
-    written: list[IngestedDocument] = []
+    stored = {
+        row.content_hash: IngestedDocument(row.id, row.content_hash, row.raw or "")
+        for row in await writer.fetch_all(tables.documents)
+    }
+    handoff: dict[str, IngestedDocument] = {}
     outcomes: list[ItemOutcome] = []
     for payload in payloads:
         digest = content_hash(payload.raw)
-        if digest in existing:
+        if digest in handoff:
+            # in-batch duplicate: its own skipped outcome, one handoff entry
+            outcomes.append(ItemOutcome("document", digest, "skipped"))
+            continue
+        if digest in stored:
+            # already committed (earlier run, or partial run that crashed
+            # before chunking) — skipped, but STILL handed to clean so the
+            # retry converges instead of stranding an unchunked document
+            handoff[digest] = stored[digest]
             outcomes.append(ItemOutcome("document", digest, "skipped"))
             continue
         document_id = uuid.uuid4()
@@ -81,7 +100,6 @@ async def ingest_documents(
             status=INGESTED_STATUS,
             ingested_at=datetime.now(tz=UTC),
         )
-        existing.add(digest)
-        written.append(IngestedDocument(document_id, digest, payload.raw))
+        handoff[digest] = IngestedDocument(document_id, digest, payload.raw)
         outcomes.append(ItemOutcome("document", digest, "ingested"))
-    return IngestReport(tuple(written), tuple(outcomes))
+    return IngestReport(tuple(handoff.values()), tuple(outcomes))
