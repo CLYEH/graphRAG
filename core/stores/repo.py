@@ -82,6 +82,27 @@ class NotBuildScopedError(TypeError):
     """
 
 
+class RowNotInBuildError(LookupError):
+    """A guarded UPDATE/DELETE named a row that is not in this writer's scope.
+
+    The statement's WHERE carries the full (id, project?, build_id) scope plus
+    the building-status guard; zero rows while the build is still ``building``
+    means the id names a row of another build/project (or nothing) — mutating
+    across scopes is the exact thing DR-006 exists to prevent, so it fails
+    typed instead of silently doing nothing.
+    """
+
+    def __init__(self, table: str, row_id: uuid.UUID, project: str, build_id: uuid.UUID) -> None:
+        super().__init__(
+            f"{table} row {row_id} is not in project {project!r} build {build_id} "
+            "— cross-scope mutation refused"
+        )
+        self.table = table
+        self.row_id = row_id
+        self.project = project
+        self.build_id = build_id
+
+
 class MentionTargetNotInBuildError(LookupError):
     """The entity an ``entity_mentions`` row targets is not in this build.
 
@@ -545,3 +566,119 @@ class BuildScopedWriter(BuildScopedRepo):
             if status != "building":
                 raise BuildNotWritableError(self.project, self.build_id, status)
             raise MentionTargetNotInBuildError(self.project, self.build_id, entity_id)
+
+    # -- resolution mutations (C4) — same per-statement guard as insert -------
+
+    def _scoped_where(self, table: sa.Table, row_id: uuid.UUID) -> list[sa.ColumnElement[bool]]:
+        """The full scope predicate for one row, plus the atomic building-
+        status guard (EXISTS ... FOR SHARE — mutually exclusive with the
+        activation UPDATE's row lock, same proof as ``_insert_values``)."""
+        guard = (
+            sa.select(tables.builds.c.id)
+            .where(
+                tables.builds.c.id == self.build_id,
+                tables.builds.c.project == self.project,
+                tables.builds.c.status == "building",
+            )
+            .with_for_update(read=True)
+        )
+        where: list[sa.ColumnElement[bool]] = [table.c.id == row_id, sa.exists(guard)]
+        for column, value in self._scope_values(table).items():
+            where.append(table.c[column] == value)
+        return where
+
+    async def _raise_zero_rows(self, table: sa.Table, row_id: uuid.UUID) -> None:
+        """Zero rows has two causes — name the real one (the C3a lesson)."""
+        status: str | None = (
+            await self._execute(
+                sa.select(tables.builds.c.status).where(
+                    tables.builds.c.id == self.build_id,
+                    tables.builds.c.project == self.project,
+                )
+            )
+        ).scalar_one_or_none()
+        if status != "building":
+            raise BuildNotWritableError(self.project, self.build_id, status)
+        raise RowNotInBuildError(table.name, row_id, self.project, self.build_id)
+
+    async def update(self, table: sa.Table, row_id: uuid.UUID, /, **values: Any) -> None:
+        """Mutate one scoped row (resolution: statuses, re-pointed endpoints,
+        re-minted signatures/hashes — DESIGN §7/§17).
+
+        Scope columns can never be changed (a "move this row to another
+        build" is a cross-build write in disguise); the row must be in THIS
+        writer's scope and the build still ``building`` — both enforced
+        inside the statement itself, like :meth:`insert`.
+        """
+        forbidden = set(values) & set(self._scope_columns(table))
+        if forbidden:
+            raise ValueError(
+                f"scope columns {sorted(forbidden)} cannot be updated — "
+                "re-scoping a row is a cross-build write"
+            )
+        statement = table.update().where(*self._scoped_where(table, row_id)).values(**values)
+        if (await self._execute(statement)).rowcount == 0:
+            await self._raise_zero_rows(table, row_id)
+
+    async def delete(self, table: sa.Table, row_id: uuid.UUID, /) -> None:
+        """Delete one scoped row — exists ONLY for resolution's true-duplicate
+        evidence case (§27.4 dedup: after a merge re-mints a signature, an
+        evidence row whose re-hash collides with an already-stored twin is an
+        exact duplicate; its twin carries the identical provenance). Same
+        atomic scope + building guard as :meth:`update`.
+        """
+        statement = table.delete().where(*self._scoped_where(table, row_id))
+        if (await self._execute(statement)).rowcount == 0:
+            await self._raise_zero_rows(table, row_id)
+
+    async def repoint_mentions(self, from_entity: uuid.UUID, to_entity: uuid.UUID) -> int:
+        """Re-point a merged entity's mentions onto the canonical (§7).
+
+        Both endpoints must be entities of THIS build (validated inside the
+        statement — a mention must never come to reference another build's
+        entity) and the build still ``building``. Zero rows is legitimate
+        (the loser may have no mentions), so the scope precondition is
+        checked EXPLICITLY first rather than inferred from rowcount.
+        """
+        for entity_id in (from_entity, to_entity):
+            in_scope = (
+                await self._execute(
+                    sa.select(tables.entities.c.id).where(
+                        tables.entities.c.id == entity_id,
+                        tables.entities.c.project == self.project,
+                        tables.entities.c.build_id == self.build_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if in_scope is None:
+                raise MentionTargetNotInBuildError(self.project, self.build_id, entity_id)
+        guard = (
+            sa.select(tables.builds.c.id)
+            .where(
+                tables.builds.c.id == self.build_id,
+                tables.builds.c.project == self.project,
+                tables.builds.c.status == "building",
+            )
+            .with_for_update(read=True)
+        )
+        statement = (
+            tables.entity_mentions.update()
+            .where(tables.entity_mentions.c.entity_id == from_entity, sa.exists(guard))
+            .values(entity_id=to_entity)
+        )
+        result = await self._execute(statement)
+        count = int(result.rowcount or 0)
+        if count == 0:
+            # no mentions moved — either genuinely none, or the build stopped
+            # being writable mid-flight; tell those apart before returning
+            status: str | None = (
+                await self._execute(
+                    sa.select(tables.builds.c.status).where(
+                        tables.builds.c.id == self.build_id,
+                        tables.builds.c.project == self.project,
+                    )
+                )
+            ).scalar_one_or_none()
+            if status != "building":
+                raise BuildNotWritableError(self.project, self.build_id, status)
+        return count

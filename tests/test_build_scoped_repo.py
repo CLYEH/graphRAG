@@ -289,3 +289,76 @@ def test_no_active_build_error_is_typed_and_carries_the_project() -> None:
     err = NoActiveBuildError("p1")
     assert err.project == "p1"
     assert isinstance(err, LookupError)
+
+
+# --- C4 mutation surface (update/delete/repoint) — SQL shape + guards --------
+
+
+class _MutConn:
+    """Fake conn for the mutation happy/zero-rows paths (no SQL executed)."""
+
+    def __init__(self, rowcount: int, build_status: str | None = "building") -> None:
+        self._rowcount = rowcount
+        self._status = build_status
+        self.statements: list[object] = []
+
+    async def execute(self, statement: object) -> _MutConn:
+        self.statements.append(statement)
+        return self
+
+    @property
+    def rowcount(self) -> int:
+        return self._rowcount
+
+    def scalar_one_or_none(self) -> str | None:
+        return self._status
+
+
+def _mut_writer(conn: _MutConn) -> BuildScopedWriter:
+    return BuildScopedWriter(
+        cast(AsyncConnection, conn), "p1", _BUILD, _token=repo_module._CONSTRUCTION_TOKEN
+    )
+
+
+def test_update_injects_scope_and_building_guard_in_the_statement() -> None:
+    """The mutation carries the SAME per-statement invariant as insert: the
+    row's full scope AND the building-status EXISTS/FOR SHARE guard live in
+    the UPDATE itself — not in a separate check that could race (TOCTOU)."""
+    row_id = uuid.uuid4()
+    where = _writer()._scoped_where(tables.entities, row_id)
+    statement = tables.entities.update().where(*where).values(status="merged")
+    pg_dialect = sa.engine.url.make_url("postgresql+asyncpg://").get_dialect()()
+    sql = str(statement.compile(dialect=pg_dialect))
+    assert "entities.id = " in sql and "entities.build_id = " in sql
+    assert "entities.project = " in sql
+    assert "EXISTS" in sql and "builds" in sql and "FOR SHARE" in sql
+
+
+async def test_update_refuses_scope_columns_and_names_the_zero_rows_cause() -> None:
+    """Scope columns are unupdatable (a re-scope is a cross-build write in
+    disguise); zero rows while the build is still building is the OTHER
+    cause — a foreign/unknown row — and gets the typed cross-scope error."""
+    with pytest.raises(ValueError, match="scope columns"):
+        await _mut_writer(_MutConn(1)).update(tables.entities, uuid.uuid4(), build_id=uuid.uuid4())
+
+    await _mut_writer(_MutConn(1)).update(tables.entities, uuid.uuid4(), status="merged")  # ok
+
+    with pytest.raises(repo_module.RowNotInBuildError):
+        await _mut_writer(_MutConn(0, "building")).update(
+            tables.entities, uuid.uuid4(), status="merged"
+        )
+    with pytest.raises(repo_module.BuildNotWritableError):
+        await _mut_writer(_MutConn(0, "active")).update(
+            tables.entities, uuid.uuid4(), status="merged"
+        )
+
+
+async def test_delete_uses_the_same_guarded_shape() -> None:
+    """delete exists only for §27.4 true-duplicate evidence; it must be
+    exactly as fenced as update — scoped row + building guard, typed on
+    zero rows."""
+    await _mut_writer(_MutConn(1)).delete(tables.relation_evidence, uuid.uuid4())  # ok
+    with pytest.raises(repo_module.RowNotInBuildError):
+        await _mut_writer(_MutConn(0, "building")).delete(tables.relation_evidence, uuid.uuid4())
+    with pytest.raises(repo_module.BuildNotWritableError):
+        await _mut_writer(_MutConn(0, "failed")).delete(tables.relation_evidence, uuid.uuid4())
