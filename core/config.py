@@ -6,7 +6,7 @@ on typed settings rather than reading os.environ directly. See DESIGN.md §3.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,10 +24,17 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     redis_url: str = "redis://localhost:6379/0"
 
-    # LLM (default provider: OpenAI — DESIGN.md §3, DR-005)
+    # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-nano"
     embedding_model: str = Field(default="text-embedding-3-large")
+    # .env keeps the conventional unprefixed name (see .env.example); the
+    # GRAPHRAG_-prefixed alias also works. Read here so no other module ever
+    # touches os.environ for it (CLAUDE.md guardrail).
+    openai_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("OPENAI_API_KEY", "GRAPHRAG_OPENAI_API_KEY"),
+    )
 
 
 def get_settings() -> Settings:

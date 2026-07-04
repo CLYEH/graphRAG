@@ -121,7 +121,7 @@ pipeline_step_items(id uuid pk, step_id uuid, item_kind text, item_ref text,  --
 每次 build 開 `builds` + `pipeline_runs`；每步 `pipeline_steps`；失敗/跳過項記 `pipeline_step_items`。以 `config_hash`+`source_hash`+`content_hash` 判斷可跳過/只重跑失敗項（冪等）。build 完成且 eval 通過 → `ready` →（activate）→ `active`（§14）。
 
 ## 6. 混合 Schema / Ontology
-每專案 config 定核心 schema。結構化資料規則對映（規則 → entities/mentions/relations/evidence，決定性）；文件用 PropertyGraph 受 schema 引導抽取，允許 LLM 提議新型別 → 待審池，Console 決定採納（🔧 `ontology.proposal_policy: auto|review`）。**mentions 由抽取階段產生**（每個出現的 surface_form/來源只有抽取看得到）；§7 的 resolve 是將既有 mentions 重新指向合併後的 canonical，非另行建立。
+每專案 config 定核心 schema。結構化資料規則對映（規則 → entities/mentions/relations/evidence，決定性）；文件用 PropertyGraph 受 schema 引導抽取，允許 LLM 提議新型別 → 待審池，Console 決定採納（🔧 `ontology.proposal_policy: auto|review`）。**mentions 由抽取階段產生**（每個出現的 surface_form/來源只有抽取看得到）；§7 的 resolve 是將既有 mentions 重新指向合併後的 canonical，非另行建立。文件抽取走 §3 的 LlamaIndex `LLM` 抽象 + **自訂 span-capturing prompt/parse，不用現成 PropertyGraphIndex 抽取器**——§27.4 要求 chunk 證據帶逐字 quote + start/end offsets，現成 triplet 抽取器不產 span,無法滿足凍結的溯源最低要求。
 
 ## 7. 實體解析
 `blocking(type+正規化名) → similarity(字串+embedding 加權) → 高信心自動合併 / 中信心產 merge_candidate / 低信心不合併 → 寫 entities(canonical, entity_key) + entity_mentions`。canonical_id 為三庫共用鍵；`entity_key` 為跨 build 穩定身分。resolve 時先套 `review_ledger`（§17）。🟡 門檻 `auto_merge_threshold`/`review_threshold`。
