@@ -43,7 +43,7 @@ Keep items small enough to finish in one loop.
 - [x] C1d Qdrant adapter + projection repo (build_id payload filter)
 - [x] C2 Ingest (structured + document connectors) + clean/chunking
 - [x] C3a Graph build — structured rule-mapping extraction → entities/mentions/relations/evidence (deterministic, no LLM)
-- [ ] C3b Graph build — LLM document/PropertyGraph extraction (schema-guided) + LLM abstraction layer (DR-005)
+- [x] C3b Graph build — LLM document extraction (schema-guided, §27.4 quote-span evidence) + LLM factory (§3: LlamaIndex 抽象)
 - [ ] C3c Ontology proposal pool (LLM-proposed new types + `ontology.proposal_policy`)
 - [ ] C4 Entity resolution + apply `review_ledger`
 - [ ] C5 Index: embeddings → Qdrant; project entities/relations → Neo4j

@@ -62,6 +62,30 @@ class RelationRule:
 
 
 @dataclass(frozen=True)
+class TextOntology:
+    """The schema that GUIDES document extraction (§6: 受 schema 引導抽取).
+
+    Entity/relation types the LLM is allowed to emit. Types outside this
+    vocabulary are not written — they are held out as proposals for the §6
+    待審池 (storage lands with the proposal-pool slice); silently accepting
+    them would let one hallucinated type mint arbitrary graph vocabulary.
+    """
+
+    entity_types: tuple[str, ...]
+    relation_types: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.entity_types:
+            raise ValueError("TextOntology defines no entity types")
+        if not self.relation_types:
+            raise ValueError("TextOntology defines no relation types")
+        for label, values in (("entity", self.entity_types), ("relation", self.relation_types)):
+            for value in values:
+                if not value.strip():
+                    raise ValueError(f"TextOntology {label} types must be non-empty")
+
+
+@dataclass(frozen=True)
 class StructuredMapping:
     """How one source ``table`` maps to entities + relations (§6)."""
 

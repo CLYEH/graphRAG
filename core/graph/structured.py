@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from core.graph.ontology import StructuredMapping
+from core.graph.state import BuildGraphState
 from core.observability.spec import ItemOutcome
 from core.resolve import fingerprints
 from core.stores import tables
@@ -73,29 +74,6 @@ class GraphExtractReport:
     outcomes: tuple[ItemOutcome, ...]
 
 
-class _BuildState:
-    """In-memory image of the build's graph, seeded from what's already stored
-    so a re-run reuses rows instead of duplicating them (§5). Every key is a
-    frozen fingerprint, matching a DB unique index — the DB is the backstop,
-    this is the fast path that also hands back the reusable row ids."""
-
-    def __init__(self) -> None:
-        self.entity_id_by_key: dict[str, uuid.UUID] = {}
-        self.relation_id_by_sig: dict[str, uuid.UUID] = {}
-        self.evidence_hashes: set[str] = set()
-        self.mention_refs: set[tuple[uuid.UUID, str]] = set()
-
-    async def preload(self, writer: BuildScopedWriter) -> None:
-        for row in await writer.fetch_all(tables.entities):
-            self.entity_id_by_key[row.entity_key] = row.id
-        for row in await writer.fetch_all(tables.relations):
-            if row.relation_signature is not None:
-                self.relation_id_by_sig[row.relation_signature] = row.id
-        for row in await writer.fetch_all(tables.relation_evidence):
-            self.evidence_hashes.add(row.evidence_hash)
-        self.mention_refs |= await writer.mention_refs()
-
-
 async def extract_structured(
     writer: BuildScopedWriter, mappings: Mapping[str, StructuredMapping]
 ) -> GraphExtractReport:
@@ -121,7 +99,7 @@ async def extract_structured(
                 "the table names the §27.2 citation; a mismatch would cite rows "
                 "under the wrong table"
             )
-    state = _BuildState()
+    state = BuildGraphState()
     await state.preload(writer)
     counts = {"entities": 0, "relations": 0, "mentions": 0, "evidence": 0}
     outcomes: list[ItemOutcome] = []
@@ -179,7 +157,7 @@ async def _extract_row(
     mapping: StructuredMapping,
     fields: dict[str, object],
     source_ref: str,
-    state: _BuildState,
+    state: BuildGraphState,
     counts: dict[str, int],
 ) -> bool:
     """Map one row to graph elements. Returns True if it produced any entity."""
