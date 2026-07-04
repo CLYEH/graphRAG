@@ -140,6 +140,18 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      join/dedup key derived from the untrusted input uses the STORE'S own
      identity function (the frozen fingerprint), never a re-implementation
      or an exact-match shortcut — checker and consumer, one identity.
+   - **State × verdict matrix (total, re-run after every fix)**: when the
+     diff introduces or consumes a state vocabulary (row statuses, review
+     verdicts), build the full cross-product table and verify EVERY cell has
+     a deliberate outcome — and REBUILD it after each fix in a review round,
+     because fixes add states/transitions of their own. (C4: five Codex
+     rounds; round 4 introduced `needs_review` and round 5 found approve had
+     no exit for it — one round after the "re-walk every state branch" rule
+     was written down in the PR itself. A noted lesson is not a prevention;
+     the table is.) Composed identity keys are part of this: a key that
+     embeds a disambiguator ASSERTS distinctness — consumers must honor what
+     the composition asserts, not merely use the key for equality (C4 round
+     1: two id-bearing namesakes auto-merged at score 1.0).
    - **Handoff completeness (every branch forwards what the consumer needs)**:
      when a step returns a subset for a downstream consumer, trace that need
      through EVERY branch — especially the skip/no-op branch that "did
