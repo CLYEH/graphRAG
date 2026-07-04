@@ -179,7 +179,7 @@ async def test_upserts_stamp_the_bound_scope_into_the_payload() -> None:
         canonical_id="e-1",
         point_type="entity",
         text="Alice",
-        entity_id="e-1",
+        source_id="e-1",
     )
     (_, kwargs) = client.calls[-1]
     (struct,) = kwargs["points"]
@@ -189,6 +189,47 @@ async def test_upserts_stamp_the_bound_scope_into_the_payload() -> None:
     assert struct.payload["canonical_id"] == "e-1"
     assert struct.payload["type"] == "entity"
     assert kwargs["wait"] is True  # §5 read-after-write for skip/rerun decisions
+
+
+async def test_the_source_key_is_derived_from_the_point_type() -> None:
+    """§4 keys the source by point type (`chunk_id|entity_id` — exactly one),
+    and §27.2 needs that id to map a hit back to its source ref. The caller
+    passes ONE source_id and the key is derived, so a point with no source,
+    both sources, or a type/key mismatch is UNREPRESENTABLE — the cross-field
+    contradiction species (selector × gated-field) closed by construction."""
+    client = _FakeClient()
+    projector = _projector(client)
+    await projector.upsert_point(
+        uuid.uuid4(), [0.1], canonical_id="c-1", point_type="chunk", text="t", source_id="c-1"
+    )
+    await projector.upsert_point(
+        uuid.uuid4(), [0.1], canonical_id="e-1", point_type="entity", text="t", source_id="e-1"
+    )
+    (_, chunk_kwargs), (_, entity_kwargs) = client.calls
+    (chunk_point,) = chunk_kwargs["points"]
+    (entity_point,) = entity_kwargs["points"]
+    assert chunk_point.payload["chunk_id"] == "c-1"
+    assert "entity_id" not in chunk_point.payload  # exactly one key, per §4
+    assert entity_point.payload["entity_id"] == "e-1"
+    assert "chunk_id" not in entity_point.payload
+
+
+async def test_unknown_point_types_are_rejected_on_every_path() -> None:
+    """The §4 vocabulary is chunk|entity. Persisted, an unknown type is
+    unmappable to a §27.2 source ref; filtered on, it silently matches
+    nothing (false-empty). Both paths refuse loudly, before any Qdrant call."""
+    client = _FakeClient()
+    projector = _projector(client)
+    with pytest.raises(ValueError, match="unknown point type"):
+        await projector.upsert_point(
+            uuid.uuid4(), [0.1], canonical_id="x", point_type="relation", text="t", source_id="x"
+        )
+    repo = _repo(client)
+    with pytest.raises(ValueError, match="unknown point type"):
+        await repo.search([0.1], limit=1, point_type="relation")
+    with pytest.raises(ValueError, match="unknown point type"):
+        await repo.point_count("relation")
+    assert client.calls == []  # all three refused before touching the store
 
 
 async def test_every_write_revalidates_the_building_status_first() -> None:
@@ -202,7 +243,7 @@ async def test_every_write_revalidates_the_building_status_first() -> None:
     stale = _projector(client, status="active")
     with pytest.raises(BuildNotWritableError) as excinfo:
         await stale.upsert_point(
-            uuid.uuid4(), [0.1], canonical_id="c", point_type="chunk", text="t"
+            uuid.uuid4(), [0.1], canonical_id="c", point_type="chunk", text="t", source_id="c"
         )
     assert excinfo.value.status == "active"
     with pytest.raises(BuildNotWritableError):

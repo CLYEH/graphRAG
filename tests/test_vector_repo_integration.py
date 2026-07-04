@@ -102,7 +102,7 @@ async def test_reader_sees_only_the_active_builds_points(
                     canonical_id=f"c-{marker}",
                     point_type="chunk",
                     text=marker,
-                    chunk_id=f"c-{marker}",
+                    source_id=f"c-{marker}",
                 )
                 await conn.commit()  # release the FOR SHARE before the next bind
 
@@ -163,7 +163,12 @@ async def test_upsert_after_activation_is_refused_typed(qdrant: AsyncQdrantClien
             )
             await projector.ensure_collection(_DIMS)
             await projector.upsert_point(
-                uuid.uuid4(), [1.0, 0.0, 0.0, 0.0], canonical_id="ok", point_type="chunk", text="ok"
+                uuid.uuid4(),
+                [1.0, 0.0, 0.0, 0.0],
+                canonical_id="ok",
+                point_type="chunk",
+                text="ok",
+                source_id="ok",
             )
             await conn.commit()  # release the share lock so activation can run
 
@@ -180,6 +185,7 @@ async def test_upsert_after_activation_is_refused_typed(qdrant: AsyncQdrantClien
                     canonical_id="late",
                     point_type="chunk",
                     text="late",
+                    source_id="late",
                 )
             assert excinfo.value.status == "active"
             # collection creation is a write too (it freezes the vector schema)
@@ -212,7 +218,12 @@ async def test_inflight_upserts_and_activation_are_mutually_exclusive(
             )
             await projector.ensure_collection(_DIMS)
             await projector.upsert_point(
-                uuid.uuid4(), [1.0, 0.0, 0.0, 0.0], canonical_id="w", point_type="chunk", text="w"
+                uuid.uuid4(),
+                [1.0, 0.0, 0.0, 0.0],
+                canonical_id="w",
+                point_type="chunk",
+                text="w",
+                source_id="w",
             )
             # projection txn open on Postgres -> share lock held -> activation blocks
             async with engine.connect() as activator:
@@ -234,6 +245,7 @@ async def test_inflight_upserts_and_activation_are_mutually_exclusive(
                     canonical_id="late",
                     point_type="chunk",
                     text="late",
+                    source_id="late",
                 )
             await conn.rollback()
     finally:

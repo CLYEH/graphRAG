@@ -44,7 +44,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from typing import Any
+from typing import Any, Final
 
 import sqlalchemy as sa
 from qdrant_client import AsyncQdrantClient, models
@@ -80,6 +80,26 @@ def collection_for(project: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", project)[:32]
     digest = hashlib.sha256(project.encode("utf-8")).hexdigest()[:32]
     return f"project_{safe}_{digest}"
+
+
+#: §4: a point is sourced from EXACTLY one of chunk|entity, and which one is
+#: determined by the point type — §27.2's source_refs minimums need that id
+#: to map a retrieval hit back to its source, so a point stored with the
+#: wrong key (or none) would be unmappable at query time.
+_POINT_SOURCE_KEYS: Final = {"chunk": "chunk_id", "entity": "entity_id"}
+
+
+def _source_key(point_type: str) -> str:
+    """The §4 payload key for this point type; unknown types are rejected
+    loudly on BOTH paths — persisted, an unknown type is unmappable to a
+    source ref; filtered on, it silently matches nothing (a false-empty)."""
+    try:
+        return _POINT_SOURCE_KEYS[point_type]
+    except KeyError:
+        raise ValueError(
+            f"unknown point type {point_type!r} — §4 defines chunk|entity points "
+            f"(allowed: {sorted(_POINT_SOURCE_KEYS)})"
+        ) from None
 
 
 #: Module-private construction token — factories are the only sanctioned
@@ -152,9 +172,13 @@ class BuildScopedVectorRepo:
 
     def _scope_filter(self, point_type: str | None = None) -> models.Filter:
         """The ONLY filter this layer ever sends: scope in a top-level `must`
-        (ANDed — additional typed conditions can only narrow, never escape)."""
+        (ANDed — additional typed conditions can only narrow, never escape).
+        A typed narrowing is validated against the §4 vocabulary here, the
+        choke point both readers pass through — filtering on a typo'd type
+        would silently match nothing (a false-empty, not an error)."""
         must = self._scope_conditions()
         if point_type is not None:
+            _source_key(point_type)  # vocabulary check only
             must.append(
                 models.FieldCondition(key="type", match=models.MatchValue(value=point_type))
             )
@@ -286,8 +310,7 @@ class BuildScopedVectorProjector(BuildScopedVectorRepo):
         canonical_id: str,
         point_type: str,
         text: str,
-        chunk_id: str | None = None,
-        entity_id: str | None = None,
+        source_id: str,
     ) -> None:
         """Upsert one point with the §4 payload, scope injected.
 
@@ -297,14 +320,21 @@ class BuildScopedVectorProjector(BuildScopedVectorRepo):
         entirely from these typed fields — there is no caller-supplied
         payload dict, so no way to hand in a foreign project/build_id at all;
         the scope keys are set by this module from the binding.
+
+        §4 keys the source by the point type (``chunk_id|entity_id`` — exactly
+        one), and §27.2 needs that id to map a retrieval hit back to its
+        source ref. So the caller passes ONE ``source_id`` and the payload key
+        is derived from ``point_type``: a point with no source id, both ids,
+        or a type/key mismatch is unrepresentable rather than validated after
+        the fact. Unknown point types are rejected before any Qdrant call.
         """
+        source_key = _source_key(point_type)
         await self._assert_building()
         payload: dict[str, Any] = {
             "canonical_id": canonical_id,
             "type": point_type,
             "text": text,
-            "chunk_id": chunk_id,
-            "entity_id": entity_id,
+            source_key: source_id,
             "project": self.project,
             "build_id": str(self.build_id),
         }
