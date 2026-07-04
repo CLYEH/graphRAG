@@ -23,6 +23,7 @@ from core.stores.repo import (
     PROJECT_AND_BUILD_SCOPED,
     BuildNotWritableError,
     BuildScopedRepo,
+    BuildScopedWriter,
     NoActiveBuildError,
     NotBuildScopedError,
 )
@@ -35,6 +36,12 @@ def _repo() -> BuildScopedRepo:
     # internal token is the documented test seam past the factory validation
     # (which needs live Postgres and is integration-tested)
     return BuildScopedRepo(
+        cast(AsyncConnection, object()), "p1", _BUILD, _token=repo_module._CONSTRUCTION_TOKEN
+    )
+
+
+def _writer() -> BuildScopedWriter:
+    return BuildScopedWriter(
         cast(AsyncConnection, object()), "p1", _BUILD, _token=repo_module._CONSTRUCTION_TOKEN
     )
 
@@ -108,6 +115,18 @@ def test_consumers_cannot_reach_the_connection_or_mutate_the_scope() -> None:
     # __slots__: no __dict__ to smuggle new state through either
     with pytest.raises(AttributeError):
         repo.escape_hatch = object()  # type: ignore[attr-defined]
+
+
+def test_active_bound_repos_cannot_insert() -> None:
+    """§27.1: the active build is an immutable live snapshot — the READ type
+    simply has no insert method, so 'this object can write' and 'this scope
+    is a verified building build' are the same fact, by type."""
+    assert not hasattr(_repo(), "insert")
+    assert hasattr(_writer(), "insert")
+    # and the writer inherits (never overrides) the read-side factory, whose
+    # return type is pinned to the read-only class — so even
+    # BuildScopedWriter.for_active_build(...) cannot mint an active-bound writer
+    assert "for_active_build" not in vars(BuildScopedWriter)
 
 
 def test_direct_construction_is_fenced_off() -> None:

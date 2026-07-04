@@ -20,6 +20,7 @@ from core.config import get_settings
 from core.stores.repo import (
     BuildNotWritableError,
     BuildScopedRepo,
+    BuildScopedWriter,
     NoActiveBuildError,
     active_build_id,
 )
@@ -113,7 +114,7 @@ async def test_pipeline_writes_land_in_the_bound_building_build(migrated: None) 
             active = await _insert_build(conn, project, "active")
             building = await _insert_build(conn, project, "building")
 
-            writer = await BuildScopedRepo.for_building_build(conn, project, building)
+            writer = await BuildScopedWriter.for_building_build(conn, project, building)
             await writer.insert(documents, source_uri="s3://new", content_hash="c-new")
 
             written = await writer.fetch_all(documents)
@@ -180,13 +181,13 @@ async def test_writer_binding_rejects_non_building_targets(migrated: None) -> No
             other_building = await _insert_build(conn, p2, "building")
 
             with pytest.raises(BuildNotWritableError) as excinfo:
-                await BuildScopedRepo.for_building_build(conn, p1, active)
+                await BuildScopedWriter.for_building_build(conn, p1, active)
             assert excinfo.value.status == "active"
             with pytest.raises(BuildNotWritableError) as cross:
-                await BuildScopedRepo.for_building_build(conn, p1, other_building)
+                await BuildScopedWriter.for_building_build(conn, p1, other_building)
             assert cross.value.status is None  # invisible outside its project
             with pytest.raises(BuildNotWritableError) as missing:
-                await BuildScopedRepo.for_building_build(conn, p1, uuid.uuid4())
+                await BuildScopedWriter.for_building_build(conn, p1, uuid.uuid4())
             assert missing.value.status is None
             await trans.rollback()
     finally:
