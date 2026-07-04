@@ -33,6 +33,34 @@ name="${repo##*/}"
 START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "watching PR #$PR on $repo since $START (interval ${INTERVAL}s, max $MAX_POLLS polls)"
 
+# Poke->watch race (H8): Codex often answers a poke within SECONDS, so a
+# quota-limits reply can land before this script's START and be invisible to
+# every created_at > START filter — the watch would poll a dead quota to
+# timeout. Bootstrap: look BACKWARD (absolute timestamps) for the latest
+# quota message; it GOVERNS unless something newer supersedes it — a +1
+# reaction, a bot review, or a newer human "@codex review" poke (after a
+# quota reset the next poke supersedes the stale message; if nobody poked
+# since it, waiting is pointless no matter how old it is).
+# gh's EMBEDDED --jq only (no standalone jq on the host); per-page maxes fold
+# through sort — ISO-8601 timestamps sort lexically
+boot_quota="$(gh api --paginate "repos/$repo/issues/$PR/comments" \
+  --jq "[.[]|select((.user.login|startswith(\"$BOT_PREFIX\")) and (.body|test(\"reached your Codex usage limits\";\"i\")))|.created_at]|max // empty" 2>/dev/null \
+  | grep -v '^null$' | sort | tail -n1)"
+if [ -n "$boot_quota" ]; then
+  boot_react="$(gh api --paginate "repos/$repo/issues/$PR/reactions" \
+    --jq "[.[]|select(.user.login==\"$BOT\" and .content==\"+1\")|.created_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
+  boot_review="$(gh api --paginate "repos/$repo/pulls/$PR/reviews" \
+    --jq "[.[]|select(.user.login|startswith(\"$BOT_PREFIX\"))|.submitted_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
+  boot_poke="$(gh api --paginate "repos/$repo/issues/$PR/comments" \
+    --jq "[.[]|select(((.user.login|startswith(\"$BOT_PREFIX\"))|not) and (.body|test(\"@codex review\")))|.created_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
+  if { [ -z "$boot_react" ] || [[ "$boot_quota" > "$boot_react" ]]; } \
+    && { [ -z "$boot_review" ] || [[ "$boot_quota" > "$boot_review" ]]; } \
+    && { [ -z "$boot_poke" ] || [[ "$boot_quota" > "$boot_poke" ]]; }; then
+    echo "RESULT: Codex is OUT OF QUOTA (limits message at $boot_quota supersedes every poke/review/+1) — stop waiting; re-poke '@codex review' after the quota window resets."
+    exit 30
+  fi
+fi
+
 for i in $(seq 1 "$MAX_POLLS"); do
   sleep "$INTERVAL"
   # --paginate everywhere: list endpoints return oldest-first pages of 30, so an
