@@ -63,6 +63,34 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
    - A deliberate gap needs a stated, distinguishing rationale ("no frozen text"
      must survive the exception-side rewrite test); a universal-sounding test
      must enumerate ALL instances or it is false-green (FAIL).
+7. **Guard & boundary sweep** (when the diff adds a security/scope guard, a
+   capability boundary, or validates a precondition — C1b burned 7 Codex rounds
+   on cells of this; the query/projection repos in C1c/C1d have the same shape):
+   - **Reject-surface completeness**: a guard that bans a dangerous construct
+     must enumerate EVERY sibling API that produces the same effect, at every
+     nesting depth — not just the one the reviewer named. (C1b: raw SQL escaped
+     the build scope via `text()` → `literal_column()` → nested inside
+     `or_`/`and_` → `op()`/`bool_op()` custom-operator strings — one guard,
+     three rounds even though round 4 already swept `text()`+`literal_column()`
+     together.) Seeing one banned constructor, grep the library surface for its
+     siblings and compose/nest them in a test.
+   - **No over-block (the dual)**: tightening a guard must not reject legitimate
+     inputs — a blanket ban is as wrong as a leaky one, and needs a POSITIVE
+     acceptance test beside the attack tests. (C1b round 6: a blanket `custom_op`
+     ban silently killed the JSONB `->>`/`@>`/`?` operators every core table
+     needs; caught only by a "safe operators still pass" test.) Attack-only tests
+     are false-green against over-block. Prefer gating on the value/string, not
+     the type (C1b: opstring vs the PG operator-char set, not "reject all
+     custom_op").
+   - **Bind-time check ≠ invariant (TOCTOU)**: a precondition validated at
+     construction/binding does not stay true for later operations if the
+     underlying state can change concurrently. Fold the recheck into the
+     mutating statement (atomic) or hold the right lock — and prove the
+     concurrent interleaving on live infra, not by reasoning. (C1b round 7: a
+     writer validated as `building` at bind time kept writing after activation;
+     fixed with `INSERT..SELECT..WHERE EXISTS(status='building' FOR SHARE)`. A
+     plain recheck still races an uncommitted change — MVCC readers don't block
+     writers.)
 
 ## Output (exactly this shape)
 ```
