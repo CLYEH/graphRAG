@@ -351,25 +351,35 @@ async def resolve_build(
             counts["pairs_suppressed"] += 1
             continue
         carried = verdict is not None and verdict.decision in ("merge", "approve")
-        if not carried and a.norm_name == b.norm_name:
-            # identical normalized (type, name) yet DIFFERENT entity_keys can
-            # only mean a disambiguator distinction (§27.3): the sources say
-            # these are namesakes, not one thing — scoring them 1.0 and
-            # auto-merging would destroy exactly what the external id
-            # protects. Only an explicit ledger merge may join them (and a
-            # candidate would re-spam review every build — DR-003 forbids).
-            counts["namesakes_skipped"] += 1
-            continue
-        if not carried and _has_disambiguator(a) and _has_disambiguator(b):
-            # both sides carry (necessarily different) external ids — the
-            # sources assert distinct identities, so similarity alone must
-            # not auto-merge them; the review band may still propose it.
+        a_id, b_id = _has_disambiguator(a), _has_disambiguator(b)
+        if not carried and a_id and b_id:
+            if a.norm_name == b.norm_name:
+                # identical normalized (type, name) with TWO different
+                # external ids: the sources explicitly assert namesakes
+                # (§27.3's disambiguator exists for exactly this). Scoring
+                # them 1.0 and auto-merging would destroy that distinction,
+                # and a candidate would re-spam review every build (DR-003).
+                # Only an explicit ledger merge may join them.
+                counts["namesakes_skipped"] += 1
+                continue
+            # both ids, different names: the sources assert distinct
+            # identities, so similarity alone must not auto-merge them; the
+            # review band may still propose a candidate for humans.
             if score < config.review_threshold:
                 continue
             score = min(score, config.auto_merge_threshold - 1e-9)
+        # one-sided ids never block: an id-less mention has asserted nothing,
+        # and joining it onto the id-bearing entity is exactly ER's job —
+        # blocking exact-name one-sided pairs was round 1's over-block.
         if carried or score >= config.auto_merge_threshold:
             canonical, loser = _pick_canonical(a, b)
-            await _apply_merge(writer, canonical, loser, key_of, counts, now)
+            if a_id != b_id:
+                # exactly one side carries an external id: that key is the
+                # stronger identity and the one future structured builds
+                # re-mint — it must SURVIVE the merge, whatever the mention
+                # counts say.
+                canonical, loser = (a, b) if a_id else (b, a)
+            await _apply_merge(writer, canonical, loser, key_of, ledger, counts, now)
             merged_away.add(loser.id)
             if carried:
                 counts["ledger_merged"] += 1
@@ -430,6 +440,7 @@ async def _apply_merge(
     canonical: _Entity,
     loser: _Entity,
     key_of: dict[uuid.UUID, str],
+    ledger: dict[tuple[str, str], list[LedgerEntry]],
     counts: dict[str, int],
     now: datetime,
 ) -> None:
@@ -490,14 +501,25 @@ async def _apply_merge(
             )
             counts["duplicate_edges_demoted"] += 1
             continue
-        await writer.update(
-            tables.relations,
-            relation.id,
-            src_entity_id=new_src,
-            dst_entity_id=new_dst,
-            relation_signature=new_signature,
-            updated_at=now,
-        )
+        values: dict[str, object] = {
+            "src_entity_id": new_src,
+            "dst_entity_id": new_dst,
+            "relation_signature": new_signature,
+            "updated_at": now,
+        }
+        # the ledger pass ran BEFORE merges, over pre-merge signatures — a
+        # decision keyed to THIS post-merge signature (minted in an earlier
+        # build's resolve) must be re-applied now, or a carried reject would
+        # sit active in the projection under the very signature it rejects
+        verdict = _decision(ledger, "relation", new_signature)
+        if verdict is not None and verdict.decision == "reject":
+            values["status"] = "rejected"
+            values["review_status"] = "rejected"
+            counts["relations_rejected"] += 1
+        elif verdict is not None and verdict.decision == "approve":
+            values["review_status"] = "approved"
+            counts["relations_approved"] += 1
+        await writer.update(tables.relations, relation.id, **values)
         if relation.relation_signature in signature_owner:
             del signature_owner[relation.relation_signature]
         signature_owner[new_signature] = relation.id

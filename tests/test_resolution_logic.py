@@ -345,3 +345,59 @@ async def test_manual_approve_resurrects_a_rejected_row() -> None:
     untouched = await _run(merged_store)
     assert untouched.entities_restored == 0
     assert {r["id"]: r for r in merged_store.rows[tables.entities]}[gone]["status"] == "merged"
+
+
+async def test_one_sided_exact_namesake_merges_toward_the_id_bearing_side() -> None:
+    """Round 2's over-block dual: an id-less text 'Alice' has asserted
+    NOTHING, so it must merge into the id-bearing structured 'Alice' (that
+    is ER's job) — and the ID side survives as canonical even with fewer
+    mentions, because its key is the stronger identity and the one future
+    structured builds re-mint."""
+    store = _FakeStore()
+    with_id = _seed(store, "Alice", etype="Person", disambiguator="hr-1", mentions=1)
+    _seed(store, "Alice", etype="Person", mentions=5)  # busier, but id-less
+    report = await _run(store)
+    assert report.auto_merged == 1 and report.namesakes_skipped == 0
+    by_id = {r["id"]: r for r in store.rows[tables.entities]}
+    assert by_id[with_id]["status"] == "active"  # the id side survived
+    assert all(m["entity_id"] == with_id for m in store.mentions)
+
+
+async def test_relation_ledger_reapplies_after_remint() -> None:
+    """A curator rejected canonical->X's signature in an earlier build; this
+    build extracted the relation against the pre-merge loser, so the initial
+    ledger pass could not see it. The re-mint must re-apply the decision —
+    otherwise the rejected signature sits ACTIVE in the projection."""
+    from core.resolve.fingerprints import relation_signature
+
+    store = _FakeStore()
+    keep = _seed(store, "Acme Corporation", mentions=3)
+    lose = _seed(store, "Acme Corporatio", mentions=1)
+    x = _seed(store, "Alice", etype="Person")
+    keep_key = entity_key("Company", "Acme Corporation")
+    lose_key = entity_key("Company", "Acme Corporatio")
+    alice_key = entity_key("Person", "Alice")
+    pre_merge_sig = relation_signature(alice_key, "WORKS_AT", lose_key)
+    post_merge_sig = relation_signature(alice_key, "WORKS_AT", keep_key)
+    rid = uuid.uuid4()
+    store.rows[tables.relations].append(
+        {
+            "id": rid,
+            "src_entity_id": x,
+            "dst_entity_id": lose,
+            "type": "WORKS_AT",
+            "relation_signature": pre_merge_sig,
+            "status": "active",
+            "review_status": "unreviewed",
+            "attributes": {},
+        }
+    )
+    store.ledger.append(_ledger_row("relation", post_merge_sig, "reject"))
+
+    report = await _run(store)
+    assert report.auto_merged == 1 and report.relations_reminted == 1
+    assert report.relations_rejected == 1  # the carried reject re-applied
+    row = {r["id"]: r for r in store.rows[tables.relations]}[rid]
+    assert row["relation_signature"] == post_merge_sig
+    assert row["status"] == "rejected" and row["review_status"] == "rejected"
+    assert keep  # canonical survived
