@@ -61,8 +61,10 @@ loop back to step 3.
      **Waiting is standardized:** run `bash scripts/watch-codex.sh <pr>` (background it) —
      it polls all three Codex channels (reactions / PR reviews / comments; a review-only
      "changes wanted" is invisible to the other two) and exits `0`=+1 approved,
-     `10`=new response to triage, `20`=timeout (poke `@codex review`). Don't hand-roll
-     one-off watchers.
+     `10`=new response to triage, `20`=timeout (poke `@codex review`), `30`=Codex is out
+     of review quota (its only fresh response is the usage-limits message) — stop waiting
+     and re-poke after the quota window resets instead of polling for nothing. Don't
+     hand-roll one-off watchers.
    - **Conversations resolved** — GitHub blocks merge (`required_conversation_resolution`)
      until every Codex thread is addressed and resolved (PR UI, or
      `gh api graphql` → `resolveReviewThread`).
