@@ -1,0 +1,426 @@
+"""Build-scoped repository over Postgres (DESIGN §27.1, DR-001/DR-006, C1b).
+
+The structural guarantee DR-006 promises: query/MCP/api layers never touch a
+raw store client, so they *cannot* forget a ``build_id`` filter and mix
+versions. This module is that structure for Postgres:
+
+- ``active_build_id`` — DR-001's single source of truth, one query against
+  ``builds.status='active'`` (the partial unique index guarantees at most one
+  row). No active build raises the typed ``NoActiveBuildError``, which the
+  API layer maps to the frozen ``NO_ACTIVE_BUILD`` error code (§15).
+- ``BuildScopedRepo`` — the READ capability: binds ``(project, build_id)``
+  once at construction (§27.1: read the active id once per request and cache
+  it — the bound repo IS that cache; no setters, so the scope cannot drift
+  mid-request) and injects the scope into every read. The repo EXECUTES
+  internally (:meth:`fetch_all`): consumers are never handed the raw
+  connection, because a repo that only built statements would force callers
+  to hold a connection to run them — making the DR-006 bypass the normal
+  path instead of a fenced-off one. The connection attribute is name-mangled
+  private; reaching it is a deliberate act, not a convenience.
+- ``BuildScopedWriter`` — the WRITE capability, a separate type: §27.1 writes
+  always target a ``building`` build, so :meth:`~BuildScopedWriter.insert`
+  exists ONLY on instances that came through the validating
+  :meth:`~BuildScopedWriter.for_building_build` factory. An active-bound repo
+  has no insert method to misuse — the live snapshot's immutability is a
+  property of the type, not a runtime flag.
+- The scope column map is explicit: tables that are deliberately NOT
+  build-scoped (``builds`` itself, ``review_ledger`` per DR-003, the
+  observability tables with their own §27.7 binding rules) and tables scoped
+  only transitively (``entity_mentions`` hang off entities, §4 gives them no
+  build_id) are rejected loudly — silently "scoping" them would fake the
+  guarantee this layer exists to give.
+
+The read/write surface is deliberately minimal (filtered fetch, scoped
+insert); C4/C6/BA3 extend it additively as their access patterns land.
+Neo4j/Qdrant projections get the same treatment in C1c/C1d (DR-004's
+``WHERE n.build_id`` / payload filter); this module is Postgres-only.
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import Sequence
+from typing import Any
+
+import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.sql import coercions, operators, roles, visitors
+
+from core.stores import tables
+
+#: §4 core tables carrying BOTH scope columns — reads filter and writes inject
+#: (project, build_id).
+PROJECT_AND_BUILD_SCOPED = (
+    tables.documents,
+    tables.entities,
+    tables.relations,
+    tables.community_reports,
+    tables.merge_candidates,
+)
+
+#: §4 core tables carrying only build_id (their project is derivable through
+#: the composite FK parent) — reads filter and writes inject build_id.
+BUILD_ONLY_SCOPED = (
+    tables.chunks,
+    tables.relation_evidence,
+)
+
+_SCOPE_COLUMNS: dict[sa.Table, tuple[str, ...]] = {
+    **{table: ("project", "build_id") for table in PROJECT_AND_BUILD_SCOPED},
+    **{table: ("build_id",) for table in BUILD_ONLY_SCOPED},
+}
+
+
+class NotBuildScopedError(TypeError):
+    """Raised when a table must not be silently build-scoped.
+
+    ``builds`` is the scope's source of truth, ``review_ledger`` is
+    deliberately cross-build (DR-003), the observability tables have their own
+    §27.7 binding rules, and ``entity_mentions`` are scoped transitively
+    through their entity (§4 gives them no build_id column). Pretending to
+    scope any of these would fake the DR-006 guarantee.
+    """
+
+
+class NoActiveBuildError(LookupError):
+    """No ``builds.status='active'`` row for the project (DR-001).
+
+    The API layer maps this to the frozen ``NO_ACTIVE_BUILD`` error code
+    (§15 / §27.2); core raises it typed instead of guessing a build.
+    """
+
+    def __init__(self, project: str) -> None:
+        super().__init__(f"no active build for project {project!r}")
+        self.project = project
+
+
+class BuildNotWritableError(LookupError):
+    """The requested write binding is not this project's ``building`` build.
+
+    §27.1: 寫入一律指定 building 的 build_id — every other status is an
+    immutable snapshot (writing into ``active`` would mutate live data;
+    another project's build would cross scopes). ``status`` is None when the
+    build id does not exist at all.
+    """
+
+    def __init__(self, project: str, build_id: uuid.UUID, status: str | None) -> None:
+        super().__init__(
+            f"build {build_id} is not a 'building' build of project {project!r} "
+            f"(found status: {status!r})"
+        )
+        self.project = project
+        self.build_id = build_id
+        self.status = status
+
+
+#: Module-private construction token: the factories below are the only
+#: sanctioned ways to bind a scope (the active build for reads, a VALIDATED
+#: building build for writes) — an unvalidated direct construction would
+#: reopen the bind-to-anything hole.
+_CONSTRUCTION_TOKEN = object()
+
+
+#: The characters a PostgreSQL operator name may contain (PG manual §4.1.3).
+#: SQLAlchemy renders dialect operators (JSONB ``->>``/``@>``/``?``, array
+#: ``&&`` …) as ``custom_op`` nodes whose opstring is drawn ENTIRELY from this
+#: set — and an opstring of only these characters cannot contain a space, a
+#: keyword (``OR``), a quote, or a ``)``, so it cannot restructure the boolean
+#: expression to escape the scope. An ``op("...")`` payload that could escape
+#: (``") OR true OR ("``, ``"= 'x' OR true"``) necessarily uses characters
+#: OUTSIDE this set, which is exactly what we reject.
+_PG_OPERATOR_CHARS = frozenset("+-*/<>=~!@#%^&|`?")
+
+
+def _is_unsafe_custom_op(candidate: object) -> bool:
+    """True if ``candidate`` is a ``custom_op`` with an unsafe opstring.
+
+    ``op()``/``bool_op()`` splice their operator string VERBATIM between the
+    operands. A symbol-only opstring is a genuine dialect operator and is safe
+    (see :data:`_PG_OPERATOR_CHARS`); anything with a letter, space, quote or
+    paren is attacker-controllable raw SQL and is rejected.
+    """
+    if not isinstance(candidate, operators.custom_op):
+        return False
+    return not (candidate.opstring and set(candidate.opstring) <= _PG_OPERATOR_CHARS)
+
+
+def _is_raw_sql_node(node: object) -> bool:
+    """True if ``node`` carries attacker-controllable SQL spliced VERBATIM.
+
+    Three sibling APIs splice a raw string with no parameterization and no
+    reliable parenthesization, so each can smuggle an ``OR`` / paren-closing
+    payload out of the ANDed scope:
+
+    - ``text()`` → :class:`TextClause`;
+    - ``literal_column()`` → a ``ColumnClause`` with ``is_literal=True``;
+    - ``op("<raw>")`` / ``bool_op("<raw>")`` → a ``custom_op`` (on a node's
+      ``operator`` or ``modifier``) whose opstring is NOT a pure operator
+      token — the safe dialect operators (``->>``, ``@>``, ``&&`` …) are
+      allowed so C4+ can filter JSONB/array columns (see
+      :func:`_is_unsafe_custom_op`).
+
+    (Plain ``column()`` and ``func.<name>`` are NOT here: SQLAlchemy quotes
+    those identifiers, so a payload lands inside quotes, contained.)
+    """
+    return (
+        isinstance(node, sa.TextClause)
+        or getattr(node, "is_literal", False)
+        or _is_unsafe_custom_op(getattr(node, "operator", None))
+        or _is_unsafe_custom_op(getattr(node, "modifier", None))
+    )
+
+
+def _reject_raw_sql(predicate: sa.ColumnExpressionArgument[bool]) -> None:
+    """Refuse any raw-SQL node in a caller predicate — even nested (DR-006).
+
+    SQLAlchemy splices raw SQL (``text()``/``literal_column()`` bodies, and
+    ``op()``/``bool_op()`` operator strings) into the WHERE conjunction
+    VERBATIM, so the scope's ANDed filters and the caller's predicate share
+    one flat boolean level. A raw ``OR`` (or a ``")...--"`` / ``") OR (..."``
+    payload that lexically closes an enclosing group) flips precedence and
+    reads outside the build scope — verified by compilation:
+
+        build_id = :b AND (documents.mime IS NOT NULL) OR (true ...)
+
+    A top-level check is not enough: ``sa.or_(sa.text(...), col == x)`` (or a
+    ``custom_op`` deeper in the tree) hides the raw node one level down, where
+    it still escapes. So coerce the predicate exactly as ``.where()`` will
+    (which also rejects a bare-string predicate — SQLAlchemy 2.x refuses to
+    auto-``text()`` it), then walk the whole expression tree
+    (``visitors.iterate``) and reject on the first raw node (see
+    :func:`_is_raw_sql_node`). Structural expressions (column comparisons,
+    ``sa.or_``/``sa.and_``, ``in_``/``like``/``between``) contain none of
+    these and self-group, so they pass and cannot widen the scope.
+    """
+    element = coercions.expect(roles.WhereHavingRole, predicate)
+    for node in visitors.iterate(element):
+        if _is_raw_sql_node(node):
+            raise TypeError(
+                "raw-SQL predicates are not accepted, even nested inside "
+                "or_/and_: text()/literal_column() bodies and op()/bool_op() "
+                "operator strings are spliced verbatim, so an OR (or a "
+                "grouping-closing ')...--' payload) inside would escape the "
+                "build scope; use structural expressions only (column "
+                "comparisons, sa.or_/sa.and_, in_/like/between)"
+            )
+
+
+async def active_build_id(conn: AsyncConnection, project: str) -> uuid.UUID:
+    """DR-001: the single-query active-build lookup (§27.1).
+
+    At most one row can match — ``one_active_build`` is a partial unique
+    index, so "the" active build is a database invariant, not a convention.
+    """
+    result = (
+        await conn.execute(
+            sa.select(tables.builds.c.id).where(
+                tables.builds.c.project == project,
+                tables.builds.c.status == "active",
+            )
+        )
+    ).scalar_one_or_none()
+    if result is None:
+        raise NoActiveBuildError(project)
+    build: uuid.UUID = result
+    return build
+
+
+class BuildScopedRepo:
+    """Read-only Postgres access bound to one ``(project, build_id)`` (DR-006).
+
+    Construct via :meth:`for_active_build` (the normal query/Console path).
+    The scope is read-only after construction, and execution happens inside
+    the repo — a consumer holding a repo holds no raw connection to escape
+    through, and no write method exists on this type (see
+    :class:`BuildScopedWriter`).
+    """
+
+    __slots__ = ("__conn", "__project", "__build_id")
+
+    def __init__(
+        self,
+        conn: AsyncConnection,
+        project: str,
+        build_id: uuid.UUID,
+        *,
+        _token: object = None,
+    ) -> None:
+        if _token is not _CONSTRUCTION_TOKEN:
+            raise TypeError(
+                "construct via BuildScopedRepo.for_active_build (reads) or "
+                "BuildScopedWriter.for_building_build (pipeline writes) — direct "
+                "construction would skip the scope validation those factories do"
+            )
+        # name-mangled: reaching the connection from outside is a deliberate
+        # bypass (visible in review), never an accident of convenience
+        self.__conn = conn
+        self.__project = project
+        self.__build_id = build_id
+
+    @property
+    def project(self) -> str:
+        return self.__project
+
+    @property
+    def build_id(self) -> uuid.UUID:
+        return self.__build_id
+
+    @classmethod
+    async def for_active_build(cls, conn: AsyncConnection, project: str) -> BuildScopedRepo:
+        """Bind to the project's active build (one lookup, then cached here).
+
+        Always returns the read-only type — pinned explicitly (not ``cls``)
+        so a subclass can never be tricked into an active-bound WRITER.
+        """
+        build = await active_build_id(conn, project)
+        return BuildScopedRepo(conn, project, build, _token=_CONSTRUCTION_TOKEN)
+
+    # -- scope plumbing (single-underscore: shared with the SQL-shape tests) --
+
+    def _scope_columns(self, table: sa.Table) -> tuple[str, ...]:
+        try:
+            return _SCOPE_COLUMNS[table]
+        except KeyError:
+            raise NotBuildScopedError(
+                f"table {table.name!r} is not directly build-scoped — "
+                "see core.stores.repo docstring for why it is excluded"
+            ) from None
+
+    def _scope_values(self, table: sa.Table) -> dict[str, Any]:
+        values: dict[str, Any] = {"build_id": self.__build_id}
+        if "project" in self._scope_columns(table):
+            values["project"] = self.__project
+        return values
+
+    def _select(self, table: sa.Table) -> sa.Select[Any]:
+        query = sa.select(table)
+        for column, value in self._scope_values(table).items():
+            query = query.where(table.c[column] == value)
+        return query
+
+    def _insert_values(self, table: sa.Table, values: dict[str, Any]) -> sa.Insert:
+        scope = self._scope_values(table)
+        conflicts = {
+            key: values[key] for key in scope.keys() & values.keys() if values[key] != scope[key]
+        }
+        if conflicts:
+            raise ValueError(
+                f"scope columns {sorted(conflicts)} conflict with this repo's binding "
+                f"(project={self.__project!r}, build_id={self.__build_id!r})"
+            )
+        payload = {**values, **scope}
+        # §27.1's "writes target a building build" must hold PER STATEMENT, not
+        # just at bind time: a build activated/failed after for_building_build
+        # validated it must not silently keep absorbing writes (TOCTOU). The
+        # status recheck is folded INTO the insert (INSERT .. SELECT .. WHERE
+        # EXISTS), so check and write are one atomic statement — and FOR SHARE
+        # on the builds row makes in-flight writes and the activation UPDATE
+        # mutually exclusive at the row-lock level (verified on live Postgres:
+        # activation blocks until the writing transaction ends, and a write
+        # after a committed activation inserts zero rows).
+        guard = (
+            sa.select(tables.builds.c.id)
+            .where(
+                tables.builds.c.id == self.__build_id,
+                tables.builds.c.project == self.__project,
+                tables.builds.c.status == "building",
+            )
+            .with_for_update(read=True)
+        )
+        row = sa.select(
+            *[
+                sa.bindparam(key, value, type_=table.c[key].type).label(key)
+                for key, value in payload.items()
+            ]
+        ).where(sa.exists(guard))
+        return table.insert().from_select(list(payload), row)
+
+    async def _execute(self, statement: sa.Executable) -> sa.CursorResult[Any]:
+        # the sole execution seam — defined here because the mangled __conn is
+        # unreachable from subclasses (that unreachability is the point)
+        return await self.__conn.execute(statement)
+
+    # -- the public, executing surface ----------------------------------------
+
+    async def fetch_all(
+        self, table: sa.Table, *where: sa.ColumnExpressionArgument[bool]
+    ) -> Sequence[sa.Row[Any]]:
+        """Read the scoped rows, optionally narrowed by caller predicates.
+
+        Predicates can only narrow — the scope filters are already in the
+        query and nothing the caller passes can remove them, PROVIDED no raw
+        SQL sneaks in (see :func:`_reject_raw_sql` for why raw text escapes
+        the scope and why the check must recurse into ``or_``/``and_``).
+        """
+        query = self._select(table)
+        for predicate in where:
+            _reject_raw_sql(predicate)
+            query = query.where(predicate)
+        return (await self._execute(query)).fetchall()
+
+
+class BuildScopedWriter(BuildScopedRepo):
+    """The pipeline write capability (§27.1: writes target a building build).
+
+    Exists ONLY via :meth:`for_building_build` — the validating factory is
+    the type's sole entry, so "this object can insert" and "this scope is a
+    verified building build of this project" are the same fact. Because that
+    fact can stop being true AFTER binding (the build activates, fails, or is
+    archived), every :meth:`insert` also revalidates it inside the statement
+    itself — the bind-time check is ergonomics (fail early, typed); the
+    per-statement guard is the invariant. Writers also read (their own build:
+    skip/rerun decisions need it).
+    """
+
+    __slots__ = ()
+
+    @classmethod
+    async def for_building_build(
+        cls, conn: AsyncConnection, project: str, build_id: uuid.UUID
+    ) -> BuildScopedWriter:
+        """Bind a pipeline writer to a VALIDATED ``building`` build (§27.1).
+
+        The id must name an existing build, of THIS project, in status
+        ``building`` — anything else (the active build, another project's
+        build, a finished snapshot, a typo'd id) raises the typed
+        ``BuildNotWritableError`` instead of silently landing writes where
+        they would mutate live data or cross scopes.
+        """
+        status = (
+            await conn.execute(
+                sa.select(tables.builds.c.status).where(
+                    tables.builds.c.id == build_id,
+                    tables.builds.c.project == project,
+                )
+            )
+        ).scalar_one_or_none()
+        if status != "building":
+            raise BuildNotWritableError(project, build_id, status)
+        return BuildScopedWriter(conn, project, build_id, _token=_CONSTRUCTION_TOKEN)
+
+    async def insert(self, table: sa.Table, /, **values: Any) -> None:
+        """Insert a row with the scope columns injected.
+
+        A caller-supplied conflicting scope value is a bug by definition —
+        rejected loudly rather than silently overwritten (either direction
+        would hide a cross-build write).
+
+        The bind-time validation is revalidated PER INSERT, inside the
+        statement itself (see ``_insert_values``): if the build stopped being
+        ``building`` after this writer was bound — activated to the live
+        snapshot, failed, archived — the insert lands zero rows and raises the
+        same typed ``BuildNotWritableError`` instead of silently mutating a
+        now-immutable build. §27.1's guarantee is per statement, not
+        per binding.
+        """
+        result = await self._execute(self._insert_values(table, values))
+        if result.rowcount == 0:
+            status: str | None = (
+                await self._execute(
+                    sa.select(tables.builds.c.status).where(
+                        tables.builds.c.id == self.build_id,
+                        tables.builds.c.project == self.project,
+                    )
+                )
+            ).scalar_one_or_none()
+            raise BuildNotWritableError(self.project, self.build_id, status)
