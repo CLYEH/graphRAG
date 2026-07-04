@@ -7,6 +7,7 @@ against the real partial-index-guarded builds table.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 
@@ -191,6 +192,99 @@ async def test_writer_binding_rejects_non_building_targets(migrated: None) -> No
                 await BuildScopedWriter.for_building_build(conn, p1, uuid.uuid4())
             assert missing.value.status is None
             await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_writes_after_activation_are_refused_typed(migrated: None) -> None:
+    """§27.1: the bind-time check alone is a TOCTOU — a writer bound while the
+    build was `building` must not keep writing after the build activates (that
+    would mutate the live snapshot the readers serve). The revalidation lives
+    INSIDE the insert statement, so the refusal is atomic with the write and
+    surfaces as the same typed error the factory raises."""
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as setup:
+            building = await _insert_build(setup, project, "building")
+            await setup.commit()  # visible to the second connection below
+        try:
+            async with engine.connect() as conn:
+                writer = await BuildScopedWriter.for_building_build(conn, project, building)
+                await writer.insert(documents, source_uri="s3://ok", content_hash="c1")
+                await conn.commit()
+
+                # the build graduates while the writer object is still alive
+                async with engine.connect() as other:
+                    await other.execute(
+                        builds.update().where(builds.c.id == building).values(status="active")
+                    )
+                    await other.commit()
+
+                with pytest.raises(BuildNotWritableError) as excinfo:
+                    await writer.insert(documents, source_uri="s3://late", content_hash="c2")
+                assert excinfo.value.status == "active"
+                await conn.rollback()
+
+            async with engine.connect() as check:
+                rows = (
+                    (
+                        await check.execute(
+                            sa.select(documents.c.source_uri).where(
+                                documents.c.build_id == building
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                assert rows == ["s3://ok"]  # the late write really landed nowhere
+        finally:
+            async with engine.connect() as cleanup:
+                await cleanup.execute(documents.delete().where(documents.c.project == project))
+                await cleanup.execute(builds.delete().where(builds.c.project == project))
+                await cleanup.commit()
+    finally:
+        await engine.dispose()
+
+
+async def test_inflight_writes_and_activation_are_mutually_exclusive(migrated: None) -> None:
+    """Why FOR SHARE and not a plain recheck: a recheck read races a not-yet-
+    committed activation (MVCC readers don't block writers). The insert's
+    FOR SHARE on the builds row CONFLICTS with the activation UPDATE's row
+    lock, so activation waits for the writing transaction to finish — the
+    guarantee is a lock, not a smaller window."""
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as setup:
+            building = await _insert_build(setup, project, "building")
+            await setup.commit()
+        try:
+            async with engine.connect() as conn, engine.connect() as activator:
+                writer = await BuildScopedWriter.for_building_build(conn, project, building)
+                await writer.insert(documents, source_uri="s3://w", content_hash="c1")
+                # write txn open -> share lock held -> activation must block
+                activation = asyncio.ensure_future(
+                    activator.execute(
+                        builds.update().where(builds.c.id == building).values(status="active")
+                    )
+                )
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(activation), timeout=1.0)
+                await conn.commit()  # release the lock; activation proceeds
+                await activation
+                await activator.commit()
+
+                # and once activation committed, further writes are refused
+                with pytest.raises(BuildNotWritableError):
+                    await writer.insert(documents, source_uri="s3://late", content_hash="c2")
+                await conn.rollback()
+        finally:
+            async with engine.connect() as cleanup:
+                await cleanup.execute(documents.delete().where(documents.c.project == project))
+                await cleanup.execute(builds.delete().where(builds.c.project == project))
+                await cleanup.commit()
     finally:
         await engine.dispose()
 

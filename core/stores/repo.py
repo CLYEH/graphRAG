@@ -308,7 +308,32 @@ class BuildScopedRepo:
                 f"scope columns {sorted(conflicts)} conflict with this repo's binding "
                 f"(project={self.__project!r}, build_id={self.__build_id!r})"
             )
-        return table.insert().values({**values, **scope})
+        payload = {**values, **scope}
+        # §27.1's "writes target a building build" must hold PER STATEMENT, not
+        # just at bind time: a build activated/failed after for_building_build
+        # validated it must not silently keep absorbing writes (TOCTOU). The
+        # status recheck is folded INTO the insert (INSERT .. SELECT .. WHERE
+        # EXISTS), so check and write are one atomic statement — and FOR SHARE
+        # on the builds row makes in-flight writes and the activation UPDATE
+        # mutually exclusive at the row-lock level (verified on live Postgres:
+        # activation blocks until the writing transaction ends, and a write
+        # after a committed activation inserts zero rows).
+        guard = (
+            sa.select(tables.builds.c.id)
+            .where(
+                tables.builds.c.id == self.__build_id,
+                tables.builds.c.project == self.__project,
+                tables.builds.c.status == "building",
+            )
+            .with_for_update(read=True)
+        )
+        row = sa.select(
+            *[
+                sa.bindparam(key, value, type_=table.c[key].type).label(key)
+                for key, value in payload.items()
+            ]
+        ).where(sa.exists(guard))
+        return table.insert().from_select(list(payload), row)
 
     async def _execute(self, statement: sa.Executable) -> sa.CursorResult[Any]:
         # the sole execution seam — defined here because the mangled __conn is
@@ -339,8 +364,12 @@ class BuildScopedWriter(BuildScopedRepo):
 
     Exists ONLY via :meth:`for_building_build` — the validating factory is
     the type's sole entry, so "this object can insert" and "this scope is a
-    verified building build of this project" are the same fact. Writers also
-    read (their own build: skip/rerun decisions need it).
+    verified building build of this project" are the same fact. Because that
+    fact can stop being true AFTER binding (the build activates, fails, or is
+    archived), every :meth:`insert` also revalidates it inside the statement
+    itself — the bind-time check is ergonomics (fail early, typed); the
+    per-statement guard is the invariant. Writers also read (their own build:
+    skip/rerun decisions need it).
     """
 
     __slots__ = ()
@@ -375,5 +404,23 @@ class BuildScopedWriter(BuildScopedRepo):
         A caller-supplied conflicting scope value is a bug by definition —
         rejected loudly rather than silently overwritten (either direction
         would hide a cross-build write).
+
+        The bind-time validation is revalidated PER INSERT, inside the
+        statement itself (see ``_insert_values``): if the build stopped being
+        ``building`` after this writer was bound — activated to the live
+        snapshot, failed, archived — the insert lands zero rows and raises the
+        same typed ``BuildNotWritableError`` instead of silently mutating a
+        now-immutable build. §27.1's guarantee is per statement, not
+        per binding.
         """
-        await self._execute(self._insert_values(table, values))
+        result = await self._execute(self._insert_values(table, values))
+        if result.rowcount == 0:
+            status: str | None = (
+                await self._execute(
+                    sa.select(tables.builds.c.status).where(
+                        tables.builds.c.id == self.build_id,
+                        tables.builds.c.project == self.project,
+                    )
+                )
+            ).scalar_one_or_none()
+            raise BuildNotWritableError(self.project, self.build_id, status)

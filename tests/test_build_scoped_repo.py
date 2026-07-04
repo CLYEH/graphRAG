@@ -90,6 +90,24 @@ def test_writes_inject_the_bound_scope() -> None:
     assert compiled.params["project"] == "p1"
 
 
+def test_writes_revalidate_the_building_status_inside_the_statement() -> None:
+    """§27.1's guarantee must hold PER STATEMENT, not per binding: a build
+    that stops being `building` after the writer was bound (activated, failed,
+    archived) must not keep absorbing writes. The status recheck is folded
+    INTO the insert (INSERT .. SELECT .. WHERE EXISTS) so check and write are
+    atomic, and FOR SHARE on the builds row makes in-flight writes and the
+    activation UPDATE mutually exclusive — a lock, not a race window (the
+    live blocking behavior is integration-tested)."""
+    insert = _repo()._insert_values(tables.documents, {"source_uri": "s3://d", "content_hash": "c"})
+    # compile with the real dialect the app runs on — the generic compiler
+    # renders every with_for_update flavor as FOR UPDATE, hiding the SHARE
+    pg_dialect = sa.engine.url.make_url("postgresql+asyncpg://").get_dialect()()
+    sql = str(insert.compile(dialect=pg_dialect))
+    assert "EXISTS" in sql
+    assert "builds.status" in sql
+    assert "FOR SHARE" in sql
+
+
 def test_conflicting_explicit_scope_is_a_loud_bug() -> None:
     """A caller passing a DIFFERENT build_id/project than the binding is a
     cross-build write either way it would be resolved — reject, don't pick."""
