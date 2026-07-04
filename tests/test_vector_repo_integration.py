@@ -182,6 +182,9 @@ async def test_upsert_after_activation_is_refused_typed(qdrant: AsyncQdrantClien
                     text="late",
                 )
             assert excinfo.value.status == "active"
+            # collection creation is a write too (it freezes the vector schema)
+            with pytest.raises(BuildNotWritableError):
+                await projector.ensure_collection(_DIMS)
             await conn.rollback()
 
             reader = await BuildScopedVectorRepo.for_active_build(conn, qdrant, project)

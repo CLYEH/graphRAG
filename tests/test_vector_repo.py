@@ -10,6 +10,7 @@ Execution against a live server is covered by the integration tests.
 from __future__ import annotations
 
 import inspect
+import re
 import uuid
 from typing import Any, cast
 
@@ -192,7 +193,11 @@ async def test_upserts_stamp_the_bound_scope_into_the_payload() -> None:
 
 async def test_every_write_revalidates_the_building_status_first() -> None:
     """§27.1 per write, not per binding (the cross-store TOCTOU): a build that
-    stopped being `building` refuses BEFORE any Qdrant call is made."""
+    stopped being `building` refuses BEFORE any Qdrant call is made — and
+    that covers ensure_collection too, because creation freezes the shared
+    collection's vector schema (a stale projector creating it with the wrong
+    size would break the next build's indexing); the write license expiring
+    stops ALL side effects, not just build-tagged payloads."""
     client = _FakeClient()
     stale = _projector(client, status="active")
     with pytest.raises(BuildNotWritableError) as excinfo:
@@ -200,6 +205,8 @@ async def test_every_write_revalidates_the_building_status_first() -> None:
             uuid.uuid4(), [0.1], canonical_id="c", point_type="chunk", text="t"
         )
     assert excinfo.value.status == "active"
+    with pytest.raises(BuildNotWritableError):
+        await stale.ensure_collection(4)
     assert client.calls == []  # refused before touching the vector store
 
 
@@ -234,8 +241,21 @@ def test_active_bound_repos_cannot_write() -> None:
     assert "for_active_build" not in vars(BuildScopedVectorProjector)
 
 
-def test_collections_are_per_project_and_prefixed() -> None:
-    """§4: one collection per project; the prefix keeps project collections
-    from colliding with anything else in the shared Qdrant instance."""
-    assert collection_for("acme") == "project_acme"
-    assert collection_for("a") != collection_for("b")
+def test_collection_names_are_derived_safe_and_collision_free() -> None:
+    """The project contract (P0) only requires a non-empty string, but Qdrant
+    collection names are URL-path identifiers — a raw mapping would make
+    contract-valid projects (slashes, '?', unicode, very long names)
+    unindexable. The derived name must be deterministic, restricted to safe
+    characters, bounded in length, and distinct even when sanitization would
+    collide two different projects."""
+    assert collection_for("acme") == collection_for("acme")  # deterministic
+    hostile = ["ab/c", "ab?c", "ab*c", "a" * 300, "專案", "a b"]
+    for project in hostile:
+        name = collection_for(project)
+        assert re.fullmatch(r"[A-Za-z0-9_-]+", name), project
+        assert len(name) <= 64, project
+    # sanitization alone would collide these — the content hash keeps them apart
+    assert collection_for("ab/c") != collection_for("ab_c")
+    assert collection_for("ab/c") != collection_for("ab?c")
+    # the readable prefix survives for debuggability
+    assert collection_for("acme").startswith("project_acme_")

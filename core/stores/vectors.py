@@ -41,6 +41,8 @@ otherwise. Deletion/pruning is C9's; richer search is C6a's.
 
 from __future__ import annotations
 
+import hashlib
+import re
 import uuid
 from typing import Any
 
@@ -59,9 +61,19 @@ def vector_client() -> AsyncQdrantClient:
 
 
 def collection_for(project: str) -> str:
-    """§4: one collection per project. The prefix keeps project collections
-    from colliding with anything else living in the shared Qdrant instance."""
-    return f"project_{project}"
+    """§4: one collection per project, as a DERIVED safe name.
+
+    The project contract (P0) only requires a non-empty string, but Qdrant
+    collection names are URL-path identifiers with their own character/length
+    restrictions — mapping the raw key would make some contract-valid
+    projects unindexable. So the name is derived deterministically: a
+    sanitized prefix keeps it human-readable, and the content-hash suffix
+    keeps two projects distinct even when sanitization (or truncation) would
+    collide them (e.g. ``ab/c`` vs ``ab_c``).
+    """
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", project)[:32]
+    digest = hashlib.sha256(project.encode("utf-8")).hexdigest()[:10]
+    return f"project_{safe}_{digest}"
 
 
 #: Module-private construction token — factories are the only sanctioned
@@ -239,11 +251,19 @@ class BuildScopedVectorProjector(BuildScopedVectorRepo):
     async def ensure_collection(self, vector_size: int) -> None:
         """Idempotently create the project's collection (§4: one per project).
 
+        Revalidated like every other projector write: creation is not
+        build-tagged data, but it FREEZES the shared collection's vector
+        schema — a stale projector (bound to a build that already activated
+        or failed) could otherwise create it with the wrong size and break
+        the next build's indexing. The write license expiring means ALL its
+        side effects stop, not just the payload-tagged ones.
+
         Cosine distance — the natural metric for the normalized OpenAI
         embeddings C5 stores (§3). Concurrent first-creation races surface as
         the client's conflict error; C5's orchestration serializes step
         startup, so that path stays fail-loud rather than silently retried.
         """
+        await self._assert_building()
         if not await self._client.collection_exists(self._collection):
             await self._client.create_collection(
                 self._collection,
