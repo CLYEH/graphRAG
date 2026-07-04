@@ -40,7 +40,7 @@ Keep items small enough to finish in one loop.
 - [x] C1a PG migrations for core tables (documents/chunks/entities/relations/evidence/reports/merge_candidates; `builds` landed with P2, `review_ledger` with P3, observability with P6)
 - [x] C1b **BuildScopedRepo** over Postgres (active-build lookup + build_id injection, DR-006)
 - [x] C1c Neo4j adapter + projection repo (build_id-filtered, DR-004)
-- [ ] C1d Qdrant adapter + projection repo (build_id payload filter)
+- [x] C1d Qdrant adapter + projection repo (build_id payload filter)
 - [ ] C2 Ingest (structured + document connectors) + clean/chunking
 - [ ] C3 Graph build (hybrid ontology extraction → entities/relations)
 - [ ] C4 Entity resolution + apply `review_ledger`
