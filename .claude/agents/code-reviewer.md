@@ -97,13 +97,27 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      class this checklist already named, missed because only the family
      pattern was transferred. Inventory explicitly: identifiers COMPOSED from
      contract strings (value-domain: can every contract-valid input be
-     served?); accepted vocabularies and (selector × gated-field) pairs
-     (exactly-one/at-least-one made unrepresentable, typos rejected on read
-     AND write paths); ids that map back to another store (type them as what
-     they are — a row id is a UUID, not a str); every side effect beyond
-     data writes (schema/metadata a write freezes — an expired write license
-     stops ALL of them, and a "no build-tagged data" style rationale must
-     survive naming the full effect set).
+     served?) — and when the identifier is a COMPOSITE (a `table + pk`
+     source ref, a compound key), validate EVERY member, not just the one
+     named (C2: `pk` was guarded missing/empty/dup while its sibling `table`
+     accepted blank — half a citation is uncitable); accepted vocabularies
+     and (selector × gated-field) pairs (exactly-one/at-least-one made
+     unrepresentable, typos rejected on read AND write paths); ids that map
+     back to another store (type them as what they are — a row id is a UUID,
+     not a str); every side effect beyond data writes (schema/metadata a
+     write freezes — an expired write license stops ALL of them, and a "no
+     build-tagged data" style rationale must survive naming the full effect
+     set).
+   - **Handoff completeness (every branch forwards what the consumer needs)**:
+     when a step returns a subset for a downstream consumer, trace that need
+     through EVERY branch — especially the skip/no-op branch that "did
+     nothing" this run but must still forward its item. Verifying the
+     consumer can handle what it receives is not the same as checking it
+     receives everything. (C2: `ingest_documents` dropped already-present
+     documents from the tuple `clean_document` consumes, so a crash-retry
+     re-ran ingest, skipped the committed doc, and stranded the build
+     unchunked — the idempotent clean step built for exactly that retry
+     never received it.)
    - **Name the threat model**: for any derived value that guards an
      invariant (hash suffixes, dedup keys, fingerprints), state whether it
      must resist ACCIDENTS or ADVERSARIES before judging its strength —
