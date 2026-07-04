@@ -18,10 +18,19 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 from core.graph.ontology import EntityRule, RelationRule, StructuredMapping
-from core.graph.structured import GraphExtractReport, extract_structured
+from core.graph.structured import GraphExtractReport, extract_structured, row_source_ref
 from core.resolve import fingerprints
 from core.stores import tables
 from core.stores.repo import BuildScopedWriter
+
+
+def test_row_source_ref_is_lossless_under_delimiter_collision() -> None:
+    """§27.2 cites table + pk. A naive 'table:pk' collides ('a:b','c') with
+    ('a','b:c'); mentions/evidence dedup by this ref, so a collision silently
+    drops the later row. Length-prefixing the table makes the pair unambiguous
+    and splittable back into the contract's separate fields."""
+    assert row_source_ref("a:b", "c") != row_source_ref("a", "b:c")
+    assert row_source_ref("people", "7") == "6:people:7"
 
 
 class _FakeWriter:
@@ -129,8 +138,9 @@ async def test_relation_and_evidence_carry_frozen_signatures() -> None:
     assert writer.relations[0]["relation_signature"] == sig
     assert writer.relations[0]["created_by"] == "rule"
     assert writer.evidence[0]["evidence_type"] == "row"
-    assert writer.evidence[0]["evidence_ref"] == "people:7"
-    assert writer.evidence[0]["evidence_hash"] == fingerprints.evidence_hash(sig, "people:7", None)
+    ref = row_source_ref("people", "7")
+    assert writer.evidence[0]["evidence_ref"] == ref
+    assert writer.evidence[0]["evidence_hash"] == fingerprints.evidence_hash(sig, ref, None)
 
 
 async def test_disambiguator_splits_namesakes() -> None:
@@ -221,4 +231,7 @@ async def test_one_relation_many_rows_gives_one_edge_many_evidence() -> None:
     report = await _extract(writer, _PERSON_COMPANY)
     assert report.relations == 1
     assert report.evidence == 2
-    assert {e["evidence_ref"] for e in writer.evidence} == {"people:1", "people:2"}
+    assert {e["evidence_ref"] for e in writer.evidence} == {
+        row_source_ref("people", "1"),
+        row_source_ref("people", "2"),
+    }

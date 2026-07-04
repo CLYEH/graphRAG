@@ -47,6 +47,21 @@ _CREATED_BY = "rule"
 _STRUCTURED_MIME = "application/json"
 
 
+def row_source_ref(table: str, pk: str) -> str:
+    """A LOSSLESS, splittable ``(table, pk)`` row ref (§27.2 cites table + pk).
+
+    The table is length-prefixed so a ``:`` inside ``table`` or ``pk`` cannot
+    collide two different pairs — ``("a:b", "c")`` and ``("a", "b:c")`` would
+    both be ``"a:b:c"`` under naive joining, silently dropping the later row's
+    mention/evidence (they dedup by this ref) — the same collision the
+    fingerprint ``_join`` avoids. C6/C8 split it back into the contract's
+    separate ``table`` and ``pk`` fields: read the integer up to the first
+    ``:``, take that many chars as ``table``, the remainder (past one ``:``)
+    is ``pk``.
+    """
+    return f"{len(table)}:{table}:{pk}"
+
+
 @dataclass(frozen=True)
 class GraphExtractReport:
     """The step result: rows written (new only) + the §18 item outcomes."""
@@ -120,7 +135,7 @@ async def extract_structured(
             outcomes.append(ItemOutcome("document", doc.content_hash, "failed"))
             continue
 
-        source_ref = f"{mapping.table}:{pk}"
+        source_ref = row_source_ref(mapping.table, pk)
         fields = parsed if isinstance(parsed, dict) else {}
         produced = await _extract_row(
             writer,

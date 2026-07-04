@@ -22,7 +22,7 @@ from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
 from core.graph.ontology import EntityRule, RelationRule, StructuredMapping
-from core.graph.structured import extract_structured
+from core.graph.structured import extract_structured, row_source_ref
 from core.ingest.connectors import DocumentPayload
 from core.ingest.documents import ingest_documents
 from core.resolve import fingerprints
@@ -115,7 +115,10 @@ async def test_structured_extraction_lands_scoped_graph(migrated: None) -> None:
                     sa.select(entity_mentions).where(entity_mentions.c.entity_id == acme.id)
                 )
             ).fetchall()
-            assert {m.source_ref for m in mention_rows} == {"people:1", "people:2"}
+            assert {m.source_ref for m in mention_rows} == {
+                row_source_ref("people", "1"),
+                row_source_ref("people", "2"),
+            }
 
             # two distinct WORKS_AT edges (Alice→Acme, Bob→Acme), each 1 evidence
             assert len(await writer.fetch_all(relations)) == 2
