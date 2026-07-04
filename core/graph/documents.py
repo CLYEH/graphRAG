@@ -190,7 +190,15 @@ async def extract_documents(
 
 
 def _parse_answer(text: str) -> dict[str, Any]:
-    """Strictly parse the model's JSON object (fenced answers unwrapped)."""
+    """Strictly parse the model's JSON object (fenced answers unwrapped).
+
+    Shape is validated HERE, inside the caller's failure boundary: a valid
+    JSON object whose ``entities``/``relations`` is not a list (``{"entities":
+    1}``) must count as a malformed answer for THAT document — if the wrong
+    shape leaked through, iterating it would raise outside the try and one
+    bad chunk would abort the whole extraction pass instead of §22's
+    fail-the-item-and-continue.
+    """
     body = text.strip()
     if body.startswith("```"):
         body = body.strip("`")
@@ -198,6 +206,10 @@ def _parse_answer(text: str) -> dict[str, Any]:
     parsed = json.loads(body)
     if not isinstance(parsed, dict):
         raise ValueError("model answer is not a JSON object")
+    for field in ("entities", "relations"):
+        value = parsed.get(field)
+        if value is not None and not isinstance(value, list):
+            raise ValueError(f"model answer field {field!r} is not a list")
     return parsed
 
 
@@ -227,6 +239,7 @@ async def _apply_chunk(
 
     for item in payload.get("entities") or []:
         if not isinstance(item, dict):
+            discarded.append(Discarded(ref, f"entity item is not an object: {item!r}"))
             continue
         etype = str(item.get("type") or "").strip()
         name = str(item.get("name") or "").strip()
@@ -269,6 +282,7 @@ async def _apply_chunk(
 
     for item in payload.get("relations") or []:
         if not isinstance(item, dict):
+            discarded.append(Discarded(ref, f"relation item is not an object: {item!r}"))
             continue
         rtype = str(item.get("type") or "").strip()
         quote = str(item.get("quote") or "")
