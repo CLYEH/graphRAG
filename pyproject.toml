@@ -14,6 +14,7 @@ dependencies = [
     "qdrant-client>=1.12",
     "llama-index-core>=0.14.23",
     "llama-index-llms-openai>=0.7.9",
+    "llama-index-embeddings-openai>=0.5.1",
 ]
 
 [project.scripts]

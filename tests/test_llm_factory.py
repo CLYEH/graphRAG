@@ -10,7 +10,7 @@ import pytest
 
 from core.config import Settings
 from core.llm import factory
-from core.llm.factory import LLMNotConfiguredError, chat_model
+from core.llm.factory import LLMNotConfiguredError, chat_model, embedding_model
 
 
 def _settings(**overrides: object) -> Settings:
@@ -50,3 +50,29 @@ def test_openai_is_built_from_settings_with_deterministic_temperature(
     llm = chat_model()
     assert llm.model == "gpt-x"  # type: ignore[attr-defined]
     assert llm.temperature == 0.0  # type: ignore[attr-defined]
+
+
+def test_embedding_missing_key_fails_at_wiring_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same wiring-time contract as chat_model: a missing key must fail when
+    the index step is wired, not on the first chunk's embedding call."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GRAPHRAG_OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(factory, "get_settings", lambda: _settings(**{"OPENAI_API_KEY": None}))
+    with pytest.raises(LLMNotConfiguredError, match="OPENAI_API_KEY"):
+        embedding_model()
+
+
+def test_embedding_is_built_from_settings_regardless_of_llm_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§3 names only OpenAI for embeddings — so the embedding model is built
+    from the 🔧 embedding_model setting and the key ALONE; a non-OpenAI
+    llm_provider (Claude for chat) must not block embeddings, which have no
+    non-OpenAI provider to switch to."""
+    monkeypatch.setattr(
+        factory,
+        "get_settings",
+        lambda: _settings(llm_provider="anthropic", embedding_model="text-embedding-3-small"),
+    )
+    embedder = embedding_model()
+    assert embedder.model_name == "text-embedding-3-small"

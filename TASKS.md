@@ -48,7 +48,7 @@ Keep items small enough to finish in one loop.
 - [x] C3b Graph build — LLM document extraction (schema-guided, §27.4 quote-span evidence) + LLM factory (§3: LlamaIndex 抽象)
 - [x] C3c Ontology proposal pool (LLM-proposed new types + `ontology.proposal_policy`)
 - [x] C4 Entity resolution + apply `review_ledger`
-- [ ] C5 Index: embeddings → Qdrant; project entities/relations → Neo4j
+- [x] C5 Index: embeddings → Qdrant; project entities/relations → Neo4j
 - [ ] C6a Retrieval: semantic (Qdrant kNN, §16 contract)
 - [ ] C6b Retrieval: sql (NLSQL + sqlglot guardrail per P5, §27.6)
 - [ ] C6c Retrieval: graph (parameterized Cypher templates + guardrail per P5, §27.6)
