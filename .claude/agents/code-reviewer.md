@@ -56,7 +56,12 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      parents expose matching UNIQUE FK targets; EVERY child FK has a supporting
      index (Postgres doesn't auto-index FKs).
    - **Conditional**: every (type, per-type required fields) pair is CHECKed
-     both directions (must-have AND must-not-have).
+     both directions (must-have AND must-not-have) — and write the IFF as an
+     EXPLICIT two-branch disjunction: `(cond) = (A AND B)` under-enforces the
+     false branch (one true conjunct satisfies NOT(A AND B) — C3c: anonymous
+     and timeless "decided" rows passed). Expand the corners (2^n) and prove
+     each rejected on live PG; a "both directions" test that only drives the
+     corners the weak form happens to reject is false-green.
    - **Emission path**: for each result_type, walk the frozen source_ref
      requirements back to stored columns — every required field must be
      derivable from NOT NULL data (denormalized where prune survival demands).
