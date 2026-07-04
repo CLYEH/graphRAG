@@ -118,6 +118,23 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      side effect beyond data writes (schema/metadata a write freezes — an
      expired write license stops ALL of them, and a "no build-tagged data"
      style rationale must survive naming the full effect set).
+   - **Untrusted-input value tree (sweep depth-first, once)**: when the diff
+     consumes structured output from an untrusted source (LLM answer,
+     external API), walk the ENTIRE value tree before first push — envelope
+     fields, array items, leaf scalars — and at EVERY leaf apply the full
+     domain checklist: {absent, wrong type, empty, BLANK (whitespace),
+     out-of-vocabulary, unlocatable reference}. C3b burned 5 Codex rounds
+     because the same tree was swept one level per round: wrong-typed
+     envelope escaped the failure boundary (r1), absent fields hid as
+     "found nothing" from retry-failed-only (r2), leaf scalars str()-coerced
+     Python reprs into canonical_names (r3), a whitespace-only quote minted
+     unauditable evidence past the DB's `<> ''` CHECK (r4). Two hard rules:
+     shape validation lives INSIDE the failure boundary (a wrong shape is a
+     failed item, not a crashed pass), and no `str()` coercion of
+     identity/evidence-bearing values — they must BE strings. And (r5) any
+     join/dedup key derived from the untrusted input uses the STORE'S own
+     identity function (the frozen fingerprint), never a re-implementation
+     or an exact-match shortcut — checker and consumer, one identity.
    - **Handoff completeness (every branch forwards what the consumer needs)**:
      when a step returns a subset for a downstream consumer, trace that need
      through EVERY branch — especially the skip/no-op branch that "did
