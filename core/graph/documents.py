@@ -328,7 +328,16 @@ async def _apply_chunk(
                 Discarded(ref, f"relation endpoint not among accepted entities: {src}→{dst}")
             )
             continue
-        match = chunk.text.find(quote) if quote else -1
+        if not quote[:_MAX_QUOTE_CHARS].strip():
+            # Blank is not evidence: a whitespace-only quote is truthy and
+            # find(" ") matches almost any chunk, so it would mint an edge
+            # whose stored quote satisfies the DB's quote <> '' CHECK yet
+            # carries no auditable span. Checked on the 512-truncated prefix,
+            # because THAT is what gets stored — a quote whose first 512
+            # chars are all whitespace would store blank the same way.
+            discarded.append(Discarded(ref, f"relation quote is blank: {quote[:80]!r}"))
+            continue
+        match = chunk.text.find(quote)
         if match < 0:
             # §27.4: chunk evidence MUST have a locatable span; a quote the
             # model paraphrased cannot be cited, and a relation without

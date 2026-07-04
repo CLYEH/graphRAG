@@ -232,6 +232,50 @@ async def test_blank_types_and_names_are_discarded_with_reasons() -> None:
     assert sum("relation missing type" in r for r in reasons) == 1
 
 
+async def test_blank_quotes_never_mint_evidence() -> None:
+    """A whitespace-only quote is truthy, find(" ") matches almost any text,
+    and " " passes the DB's quote <> '' CHECK — so without this guard a
+    relation could store blank 'evidence' with no auditable span. Also holds
+    for the pathological quote whose first 512 chars (the stored prefix) are
+    all whitespace."""
+    pathological = " " * 600 + "x"
+    text = f"Alice works at Acme.{pathological}"
+    for bad_quote in (" ", "\n\t ", pathological):
+        answer = _answer(
+            [
+                {"type": "Person", "name": "Alice", "confidence": 0.9},
+                {"type": "Company", "name": "Acme", "confidence": 0.8},
+            ],
+            [
+                {
+                    "src_type": "Person",
+                    "src_name": "Alice",
+                    "type": "WORKS_AT",
+                    "dst_type": "Company",
+                    "dst_name": "Acme",
+                    "quote": bad_quote,
+                    "confidence": 0.7,
+                }
+            ],
+        )
+        writer = _FakeWriter(
+            [_doc()],
+            [
+                SimpleNamespace(
+                    id="c",
+                    ordinal=0,
+                    text=text,
+                    start_offset=0,
+                    end_offset=len(text),
+                    document_id="doc-1",
+                )
+            ],
+        )
+        report = await _extract(writer, _FakeLLM({text: answer}))
+        assert writer.relations == [] and writer.evidence == [], bad_quote
+        assert any("quote is blank" in d.reason for d in report.discarded), bad_quote
+
+
 async def test_unlocatable_quote_costs_the_relation_not_the_contract() -> None:
     """§27.4: chunk evidence must be a locatable verbatim span. A paraphrased
     quote cannot be cited, and a relation without evidence would violate the
