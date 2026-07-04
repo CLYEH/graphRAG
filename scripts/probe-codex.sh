@@ -22,8 +22,10 @@ for probe in $(seq 1 "$MAX_PROBES"); do
     echo "RESULT: probe got a real response (watcher exit $verdict)"
     exit "$verdict"
   fi
-  echo "[probe $probe/$MAX_PROBES] still out of quota; sleeping ${SLEEP}s"
-  sleep "$SLEEP"
+  if [ "$probe" -lt "$MAX_PROBES" ]; then
+    echo "[probe $probe/$MAX_PROBES] still out of quota; sleeping ${SLEEP}s"
+    sleep "$SLEEP"
+  fi
 done
 echo "RESULT: quota still exhausted after $MAX_PROBES probes — escalate to the owner."
 exit 20

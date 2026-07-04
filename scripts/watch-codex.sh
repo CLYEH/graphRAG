@@ -53,8 +53,14 @@ if [ -n "$boot_quota" ]; then
     --jq "[.[]|select(.user.login|startswith(\"$BOT_PREFIX\"))|.submitted_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
   boot_poke="$(gh api --paginate "repos/$repo/issues/$PR/comments" \
     --jq "[.[]|select(((.user.login|startswith(\"$BOT_PREFIX\"))|not) and (.body|test(\"@codex review\")))|.created_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
+  # a newer NON-quota bot comment supersedes too: actionable feedback can
+  # arrive as a plain comment (the three-channel lesson) — hiding it behind
+  # an older limits message would make the probe loop sleep past real triage
+  boot_botc="$(gh api --paginate "repos/$repo/issues/$PR/comments" \
+    --jq "[.[]|select((.user.login|startswith(\"$BOT_PREFIX\")) and ((.body|test(\"reached your Codex usage limits\";\"i\"))|not))|.created_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
   if { [ -z "$boot_react" ] || [[ "$boot_quota" > "$boot_react" ]]; } \
     && { [ -z "$boot_review" ] || [[ "$boot_quota" > "$boot_review" ]]; } \
+    && { [ -z "$boot_botc" ] || [[ "$boot_quota" > "$boot_botc" ]]; } \
     && { [ -z "$boot_poke" ] || [[ "$boot_quota" > "$boot_poke" ]]; }; then
     echo "RESULT: Codex is OUT OF QUOTA (limits message at $boot_quota supersedes every poke/review/+1) — stop waiting; re-poke '@codex review' after the quota window resets."
     exit 30
