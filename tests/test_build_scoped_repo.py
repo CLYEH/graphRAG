@@ -163,6 +163,40 @@ async def test_fetch_all_refuses_raw_sql_predicates() -> None:
             await _repo().fetch_all(tables.documents, attack)
 
 
+async def test_fetch_all_refuses_raw_sql_nested_inside_structural_operators() -> None:
+    """A top-level TextClause check is not enough: sa.or_(text(...), col==x)
+    buries the raw node one level down, but SQLAlchemy still splices it
+    verbatim — the ')...--' payload lexically closes the or_ group and the
+    tail escapes the ANDed scope (proven by the compiled string below). The
+    guard must recurse, so it rejects the raw node wherever it hides."""
+    payload = "1=1) OR documents.build_id <> :b --"
+    # the buried attack really escapes: the OR lands OUTSIDE the scope's AND
+    escaped = (
+        _repo()
+        ._select(tables.documents)
+        .where(sa.or_(sa.text(payload), tables.documents.c.mime == "x"))
+    )
+    compiled = str(escaped.whereclause)
+    assert ") OR documents.build_id <> :b --" in compiled
+
+    nested_attacks: tuple[sa.ColumnExpressionArgument[bool], ...] = (
+        sa.or_(sa.text(payload), tables.documents.c.mime == "x"),
+        sa.or_(sa.literal_column(payload), tables.documents.c.mime == "x"),
+        sa.and_(
+            tables.documents.c.mime == "a", sa.or_(sa.text("1=1"), tables.documents.c.mime == "b")
+        ),
+    )
+    for attack in nested_attacks:
+        with pytest.raises(TypeError, match="raw-SQL"):
+            await _repo().fetch_all(tables.documents, attack)
+    # a bare string predicate can't sneak past either — SQLAlchemy 2.x refuses
+    # to auto-text() it, so the coercion the guard runs rejects it up front
+    with pytest.raises(sa.exc.ArgumentError):
+        await _repo().fetch_all(
+            tables.documents, cast(sa.ColumnExpressionArgument[bool], "1=1 OR x")
+        )
+
+
 def test_direct_construction_is_fenced_off() -> None:
     """The factories are the only sanctioned bindings — for_active_build
     resolves the scope, for_building_build VALIDATES it (§27.1). A public

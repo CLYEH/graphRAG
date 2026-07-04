@@ -44,6 +44,7 @@ from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.sql import coercions, roles, visitors
 
 from core.stores import tables
 
@@ -117,6 +118,39 @@ class BuildNotWritableError(LookupError):
 #: building build for writes) — an unvalidated direct construction would
 #: reopen the bind-to-anything hole.
 _CONSTRUCTION_TOKEN = object()
+
+
+def _reject_raw_sql(predicate: sa.ColumnExpressionArgument[bool]) -> None:
+    """Refuse any raw-SQL node in a caller predicate — even nested (DR-006).
+
+    SQLAlchemy splices ``text()``/``literal_column()`` into the WHERE
+    conjunction VERBATIM and WITHOUT parentheses, so the scope's ANDed
+    filters and the caller's predicate share one flat boolean level. A raw
+    ``OR`` (or a ``")...--"`` payload that lexically closes an enclosing
+    ``or_`` group) flips precedence and reads outside the build scope —
+    verified by compilation:
+
+        build_id = :b AND (1=1) OR documents.build_id <> :x -- OR mime = :m)
+
+    A top-level check is not enough: ``sa.or_(sa.text(...), col == x)`` hides
+    the raw node one level down, where it still escapes. So coerce the
+    predicate exactly as ``.where()`` will (which also rejects a bare-string
+    predicate — SQLAlchemy 2.x refuses to auto-``text()`` it), then walk the
+    whole expression tree (``visitors.iterate``) and reject on the first raw
+    node. Structural expressions (column comparisons, ``sa.or_``/``sa.and_``)
+    contain zero such nodes and self-group, so they pass and cannot widen the
+    scope.
+    """
+    element = coercions.expect(roles.WhereHavingRole, predicate)
+    for node in visitors.iterate(element):
+        if isinstance(node, sa.TextClause) or getattr(node, "is_literal", False):
+            raise TypeError(
+                "raw-SQL nodes (text()/literal_column()) are not accepted, even "
+                "nested inside or_/and_ — raw SQL is spliced verbatim, so an OR "
+                "(or a grouping-closing ')...--' payload) inside would escape the "
+                "build scope; use structural expressions only (column comparisons, "
+                "sa.or_/sa.and_)"
+            )
 
 
 async def active_build_id(conn: AsyncConnection, project: str) -> uuid.UUID:
@@ -237,22 +271,13 @@ class BuildScopedRepo:
         """Read the scoped rows, optionally narrowed by caller predicates.
 
         Predicates can only narrow — the scope filters are already in the
-        query and nothing the caller passes can remove them. Raw textual
-        predicates are rejected: SQLAlchemy splices ``text()`` into the WHERE
-        conjunction WITHOUT parenthesizing it, so ``text("1=1 OR ...")``
-        would flip boolean precedence and read outside the scope (verified
-        by compilation; structural expressions like ``or_()`` self-group and
-        cannot do this).
+        query and nothing the caller passes can remove them, PROVIDED no raw
+        SQL sneaks in (see :func:`_reject_raw_sql` for why raw text escapes
+        the scope and why the check must recurse into ``or_``/``and_``).
         """
         query = self._select(table)
         for predicate in where:
-            if isinstance(predicate, sa.TextClause) or getattr(predicate, "is_literal", False):
-                raise TypeError(
-                    "raw-SQL predicates (text()/literal_column()) are not accepted — "
-                    "their SQL is spliced unparenthesized and an OR inside would "
-                    "escape the build scope; use structural expressions "
-                    "(column comparisons, sa.or_/sa.and_)"
-                )
+            _reject_raw_sql(predicate)
             query = query.where(predicate)
         return (await self._execute(query)).fetchall()
 
