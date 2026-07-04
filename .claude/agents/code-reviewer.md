@@ -95,19 +95,29 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      surfaces get their own catalog pass — C1c (surfaces 1:1 with C1b) took 0
      Codex rounds while C1d (new surfaces) took 4, every finding a cataloged
      class this checklist already named, missed because only the family
-     pattern was transferred. Inventory explicitly: identifiers COMPOSED from
-     contract strings (value-domain: can every contract-valid input be
+     pattern was transferred. THE MODULE'S OWN API ARGUMENT SHAPES ARE
+     SURFACES TOO (C3a: both Codex rounds were class-1 species living in the
+     argument shapes, not in stored data — the inventory had only been run
+     over the store/DB surfaces). Inventory explicitly: identifiers COMPOSED
+     from contract strings (value-domain: can every contract-valid input be
      served?) — and when the identifier is a COMPOSITE (a `table + pk`
      source ref, a compound key), validate EVERY member, not just the one
      named (C2: `pk` was guarded missing/empty/dup while its sibling `table`
-     accepted blank — half a citation is uncitable); accepted vocabularies
-     and (selector × gated-field) pairs (exactly-one/at-least-one made
-     unrepresentable, typos rejected on read AND write paths); ids that map
-     back to another store (type them as what they are — a row id is a UUID,
-     not a str); every side effect beyond data writes (schema/metadata a
-     write freezes — an expired write license stops ALL of them, and a "no
-     build-tagged data" style rationale must survive naming the full effect
-     set).
+     accepted blank — half a citation is uncitable), AND encode it
+     LOSSLESSLY — a naive `f"{a}:{b}"` join collides ("a:b","c") with
+     ("a","b:c"), and if anything dedups by the joined value the collision
+     SILENTLY DROPS data (C3a round 1: length-prefix, the fingerprint
+     `_join` defense, on every joined ref); accepted vocabularies and
+     (selector × gated-field) pairs (exactly-one/at-least-one made
+     unrepresentable, typos rejected on read AND write paths) — INCLUDING
+     any two argument fields/keys that assert the same fact (C3a round 2: a
+     mappings dict key routes documents while `mapping.table` names the
+     citation — a typo'd pair miscites every row; validate agreement at the
+     door, don't silently prefer either); ids that map back to another store
+     (type them as what they are — a row id is a UUID, not a str); every
+     side effect beyond data writes (schema/metadata a write freezes — an
+     expired write license stops ALL of them, and a "no build-tagged data"
+     style rationale must survive naming the full effect set).
    - **Handoff completeness (every branch forwards what the consumer needs)**:
      when a step returns a subset for a downstream consumer, trace that need
      through EVERY branch — especially the skip/no-op branch that "did

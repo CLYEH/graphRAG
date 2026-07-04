@@ -1,0 +1,16 @@
+---
+name: graphrag-ci-before-codex
+description: "push 後先查/修 CI(gh pr checks)再 triage Codex——CI 快、Codex 慢,別把兩個等待串起來"
+metadata: 
+  node_type: memory
+  type: feedback
+  originSessionId: 4822fc72-b943-4955-806c-12c697183042
+---
+
+**開 PR / push 後,先 `gh pr checks <pr>` 查 CI 並修好紅燈,再去等/triage Codex。**
+
+CI(GitHub Actions:governance / backend / frontend / integration)通常數十秒~1 分鐘就回;Codex 常要數分鐘。watcher(`scripts/watch-codex.sh`)只輪詢 Codex 三管道、**不盯 CI**。若先卡在 Codex 意見、把 CI 紅燈晾著,等於把兩個等待串起來、拖慢整體進度。
+
+**Why:** 使用者 2026-07-04 指出「CI 通常比 codex 早回,先修 CI 會加速」。CI 是確定性且快速的 gate,早修早綠;而 CI 紅燈常是機械性小錯(governance 分支名/checkoff 不符、lint、format),幾秒可修,不該讓它跟慢的 Codex 排隊。
+
+**How to apply:** push → 立刻(或 ~60s 後)`gh pr checks <pr>` → 有紅燈**先修**(governance / lint / test / cov)→ 綠了再啟 Codex watcher。特別記住 **governance job** 規則:`task/<id>` 分支必須恰好勾掉 TASKS.md 的 `<id>` 項且不勾別項——**切片任務時分支名要對到子項**(C3a 的 PR 走 `task/C3a`,不是 `task/C3`),否則 `scripts/governance-check.sh` 會擋。相關 [[graphrag-loop-paused-pr5]]。
