@@ -253,9 +253,16 @@ def test_collection_names_are_derived_safe_and_collision_free() -> None:
     for project in hostile:
         name = collection_for(project)
         assert re.fullmatch(r"[A-Za-z0-9_-]+", name), project
-        assert len(name) <= 64, project
+        assert len(name) <= 73, project  # ≤ Qdrant's 255, verified live
     # sanitization alone would collide these — the content hash keeps them apart
     assert collection_for("ab/c") != collection_for("ab_c")
     assert collection_for("ab/c") != collection_for("ab?c")
+    # the suffix must hold against ADVERSARIAL prefix-sharing names, not just
+    # accidents: this pair is a real brute-forced sha256 10-hex-prefix
+    # collision (found in review) — a 40-bit digest mapped both projects to
+    # ONE collection, breaking §4's one-collection-per-project invariant
+    forged_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaamDxDx3C9sN22"
+    forged_b = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaapkavJiXz5Amz"
+    assert collection_for(forged_a) != collection_for(forged_b)
     # the readable prefix survives for debuggability
     assert collection_for("acme").startswith("project_acme_")

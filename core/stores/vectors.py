@@ -70,9 +70,15 @@ def collection_for(project: str) -> str:
     sanitized prefix keeps it human-readable, and the content-hash suffix
     keeps two projects distinct even when sanitization (or truncation) would
     collide them (e.g. ``ab/c`` vs ``ab_c``).
+
+    The digest is 32 hex chars (128 bits): §4's one-collection-per-project is
+    an INVARIANT, so the suffix must hold against adversarial prefix-sharing
+    names, not just accidents — a 10-hex suffix (40 bits) was demonstrated
+    brute-forceable in review. 128 bits puts the birthday bound at ~2^64.
+    Total length 73 ≤ Qdrant's 255 (verified live).
     """
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", project)[:32]
-    digest = hashlib.sha256(project.encode("utf-8")).hexdigest()[:10]
+    digest = hashlib.sha256(project.encode("utf-8")).hexdigest()[:32]
     return f"project_{safe}_{digest}"
 
 
