@@ -326,6 +326,53 @@ async def test_the_traversal_reads_only_the_active_build(
         await _cleanup(session, project)
 
 
+async def test_a_stale_shortest_path_yields_the_longer_active_path(
+    stores: tuple[AsyncConnection, AsyncSession],
+) -> None:
+    """The projection's SHORTEST path can be stale (its relation rejected in
+    the SoR after projection) while a longer fully-active path exists: the
+    stale edge must be excluded and the pair retried — the exclusion predicate
+    is pushed into the live shortestPath expansion — so the active path is
+    returned, not PARTIAL_RESULTS for a connection the active graph has."""
+    conn, session = stores
+    project = f"graphq-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        a = await _entity(writer, "Acme")
+        b = await _entity(writer, "BobCo")
+        c = await _entity(writer, "CarolInc")
+        await _relation(writer, a, "works_with", b)
+        await _relation(writer, b, "supplies", c)
+        shortcut = await _relation(writer, a, "shortcut", c)  # the 1-hop path
+        await conn.commit()
+        await _project_all(conn, session, writer)
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+        # the shortcut is rejected AFTER projection — Neo4j still has the edge
+        await conn.execute(
+            relations.update().where(relations.c.id == shortcut).values(status="rejected")
+        )
+        await conn.commit()
+
+        graph, repo = await _bound(conn, session, project)
+        response = await graph_query(
+            graph,
+            repo,
+            _POLICY,
+            GraphQueryParams(template="path", entity="Acme", other_entity="CarolInc", hops=3),
+            "acme to carol",
+            max_graph_hops=3,
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert len(response.results) == 1
+        path = response.results[0]
+        assert path.text == "Acme -[works_with]-> BobCo -[supplies]-> CarolInc"
+        assert len(path.source_refs) == 2  # the ACTIVE 2-hop path, fully cited
+        assert response.warnings == ()
+    finally:
+        await _cleanup(session, project)
+
+
 async def test_a_drifted_entity_is_dropped_not_surfaced(
     stores: tuple[AsyncConnection, AsyncSession],
 ) -> None:

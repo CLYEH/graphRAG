@@ -176,21 +176,44 @@ async def _path(
     timed_out = False
     stale = 0
     for src_id, dst_id in itertools.product(src_ids, dst_ids):
-        remaining_ms = int((deadline - time.monotonic()) * 1000)
-        if remaining_ms < 1:
-            timed_out = True
+        # a stale SHORTEST path must not mask a longer still-active path for
+        # the SAME pair: after a candidate fails SoR verification, its stale
+        # elements are EXCLUDED and the pair is retried — the exclusion
+        # predicates are pushed into the shortestPath expansion (verified
+        # live), so the next-shortest active path surfaces. Each retry grows
+        # the exclusion set, so the inner loop terminates; the shared
+        # deadline bounds it all the same.
+        excluded_nodes: set[str] = set()
+        excluded_edges: set[str] = set()
+        while True:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms < 1:
+                timed_out = True
+                break
+            found = await graph.shortest_path(
+                str(src_id),
+                str(dst_id),
+                max_hops=params.hops,
+                timeout_ms=remaining_ms,
+                excluded_nodes=sorted(excluded_nodes),
+                excluded_edges=sorted(excluded_edges),
+            )
+            if found is None:
+                break  # no (further) path for this pair — next pair
+            result, stale_nodes, stale_edges = await _verified_path_result(
+                repo, found, src_id, dst_id
+            )
+            if result is not None:
+                # a fully-verified path IS the complete answer — earlier stale
+                # candidates were alternates, not omitted results, so no warning
+                return _response(graph, query, ordered_results([result]), ())
+            stale += 1  # this candidate failed SoR re-verification
+            if not stale_nodes and not stale_edges:
+                break  # unidentifiable (corrupt) elements — can't exclude, next pair
+            excluded_nodes |= stale_nodes
+            excluded_edges |= stale_edges
+        if timed_out:
             break
-        found = await graph.shortest_path(
-            str(src_id), str(dst_id), max_hops=params.hops, timeout_ms=remaining_ms
-        )
-        if found is None:
-            continue
-        result = await _verified_path_result(repo, found, src_id, dst_id)
-        if result is not None:
-            # a fully-verified path IS the complete answer — earlier stale
-            # candidates were alternates, not omitted results, so no warning
-            return _response(graph, query, ordered_results([result]), ())
-        stale += 1  # this candidate failed SoR re-verification — try the next pair
 
     if timed_out:
         warning = _warn(
@@ -206,23 +229,34 @@ async def _path(
 
 async def _verified_path_result(
     repo: BuildScopedRepo, found: dict[str, Any], src_id: uuid.UUID, dst_id: uuid.UUID
-) -> RetrievalResult | None:
-    """One projection path → a fully SoR-verified §16 path result, or None.
+) -> tuple[RetrievalResult | None, set[str], set[str]]:
+    """One projection path → a fully SoR-verified §16 path result, or the
+    STALE ELEMENTS that sank it (``(None, stale_node_ids, stale_edge_keys)``,
+    exclusion-encoded) so the caller can retry the pair without them.
 
     A path is ONE claim: every projected value must parse, every node must
     still be active, and every edge must resolve to an active SoR relation —
-    ANY stale hop rejects the whole candidate (§27.2/§19)."""
+    ANY stale hop rejects the whole candidate (§27.2/§19). Corrupt
+    (unparseable) values return empty exclusion sets: they cannot be named, so
+    the caller moves on rather than retrying the same path forever."""
     node_ids = [_projected_uuid(node.get("canonical_id")) for node in found["nodes"]]
     triples = [_edge_triple(rel) for rel in found["rels"]]
     if None in node_ids or None in triples:
-        return None  # corrupt projection values — the path can't be traced to the SoR
+        # corrupt projection values — the path can't be traced to the SoR
+        return None, set(), set()
     ids = [node_id for node_id in node_ids if node_id is not None]
     clean = [triple for triple in triples if triple is not None]
 
     active = await repo.active_entity_ids(ids)
     resolved = await repo.relations_with_evidence(clean)
-    if len(active) != len(set(ids)) or any(triple not in resolved for triple in clean):
-        return None  # a node or edge went stale in the SoR after projection
+    stale_nodes = {str(node_id) for node_id in ids if node_id not in active}
+    stale_edges = {
+        f"{src}|{rel_type}|{dst}"  # the template's exclusion key, STORED direction
+        for (src, dst, rel_type) in clean
+        if (src, dst, rel_type) not in resolved
+    }
+    if stale_nodes or stale_edges:
+        return None, stale_nodes, stale_edges  # stale in the SoR after projection
 
     refs = tuple(SourceRef(source_type="relation", id=str(resolved[triple][0])) for triple in clean)
     names = [_display(node) for node in found["nodes"]]
@@ -236,13 +270,14 @@ async def _verified_path_result(
             parts.append(f" -[{rel['type']}]-> {name}")
         else:
             parts.append(f" <-[{rel['type']}]- {name}")
-    return RetrievalResult(
+    result = RetrievalResult(
         result_type="path",
         id=f"path:{src_id}->{dst_id}",  # the pair that actually connected
         score=1.0,
         source_refs=refs,
         text="".join(parts),
     )
+    return result, set(), set()
 
 
 async def _subgraph(
@@ -341,6 +376,7 @@ async def _neighbor_entities(
     candidates: set[uuid.UUID] = set()
     dropped = 0
     timed_out = False
+    fetch_clipped = False
     for seed in seeds:
         remaining_ms = int((deadline - time.monotonic()) * 1000)
         if remaining_ms < 1:
@@ -352,6 +388,12 @@ async def _neighbor_entities(
             limit=policy.max_rows + 1,  # the truncation probe (policy cap only)
             timeout_ms=remaining_ms,
         )
+        if len(rows) > policy.max_rows:
+            # the store LIMIT was hit — later valid neighbors may exist beyond
+            # it, so the clip is recorded at FETCH time: judging it after the
+            # SoR drops would let drift shrink the count back under the cap
+            # and silently suppress TRUNCATED
+            fetch_clipped = True
         for row in rows:
             entity_id = _projected_uuid(row["entity"].get("canonical_id"))
             if entity_id is None:
@@ -390,7 +432,7 @@ async def _neighbor_entities(
     dropped += len(candidates - set(best))  # unreachable via the ACTIVE graph → drift
 
     ordered = sorted(best.items(), key=lambda item: (item[1], item[0]))
-    truncated = len(ordered) > policy.max_rows
+    truncated = fetch_clipped or len(ordered) > policy.max_rows
     ordered = ordered[: policy.max_rows]
 
     # SoR re-verification (§27.2): an entity result needs ≥1 mention of a

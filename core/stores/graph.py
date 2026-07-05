@@ -118,9 +118,12 @@ MATCH (src:Entity {canonical_id: $src, status: 'active',
       (dst:Entity {canonical_id: $dst, status: 'active',
                    build_id: $build_id, project: $project}),
       p = shortestPath((src)-[:REL*..__HOPS__]-(dst))
-WHERE all(rel IN relationships(p) WHERE rel.build_id = $build_id)
+WHERE all(rel IN relationships(p) WHERE rel.build_id = $build_id
+          AND NOT (startNode(rel).canonical_id + '|' + rel.type + '|'
+                   + endNode(rel).canonical_id) IN $excluded_edges)
   AND all(n IN nodes(p) WHERE n.project = $project
-          AND n.build_id = $build_id AND n.status = 'active')
+          AND n.build_id = $build_id AND n.status = 'active'
+          AND NOT n.canonical_id IN $excluded_nodes)
 RETURN [n IN nodes(p) | n{.*}] AS nodes,
        [rel IN relationships(p) | {type: rel.type,
                                    src: startNode(rel).canonical_id,
@@ -317,14 +320,36 @@ class BuildScopedGraphRepo:
         )
 
     async def shortest_path(
-        self, src: str, dst: str, *, max_hops: int, timeout_ms: int
+        self,
+        src: str,
+        dst: str,
+        *,
+        max_hops: int,
+        timeout_ms: int,
+        excluded_nodes: Sequence[str] = (),
+        excluded_edges: Sequence[str] = (),
     ) -> dict[str, Any] | None:
         """One shortest active path ``src`` → ``dst`` within ``max_hops``, or
         ``None``. Returns ``{nodes: [{…}, …], rels: [{type, src, dst}, …]}`` —
         the rels carry endpoint canonical_ids so the caller can map every edge
-        back to its SoR relation row (§27.2: a path cites every edge)."""
+        back to its SoR relation row (§27.2: a path cites every edge).
+
+        ``excluded_nodes`` (canonical_ids) and ``excluded_edges``
+        (``src|type|dst`` in STORED direction) are skipped during expansion —
+        the predicates are rel/node-local, so Neo4j pushes them into the
+        shortestPath search and finds the shortest path AVOIDING them
+        (verified live: excluding a stale short edge yields the longer active
+        path, not no-path). The caller uses this to retry a pair after SoR
+        verification rejects a projection-stale shortest path."""
         rows = await self._run_read(
-            self._hop_template(_SHORTEST_PATH, max_hops), {"src": src, "dst": dst}, timeout_ms
+            self._hop_template(_SHORTEST_PATH, max_hops),
+            {
+                "src": src,
+                "dst": dst,
+                "excluded_nodes": list(excluded_nodes),
+                "excluded_edges": list(excluded_edges),
+            },
+            timeout_ms,
         )
         return rows[0] if rows else None
 

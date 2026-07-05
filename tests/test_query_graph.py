@@ -53,7 +53,7 @@ class _FakeGraph:
         path: dict[str, Any] | None = None,
         edges: list[dict[str, Any]] | None = None,
         raise_exc: Exception | None = None,
-        paths_by_pair: dict[tuple[str, str], dict[str, Any]] | None = None,
+        paths_by_pair: dict[tuple[str, str], Any] | None = None,  # dict or list-of-dicts
         slow: bool = False,
     ) -> None:
         self.project = _PROJECT
@@ -77,12 +77,26 @@ class _FakeGraph:
         return self._neighbors
 
     async def shortest_path(
-        self, src: str, dst: str, *, max_hops: int, timeout_ms: int
+        self,
+        src: str,
+        dst: str,
+        *,
+        max_hops: int,
+        timeout_ms: int,
+        excluded_nodes: tuple[str, ...] = (),
+        excluded_edges: tuple[str, ...] = (),
     ) -> dict[str, Any] | None:
         self.calls.append(
             (
                 "shortest_path",
-                {"src": src, "dst": dst, "max_hops": max_hops, "timeout_ms": timeout_ms},
+                {
+                    "src": src,
+                    "dst": dst,
+                    "max_hops": max_hops,
+                    "timeout_ms": timeout_ms,
+                    "excluded_nodes": tuple(excluded_nodes),
+                    "excluded_edges": tuple(excluded_edges),
+                },
             )
         )
         if self._raise is not None:
@@ -90,7 +104,20 @@ class _FakeGraph:
         if self._paths_by_pair is not None:
             # a real (tiny) cost per attempt, so the deadline test can bite
             await asyncio.sleep(0.002)
-            return self._paths_by_pair.get((src, dst))
+            canned = self._paths_by_pair.get((src, dst))
+            options: list[dict[str, Any]] = (
+                canned if isinstance(canned, list) else [canned] if canned else []
+            )
+            for path in options:
+                # mimic the template's exclusion pushdown: shortest first,
+                # skipping any path touching an excluded node/edge
+                nodes_ok = all(n.get("canonical_id") not in excluded_nodes for n in path["nodes"])
+                edges_ok = all(
+                    f"{r['src']}|{r['type']}|{r['dst']}" not in excluded_edges for r in path["rels"]
+                )
+                if nodes_ok and edges_ok:
+                    return path
+            return None
         return self._path
 
     async def edges_among(
@@ -531,6 +558,62 @@ async def test_a_stale_candidate_path_does_not_end_the_search() -> None:
     assert len(response.results) == 1
     assert response.results[0].id == f"path:{hit}->{d1}"  # the verified pair, not the stale one
     assert response.warnings == ()  # a verified answer is complete; the stale one was an alternate
+
+
+async def test_a_stale_shortest_path_does_not_mask_a_longer_active_path() -> None:
+    """shortestPath returns ONE path — the projection's shortest. When that
+    path is stale (its relation was rejected post-projection) but a LONGER
+    fully-active path exists for the SAME pair, the stale elements are
+    excluded and the pair retried, so the active path surfaces — not
+    PARTIAL_RESULTS for a connection the active graph genuinely has."""
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    rel_ab, rel_bc = uuid.uuid4(), uuid.uuid4()
+    stale_short = {
+        "nodes": [_node(a, "A"), _node(c, "C")],
+        "rels": [{"type": "short", "src": str(a), "dst": str(c)}],  # no SoR relation
+    }
+    long_valid = {
+        "nodes": [_node(a, "A"), _node(b, "B"), _node(c, "C")],
+        "rels": [
+            {"type": "r1", "src": str(a), "dst": str(b)},
+            {"type": "r2", "src": str(b), "dst": str(c)},
+        ],
+    }
+    graph = _FakeGraph(paths_by_pair={(str(a), str(c)): [stale_short, long_valid]})
+    sor = _FakeSoR(
+        seeds={"a": [a], "c": [c]},
+        relations={
+            (a, b, "r1"): (rel_ab, [_chunk_evidence()]),
+            (b, c, "r2"): (rel_bc, [_chunk_evidence()]),
+        },
+    )
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="c", hops=3)
+    )
+    assert len(response.results) == 1
+    assert response.results[0].text == "A -[r1]-> B -[r2]-> C"  # the longer ACTIVE path
+    assert response.warnings == ()  # a verified answer is complete
+    retry = [call for call in graph.calls if call[0] == "shortest_path"][1]
+    assert f"{a}|short|{c}" in retry[1]["excluded_edges"]  # the stale edge was excluded
+
+
+async def test_truncation_survives_sor_drops() -> None:
+    """The store LIMIT clip is recorded at FETCH time: when the probe row came
+    back AND drift drops shrink the survivors under the cap, TRUNCATED must
+    still fire — otherwise an incomplete traversal (later valid neighbors
+    hidden by the LIMIT) reads as merely drifted."""
+    seed = uuid.uuid4()
+    ids = [uuid.uuid4() for _ in range(_POLICY.max_rows + 1)]  # the probe row came back
+    graph = _FakeGraph(neighbor_rows=[{"entity": _node(eid), "distance": 1} for eid in ids])
+    sor = _FakeSoR(
+        seeds={"acme": [seed]},
+        mentions={eid: [("text", f"c-{eid}")] for eid in ids},
+        pairs={(seed, eid) for eid in ids[1:]},  # the first candidate's edge went stale
+    )
+    response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
+    assert len(response.results) == _POLICY.max_rows  # survivors exactly fill the cap
+    codes = _codes(response)
+    assert "TRUNCATED" in codes and "PARTIAL_RESULTS" in codes  # both facts surfaced
 
 
 async def test_the_pair_search_shares_one_policy_deadline() -> None:

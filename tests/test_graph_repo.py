@@ -79,7 +79,9 @@ def test_every_cypher_template_filters_every_pattern_by_the_scope() -> None:
     # keep the scan honest: it must actually find the module's templates
     assert len(templates) == 8, sorted(templates)
     inline_rel = re.compile(r":REL[^\]]*\{build_id: \$build_id")
-    path_guard = "all(rel IN relationships(p) WHERE rel.build_id = $build_id)"
+    # no closing paren: the guard may carry further AND-ed rel-local predicates
+    # (e.g. the shortestPath exclusion pushdown) after the scope condition
+    path_guard = "all(rel IN relationships(p) WHERE rel.build_id = $build_id"
     for name, template in templates.items():
         assert "$build_id" in template, name
         # every Entity node pattern carries BOTH scope properties, adjacent
