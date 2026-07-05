@@ -24,6 +24,8 @@ never decides what an entity IS, only how entities connect.
 
 from __future__ import annotations
 
+import itertools
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -158,11 +160,35 @@ async def _path(
     dst_ids = await repo.entity_ids_by_name(params.other_entity)
     if not src_ids or not dst_ids:
         return _response(graph, query, (), ())
-    # deterministic seed choice: the first id of each ordered SoR resolution
-    found = await graph.shortest_path(
-        str(src_ids[0]), str(dst_ids[0]), max_hops=params.hops, timeout_ms=policy.timeout_ms
-    )
+    # A name can resolve to SEVERAL active entities (distinct disambiguators,
+    # §27.3) — try every (src, dst) pair in deterministic order until one
+    # connects. The WHOLE search shares ONE policy deadline (each query gets
+    # only the remaining budget): per-pair timeouts would stack to
+    # pairs × timeout_ms — the same per-statement-vs-per-phase trap as C6b's
+    # schema discovery.
+    found: dict[str, Any] | None = None
+    src_id = src_ids[0]
+    dst_id = dst_ids[0]
+    deadline = time.monotonic() + policy.timeout_ms / 1000.0
+    timed_out = False
+    for src_id, dst_id in itertools.product(src_ids, dst_ids):
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms < 1:
+            timed_out = True
+            break
+        found = await graph.shortest_path(
+            str(src_id), str(dst_id), max_hops=params.hops, timeout_ms=remaining_ms
+        )
+        if found is not None:
+            break
     if found is None:
+        if timed_out:
+            warning = _warn(
+                "PARTIAL_RESULTS",
+                f"path search exceeded the {policy.timeout_ms}ms deadline before "
+                "every endpoint pair was tried (§21)",
+            )
+            return _response(graph, query, (), (warning,))
         return _response(graph, query, (), ())
 
     node_ids = [_projected_uuid(node.get("canonical_id")) for node in found["nodes"]]
@@ -195,7 +221,7 @@ async def _path(
     text = "".join(parts)
     result = RetrievalResult(
         result_type="path",
-        id=f"path:{src_ids[0]}->{dst_ids[0]}",
+        id=f"path:{src_id}->{dst_id}",  # the pair that actually connected
         score=1.0,
         source_refs=refs,
         text=text,
@@ -213,11 +239,41 @@ async def _subgraph(
     entities, dropped, truncated = await _neighbor_entities(
         graph, repo, policy, params, include_seeds=True
     )
+    # §21: max_rows is the ceiling on the WHOLE response, entities AND
+    # relations combined — a dense neighborhood has O(n²) edges, so both the
+    # edge FETCH (LIMIT in the store, +1 as the truncation probe) and the
+    # emitted result list are capped; entities keep priority (nearest-first),
+    # relations fill the remainder.
     node_ids = [entity_id for entity_id, _, _ in entities]
-    edges = await graph.edges_among(
-        [str(entity_id) for entity_id in node_ids], timeout_ms=policy.timeout_ms
-    )
-    relations, edge_dropped = await _relation_results(repo, edges)
+    edge_budget = policy.max_rows - len(entities)
+    relations: list[tuple[uuid.UUID, str, tuple[SourceRef, ...]]] = []
+    edge_dropped = 0
+    if edge_budget > 0:
+        edges = await graph.edges_among(
+            [str(entity_id) for entity_id in node_ids],
+            limit=edge_budget + 1,  # the truncation probe (policy cap only)
+            timeout_ms=policy.timeout_ms,
+        )
+        if len(edges) > edge_budget:
+            # truncation is judged on the FETCHED count (like the neighbor
+            # path), not post-drop — a stale edge dropping out must not hide
+            # that the ceiling clipped the set
+            truncated = True
+            edges = edges[:edge_budget]
+        relations, edge_dropped = await _relation_results(repo, edges)
+    elif len(node_ids) >= 2:
+        if params.hops == 1:
+            # every distance-1 neighbor is directly adjacent to the seed, so
+            # edges exist by construction and had no room — surfaced
+            truncated = True
+        else:
+            # at hops ≥ 2 a neighbor can connect only through an excluded
+            # intermediate, so direct edges may genuinely not exist — probe
+            # (LIMIT 1) instead of asserting, keeping TRUNCATED exact
+            probe = await graph.edges_among(
+                [str(entity_id) for entity_id in node_ids], limit=1, timeout_ms=policy.timeout_ms
+            )
+            truncated = truncated or bool(probe)
     results = _score(entities, relations)
     warnings = _standard_warnings(policy, truncated, dropped + edge_dropped)
     return _response(graph, query, results, warnings)

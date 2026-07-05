@@ -10,6 +10,7 @@ response. Each response here is validated against the frozen schema itself.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -52,11 +53,13 @@ class _FakeGraph:
         path: dict[str, Any] | None = None,
         edges: list[dict[str, Any]] | None = None,
         raise_exc: Exception | None = None,
+        paths_by_pair: dict[tuple[str, str], dict[str, Any]] | None = None,
     ) -> None:
         self.project = _PROJECT
         self.build_id = _BUILD
         self._neighbors = neighbor_rows or []
         self._path = path
+        self._paths_by_pair = paths_by_pair
         self._edges = edges or []
         self._raise = raise_exc
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -72,16 +75,25 @@ class _FakeGraph:
     async def shortest_path(
         self, src: str, dst: str, *, max_hops: int, timeout_ms: int
     ) -> dict[str, Any] | None:
-        self.calls.append(("shortest_path", {"src": src, "dst": dst, "max_hops": max_hops}))
+        self.calls.append(
+            (
+                "shortest_path",
+                {"src": src, "dst": dst, "max_hops": max_hops, "timeout_ms": timeout_ms},
+            )
+        )
         if self._raise is not None:
             raise self._raise
+        if self._paths_by_pair is not None:
+            # a real (tiny) cost per attempt, so the deadline test can bite
+            await asyncio.sleep(0.002)
+            return self._paths_by_pair.get((src, dst))
         return self._path
 
     async def edges_among(
-        self, canonical_ids: list[str], *, timeout_ms: int
+        self, canonical_ids: list[str], *, limit: int, timeout_ms: int
     ) -> list[dict[str, Any]]:
-        self.calls.append(("edges_among", {"ids": list(canonical_ids)}))
-        return self._edges
+        self.calls.append(("edges_among", {"ids": list(canonical_ids), "limit": limit}))
+        return self._edges[:limit]  # the store caps the fetch, like the template's LIMIT
 
 
 class _FakeSoR:
@@ -385,6 +397,63 @@ async def test_a_path_through_a_non_active_node_is_dropped_whole() -> None:
     assert _codes(response) == ["PARTIAL_RESULTS"]
 
 
+async def test_path_tries_every_endpoint_pair_until_one_connects() -> None:
+    """A name resolves to several active entities (distinct disambiguators,
+    §27.3) — a path query must search the resolved pairs, not silently give up
+    because the FIRST pair happens to be unconnected."""
+    miss, hit = sorted([uuid.uuid4(), uuid.uuid4()], key=str)  # tried in THIS order
+    d1 = uuid.uuid4()
+    rel = uuid.uuid4()
+    connected = {
+        "nodes": [_node(hit, "S2"), _node(d1, "D1")],
+        "rels": [{"type": "works_at", "src": str(hit), "dst": str(d1)}],
+    }
+    graph = _FakeGraph(paths_by_pair={(str(hit), str(d1)): connected})
+    sor = _FakeSoR(
+        seeds={"s": [miss, hit], "d": [d1]},  # the connected pair is SECOND
+        relations={(hit, d1, "works_at"): (rel, [_chunk_evidence()])},
+    )
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="s", other_entity="d", hops=3)
+    )
+    assert len(response.results) == 1
+    assert response.results[0].id == f"path:{hit}->{d1}"  # the pair that connected
+    pair_calls = [c for c in graph.calls if c[0] == "shortest_path"]
+    assert len(pair_calls) == 2  # first pair tried and missed, second connected
+
+
+async def test_the_pair_search_shares_one_policy_deadline() -> None:
+    """Per-pair timeouts would stack to pairs × timeout_ms (the C6b
+    per-statement-vs-per-phase lesson) — the search gets ONE deadline: each
+    attempt runs on the REMAINING budget, and running out surfaces
+    PARTIAL_RESULTS rather than silently reporting 'no path'."""
+    srcs = [uuid.uuid4() for _ in range(5)]
+    dst = uuid.uuid4()
+    tight = TextToCypher(
+        enabled=False,
+        allowed_clauses=CYPHER_ALLOWED_CLAUSES,
+        blocked=CYPHER_BLOCKED_MIN,
+        max_rows=10,
+        timeout_ms=1,  # the whole search budget — attempts cost ~2ms each
+    )
+    graph = _FakeGraph(paths_by_pair={})  # nothing connects; every attempt burns time
+    sor = _FakeSoR(seeds={"s": sorted(srcs, key=str), "d": [dst]})
+    response = await graph_query(
+        cast(BuildScopedGraphRepo, graph),
+        cast(BuildScopedRepo, sor),
+        tight,
+        GraphQueryParams(template="path", entity="s", other_entity="d", hops=3),
+        "q",
+        3,
+    )
+    _VALIDATOR.validate(response.to_dict())
+    assert response.results == () and _codes(response) == ["PARTIAL_RESULTS"]
+    assert "deadline" in response.warnings[0].message
+    pair_calls = [c for c in graph.calls if c[0] == "shortest_path"]
+    assert len(pair_calls) < 5  # the deadline stopped the scan early
+    assert all(c[1]["timeout_ms"] <= tight.timeout_ms for c in pair_calls)  # remaining budget only
+
+
 async def test_no_seeds_or_no_path_yield_empty_without_warnings() -> None:
     graph, sor, *_ = _path_fixture()
     missing = await _run(
@@ -443,6 +512,78 @@ async def test_subgraph_emits_cited_entities_and_evidence_backed_relations() -> 
         str(other),
     }
     assert response.warnings == ()
+
+
+async def test_subgraph_caps_the_combined_response_at_max_rows() -> None:
+    """§21: max_rows ceils the WHOLE response — entities AND relations. A dense
+    neighborhood has O(n²) edges, so without a combined cap a max_rows policy
+    would still return dozens of relation rows (and fetch unbounded edges).
+    Entities keep priority; relations fill the remainder; the clip is TRUNCATED."""
+    seed = uuid.uuid4()
+    others = [uuid.uuid4() for _ in range(2)]  # 3 entities incl. seed
+    graph = _FakeGraph(
+        neighbor_rows=[{"entity": _node(o), "distance": 1} for o in others],
+        edges=[{"src": str(seed), "dst": str(others[0]), "type": f"t{i}"} for i in range(9)],
+    )
+    sor = _FakeSoR(
+        seeds={"acme": [seed]},
+        mentions={eid: [("text", f"c-{eid}")] for eid in [seed, *others]},
+        relations={
+            (seed, others[0], f"t{i}"): (uuid.uuid4(), [_chunk_evidence()]) for i in range(9)
+        },
+    )
+    response = await _run(graph, sor, GraphQueryParams(template="subgraph", entity="acme"))
+    assert len(response.results) == _POLICY.max_rows  # 3 entities + 7 relations = the ceiling
+    assert sum(1 for r in response.results if r.result_type == "entity") == 3
+    assert sum(1 for r in response.results if r.result_type == "relation") == 7
+    assert "TRUNCATED" in _codes(response)
+    edge_call = next(c for c in graph.calls if c[0] == "edges_among")
+    assert edge_call[1]["limit"] == _POLICY.max_rows - 3 + 1  # the fetch is capped too (probe)
+
+
+async def test_subgraph_with_no_edge_budget_skips_the_edge_query_and_flags() -> None:
+    """Entities alone can fill the ceiling; ≥2 connected-by-construction nodes
+    mean edges exist that had no room — surfaced as TRUNCATED, and the edge
+    query is not even sent (its results could never be emitted)."""
+    seed = uuid.uuid4()
+    others = [uuid.uuid4() for _ in range(_POLICY.max_rows - 1)]  # fills the cap with seed
+    graph = _FakeGraph(neighbor_rows=[{"entity": _node(o), "distance": 1} for o in others])
+    sor = _FakeSoR(
+        seeds={"acme": [seed]},
+        mentions={eid: [("text", f"c-{eid}")] for eid in [seed, *others]},
+    )
+    response = await _run(graph, sor, GraphQueryParams(template="subgraph", entity="acme"))
+    assert len(response.results) == _POLICY.max_rows
+    assert all(r.result_type == "entity" for r in response.results)
+    assert "TRUNCATED" in _codes(response)
+    assert not any(c[0] == "edges_among" for c in graph.calls)  # no budget → no query
+
+
+async def test_no_budget_at_multi_hop_probes_for_edges_instead_of_asserting() -> None:
+    """At hops ≥ 2 a neighbor can connect solely through an EXCLUDED
+    intermediate, so direct edges among the kept nodes may genuinely not exist
+    — TRUNCATED must come from a LIMIT-1 existence probe, not an assertion:
+    over-firing is a spurious warning, under-firing is a silent omission."""
+    seed = uuid.uuid4()
+    others = [uuid.uuid4() for _ in range(_POLICY.max_rows - 1)]
+    mentions = {eid: [("text", f"c-{eid}")] for eid in [seed, *others]}
+    rows = [{"entity": _node(o), "distance": 2} for o in others]
+
+    # no direct edges exist → the probe finds nothing → NOT truncated
+    graph = _FakeGraph(neighbor_rows=rows)
+    sor = _FakeSoR(seeds={"acme": [seed]}, mentions=mentions)
+    response = await _run(graph, sor, GraphQueryParams(template="subgraph", entity="acme", hops=2))
+    assert "TRUNCATED" not in _codes(response)
+    probe = next(c for c in graph.calls if c[0] == "edges_among")
+    assert probe[1]["limit"] == 1  # an existence probe, not a fetch
+
+    # a direct edge exists → the probe finds it → TRUNCATED
+    graph = _FakeGraph(
+        neighbor_rows=rows,
+        edges=[{"src": str(seed), "dst": str(others[0]), "type": "t"}],
+    )
+    response = await _run(graph, sor, GraphQueryParams(template="subgraph", entity="acme", hops=2))
+    assert "TRUNCATED" in _codes(response)
 
 
 async def test_a_relation_whose_evidence_cannot_satisfy_the_contract_is_dropped() -> None:

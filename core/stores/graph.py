@@ -135,6 +135,7 @@ MATCH (x:Entity {build_id: $build_id, project: $project, status: 'active'})
 WHERE x.canonical_id IN $ids AND y.canonical_id IN $ids
 RETURN x.canonical_id AS src, y.canonical_id AS dst, r.type AS type
 ORDER BY src, dst, type
+LIMIT $limit
 """
 
 _PROJECT_ENTITY: Final = """\
@@ -328,13 +329,19 @@ class BuildScopedGraphRepo:
         return rows[0] if rows else None
 
     async def edges_among(
-        self, canonical_ids: Sequence[str], *, timeout_ms: int
+        self, canonical_ids: Sequence[str], *, limit: int, timeout_ms: int
     ) -> list[dict[str, Any]]:
-        """All active edges whose BOTH endpoints are in ``canonical_ids`` —
-        the subgraph template's edge set (nodes come from :meth:`neighbors`)."""
+        """Active edges whose BOTH endpoints are in ``canonical_ids`` — the
+        subgraph template's edge set (nodes come from :meth:`neighbors`),
+        capped at ``limit``: a dense neighborhood has O(n²) edges, and an
+        unbounded fetch would bypass the §21 row ceiling the caller enforces."""
         if not canonical_ids:
             return []
-        return await self._run_read(_EDGES_AMONG, {"ids": list(canonical_ids)}, timeout_ms)
+        if type(limit) is not int or limit < 1:
+            raise ValueError(f"limit must be a positive int, got {limit!r}")
+        return await self._run_read(
+            _EDGES_AMONG, {"ids": list(canonical_ids), "limit": limit}, timeout_ms
+        )
 
 
 class BuildScopedGraphProjector(BuildScopedGraphRepo):

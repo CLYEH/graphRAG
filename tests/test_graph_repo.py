@@ -329,8 +329,21 @@ async def test_edges_among_short_circuits_an_empty_id_set() -> None:
     under the phase deadline)."""
     session = _FakeSession()
     repo = _wired_repo(session)
-    assert await repo.edges_among([], timeout_ms=1000) == []
+    assert await repo.edges_among([], limit=5, timeout_ms=1000) == []
     assert session.calls == []
+
+
+async def test_edges_among_caps_the_fetch_and_validates_the_cap() -> None:
+    """A dense neighborhood has O(n²) edges — the fetch itself is LIMITed (the
+    §21 ceiling is enforced at the store, not just post-hoc), and the cap is a
+    validated positive int like every other embed-adjacent parameter."""
+    session = _FakeSession()
+    repo = _wired_repo(session)
+    await repo.edges_among(["a", "b"], limit=7, timeout_ms=1000)
+    (query, parameters), *_ = session.calls
+    assert "LIMIT $limit" in str(query) and parameters["limit"] == 7
+    with pytest.raises(ValueError, match="limit must be a positive int"):
+        await repo.edges_among(["a"], limit=0, timeout_ms=1000)
 
 
 async def test_shortest_path_returns_none_when_no_row_comes_back() -> None:
