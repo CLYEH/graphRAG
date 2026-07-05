@@ -51,7 +51,7 @@ Keep items small enough to finish in one loop.
 - [x] C5 Index: embeddings → Qdrant; project entities/relations → Neo4j
 - [x] C6a Retrieval: semantic (Qdrant kNN, §16 contract)
 - [x] C6b Retrieval: sql (NLSQL + sqlglot guardrail per P5, §27.6)
-- [ ] C6c Retrieval: graph (parameterized Cypher templates + guardrail per P5, §27.6)
+- [x] C6c Retrieval: graph (parameterized Cypher templates + guardrail per P5, §27.6)
 - [ ] C6d Retrieval: global (community_reports — needs C7)
 - [ ] C6e Hybrid router + fusion + routing trace (§8, §16 debug)
 - [ ] C7 Global summary (Leiden communities + reports)

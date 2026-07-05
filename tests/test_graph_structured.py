@@ -20,7 +20,12 @@ from typing import Any, cast
 import pytest
 
 from core.graph.ontology import EntityRule, RelationRule, StructuredMapping
-from core.graph.structured import GraphExtractReport, extract_structured, row_source_ref
+from core.graph.structured import (
+    GraphExtractReport,
+    extract_structured,
+    row_source_ref,
+    split_row_source_ref,
+)
 from core.resolve import fingerprints
 from core.stores import tables
 from core.stores.repo import BuildScopedWriter
@@ -33,6 +38,17 @@ def test_row_source_ref_is_lossless_under_delimiter_collision() -> None:
     and splittable back into the contract's separate fields."""
     assert row_source_ref("a:b", "c") != row_source_ref("a", "b:c")
     assert row_source_ref("people", "7") == "6:people:7"
+
+
+def test_split_row_source_ref_roundtrips_and_refuses_corrupt_refs() -> None:
+    """The C6 read side: the encoding must split back into the EXACT pair the
+    writer joined (both collision-prone pairs included), and a corrupt stored
+    ref must come back None — the reader drops it (§22), never crashes on SoR
+    data that predates or violates the encoding."""
+    for table, pk in [("people", "7"), ("a:b", "c"), ("a", "b:c"), ("orders", "x:y:z")]:
+        assert split_row_source_ref(row_source_ref(table, pk)) == (table, pk)
+    for corrupt in ["", "people:7", "notanum:people:7", "9:people:7", "6:people", "6"]:
+        assert split_row_source_ref(corrupt) is None
 
 
 class _FakeWriter:

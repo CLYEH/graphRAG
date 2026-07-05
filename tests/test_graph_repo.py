@@ -10,6 +10,7 @@ without a live server; execution is covered by the integration tests.
 from __future__ import annotations
 
 import inspect
+import re
 import uuid
 from typing import cast
 
@@ -67,17 +68,26 @@ def test_every_cypher_template_filters_every_pattern_by_the_scope() -> None:
     """§4's projection rule is per-pattern, not per-query: a single ``:Entity``
     or ``:REL`` pattern missing the scope would let one query mix builds even
     though every other pattern is filtered. So the pin counts patterns, not
-    just presence."""
+    just presence.
+
+    Two relationship-scoping forms are legal: an inline property map on the
+    pattern (``[:REL… {build_id: $build_id}]``), or — ONLY where Cypher forbids
+    the map (``shortestPath`` rejects properties in its pattern, verified
+    live) — a whole-path ``all(rel IN relationships(p) …)`` guard covering
+    every hop."""
     templates = _all_cypher_templates()
     # keep the scan honest: it must actually find the module's templates
-    assert len(templates) == 5, sorted(templates)
+    assert len(templates) == 8, sorted(templates)
+    inline_rel = re.compile(r":REL[^\]]*\{build_id: \$build_id")
+    path_guard = "all(rel IN relationships(p) WHERE rel.build_id = $build_id)"
     for name, template in templates.items():
         assert "$build_id" in template, name
-        # every Entity node pattern carries BOTH scope properties
+        # every Entity node pattern carries BOTH scope properties, adjacent
         assert template.count(":Entity") == template.count("project: $project"), name
         assert template.count(":Entity") == template.count("build_id: $build_id, project"), name
-        # every relationship pattern carries build_id (§4: [:REL {build_id, type}])
-        assert template.count(":REL") == template.count(":REL {build_id: $build_id"), name
+        # every relationship pattern is scoped: inline map, or the whole-path guard
+        unscoped = template.count(":REL") - len(inline_rel.findall(template))
+        assert unscoped == 0 or (unscoped > 0 and path_guard in template), name
 
 
 def test_public_surface_accepts_no_query_text() -> None:
@@ -93,6 +103,9 @@ def test_public_surface_accepts_no_query_text() -> None:
         "fetch_entities",
         "entity_count",
         "relation_count",
+        "neighbors",
+        "shortest_path",
+        "edges_among",
     }
     projector_public = {name for name in dir(BuildScopedGraphProjector) if not name.startswith("_")}
     assert projector_public == reader_public | {
@@ -270,3 +283,59 @@ async def test_relation_projection_with_missing_endpoints_fails_loud() -> None:
         projector = _wired_projector(_FakeSession(rows=rows))
         with pytest.raises(RelationEndpointsNotProjectedError):
             await projector.project_relation("e-1", "e-ghost", "works_at")
+
+
+# -- C6c read surface (templates are fixed; hops is the one validated embed) ---
+
+
+async def test_neighbors_substitutes_a_validated_hop_bound_and_a_deadline() -> None:
+    """The hop bound cannot be a driver parameter (Cypher rejects `*1..$hops` —
+    verified live), so it is embedded — but ONLY as a validated int, and the
+    policy deadline rides the Query object so Neo4j kills a runaway traversal
+    server-side (§21)."""
+    session = _FakeSession()
+    repo = _wired_repo(session)
+    await repo.neighbors("seed-1", hops=3, limit=10, timeout_ms=1500)
+    (query, parameters), *_ = session.calls
+    text = str(query)
+    assert "*1..3" in text and "__HOPS__" not in text  # substituted, validated
+    assert getattr(query, "timeout", None) == 1.5  # the §21 deadline, in seconds
+    assert parameters["seed"] == "seed-1" and parameters["limit"] == 10
+    assert parameters["build_id"] == str(_BUILD)  # scope still merged last
+
+
+@pytest.mark.parametrize("hops", [0, -1, True, 2.0, "2", "1 OR x"])
+async def test_a_non_positive_or_non_int_hop_bound_is_refused(hops: object) -> None:
+    """The embed seam accepts a positive int and NOTHING else — bool included
+    (True would render as the string 'True' mid-pattern), so no value can
+    smuggle pattern text into the one dynamic slot."""
+    repo = _wired_repo(_FakeSession())
+    with pytest.raises(ValueError, match="hops must be a positive int"):
+        await repo.neighbors("s", hops=hops, limit=5, timeout_ms=1000)  # type: ignore[arg-type]
+
+
+async def test_limit_and_timeout_are_validated_ints_too() -> None:
+    session = _FakeSession()
+    repo = _wired_repo(session)
+    with pytest.raises(ValueError, match="limit must be a positive int"):
+        await repo.neighbors("s", hops=1, limit=0, timeout_ms=1000)
+    with pytest.raises(ValueError, match="timeout_ms must be a positive int"):
+        await repo.neighbors("s", hops=1, limit=5, timeout_ms=0)
+    assert session.calls == []  # refused before any query was sent
+
+
+async def test_edges_among_short_circuits_an_empty_id_set() -> None:
+    """No ids → no query at all (an `IN []` round-trip would be a wasted call
+    under the phase deadline)."""
+    session = _FakeSession()
+    repo = _wired_repo(session)
+    assert await repo.edges_among([], timeout_ms=1000) == []
+    assert session.calls == []
+
+
+async def test_shortest_path_returns_none_when_no_row_comes_back() -> None:
+    session = _FakeSession(rows=[])
+    repo = _wired_repo(session)
+    assert await repo.shortest_path("a", "b", max_hops=3, timeout_ms=1000) is None
+    (query, parameters), *_ = session.calls
+    assert "*..3" in str(query) and parameters["src"] == "a" and parameters["dst"] == "b"

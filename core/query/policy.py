@@ -121,3 +121,72 @@ class TextToSql:
             timeout_ms=int(data["timeout_ms"]),
             readonly=bool(data.get("readonly", True)),
         )
+
+
+@dataclass(frozen=True)
+class TextToCypher:
+    """Typed mirror of ``query_policy.text_to_cypher`` (§21/§27.6), the config
+    the C6c graph mode consumes.
+
+    ``enabled`` gates ONLY the optional free NL→Cypher add-on (§27.6 選配) —
+    the parameterized templates (:data:`GRAPH_QUERY_TEMPLATES`) are the default
+    graph path and run regardless of it (the policy schema's ``default_mode``
+    description freezes that reading). ``max_rows``/``timeout_ms`` are the
+    graph mode's row cap and deadline either way; the hop ceiling is the
+    TOP-LEVEL ``max_graph_hops`` (single source, deliberately not duplicated
+    here), so the caller passes it alongside this block.
+
+    Construction re-checks the frozen §21 guarantees (the same discipline as
+    :class:`TextToSql`):
+
+    - ``readonly`` is frozen ``True`` — a writable Cypher path is forbidden;
+    - ``allowed_clauses`` is a non-empty subset of the frozen
+      :data:`CYPHER_ALLOWED_CLAUSES` universe — nothing outside it can ever be
+      whitelisted (so ``CALL``/APOC can never be allowed in);
+    - ``blocked`` covers :data:`CYPHER_BLOCKED_MIN` — extend, never shrink;
+    - ``max_rows`` and ``timeout_ms`` are ``≥ 1`` (schema minimum) — a
+      non-positive deadline would disable the driver-side timeout (§21/§22).
+    """
+
+    enabled: bool
+    allowed_clauses: tuple[str, ...]
+    blocked: tuple[str, ...]
+    max_rows: int
+    timeout_ms: int
+    readonly: bool = True
+
+    def __post_init__(self) -> None:
+        if self.readonly is not True:
+            raise ValueError(
+                "text_to_cypher.readonly is frozen true (§21) — a writable Cypher path is forbidden"
+            )
+        outside = [c for c in self.allowed_clauses if c not in CYPHER_ALLOWED_CLAUSES]
+        if outside or not self.allowed_clauses:
+            raise ValueError(
+                f"allowed_clauses {list(self.allowed_clauses)} must be a non-empty subset "
+                f"of the frozen §21 universe {list(CYPHER_ALLOWED_CLAUSES)}"
+            )
+        present = {word.upper() for word in self.blocked}
+        missing = [word for word in CYPHER_BLOCKED_MIN if word not in present]
+        if missing:
+            raise ValueError(
+                f"blocked is missing the frozen §21 minimum {missing} — "
+                "the list may be extended, never shrunk below the frozen six"
+            )
+        if self.max_rows < 1 or self.timeout_ms < 1:
+            raise ValueError(
+                f"max_rows ({self.max_rows}) and timeout_ms ({self.timeout_ms}) are frozen "
+                "≥ 1 (§21 schema minimum) — a non-positive timeout_ms disables the deadline"
+            )
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> TextToCypher:
+        """Build from a (schema-validated) ``text_to_cypher`` mapping."""
+        return cls(
+            enabled=bool(data["enabled"]),
+            allowed_clauses=tuple(data["allowed_clauses"]),
+            blocked=tuple(data["blocked"]),
+            max_rows=int(data["max_rows"]),
+            timeout_ms=int(data["timeout_ms"]),
+            readonly=bool(data.get("readonly", True)),
+        )

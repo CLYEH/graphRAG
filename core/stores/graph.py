@@ -38,18 +38,26 @@ This module is that structure for Neo4j:
   writers.)
 
 The surface is deliberately minimal: entity/relation projection for C5,
-scoped fetch + the two counts §19's projection-drift reconciliation needs.
-C6b's graph retrieval templates (neighbors/path/subgraph, §21) extend this
-additively.
+scoped fetch + the two counts §19's projection-drift reconciliation needs,
+and C6c's retrieval templates (neighbors/path/subgraph — §21/§27.6's
+parameterized default graph path).
+
+One deliberate seam in the no-dynamic-text rule: Cypher cannot parameterize a
+variable-length bound (``*1..$hops`` is a syntax error — verified live), so
+the two traversal templates carry a ``__HOPS__`` placeholder substituted by
+:meth:`BuildScopedGraphRepo._hop_template` with a VALIDATED ``int`` — the
+same contained exception as the SQL reader's ``int(timeout_ms)`` embed: an
+integer literal cannot smuggle query text.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from typing import Any, Final, LiteralString
 
 import sqlalchemy as sa
-from neo4j import AsyncDriver, AsyncGraphDatabase, AsyncSession
+from neo4j import AsyncDriver, AsyncGraphDatabase, AsyncSession, Query
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.config import get_settings
@@ -78,6 +86,55 @@ MATCH (:Entity {build_id: $build_id, project: $project})
       -[r:REL {build_id: $build_id}]->
       (:Entity {build_id: $build_id, project: $project})
 RETURN count(r) AS total
+"""
+
+# -- C6c retrieval templates (§27.6: the parameterized default graph path) ----
+#
+# The variable-length templates re-filter the WHOLE path with
+# `all(n IN nodes(p) …)`: the endpoint property maps do NOT constrain the
+# intermediate nodes a multi-hop path passes through, so without it a
+# traversal could tunnel THROUGH a rejected/merged node to reach an active
+# one — surfacing a connection the active graph does not have. (Relationships
+# are already per-hop scoped: a property map inside a variable-length pattern
+# applies to every hop — verified live.)
+
+_NEIGHBORS: Final = """\
+MATCH p = (seed:Entity {canonical_id: $seed, status: 'active',
+                        build_id: $build_id, project: $project})
+          -[:REL*1..__HOPS__ {build_id: $build_id}]-
+          (m:Entity {build_id: $build_id, project: $project, status: 'active'})
+WHERE m.canonical_id <> $seed
+  AND all(n IN nodes(p) WHERE n.project = $project
+          AND n.build_id = $build_id AND n.status = 'active')
+WITH m, min(length(p)) AS distance
+RETURN m{.*} AS entity, distance
+ORDER BY distance, m.canonical_id
+LIMIT $limit
+"""
+
+_SHORTEST_PATH: Final = """\
+MATCH (src:Entity {canonical_id: $src, status: 'active',
+                   build_id: $build_id, project: $project}),
+      (dst:Entity {canonical_id: $dst, status: 'active',
+                   build_id: $build_id, project: $project}),
+      p = shortestPath((src)-[:REL*..__HOPS__]-(dst))
+WHERE all(rel IN relationships(p) WHERE rel.build_id = $build_id)
+  AND all(n IN nodes(p) WHERE n.project = $project
+          AND n.build_id = $build_id AND n.status = 'active')
+RETURN [n IN nodes(p) | n{.*}] AS nodes,
+       [rel IN relationships(p) | {type: rel.type,
+                                   src: startNode(rel).canonical_id,
+                                   dst: endNode(rel).canonical_id}] AS rels
+LIMIT 1
+"""
+
+_EDGES_AMONG: Final = """\
+MATCH (x:Entity {build_id: $build_id, project: $project, status: 'active'})
+      -[r:REL {build_id: $build_id}]->
+      (y:Entity {build_id: $build_id, project: $project, status: 'active'})
+WHERE x.canonical_id IN $ids AND y.canonical_id IN $ids
+RETURN x.canonical_id AS src, y.canonical_id AS dst, r.type AS type
+ORDER BY src, dst, type
 """
 
 _PROJECT_ENTITY: Final = """\
@@ -207,6 +264,77 @@ class BuildScopedGraphRepo:
         rows = await self._run(_RELATION_COUNT, {})
         total: int = rows[0]["total"]
         return total
+
+    # -- C6c retrieval templates (§27.6 default graph path) --------------------
+
+    @staticmethod
+    def _hop_template(template: LiteralString, hops: int) -> str:
+        """Substitute the ``__HOPS__`` placeholder with a VALIDATED int.
+
+        The one sanctioned exception to the fixed-LiteralString rule (see the
+        module docstring): a variable-length bound cannot be a driver
+        parameter, and an ``int``'s decimal rendering cannot carry query text.
+        ``type() is int`` (not isinstance) also refuses ``bool`` — ``True``
+        would render as the string ``True`` mid-pattern."""
+        if type(hops) is not int or hops < 1:
+            raise ValueError(f"hops must be a positive int, got {hops!r}")
+        return template.replace("__HOPS__", str(hops))
+
+    async def _run_read(
+        self, query: str, params: dict[str, Any], timeout_ms: int
+    ) -> list[dict[str, Any]]:
+        """Run one retrieval template under the policy deadline (§21/§22).
+
+        ``timeout`` is enforced server-side by Neo4j (the transaction is
+        killed at the deadline and the driver raises), so a runaway traversal
+        cannot hold the session past the policy budget. The ``query`` str is
+        either a module template verbatim or one that went through
+        :meth:`_hop_template` — this private method takes no caller text, so
+        it does not open a caller-facing splice point."""
+        if type(timeout_ms) is not int or timeout_ms < 1:
+            raise ValueError(f"timeout_ms must be a positive int, got {timeout_ms!r}")
+        result = await self.__session.run(
+            Query(query, timeout=timeout_ms / 1000.0),
+            {**params, **self._scope_params()},
+        )
+        return await result.data()
+
+    async def neighbors(
+        self, seed: str, *, hops: int, limit: int, timeout_ms: int
+    ) -> list[dict[str, Any]]:
+        """Active entities within ``hops`` of ``seed``, nearest first.
+
+        Each row is ``{entity: {…node properties…}, distance: int}``. The
+        template excludes the seed itself, scopes every hop's relationship and
+        EVERY node on the path (incl. intermediates) to the bound build's
+        active entities, and caps the result at ``limit`` (the §21 row cap —
+        parameterizable, unlike the hop bound)."""
+        if type(limit) is not int or limit < 1:
+            raise ValueError(f"limit must be a positive int, got {limit!r}")
+        return await self._run_read(
+            self._hop_template(_NEIGHBORS, hops), {"seed": seed, "limit": limit}, timeout_ms
+        )
+
+    async def shortest_path(
+        self, src: str, dst: str, *, max_hops: int, timeout_ms: int
+    ) -> dict[str, Any] | None:
+        """One shortest active path ``src`` → ``dst`` within ``max_hops``, or
+        ``None``. Returns ``{nodes: [{…}, …], rels: [{type, src, dst}, …]}`` —
+        the rels carry endpoint canonical_ids so the caller can map every edge
+        back to its SoR relation row (§27.2: a path cites every edge)."""
+        rows = await self._run_read(
+            self._hop_template(_SHORTEST_PATH, max_hops), {"src": src, "dst": dst}, timeout_ms
+        )
+        return rows[0] if rows else None
+
+    async def edges_among(
+        self, canonical_ids: Sequence[str], *, timeout_ms: int
+    ) -> list[dict[str, Any]]:
+        """All active edges whose BOTH endpoints are in ``canonical_ids`` —
+        the subgraph template's edge set (nodes come from :meth:`neighbors`)."""
+        if not canonical_ids:
+            return []
+        return await self._run_read(_EDGES_AMONG, {"ids": list(canonical_ids)}, timeout_ms)
 
 
 class BuildScopedGraphProjector(BuildScopedGraphRepo):
