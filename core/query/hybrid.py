@@ -261,6 +261,18 @@ async def _select_modes(
         )
         payload = _parse_selection(answer.message.content or "")
         picked = [mode for mode in available if mode in payload["modes"]]
+        extras = [mode for mode in payload["modes"] if mode not in available]
+        if extras:
+            # a MIXED answer (valid + hallucinated/unavailable modes) is not
+            # half-trusted: one out-of-vocabulary member marks the whole
+            # selection unreliable, and honoring the valid half would silently
+            # narrow retrieval — the documented failure rule (any
+            # out-of-vocabulary output → breadth) applies to the whole answer
+            return (
+                list(available),
+                [],
+                f"selector named unavailable mode(s) {extras} — ran every available mode",
+            )
         if not picked:
             return (
                 list(available),

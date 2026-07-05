@@ -224,6 +224,7 @@ async def test_the_selector_narrows_and_the_trace_tells_the_truth(
         json.dumps({"modes": "semantic", "reason": "wrong type"}),
         json.dumps({"modes": [1, 2], "reason": "wrong item types"}),
         json.dumps({"modes": ["teleport"], "reason": "out of vocabulary"}),
+        json.dumps({"modes": ["semantic", "teleport"], "reason": "MIXED valid + hallucinated"}),
         json.dumps({"modes": [], "reason": "empty"}),
     ],
 )
@@ -366,3 +367,19 @@ async def test_a_single_available_mode_skips_the_selector(
     await _run(_deps(llm), _policy())
     assert llm.calls == 0  # selector never consulted
     assert len(calls["semantic"]) == 1
+
+
+async def test_a_mode_outside_the_offered_set_distrusts_the_whole_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The selector is TOLD the available set; naming a real-but-GATED mode is
+    the same non-compliance as a hallucinated one — the whole answer is
+    distrusted and every available mode runs (silently honoring the valid
+    half would narrow retrieval without a warning)."""
+    calls = _patch_modes(monkeypatch)
+    llm = _FakeLLM(json.dumps({"modes": ["semantic", "sql"], "reason": "sql is gated"}))
+    response = await _run(_deps(llm), _policy(sql_enabled=False))  # sql gated by policy
+    assert calls["sql"] == []  # the gate still holds absolutely
+    assert len(calls["semantic"]) == 1 and len(calls["graph"]) == 1 and len(calls["global"]) == 1
+    assert response.debug is not None
+    assert "unavailable mode" in response.debug["routing_decision"]["reason"]
