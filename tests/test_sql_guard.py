@@ -34,7 +34,8 @@ def _validate(
     [
         "SELECT * FROM orders",
         "SELECT * FROM orders WHERE amount = '5'",
-        "SELECT * FROM orders WHERE amount::numeric > 100",  # a cast is read-only
+        "SELECT * FROM orders WHERE amount::numeric > 100",  # a `::` cast is read-only
+        "SELECT * FROM orders WHERE CAST(amount AS numeric) > 100",  # the CAST() form too
         "SELECT * FROM orders WHERE customer = 'acme' ORDER BY amount LIMIT 10",
         "select * from customers",  # lowercase keywords
         "SELECT * FROM orders WHERE note = 'please delete this order'",  # blocked word in a STRING
@@ -97,6 +98,33 @@ def test_rejects_uncitable_constructs(sql: str) -> None:
     """A join/subquery/CTE/set-op/GROUP BY/aggregate/DISTINCT produces rows that
     fold many source rows or none — no single (table, pk) can cite them, so the
     §27.2 require_sources contract can't be met. Rejected in v1."""
+    with pytest.raises(GuardrailBlocked):
+        _validate(sql)
+
+
+# --- REJECT: side-effecting reads (§21 read-only — a SELECT can still mutate) --
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM orders WHERE pg_advisory_lock(42) IS NULL",  # session-level lock
+        "SELECT * FROM orders WHERE pg_advisory_xact_lock(1) IS NULL",  # txn lock
+        "SELECT * FROM orders WHERE set_config('work_mem', '1GB', false) IS NULL",  # setting
+        "SELECT * FROM orders WHERE nextval('s') > 0",  # advances a sequence
+        "SELECT * FROM orders WHERE pg_sleep(5) IS NULL",  # DoS / resource hold
+        "SELECT * FROM orders WHERE lower(customer) = 'acme'",  # any non-cast function
+        "SELECT * FROM orders FOR UPDATE",  # row locks
+        "SELECT * FROM orders FOR SHARE",  # row share locks
+        "SELECT * INTO evil FROM orders",  # writes a new table
+    ],
+)
+def test_rejects_side_effecting_reads(sql: str) -> None:
+    """A SELECT is not automatically side-effect-free: a function can take an
+    advisory lock, change a setting, or advance a sequence; FOR UPDATE/SHARE takes
+    row locks; SELECT INTO writes a table. None are stopped by the read-only role,
+    so the guardrail refuses every non-cast function, any lock clause, and INTO —
+    only a type cast survives (§21 read-only)."""
     with pytest.raises(GuardrailBlocked):
         _validate(sql)
 

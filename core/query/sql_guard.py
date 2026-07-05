@@ -26,6 +26,15 @@ reconstructs each logical table as a build-scoped CTE of the *same bare name*
 to a real base table. Keyword blocking is defense in depth on top of the AST and
 runs on the token stream, so a blocked word inside a string literal or a quoted
 identifier (``WHERE note = 'please delete this'``) does not false-trip it.
+
+Read-only is not just "no DML root": a ``SELECT`` can still mutate session or
+transaction state through a FUNCTION (``pg_advisory_lock``, ``set_config``,
+``nextval``) — leaving a pooled connection carrying locks/settings — or through
+``FOR UPDATE`` (row locks) or ``SELECT INTO`` (writes a table), none of which the
+deferred read-only role would stop. So within the flat ``SELECT *`` only a type
+CAST is permitted (``amount::numeric``); every other function call, any row-lock
+clause, and ``SELECT INTO`` are refused. This is the allow-list stance §21 asks
+for — the guardrail may over-block, never under-block.
 """
 
 from __future__ import annotations
@@ -99,6 +108,7 @@ def validate_sql(
     for node_type, label in _FORBIDDEN:
         if statement.find(node_type) is not None:
             raise GuardrailBlocked(f"{label} is not allowed in a SQL retrieval query")
+    _reject_side_effects(statement)
     if not _is_select_star(statement):
         raise GuardrailBlocked(
             "the projection must be SELECT * — whole source rows are returned so each "
@@ -120,6 +130,30 @@ def _parse_single(sql: str) -> exp.Expr:
     if len(statements) != 1:
         raise GuardrailBlocked(f"exactly one statement is allowed, parsed {len(statements)}")
     return statements[0]
+
+
+def _reject_side_effects(statement: exp.Select) -> None:
+    """Reject reads that can still mutate state or escape a pure SELECT — the
+    structural checks above do not catch these (§21 read-only). A function call
+    may take an advisory lock, change a setting, or advance a sequence
+    (``pg_advisory_lock``, ``set_config``, ``nextval``), which the deferred
+    read-only role would NOT stop; so only a type CAST is allowed and every other
+    function is refused (``exp.Cast`` is itself an ``exp.Func`` subclass, hence the
+    isinstance skip). ``FOR UPDATE``/``FOR SHARE`` takes row locks; ``SELECT INTO``
+    writes a new table — both refused."""
+    for func in statement.find_all(exp.Func):
+        if not isinstance(func, exp.Cast):
+            rendered = func.sql(dialect=_DIALECT)
+            raise GuardrailBlocked(
+                f"a function call ({rendered[:40]}) is not allowed — a function may take a lock, "
+                "change settings, be non-deterministic, or fold rows; only casts are permitted"
+            )
+    if statement.args.get("locks"):
+        raise GuardrailBlocked(
+            "row locking (FOR UPDATE / FOR SHARE) is not allowed (§21 read-only)"
+        )
+    if statement.args.get("into") is not None:
+        raise GuardrailBlocked("SELECT INTO is not allowed — it writes a new table (§21 read-only)")
 
 
 def _is_select_star(statement: exp.Select) -> bool:

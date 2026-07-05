@@ -20,16 +20,20 @@ from typing import Any, cast
 import jsonschema
 import pytest
 import pytest_asyncio
+import sqlglot
 from alembic import command
 from alembic.config import Config
 from llama_index.core.llms import LLM
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
+from sqlglot import exp
 
 from core.config import get_settings
 from core.query.policy import SQL_BLOCKED_KEYWORDS_MIN, TextToSql
 from core.query.sql import sql_query
+from core.query.sql_guard import ValidatedSql
 from core.stores.repo import BuildScopedWriter
 from core.stores.sqlreader import BuildScopedSqlReader
 from core.stores.tables import builds, documents
@@ -179,11 +183,14 @@ async def test_query_reads_only_the_active_build(conn: AsyncConnection) -> None:
         await _cleanup(project)
 
 
-async def test_an_expensive_query_is_cancelled_at_the_deadline(conn: AsyncConnection) -> None:
-    """A guardrail-valid but expensive query (pg_sleep in the predicate) is
-    cancelled by the policy statement_timeout instead of holding the connection —
-    it degrades to PARTIAL_RESULTS (§21/§22), proving the deadline is enforced on
-    the database, not just carried in the policy."""
+async def test_statement_timeout_cancels_and_leaves_a_reusable_connection(
+    conn: AsyncConnection,
+) -> None:
+    """The reader enforces the policy deadline as a real Postgres statement_timeout
+    and, after the cancel aborts the transaction, rolls back so the SAME connection
+    is reusable. Tested at the reader seam because the guardrail (correctly) rejects
+    pg_sleep — the only deterministic way to make a query slow — so we hand the
+    reader a ValidatedSql directly to prove the SET LOCAL + rollback on live PG."""
     project = f"sqltest-{uuid.uuid4().hex[:10]}"
     try:
         writer = await _new_build(conn, project)
@@ -192,28 +199,24 @@ async def test_an_expensive_query_is_cancelled_at_the_deadline(conn: AsyncConnec
         await _activate(conn, writer.build_id)
         await conn.commit()
 
-        fast_deadline = TextToSql(
-            enabled=True,
-            allowed_tables=("orders",),
-            blocked_keywords=SQL_BLOCKED_KEYWORDS_MIN,
-            max_rows=100,
-            timeout_ms=200,  # 200ms deadline vs a 5s sleep → cancelled
-        )
         reader = await BuildScopedSqlReader.for_active_build(conn, project)
-        response = await sql_query(
-            reader,
-            cast(LLM, _FakeLLM("SELECT * FROM orders WHERE pg_sleep(5) IS NOT NULL")),
-            fast_deadline,
-            "slow scan",
-            100,
+        await reader.apply_timeout(200)  # 200ms deadline vs a 5s sleep
+        slow = ValidatedSql(
+            statement=cast(
+                exp.Select,
+                sqlglot.parse_one(
+                    "SELECT * FROM orders WHERE pg_sleep(5) IS NOT NULL", dialect="postgres"
+                ),
+            ),
+            table="orders",
         )
-        _VALIDATOR.validate(response.to_dict())
-        assert response.results == () and response.warnings[0].code == "PARTIAL_RESULTS"
-        # the degradation rolled the aborted transaction back — the SAME connection
-        # is immediately reusable (a hybrid follow-up read would not 500). Without
-        # the rollback this raises "current transaction is aborted".
+        with pytest.raises(DBAPIError) as excinfo:
+            await reader.run(slow, max_rows=100)
+        assert getattr(excinfo.value.orig, "sqlstate", None) == "57014"  # query_canceled
+
+        await reader.rollback()  # what sql_query._degrade does before degrading
         reusable = (await conn.execute(text("SELECT 1"))).scalar_one()
-        assert reusable == 1
+        assert reusable == 1  # aborted transaction cleared → connection reusable
     finally:
         await _cleanup(project)
 

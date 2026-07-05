@@ -210,7 +210,7 @@ def test_a_timeout_degrades_to_partial_results() -> None:
     from GUARDRAIL_BLOCKED (the query was invalid) — and the tool passes the
     policy's timeout through and rolls the aborted transaction back."""
     reader = _FakeReader(raise_timeout=True)
-    response = _run(reader, _FakeLLM("SELECT * FROM orders WHERE pg_sleep(9) IS NULL"))
+    response = _run(reader, _FakeLLM("SELECT * FROM orders"))  # valid; the reader fakes the cancel
     _VALIDATOR.validate(response.to_dict())
     assert response.results == () and _codes(response) == ["PARTIAL_RESULTS"]
     assert reader.timeout_ms == _POLICY.timeout_ms  # the deadline was actually plumbed through
