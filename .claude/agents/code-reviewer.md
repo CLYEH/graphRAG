@@ -175,6 +175,30 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      stand-in. (C1d round 4: `ensure_collection` checked a collection EXISTS
      but not that its vector size/distance can hold this build's points —
      C5 would pass preflight then fail every upsert.)
+   - **Retrieval read/emit surface (untrusted projection → SoR re-verify →
+     frozen contract)**: when the diff READS from a derived projection
+     (Qdrant/Neo4j) and emits a frozen contract (§16), the projection is
+     UNTRUSTED (§19 drift; stale/corrupt points) — the READ-side dual of the
+     untrusted-input value tree above. Every payload value reaching the output
+     is validated-against-the-SoR-or-DROPPED: never raises, never emits an
+     unvalidated value. Ids come from the validated key (a uuid parsed once;
+     corrupt → drop the hit), optional display fields coerce to null on wrong
+     type (the hit stays, only the field drops), and every drop is counted into
+     a `PARTIAL_RESULTS` warning (§22 degrade-not-fail) — never a crash, never a
+     schema-invalid response. Sweep it SYMMETRICALLY: re-verify the SoR
+     invariant for EVERY result_type × EVERY invariant — if chunk hits
+     re-verify the row EXISTS, entity hits must re-verify existence AND
+     `status == 'active'`, because forward-only projection leaves the derived
+     store holding rows the SoR later excluded (resolution moved an entity off
+     `active` → rejected/merged/needs_review/deprecated). An ABSENT
+     derived-store artifact is a legitimate producer state, not an error: a
+     lazily-created collection a build with nothing to embed never created must
+     read as empty (Qdrant 404 → `[]`/`0`), not a 500 — but a non-404 store
+     error still surfaces (don't launder an outage into an empty answer). (C6a:
+     4 Codex rounds, each a cataloged class on this new read face — corrupt-uuid
+     crash, missing-collection 500, corrupt-`canonical_id` schema-invalid
+     output, non-active entity surfaced — all missed by the local reviewer's
+     narrow-property pass.)
 
 ## Output (exactly this shape)
 ```
