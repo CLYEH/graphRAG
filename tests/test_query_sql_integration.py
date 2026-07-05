@@ -452,6 +452,50 @@ async def test_a_row_without_a_pk_is_dropped_and_surfaced_as_partial(
         await _cleanup(project)
 
 
+async def test_a_table_whose_only_column_is_a_reserved_key_still_returns_cited_rows(
+    conn: AsyncConnection,
+) -> None:
+    """A structured table whose only column is a ``__``-prefixed key (read_csv_rows
+    accepts a `__id` pk column) has no queryable DATA columns, but the rows exist
+    and are citable by pk. `SELECT * FROM t` must return them cited — not silently
+    drop every row as if the table were empty (§27.2)."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await writer.insert(  # only column is the reserved-name pk `__id`
+            documents,
+            id=uuid.uuid4(),
+            source_uri="file:///weird.csv#__id=1",
+            content_hash=f"weird:1:{writer.build_id}",
+            mime=STRUCTURED_MIME,
+            metadata={"table": "weird", "pk": "1"},
+            raw=json.dumps({"__id": "1"}, sort_keys=True),
+            ingested_at=NOW,
+        )
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        policy = TextToSql(
+            enabled=True,
+            allowed_tables=("weird",),
+            blocked_keywords=SQL_BLOCKED_KEYWORDS_MIN,
+            max_rows=100,
+            timeout_ms=5000,
+        )
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("SELECT * FROM weird")), policy, "all", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert response.warnings == ()
+        (result,) = response.results  # the row is returned, not dropped
+        assert result.source_refs[0].metadata == {"table": "weird", "pk": "1"}
+        assert result.text is not None and json.loads(result.text) == {}  # __id not a data column
+    finally:
+        await _cleanup(project)
+
+
 async def test_a_write_attempt_is_blocked_end_to_end(conn: AsyncConnection) -> None:
     """If the LLM emits a write, the guardrail rejects it before execution: the
     response is GUARDRAIL_BLOCKED and the documents table is untouched."""

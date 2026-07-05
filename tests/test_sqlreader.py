@@ -37,6 +37,16 @@ class _Result:
         return self._rows
 
 
+class _ScalarResult:
+    """A scalar-returning result, as the _has_rows EXISTS probe expects."""
+
+    def __init__(self, value: bool) -> None:
+        self._value = value
+
+    def scalar_one(self) -> bool:
+        return self._value
+
+
 class _FakeConn:
     """Routes the reader's reads — the jsonb_object_keys column probe (bound
     text() via ``execute``) and the reconstructed query (fully-literal raw SQL via
@@ -59,13 +69,15 @@ class _FakeConn:
         self.rolled_back = True
         self._in_txn = False
 
-    async def execute(self, clause: Any) -> _Result:
+    async def execute(self, clause: Any) -> Any:
         self._in_txn = True
         sql = str(clause)
         params = {name: bp.value for name, bp in clause._bindparams.items()}
         self.executed.append((sql, params))
         if "jsonb_object_keys" in sql:
             return _Result([SimpleNamespace(k=col) for col in self._columns])
+        if "EXISTS" in sql:  # the _has_rows probe — the table has rows iff we seeded any
+            return _ScalarResult(bool(self._rows))
         return _Result(self._rows)
 
     async def exec_driver_sql(self, sql: str) -> _Result:
@@ -153,15 +165,28 @@ async def test_a_hostile_table_name_cannot_inject() -> None:
     assert '"a"" ; drop table documents; --"' in main_sql  # the name is an escaped identifier
 
 
-async def test_an_empty_logical_table_yields_no_results_without_a_query() -> None:
-    """A table with no rows in this build has no columns to reconstruct — the
-    reader returns empty and never runs a query against an empty schema (which
-    would error on the user's WHERE columns)."""
-    conn = _FakeConn([], [{"__row_pk": "1"}])
+async def test_a_genuinely_empty_table_yields_no_results_without_a_query() -> None:
+    """A table with NO rows in this build (no columns AND _has_rows false) has
+    nothing to reconstruct — the reader returns empty and never runs a query
+    against an empty schema (which would error on the user's WHERE columns)."""
+    conn = _FakeConn([], [])  # no columns, and no rows → truly empty
     validated = validate_sql("SELECT * FROM orders WHERE x = '1'", _ALLOWED, _BLOCKED)
     rows, truncated = await _reader(conn).run(validated, max_rows=10)
     assert rows == [] and truncated is False
     assert conn.driver_sql == []  # the reconstructed query never ran
+
+
+async def test_rows_with_only_reserved_keys_are_still_cited_not_dropped() -> None:
+    """A table whose rows carry only reserved (``__``-prefixed) JSON keys has no
+    DATA columns, but the rows EXIST and are citable by pk — so the reconstruction
+    runs (citation columns only) and returns them, rather than the empty-table
+    short-circuit silently dropping every row."""
+    conn = _FakeConn([], [{"__row_pk": "1", "__source_uri": "s3://1"}])  # rows, no data cols
+    validated = validate_sql("SELECT * FROM orders", _ALLOWED, _BLOCKED)
+    rows, truncated = await _reader(conn).run(validated, max_rows=10)
+    assert rows == [{"__row_pk": "1", "__source_uri": "s3://1"}]  # cited, not dropped
+    assert truncated is False
+    assert conn.driver_sql != []  # the reconstruction ran (rows exist)
 
 
 async def test_ceiling_clips_and_flags_truncation() -> None:

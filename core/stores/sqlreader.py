@@ -148,6 +148,21 @@ class BuildScopedSqlReader:
         )
         return tuple(sorted(row.k for row in result if not row.k.startswith("__")))
 
+    async def _has_rows(self, table: str) -> bool:
+        """Whether this logical table has ANY row in the active build — distinct
+        from whether it has queryable DATA columns. A row whose JSON carries only
+        reserved (``__``-prefixed) or empty keys still EXISTS and is citable by its
+        metadata pk, so :meth:`column_names` returning empty must not be read as an
+        empty table (which would silently drop those citable rows)."""
+        result = await self.__conn.execute(
+            text(
+                "SELECT EXISTS(SELECT 1 FROM documents WHERE project = :__g_project "
+                "AND build_id = CAST(:__g_build AS uuid) AND mime = :__g_mime "
+                "AND metadata ->> 'table' = :__g_table)"
+            ).bindparams(**self._scope_params(table))
+        )
+        return bool(result.scalar_one())
+
     async def run(
         self, validated: ValidatedSql, max_rows: int
     ) -> tuple[list[dict[str, Any]], bool]:
@@ -155,17 +170,20 @@ class BuildScopedSqlReader:
 
         Returns ``(rows, truncated)``: at most ``max_rows`` row dicts (each
         carrying ``__row_pk`` + ``__source_uri`` + the data columns), and whether
-        the ``max_rows`` ceiling clipped the result (§22 TRUNCATED). A logical
-        table with no rows in this build yields no columns and thus no results —
-        nothing to reconstruct — rather than a query against an empty schema.
+        the ``max_rows`` ceiling clipped the result (§22 TRUNCATED). A GENUINELY
+        empty table (no rows) short-circuits — nothing to reconstruct, and a user
+        WHERE on a data column would only error against an empty schema. But rows
+        with only reserved/empty JSON keys have no DATA columns yet still exist and
+        are citable by pk, so those are reconstructed (citation columns only) and
+        returned, not mistaken for an empty table.
 
         Runs inside :meth:`timed_transaction` (the caller wraps this phase in it),
         so the policy deadline bounds this statement and the transaction is ended
         on exit — the rows are materialised into Python here, before that exit.
         """
         columns = await self.column_names(validated.table)
-        if not columns:
-            return [], False
+        if not columns and not await self._has_rows(validated.table):
+            return [], False  # a genuinely empty table — nothing to reconstruct
 
         ceiling = self._ceiling(validated.statement, max_rows)
         # Name the CTE and the outer table reference with the SAME quoted
