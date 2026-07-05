@@ -70,7 +70,10 @@ class TextToSql:
     - ``blocked_keywords`` covers :data:`SQL_BLOCKED_KEYWORDS_MIN` — a project
       may extend the list, never shrink it below the frozen six;
     - an ``enabled`` mode has a non-empty ``allowed_tables`` — an enabled empty
-      whitelist is a deny-all contradiction (use ``enabled=False`` for that).
+      whitelist is a deny-all contradiction (use ``enabled=False`` for that);
+    - ``max_rows`` and ``timeout_ms`` are ``≥ 1`` (the schema minimum) — a
+      non-positive ``timeout_ms`` would render ``statement_timeout = 0``, which
+      *disables* the Postgres deadline the executor relies on (§21/§22).
 
     The row/latency reconciliation with the top-level ``max_sql_rows`` /
     ``max_latency_ms`` is the caller's job (C6b takes an already-reconciled
@@ -100,6 +103,11 @@ class TextToSql:
             raise ValueError(
                 "an enabled text_to_sql needs a non-empty allowed_tables — an enabled "
                 "empty whitelist is a deny-all contradiction (use enabled=False to deny all)"
+            )
+        if self.max_rows < 1 or self.timeout_ms < 1:
+            raise ValueError(
+                f"max_rows ({self.max_rows}) and timeout_ms ({self.timeout_ms}) are frozen "
+                "≥ 1 (§21 schema minimum) — a non-positive timeout_ms disables the deadline"
             )
 
     @classmethod

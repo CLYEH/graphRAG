@@ -60,3 +60,12 @@ def test_disabled_may_have_an_empty_whitelist() -> None:
     there is nothing to whitelist."""
     sql = TextToSql.from_mapping({**_VALID, "enabled": False, "allowed_tables": []})
     assert sql.enabled is False and sql.allowed_tables == ()
+
+
+@pytest.mark.parametrize("field", ["max_rows", "timeout_ms"])
+def test_non_positive_caps_are_rejected(field: str) -> None:
+    """The schema freezes both caps at ≥ 1; the model re-checks it because a
+    timeout_ms of 0 would render `statement_timeout = 0` — Postgres's value for
+    NO deadline — silently disabling the very guardrail §21/§22 relies on."""
+    with pytest.raises(ValueError, match="timeout_ms"):
+        TextToSql.from_mapping({**_VALID, field: 0})

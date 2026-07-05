@@ -83,11 +83,25 @@ async def sql_query(
         return _response(reader, query, (), (_warn(GUARDRAIL_WARNING_CODE, blocked.reason),))
 
     try:
-        rows, truncated = await reader.run(validated, max_rows)
+        rows, truncated = await reader.run(validated, max_rows, policy.timeout_ms)
     except DBAPIError as exc:
-        # a guardrail-valid query the DB still rejects — an LLM-hallucinated
-        # column, a bad cast — degrades (§22). Narrow to the DB-API family so a
-        # bug in our own SQL composition fails loud (Rule 12), not masked here.
+        # a guardrail-valid query the DB still rejects degrades (§22); a bug in
+        # our own SQL composition is NOT a DBAPIError, so it fails loud (Rule 12).
+        if _is_timeout(exc):
+            # the policy deadline cancelled it — the answer is incomplete (§22
+            # "逾時：回部分結果 + warning"), distinct from an invalid query.
+            return _response(
+                reader,
+                query,
+                (),
+                (
+                    _warn(
+                        "PARTIAL_RESULTS",
+                        f"query exceeded the {policy.timeout_ms}ms deadline (§21)",
+                    ),
+                ),
+            )
+        # otherwise an LLM-hallucinated column / bad cast — the query is unusable.
         return _response(
             reader,
             query,
@@ -167,6 +181,17 @@ def _to_results(rows: list[dict[str, Any]], table: str) -> tuple[RetrievalResult
             )
         )
     return ordered_results(results)
+
+
+#: Postgres SQLSTATE for a statement cancelled by ``statement_timeout``
+#: (query_canceled) — driver-agnostic (exposed on the DB-API ``orig``), so we
+#: don't couple this layer to asyncpg's exception classes.
+_QUERY_CANCELED_SQLSTATE = "57014"
+
+
+def _is_timeout(exc: DBAPIError) -> bool:
+    """True when the DB cancelled the statement for exceeding the deadline."""
+    return getattr(exc.orig, "sqlstate", None) == _QUERY_CANCELED_SQLSTATE
 
 
 def _warn(code: str, message: str) -> QueryWarning:

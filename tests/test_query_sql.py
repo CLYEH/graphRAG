@@ -17,7 +17,7 @@ from typing import Any, cast
 
 import jsonschema
 from llama_index.core.llms import LLM
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from core.graph.structured import row_source_ref
 from core.query.policy import SQL_BLOCKED_KEYWORDS_MIN, TextToSql
@@ -45,6 +45,13 @@ _POLICY = TextToSql(
 )
 
 
+class _Canceled(Exception):
+    """A DB-API `orig` carrying the query_canceled SQLSTATE, as asyncpg exposes
+    when statement_timeout fires."""
+
+    sqlstate = "57014"
+
+
 class _FakeLLM:
     def __init__(self, sql: str) -> None:
         self._sql = sql
@@ -62,6 +69,7 @@ class _FakeReader:
         columns: tuple[str, ...] = ("id", "amount"),
         raise_run: bool = False,
         raise_bug: bool = False,
+        raise_timeout: bool = False,
     ) -> None:
         self.project = "acme"
         self.build_id = _BUILD
@@ -70,13 +78,21 @@ class _FakeReader:
         self._columns = columns
         self._raise = raise_run
         self._bug = raise_bug
+        self._timeout = raise_timeout
+        self.timeout_ms: int | None = None
 
     async def column_names(self, table: str) -> tuple[str, ...]:
         return self._columns
 
-    async def run(self, validated: Any, max_rows: int) -> tuple[list[dict[str, Any]], bool]:
+    async def run(
+        self, validated: Any, max_rows: int, timeout_ms: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        self.timeout_ms = timeout_ms  # capture what the tool passed through
         if self._bug:
             raise RuntimeError("a bug in SQL composition")
+        if self._timeout:
+            # a statement cancelled by statement_timeout (SQLSTATE 57014)
+            raise OperationalError("SELECT ...", {}, _Canceled())
         if self._raise:
             # the DB rejecting a guardrail-valid query (unknown column / bad cast)
             raise ProgrammingError("SELECT ...", {}, Exception("column does not exist"))
@@ -177,6 +193,18 @@ def test_an_execution_error_degrades_not_raises() -> None:
     response = _run(reader, _FakeLLM("SELECT * FROM orders WHERE nope = '1'"))
     _VALIDATOR.validate(response.to_dict())
     assert response.results == () and _codes(response) == ["GUARDRAIL_BLOCKED"]
+
+
+def test_a_timeout_degrades_to_partial_results() -> None:
+    """A statement cancelled at the policy deadline (§21 timeout_ms) is the §22
+    timeout degradation — PARTIAL_RESULTS (the answer is incomplete), distinct
+    from GUARDRAIL_BLOCKED (the query was invalid) — and the tool passes the
+    policy's timeout through to the executor."""
+    reader = _FakeReader(raise_timeout=True)
+    response = _run(reader, _FakeLLM("SELECT * FROM orders WHERE pg_sleep(9) IS NULL"))
+    _VALIDATOR.validate(response.to_dict())
+    assert response.results == () and _codes(response) == ["PARTIAL_RESULTS"]
+    assert reader.timeout_ms == _POLICY.timeout_ms  # the deadline was actually plumbed through
 
 
 def test_a_code_bug_is_not_masked_as_a_warning() -> None:

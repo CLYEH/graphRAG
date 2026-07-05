@@ -179,6 +179,41 @@ async def test_query_reads_only_the_active_build(conn: AsyncConnection) -> None:
         await _cleanup(project)
 
 
+async def test_an_expensive_query_is_cancelled_at_the_deadline(conn: AsyncConnection) -> None:
+    """A guardrail-valid but expensive query (pg_sleep in the predicate) is
+    cancelled by the policy statement_timeout instead of holding the connection —
+    it degrades to PARTIAL_RESULTS (§21/§22), proving the deadline is enforced on
+    the database, not just carried in the policy."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", customer="acme", amount="9")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        fast_deadline = TextToSql(
+            enabled=True,
+            allowed_tables=("orders",),
+            blocked_keywords=SQL_BLOCKED_KEYWORDS_MIN,
+            max_rows=100,
+            timeout_ms=200,  # 200ms deadline vs a 5s sleep → cancelled
+        )
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader,
+            cast(LLM, _FakeLLM("SELECT * FROM orders WHERE pg_sleep(5) IS NOT NULL")),
+            fast_deadline,
+            "slow scan",
+            100,
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert response.results == () and response.warnings[0].code == "PARTIAL_RESULTS"
+    finally:
+        await conn.rollback()  # clear the cancelled transaction before cleanup
+        await _cleanup(project)
+
+
 async def test_a_write_attempt_is_blocked_end_to_end(conn: AsyncConnection) -> None:
     """If the LLM emits a write, the guardrail rejects it before execution: the
     response is GUARDRAIL_BLOCKED and the documents table is untouched."""

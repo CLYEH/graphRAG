@@ -134,7 +134,7 @@ class BuildScopedSqlReader:
         return tuple(sorted(row.k for row in result if not row.k.startswith("__")))
 
     async def run(
-        self, validated: ValidatedSql, max_rows: int
+        self, validated: ValidatedSql, max_rows: int, timeout_ms: int
     ) -> tuple[list[dict[str, Any]], bool]:
         """Run the validated SELECT against the build-scoped reconstruction.
 
@@ -143,7 +143,12 @@ class BuildScopedSqlReader:
         the ``max_rows`` ceiling clipped the result (§22 TRUNCATED). A logical
         table with no rows in this build yields no columns and thus no results —
         nothing to reconstruct — rather than a query against an empty schema.
+
+        ``timeout_ms`` (§21) bounds execution: an LLM query with an expensive
+        predicate (``pg_sleep``, a broad JSON scan) is cancelled at the policy
+        deadline rather than holding the connection to the server default.
         """
+        await self._apply_timeout(timeout_ms)
         columns = await self.column_names(validated.table)
         if not columns:
             return [], False
@@ -161,6 +166,20 @@ class BuildScopedSqlReader:
         # query's own smaller LIMIT, which is the caller's deliberate choice.
         truncated = len(rows) > ceiling and ceiling == max_rows
         return rows[:ceiling], truncated
+
+    async def _apply_timeout(self, timeout_ms: int) -> None:
+        """Bind the policy deadline to this transaction's statements. ``SET LOCAL``
+        is transaction-scoped (auto-resets at commit/rollback, so it never leaks
+        to a reused connection) and applies to every statement the reader then
+        runs on the same connection — the column probe and the user query alike.
+        ``timeout_ms`` is a validated positive int (SET takes no bind params, so
+        it is embedded; ``int()`` keeps it non-injectable).
+
+        Assumes a non-AUTOCOMMIT connection: under AUTOCOMMIT ``SET LOCAL`` warns
+        and no-ops (each statement is its own transaction), silently re-disabling
+        this deadline — so the deferred read-only engine (C8) must not enable it.
+        """
+        await self.__conn.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
 
     @staticmethod
     def _ceiling(statement: exp.Select, max_rows: int) -> int:

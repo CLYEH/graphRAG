@@ -71,7 +71,7 @@ async def test_reconstruction_is_build_scoped_and_never_a_base_table() -> None:
     `SELECT * FROM orders` can never reach a real base table."""
     conn = _FakeConn(["id", "amount"], [_row("1", id="1", amount="9")])
     validated = validate_sql("SELECT * FROM orders WHERE amount = '9'", _ALLOWED, _BLOCKED)
-    await _reader(conn).run(validated, max_rows=10)
+    await _reader(conn).run(validated, max_rows=10, timeout_ms=5000)
 
     main_sql, params = conn.executed[-1]
     assert "WITH orders AS" in main_sql  # reconstructed, not the base table
@@ -93,7 +93,7 @@ async def test_untrusted_column_names_cannot_inject() -> None:
     evil = "k' ; drop table documents; --"  # a single-quote break-out attempt
     conn = _FakeConn([evil], [{"__row_pk": "1", evil: "v"}])
     validated = validate_sql("SELECT * FROM orders", _ALLOWED, _BLOCKED)
-    await _reader(conn).run(validated, max_rows=10)
+    await _reader(conn).run(validated, max_rows=10, timeout_ms=5000)
     main_sql = conn.executed[-1][0]
     assert len(sqlglot.parse(main_sql, dialect="postgres")) == 1  # injection contained
     assert "'k'' ; drop table documents; --'" in main_sql  # the key is an escaped literal
@@ -105,9 +105,9 @@ async def test_an_empty_logical_table_yields_no_results_without_a_query() -> Non
     would error on the user's WHERE columns)."""
     conn = _FakeConn([], [{"__row_pk": "1"}])
     validated = validate_sql("SELECT * FROM orders WHERE x = '1'", _ALLOWED, _BLOCKED)
-    rows, truncated = await _reader(conn).run(validated, max_rows=10)
+    rows, truncated = await _reader(conn).run(validated, max_rows=10, timeout_ms=5000)
     assert rows == [] and truncated is False
-    assert all("jsonb_object_keys" in sql for sql, _ in conn.executed)  # only the column probe ran
+    assert not any("WITH orders" in sql for sql, _ in conn.executed)  # the query never ran
 
 
 async def test_ceiling_clips_and_flags_truncation() -> None:
@@ -115,14 +115,14 @@ async def test_ceiling_clips_and_flags_truncation() -> None:
     True (§22 TRUNCATED); the reader fetches one past the ceiling to detect it."""
     conn = _FakeConn(["id"], [_row(str(i), id=str(i)) for i in range(5)])
     validated = validate_sql("SELECT * FROM orders", _ALLOWED, _BLOCKED)
-    rows, truncated = await _reader(conn).run(validated, max_rows=3)
+    rows, truncated = await _reader(conn).run(validated, max_rows=3, timeout_ms=5000)
     assert len(rows) == 3 and truncated is True
 
 
 async def test_within_ceiling_is_not_truncated() -> None:
     conn = _FakeConn(["id"], [_row("1", id="1"), _row("2", id="2")])
     validated = validate_sql("SELECT * FROM orders", _ALLOWED, _BLOCKED)
-    rows, truncated = await _reader(conn).run(validated, max_rows=5)
+    rows, truncated = await _reader(conn).run(validated, max_rows=5, timeout_ms=5000)
     assert len(rows) == 2 and truncated is False
 
 
@@ -132,8 +132,19 @@ async def test_a_smaller_user_limit_is_not_a_policy_truncation() -> None:
     NOT fire even though more rows matched."""
     conn = _FakeConn(["id"], [_row(str(i), id=str(i)) for i in range(5)])
     validated = validate_sql("SELECT * FROM orders LIMIT 2", _ALLOWED, _BLOCKED)
-    rows, truncated = await _reader(conn).run(validated, max_rows=10)
+    rows, truncated = await _reader(conn).run(validated, max_rows=10, timeout_ms=5000)
     assert len(rows) == 2 and truncated is False
+
+
+async def test_run_applies_the_policy_statement_timeout() -> None:
+    """The policy deadline is enforced as a Postgres statement_timeout BEFORE any
+    read runs, so an expensive LLM predicate is cancelled at the deadline rather
+    than holding the connection to the server default (§21/§22)."""
+    conn = _FakeConn(["id"], [_row("1", id="1")])
+    validated = validate_sql("SELECT * FROM orders", _ALLOWED, _BLOCKED)
+    await _reader(conn).run(validated, max_rows=10, timeout_ms=250)
+    first_sql = conn.executed[0][0]
+    assert first_sql == "SET LOCAL statement_timeout = 250"  # applied, and applied first
 
 
 async def test_column_names_reserve_the_internal_namespace() -> None:
