@@ -16,6 +16,8 @@ dependencies = [
     "llama-index-llms-openai>=0.7.9",
     "llama-index-embeddings-openai>=0.5.1",
     "sqlglot>=25.0",
+    "leidenalg>=0.12.0",
+    "python-igraph>=1.0.0",
 ]
 
 [project.scripts]
