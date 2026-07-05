@@ -238,6 +238,41 @@ async def test_semantic_search_returns_the_nearest_cited_result_end_to_end(
         await _cleanup(qdrant, project)
 
 
+async def test_semantic_search_over_an_unindexed_build_is_empty_not_an_error(
+    qdrant: AsyncQdrantClient,
+) -> None:
+    """The lazy-collection producer/consumer edge: a build that embedded
+    nothing (index_build never called ensure_collection, so the project's
+    Qdrant collection is absent) must still answer a semantic query with an
+    empty, schema-valid response — not propagate Qdrant's collection-not-found
+    error (§22)."""
+    engine = _engine()
+    project = f"qtest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            writer = await _new_build(conn, project)
+            await conn.commit()
+            await _index(conn, qdrant, writer)  # nothing to embed → no collection
+            await conn.commit()
+            assert not await qdrant.collection_exists(collection_for(project))
+            await conn.execute(
+                builds.update().where(builds.c.id == writer.build_id).values(status="active")
+            )
+            await conn.commit()
+
+            repo = await BuildScopedRepo.for_active_build(conn, project)
+            vectors = await BuildScopedVectorRepo.for_active_build(conn, qdrant, project)
+            resp = await semantic_search(repo, vectors, _embedder(), "anything", top_k=5)
+            _VALIDATOR.validate(resp.to_dict())
+            assert resp.results == () and resp.warnings == ()
+            assert (
+                await vectors.point_count() == 0
+            )  # count over the absent collection is 0, not 404
+    finally:
+        await engine.dispose()
+        await _cleanup(qdrant, project)
+
+
 async def test_semantic_search_reads_only_the_active_build(
     qdrant: AsyncQdrantClient,
 ) -> None:

@@ -17,6 +17,7 @@ from typing import Any, cast
 
 import pytest
 from qdrant_client import AsyncQdrantClient, models
+from qdrant_client.http.exceptions import UnexpectedResponse
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.stores import vectors as vectors_module
@@ -42,19 +43,34 @@ class _FakeClient:
         count: int = 0,
         exists: bool = False,
         vectors_config: Any = None,
+        read_status: int | None = None,
     ) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self._points = points or []
         self._count = count
         self._exists = exists
         self._vectors_config = vectors_config
+        # if set, query_points/count raise this HTTP status (404 = collection
+        # not yet created — the lazy-creation state a scoped read must survive)
+        self._read_status = read_status
+
+    def _maybe_raise(self) -> None:
+        if self._read_status is not None:
+            raise UnexpectedResponse(
+                status_code=self._read_status,
+                reason_phrase="Not Found",
+                content=b"collection not found",
+                headers=cast(Any, None),
+            )
 
     async def query_points(self, collection_name: str, **kwargs: Any) -> Any:
         self.calls.append(("query_points", {"collection_name": collection_name, **kwargs}))
+        self._maybe_raise()
         return type("R", (), {"points": self._points})()
 
     async def count(self, collection_name: str, **kwargs: Any) -> Any:
         self.calls.append(("count", {"collection_name": collection_name, **kwargs}))
+        self._maybe_raise()
         return type("R", (), {"count": self._count})()
 
     async def collection_exists(self, collection_name: str) -> bool:
@@ -182,6 +198,32 @@ async def test_reads_send_the_scope_filter_and_nothing_else() -> None:
     assert search_kwargs["limit"] == 5
     assert _scope_of(count_kwargs["count_filter"])["type"] == "entity"
     assert count_kwargs["exact"] is True
+
+
+async def test_a_missing_collection_reads_as_empty_not_an_error() -> None:
+    """The collection is created lazily (only when a build embeds its first
+    point), so an active build that indexed nothing has NO collection. A scoped
+    read must then read as empty — Qdrant's 404 becomes zero hits / zero count,
+    so a semantic query over an un-indexed build returns no hits, never a 500
+    (§22). The vocabulary check still runs first: an unknown type raises even
+    with no collection."""
+    client = _FakeClient(read_status=404)
+    repo = _repo(client)
+    assert await repo.search([0.1, 0.2], limit=5) == []
+    assert await repo.point_count() == 0
+    with pytest.raises(ValueError, match="unknown point type"):
+        await repo.search([0.1], limit=1, point_type="relation")
+
+
+async def test_non_404_read_errors_propagate() -> None:
+    """Only a missing collection (404) is 'empty' — a real store failure (500)
+    must surface, not be silently swallowed into an empty result (that would
+    hide an outage behind a valid-looking no-hit answer)."""
+    repo = _repo(_FakeClient(read_status=500))
+    with pytest.raises(UnexpectedResponse):
+        await repo.search([0.1], limit=1)
+    with pytest.raises(UnexpectedResponse):
+        await repo.point_count()
 
 
 async def test_upserts_stamp_the_bound_scope_into_the_payload() -> None:

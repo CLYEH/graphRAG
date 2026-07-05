@@ -48,6 +48,7 @@ from typing import Any, Final
 
 import sqlalchemy as sa
 from qdrant_client import AsyncQdrantClient, models
+from qdrant_client.http.exceptions import UnexpectedResponse
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.config import get_settings
@@ -220,20 +221,41 @@ class BuildScopedVectorRepo:
     async def search(
         self, vector: list[float], limit: int, point_type: str | None = None
     ) -> list[models.ScoredPoint]:
-        """Scoped kNN: nearest points of the bound build (optionally one type)."""
-        response = await self._client.query_points(
-            self._collection,
-            query=vector,
-            query_filter=self._scope_filter(point_type),
-            limit=limit,
-        )
+        """Scoped kNN: nearest points of the bound build (optionally one type).
+
+        The collection is created LAZILY by the projector — only once a build
+        embeds its first point (its vector size is unknown before that). So an
+        ABSENT collection means this project has indexed nothing yet, and a
+        scoped read reads as empty rather than 500-ing (§22): a semantic query
+        over an un-indexed / empty active build returns no hits, not an error.
+        The vocabulary check runs first (an unknown point_type still raises,
+        even with no collection)."""
+        query_filter = self._scope_filter(point_type)
+        try:
+            response = await self._client.query_points(
+                self._collection, query=vector, query_filter=query_filter, limit=limit
+            )
+        except UnexpectedResponse as exc:
+            if exc.status_code == 404:
+                return []
+            raise
         return response.points
 
     async def point_count(self, point_type: str | None = None) -> int:
-        """Scoped exact count — §19 projection-drift reconciliation (PG vs Qdrant)."""
-        result = await self._client.count(
-            self._collection, count_filter=self._scope_filter(point_type), exact=True
-        )
+        """Scoped exact count — §19 projection-drift reconciliation (PG vs Qdrant).
+
+        An absent collection is zero points (same lazy-creation reasoning as
+        :meth:`search`): a build that indexed nothing reconciles against a PG
+        count of zero without a spurious store error."""
+        count_filter = self._scope_filter(point_type)
+        try:
+            result = await self._client.count(
+                self._collection, count_filter=count_filter, exact=True
+            )
+        except UnexpectedResponse as exc:
+            if exc.status_code == 404:
+                return 0
+            raise
         return result.count
 
 
