@@ -190,7 +190,22 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      re-verify the row EXISTS, entity hits must re-verify existence AND
      `status == 'active'`, because forward-only projection leaves the derived
      store holding rows the SoR later excluded (resolution moved an entity off
-     `active` → rejected/merged/needs_review/deprecated). An ABSENT
+     `active` → rejected/merged/needs_review/deprecated). For GRAPH reads the
+     re-verify surface is deeper than values and status — it is the whole
+     TRAVERSAL: {corrupt values, node status, EDGE existence, REACHABILITY
+     (a target reached only through a stale edge/node is drift — recompute
+     reachability over SoR-active nodes+relations, don't trust projected
+     distances), SHORTEST-ness (a stale shortest path must not mask a longer
+     still-active path — exclude the stale elements and retry the same pair)}.
+     And verification REJECTS THE CANDIDATE, NOT THE SEARCH: it must run
+     inside the candidate loop with the search continuing past failures (C6c:
+     5 Codex rounds, all on these cells — the parameterized templates left
+     zero grammar findings, so the projection-trust surface was where every
+     finding lived). Resource ceilings are guards too, symmetric across every
+     result source: a cap applied to entities but not the edges appended
+     beside them (or an uncapped fetch feeding a capped emitter) bypasses
+     §21; judge truncation at FETCH time, or drift drops shrinking survivors
+     back under the cap silently suppress TRUNCATED. An ABSENT
      derived-store artifact is a legitimate producer state, not an error: a
      lazily-created collection a build with nothing to embed never created must
      read as empty (Qdrant 404 → `[]`/`0`), not a 500 — but a non-404 store
@@ -226,6 +241,19 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      AFTER a coercing extraction sees only the coerced value — gate at the
      layer where the coercion happens (`jsonb_typeof(...)='string'` inside
      the SQL, not `isinstance` on the driver's already-stringified text).
+   - **When fixing a finding, sweep its class's siblings in the SAME pass**:
+     every review finding names a class — before shipping the fix, ask where
+     else that class bites: the SAME rule on other templates/functions (C6c:
+     the per-phase-deadline fix landed on the path search, then the seed scan
+     took another round for the identical stacking), and the SAME check on
+     sibling parameters of the very function (C6c: hops got its type guard;
+     `entity.strip()` on a non-string 500'd one round later). And a reviewer
+     nit that touches CORRECTNESS or signal precision (not style) is fixed
+     immediately even when marked optional — C6c's "TRUNCATED can be
+     suppressed by drift" nit was waved through as no-change-required and
+     came back one round later as a Codex P2 (no commit/comment records that
+     local-review pass — only the session does; the fix landing one commit
+     after the round-3 fix commit is the sole trace-visible corroboration).
 
 ## Output (exactly this shape)
 ```
