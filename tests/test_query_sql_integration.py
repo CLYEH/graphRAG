@@ -398,6 +398,42 @@ async def test_a_successful_query_does_not_leak_the_statement_timeout(
         await _cleanup(project)
 
 
+async def test_a_row_without_a_pk_is_dropped_and_surfaced_as_partial(
+    conn: AsyncConnection,
+) -> None:
+    """A structured row whose metadata carries no pk (a corrupt / hand-written
+    `documents` row) reconstructs a NULL `__row_pk`; it can't be cited (§27.2), so
+    it is dropped AND the response carries PARTIAL_RESULTS (§22) — the short answer
+    is not mistaken for a complete one."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", amount="9")  # citable
+        await writer.insert(  # a corrupt row: same logical table, but no pk in metadata
+            documents,
+            id=uuid.uuid4(),
+            source_uri="file:///orders.csv#corrupt",
+            content_hash=f"orders:corrupt:{writer.build_id}",
+            mime=STRUCTURED_MIME,
+            metadata={"table": "orders"},
+            raw=json.dumps({"amount": "5"}, sort_keys=True),
+            ingested_at=NOW,
+        )
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("SELECT * FROM orders")), _POLICY, "all", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert [r.source_refs[0].metadata["pk"] for r in response.results] == ["1"]  # citable only
+        assert [w.code for w in response.warnings] == ["PARTIAL_RESULTS"]  # the drop is surfaced
+    finally:
+        await _cleanup(project)
+
+
 async def test_a_write_attempt_is_blocked_end_to_end(conn: AsyncConnection) -> None:
     """If the LLM emits a write, the guardrail rejects it before execution: the
     response is GUARDRAIL_BLOCKED and the documents table is untouched."""

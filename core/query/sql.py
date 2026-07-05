@@ -99,11 +99,18 @@ async def sql_query(
     except DBAPIError as exc:
         return _degrade(reader, query, exc, policy.timeout_ms)
 
-    results = _to_results(rows, validated.table)
-    warnings: tuple[QueryWarning, ...] = ()
+    results, dropped = _to_results(rows, validated.table)
+    warnings: list[QueryWarning] = []
     if truncated:
-        warnings = (_warn("TRUNCATED", f"result truncated to the {max_rows}-row ceiling (§21)"),)
-    return _response(reader, query, results, warnings)
+        warnings.append(_warn("TRUNCATED", f"result truncated to the {max_rows}-row ceiling (§21)"))
+    if dropped:
+        # rows the DB returned but that carry no citable (table, pk) — §27.2 forbids
+        # emitting them uncited, and §22 forbids hiding the shortfall as a complete
+        # answer, so the caller learns the result is partial.
+        warnings.append(
+            _warn("PARTIAL_RESULTS", f"{dropped} row(s) omitted — no citable (table, pk) (§27.2)")
+        )
+    return _response(reader, query, results, tuple(warnings))
 
 
 def _degrade(
@@ -161,14 +168,20 @@ def _extract_sql(raw: str) -> str:
     return text.strip()
 
 
-def _to_results(rows: list[dict[str, Any]], table: str) -> tuple[RetrievalResult, ...]:
-    """One source row → one §16 ``row`` result cited by ``(table, pk)``. A row
-    with no usable pk is dropped (uncitable), not emitted."""
+def _to_results(rows: list[dict[str, Any]], table: str) -> tuple[tuple[RetrievalResult, ...], int]:
+    """One source row → one §16 ``row`` result cited by ``(table, pk)``. A row with
+    no usable pk is dropped (uncitable, §27.2), not emitted — returns the ordered
+    results AND the count dropped, so the caller can surface the shortfall (§22: an
+    incomplete answer must carry a warning, not look complete). A missing/non-string
+    ``pk`` means a corrupt or hand-written ``documents`` row; C2's connector always
+    writes one, so ``dropped`` is 0 on well-formed builds."""
     results: list[RetrievalResult] = []
     total = len(rows)
+    dropped = 0
     for index, row in enumerate(rows):
         pk = row.get("__row_pk")
         if not isinstance(pk, str) or not pk:
+            dropped += 1
             continue
         source_uri = row.get("__source_uri")
         data = {key: value for key, value in row.items() if not key.startswith("__")}
@@ -190,7 +203,7 @@ def _to_results(rows: list[dict[str, Any]], table: str) -> tuple[RetrievalResult
                 text=json.dumps(data, ensure_ascii=False, sort_keys=True),
             )
         )
-    return ordered_results(results)
+    return ordered_results(results), dropped
 
 
 #: Postgres SQLSTATE for a statement cancelled by ``statement_timeout``

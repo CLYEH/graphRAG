@@ -178,9 +178,11 @@ def test_a_hit_is_a_row_result_cited_by_table_and_pk() -> None:
     assert json.loads(result["text"]) == {"id": "7", "amount": "9"}  # __-prefixed cols stripped
 
 
-def test_a_row_with_no_pk_is_dropped_not_emitted_uncited() -> None:
+def test_a_row_with_no_pk_is_dropped_and_surfaced_as_partial() -> None:
     """A row missing a usable pk can't be cited (§27.2), so it is dropped rather
-    than emitted uncited — the read/emit discipline applied to SQL rows."""
+    than emitted uncited — the read/emit discipline applied to SQL rows. And the
+    drop is SURFACED as PARTIAL_RESULTS (§22): a short answer must not look
+    complete when rows were silently omitted."""
     reader = _FakeReader(
         rows=[
             {"__row_pk": None, "id": "1"},  # no pk → dropped
@@ -190,6 +192,7 @@ def test_a_row_with_no_pk_is_dropped_not_emitted_uncited() -> None:
     response = _run(reader, _FakeLLM("SELECT * FROM orders"))
     _VALIDATOR.validate(response.to_dict())
     assert [r.source_refs[0].metadata["pk"] for r in response.results] == ["2"]
+    assert _codes(response) == ["PARTIAL_RESULTS"]  # the omitted row is not hidden
 
 
 def test_truncation_is_surfaced() -> None:
