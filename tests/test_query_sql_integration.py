@@ -473,6 +473,45 @@ async def test_a_row_without_a_pk_is_dropped_and_surfaced_as_partial(
         await _cleanup(project)
 
 
+async def test_a_nonstring_pk_is_dropped_not_forged_into_a_citation(
+    conn: AsyncConnection,
+) -> None:
+    """A structured row whose metadata.pk is a JSON number (not a string) must not be
+    cited by a coerced '123'. The reconstruction gates __row_pk on
+    jsonb_typeof(...) = 'string', so a non-string pk reconstructs NULL — the row is
+    dropped (§27.2 requires the source to carry a string (table, pk)) AND surfaced as
+    PARTIAL_RESULTS (§22), not silently emitted with a stringified pk."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", amount="9")  # citable (string pk)
+        await writer.insert(  # a corrupt row: pk is a JSON number, not a string
+            documents,
+            id=uuid.uuid4(),
+            source_uri="file:///orders.csv#numeric-pk",
+            content_hash=f"orders:numpk:{writer.build_id}",
+            mime=STRUCTURED_MIME,
+            metadata={"table": "orders", "pk": 123},
+            raw=json.dumps({"amount": "7"}, sort_keys=True),
+            ingested_at=NOW,
+        )
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("SELECT * FROM orders")), _POLICY, "all", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert [r.source_refs[0].metadata["pk"] for r in response.results] == [
+            "1"
+        ]  # string pk only
+        assert [w.code for w in response.warnings] == ["PARTIAL_RESULTS"]  # numeric-pk row dropped
+    finally:
+        await _cleanup(project)
+
+
 async def test_a_table_whose_only_column_is_a_reserved_key_still_returns_cited_rows(
     conn: AsyncConnection,
 ) -> None:

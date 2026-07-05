@@ -72,6 +72,25 @@ def _json_text(column: str, key: str) -> exp.Expr:
     )
 
 
+def _string_typed_pk() -> exp.Expr:
+    """``metadata.pk`` as text, but ONLY when it is a JSON *string* — otherwise NULL.
+
+    ``->>`` / ``JSON_EXTRACT_PATH_TEXT`` coerce ANY json scalar (a number ``123``, a
+    bool, an object) to text, which would forge a string pk for a corrupt or
+    hand-written row; ``_to_results``' ``isinstance(pk, str)`` check runs on the
+    already-coerced text and so cannot see through it. Gating on
+    ``jsonb_typeof(metadata->'pk') = 'string'`` keeps the citation HONEST: a
+    non-string (or absent) pk yields NULL, so the row is dropped and surfaced as
+    PARTIAL_RESULTS — §27.2 requires the source row to actually carry a string
+    ``(table, pk)``, not one coerced into being. ``metadata`` is jsonb, so the
+    jsonb-native functions apply directly (no cast); the key ``'pk'`` is a fixed
+    literal, so no escaping concern."""
+    pk = exp.func("jsonb_extract_path", exp.column("metadata"), exp.Literal.string("pk"))
+    is_string = exp.func("jsonb_typeof", pk).eq(exp.Literal.string("string"))
+    pk_text = exp.func("jsonb_extract_path_text", exp.column("metadata"), exp.Literal.string("pk"))
+    return exp.case().when(is_string, pk_text).else_(exp.null())
+
+
 class BuildScopedSqlReader:
     """Executes one guardrail-validated SELECT against a build-scoped
     reconstruction of the logical structured tables. Construct via
@@ -314,7 +333,7 @@ class BuildScopedSqlReader:
         STRUCTURALLY (every row seen carries the active build_id, DR-006); the CTE
         takes its NAME from ``table`` in :meth:`run` (``.with_``)."""
         projections = [
-            exp.alias_(_json_text("metadata", "pk"), "__row_pk"),
+            exp.alias_(_string_typed_pk(), "__row_pk"),
             exp.alias_(exp.column("source_uri"), "__source_uri"),
             *[exp.alias_(_json_text("raw", column), column, quoted=True) for column in columns],
         ]

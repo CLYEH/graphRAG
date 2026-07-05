@@ -145,6 +145,20 @@ async def test_reconstruction_is_build_scoped_and_never_a_base_table() -> None:
     assert "'id') AS \"id\"" in main_sql and "'amount') AS \"amount\"" in main_sql
 
 
+async def test_a_nonstring_pk_is_gated_out_of_the_citation() -> None:
+    """metadata.pk is exposed as __row_pk only when it is a JSON string: the
+    reconstruction gates it on jsonb_typeof(...) = 'string'. A corrupt row whose pk
+    is a number/object then yields NULL and is dropped (PARTIAL_RESULTS), rather than
+    cited by a coerced '123' — ->>/JSON_EXTRACT_PATH_TEXT would silently stringify it
+    and _to_results' isinstance check can't see through that coercion (§27.2)."""
+    conn = _FakeConn(["id"], [_row("1", id="1")])
+    validated = validate_sql("SELECT * FROM orders", _ALLOWED, _BLOCKED)
+    await _reader(conn).run(validated, max_rows=10)
+    main_sql = conn.driver_sql[-1]
+    assert "JSONB_TYPEOF" in main_sql and "= 'string'" in main_sql  # pk gated on json string type
+    assert "AS __row_pk" in main_sql
+
+
 async def test_a_table_name_needing_quotes_is_reconstructed_correctly() -> None:
     """allowed_tables is not restricted to bare identifiers, so a whitelisted name
     with a space (`Order Details`) must work: the CTE and the outer reference are
