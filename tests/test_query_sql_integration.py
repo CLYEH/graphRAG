@@ -228,6 +228,24 @@ async def test_statement_timeout_cancels_and_releases_the_connection(
         await _cleanup(project)
 
 
+async def test_for_active_build_leaves_the_connection_clean(conn: AsyncConnection) -> None:
+    """The active-build lookup runs in its own committed transaction, so the reader
+    is handed back a CLEAN connection — a disabled (MODE_SKIPPED) query that returns
+    before any phase leaves no lookup transaction lingering idle."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", amount="9")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        await BuildScopedSqlReader.for_active_build(conn, project)
+        assert conn.in_transaction() is False  # lookup committed → nothing left open
+    finally:
+        await _cleanup(project)
+
+
 async def test_no_transaction_is_held_across_the_llm_call(conn: AsyncConnection) -> None:
     """sql_query runs schema discovery and execution in SEPARATE timed transactions,
     releasing the connection across the LLM call — so no session sits

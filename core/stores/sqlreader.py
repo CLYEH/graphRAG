@@ -25,12 +25,14 @@ a safely quoted identifier, never SQL. This is a READER: it opens no write path,
 and in production runs under a dedicated read-only role (that role + its engine
 are deferred infra — the executor takes an injected connection, C6a-style).
 
-The connection is loaned to the reader CLEAN and the reader owns its transaction
-lifecycle: each phase (schema discovery, then execution) runs in its own short,
-deadline-bound :meth:`timed_transaction`, ended on exit. It deliberately holds NO
-transaction across the LLM call that turns the schema into SQL, so no session sits
-idle-in-transaction while the model runs — the C8 read pool hands out clean
-connections and takes them back between phases.
+The connection is loaned to the reader CLEAN (:meth:`for_active_build` FAILS LOUD
+otherwise) and the reader owns its transaction lifecycle: each phase (schema
+discovery, then execution) runs in its own short, deadline-bound
+:meth:`timed_transaction`, ended on exit. The reader never rolls back a transaction
+it did not open, and it deliberately holds NO transaction across the LLM call that
+turns the schema into SQL, so no session sits idle-in-transaction while the model
+runs — the C8 read pool hands out clean connections and takes them back between
+phases.
 """
 
 from __future__ import annotations
@@ -100,12 +102,25 @@ class BuildScopedSqlReader:
 
     @classmethod
     async def for_active_build(cls, conn: AsyncConnection, project: str) -> BuildScopedSqlReader:
-        """Bind to the project's active build (DR-001), like the read repo. Ends the
-        lookup's read transaction so the reader starts from a CLEAN connection: it
-        manages its own short per-phase transactions (:meth:`timed_transaction`) and
-        is loaned the connection transaction-free."""
-        build = await active_build_id(conn, project)
-        await conn.rollback()  # release the lookup read — the reader owns per-phase txns
+        """Bind to the project's active build (DR-001), like the read repo.
+
+        REQUIRES a clean connection (no open transaction). The reader manages its
+        own short per-phase transactions (:meth:`timed_transaction`) and must never
+        roll back a transaction it did not open, so rather than silently discarding a
+        caller's unit — an audit write, other build-scoped repos sharing the
+        connection — it FAILS LOUD when handed a dirty one (Rule 12). The active-build
+        lookup runs in its OWN committed transaction, so the connection is clean both
+        IN and OUT — even a disabled (MODE_SKIPPED) query that returns before any
+        phase leaves nothing open — and the reader never issues a rollback that could
+        reach caller-owned state."""
+        if conn.in_transaction():
+            raise RuntimeError(
+                "BuildScopedSqlReader.for_active_build requires a connection with no "
+                "open transaction — it owns its per-phase transactions and must not "
+                "roll back caller-owned state"
+            )
+        async with conn.begin():  # the lookup's OWN txn, committed on exit → clean out
+            build = await active_build_id(conn, project)
         return BuildScopedSqlReader(conn, project, build, _token=_SQL_READER_TOKEN)
 
     def _scope_params(self, table: str) -> dict[str, Any]:

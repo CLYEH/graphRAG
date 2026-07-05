@@ -190,6 +190,18 @@ async def test_a_smaller_user_limit_is_not_a_policy_truncation() -> None:
     assert len(rows) == 2 and truncated is False
 
 
+async def test_for_active_build_refuses_a_dirty_connection() -> None:
+    """The reader owns its per-phase transactions, so it must be handed a CLEAN
+    connection — one already in a transaction (a caller's open unit) is refused
+    LOUDLY rather than silently rolled back (Rule 12 / loaned-clean); the check runs
+    before the build lookup, so no query is issued."""
+    conn = _FakeConn([], [])
+    conn._in_txn = True  # a caller's open transaction on the loaned connection
+    with pytest.raises(RuntimeError, match="no open transaction"):
+        await BuildScopedSqlReader.for_active_build(cast(AsyncConnection, conn), _PROJECT)
+    assert conn.executed == []  # refused before the active-build lookup ran
+
+
 async def test_timed_transaction_bounds_the_phase_and_ends_it() -> None:
     """Each phase runs in its own short timed transaction: the FIRST statement is
     the SET LOCAL binding the policy deadline (§21), and the exit rollback ends the
