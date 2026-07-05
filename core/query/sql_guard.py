@@ -116,6 +116,7 @@ def validate_sql(
             raise GuardrailBlocked(f"{label} is not allowed in a SQL retrieval query")
     _reject_side_effects(statement)
     _reject_nonliteral_limit(statement)
+    _reject_positional_order_by(statement)
     if not _is_select_star(statement):
         raise GuardrailBlocked(
             "the projection must be SELECT * — whole source rows are returned so each "
@@ -184,6 +185,30 @@ def _reject_nonliteral_limit(statement: exp.Select) -> None:
             "LIMIT must be a plain integer literal — a casted, computed, or "
             "non-integer LIMIT (LIMIT 2::int, LIMIT 1+1, LIMIT 2.5) would bypass the row cap"
         )
+
+
+def _reject_positional_order_by(statement: exp.Select) -> None:
+    """A positional ORDER BY (``ORDER BY 1``) sorts by output-column ORDINAL. The
+    executor reconstructs the table with the hidden citation columns
+    (``__row_pk``/``__source_uri``) PREPENDED before the data columns, so
+    ``ORDER BY 1`` would sort by ``__row_pk`` — not the first column the schema
+    prompt shows — returning a successful response in the WRONG order. A named
+    ORDER BY (``ORDER BY amount``, even ``amount::numeric``) binds to the column by
+    name and is unaffected by layout; only bare integer ordinals are rejected (§21
+    over-block, never a silently wrong order)."""
+    order = statement.args.get("order")
+    if order is None:
+        return
+    for ordered in order.find_all(exp.Ordered):
+        # unnest() strips parentheses first: PostgreSQL honours `ORDER BY (1)` and
+        # `ORDER BY ((1))` as positional ordinals too, but they parse to Paren(Literal),
+        # not Literal — a bare isinstance check would let them slip past.
+        key = ordered.this.unnest()
+        if isinstance(key, exp.Literal) and key.is_int:
+            raise GuardrailBlocked(
+                "a positional ORDER BY (ORDER BY 1) is not allowed — it sorts by output "
+                "column position, which includes hidden citation fields; order by a column name"
+            )
 
 
 def _is_select_star(statement: exp.Select) -> bool:

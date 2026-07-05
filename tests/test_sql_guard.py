@@ -37,6 +37,8 @@ def _validate(
         "SELECT * FROM orders WHERE amount::numeric > 100",  # a `::` cast is read-only
         "SELECT * FROM orders WHERE CAST(amount AS numeric) > 100",  # the CAST() form too
         "SELECT * FROM orders WHERE customer = 'acme' ORDER BY amount LIMIT 10",
+        "SELECT * FROM orders ORDER BY amount::numeric DESC",  # a named/cast sort key is fine
+        "SELECT * FROM orders ORDER BY (amount) DESC",  # a parenthesized EXPRESSION, not an ordinal
         "select * from customers",  # lowercase keywords
         "SELECT * FROM orders WHERE note = 'please delete this order'",  # blocked word in a STRING
         'SELECT * FROM orders WHERE "select" = 1',  # blocked word as a QUOTED identifier
@@ -104,6 +106,26 @@ def test_rejects_uncitable_constructs(sql: str) -> None:
     fold many source rows or none — no single (table, pk) can cite them, so the
     §27.2 require_sources contract can't be met. Rejected in v1."""
     with pytest.raises(GuardrailBlocked):
+        _validate(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM orders ORDER BY 1",  # ordinal → sorts by the hidden __row_pk
+        "SELECT * FROM orders ORDER BY 2 DESC",  # ordinal → sorts by __source_uri
+        "SELECT * FROM orders ORDER BY amount DESC, 1",  # one positional term among named
+        "SELECT * FROM orders ORDER BY (1)",  # PG honours a parenthesized ordinal too
+        "SELECT * FROM orders ORDER BY (2) DESC",  # …with a direction
+        "SELECT * FROM orders ORDER BY ((1))",  # …and nested parens
+    ],
+)
+def test_rejects_a_positional_order_by_that_sorts_by_hidden_citation_fields(sql: str) -> None:
+    """A positional ORDER BY sorts by output-column ordinal, but the reconstruction
+    prepends __row_pk/__source_uri before the data columns — so ORDER BY 1/2 would
+    silently sort by a hidden citation field, not the column the schema prompt
+    shows. Rejected; the model must order by a column name (§21 over-block)."""
+    with pytest.raises(GuardrailBlocked, match="positional ORDER BY"):
         _validate(sql)
 
 
