@@ -179,6 +179,25 @@ async def test_query_is_embedded_and_top_k_bounds_the_search() -> None:
     assert vectors.searched_limit == 3
 
 
+@pytest.mark.parametrize("bad", [0, -1, True, "3"])
+async def test_an_out_of_contract_top_k_degrades_typed(bad: Any) -> None:
+    """§22 sibling parity (the C6d/C6e door guard): a non-positive, bool, or
+    non-int top_k must come back as a typed GUARDRAIL_BLOCKED — never reach
+    Qdrant as an invalid limit and error the tool (the contract minimum is 1)."""
+    embedder = _FakeEmbedder()
+    vectors = _FakeVectors([])
+    response = await semantic_search(
+        cast(BuildScopedRepo, _FakeRepo()),
+        cast(BuildScopedVectorRepo, vectors),
+        cast("Any", embedder),
+        "find it",
+        top_k=bad,
+    )
+    assert response.results == ()
+    assert [w.code for w in response.warnings] == ["GUARDRAIL_BLOCKED"]
+    assert embedder.calls == [] and vectors.searched_limit is None  # nothing reached the store
+
+
 async def test_entity_mention_kind_maps_to_the_citable_source_type() -> None:
     """§27.2: a `text` mention is a chunk citation, a `structured` mention is a
     row citation — the source_kind is the only thing that tells them apart."""

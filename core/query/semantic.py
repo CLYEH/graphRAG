@@ -114,6 +114,23 @@ async def semantic_search(
             f"({repo.project}/{repo.build_id} vs {vectors.project}/{vectors.build_id}) — "
             "both must bind the same active build or enrichment would cross scopes"
         )
+    if type(top_k) is not int or top_k < 1:
+        # out-of-contract input degrades typed (§22), never a store error —
+        # bool <: int is annotation-silent, and a non-positive limit would
+        # reach Qdrant as an invalid search (the sibling-mode door guard,
+        # C6d/C6e parity)
+        return McpResponse(
+            query=query,
+            tool=_TOOL,
+            project=repo.project,
+            build_id=str(repo.build_id),
+            results=(),
+            warnings=(
+                QueryWarning(
+                    "GUARDRAIL_BLOCKED", f"top_k must be a positive integer, got {top_k!r}"
+                ),
+            ),
+        )
 
     query_vector = await embedder.aget_text_embedding(query)
     hits = await vectors.search(query_vector, limit=top_k)
