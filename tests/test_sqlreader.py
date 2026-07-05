@@ -14,11 +14,20 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.query.sql_guard import GuardrailBlocked, validate_sql
 from core.stores.sqlreader import _SQL_READER_TOKEN, BuildScopedSqlReader
 from core.stores.tables import STRUCTURED_MIME
+
+
+class _Canceled(Exception):
+    """A DB-API ``orig`` carrying an out-of-range SQLSTATE (22023), as the driver
+    raises when ``SET LOCAL statement_timeout`` is given a value past its range."""
+
+    sqlstate = "22023"
+
 
 _PROJECT = "acme"
 _BUILD = __import__("uuid").UUID("7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d")
@@ -59,10 +68,12 @@ class _FakeConn:
         columns: list[str],
         rows: list[dict[str, Any]],
         by_table: dict[str, list[str]] | None = None,
+        raise_on_set: bool = False,
     ) -> None:
         self._columns = columns
         self._rows = rows
         self._by_table = by_table or {}
+        self._raise_on_set = raise_on_set
         self.executed: list[tuple[str, dict[str, Any]]] = []
         self.driver_sql: list[str] = []
         self.rolled_back = False
@@ -76,10 +87,13 @@ class _FakeConn:
         self._in_txn = False
 
     async def execute(self, clause: Any) -> Any:
-        self._in_txn = True
+        self._in_txn = True  # a statement auto-begins the transaction (even a failing one)
         sql = str(clause)
         params = {name: bp.value for name, bp in clause._bindparams.items()}
         self.executed.append((sql, params))
+        if "statement_timeout" in sql and self._raise_on_set:
+            # an out-of-range value makes SET LOCAL itself fail (SQLSTATE 22023)
+            raise OperationalError(sql, params, _Canceled())
         if "AS tname" in sql:  # the batched columns_by_table probe (table, key) pairs
             return _Result(
                 [
@@ -263,6 +277,19 @@ async def test_timed_transaction_bounds_the_phase_and_ends_it() -> None:
         assert conn.executed[0][0] == "SET LOCAL statement_timeout = 250"  # deadline bound first
         assert conn.in_transaction() is True  # the phase holds the transaction while working
     assert conn.rolled_back is True and conn.in_transaction() is False  # released on exit
+
+
+async def test_timed_transaction_rolls_back_when_the_set_itself_fails() -> None:
+    """If the SET LOCAL statement_timeout itself fails (an out-of-range timeout_ms
+    that passed the schema's minimum-only check), it has already auto-begun the
+    transaction. The finally must still roll back — otherwise the pooled connection
+    is handed back in an aborted transaction and its next user hits 'current
+    transaction is aborted'. The DBAPIError still propagates (sql_query degrades it)."""
+    conn = _FakeConn([], [], raise_on_set=True)
+    with pytest.raises(DBAPIError):
+        async with _reader(conn).timed_transaction(99_999_999_999):
+            pass  # the SET raises on entry — the body never runs
+    assert conn.rolled_back is True and conn.in_transaction() is False  # cleaned up despite failure
 
 
 async def test_columns_by_table_groups_each_tables_keys_in_one_probe() -> None:

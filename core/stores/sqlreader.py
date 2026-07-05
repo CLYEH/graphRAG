@@ -281,8 +281,13 @@ class BuildScopedSqlReader:
         non-AUTOCOMMIT connection — under AUTOCOMMIT ``SET LOCAL`` no-ops, silently
         disabling the deadline, so the deferred read-only engine (C8) must not
         enable it."""
-        await self.__conn.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
         try:
+            # The SET is INSIDE the try: it auto-begins the transaction, so if it
+            # itself fails (e.g. a timeout_ms past PostgreSQL's accepted range — the
+            # policy schema bounds only a minimum), the finally still rolls back the
+            # now-aborted transaction, leaving the pooled connection clean for its
+            # next user rather than poisoned with "current transaction is aborted".
+            await self.__conn.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
             yield
         finally:
             await self.__conn.rollback()  # end the phase's txn — reset deadline, clear aborts
