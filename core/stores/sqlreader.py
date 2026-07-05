@@ -252,6 +252,16 @@ class BuildScopedSqlReader:
             return [], False  # a genuinely empty table — nothing to reconstruct
 
         ceiling = self._ceiling(validated.statement, max_rows)
+        # Fetch ONE row past the ceiling ONLY when the POLICY max_rows is the binding
+        # cap — that extra row is what detects (and reports) TRUNCATED. When the
+        # query's OWN smaller LIMIT is the cap, clipping to it is the caller's choice
+        # (never TRUNCATED), so the extra row is pure downside: it makes PostgreSQL
+        # evaluate WHERE/casts on a row the query did not ask for — a later
+        # `amount::numeric` on a nonnumeric value could degrade the whole result to
+        # GUARDRAIL_BLOCKED — and for `LIMIT 0` it would read a row the caller
+        # explicitly excluded. So probe only at the policy ceiling.
+        probe = ceiling == max_rows
+        fetch = ceiling + 1 if probe else ceiling
         # Name the CTE and the outer table reference with the SAME quoted
         # identifier, so the CTE shadows the reference for ANY whitelisted name —
         # a bare `orders` (folds to `"orders"`) or a `"Order Details"` that
@@ -262,7 +272,7 @@ class BuildScopedSqlReader:
         table_ref = statement.find(exp.Table)
         assert table_ref is not None  # the guardrail guarantees exactly one table
         table_ref.set("this", alias.copy())
-        final = statement.limit(ceiling + 1, copy=True).with_(
+        final = statement.limit(fetch, copy=True).with_(
             alias.copy(), as_=self._reconstruction(validated.table, columns), copy=True
         )
         # The rendered SQL is fully self-contained — scope values and untrusted
@@ -274,9 +284,10 @@ class BuildScopedSqlReader:
         # binds by $N, so `:` and `%` in data are inert).
         result = await self.__conn.exec_driver_sql(final.sql(dialect=_DIALECT))
         rows = [dict(row) for row in result.mappings()]
-        # TRUNCATED means the POLICY ceiling clipped the set (§22) — not the
-        # query's own smaller LIMIT, which is the caller's deliberate choice.
-        truncated = len(rows) > ceiling and ceiling == max_rows
+        # TRUNCATED means the POLICY ceiling clipped the set (§22) — detectable only
+        # at the probe (the query's own smaller LIMIT is the caller's deliberate
+        # choice, never TRUNCATED).
+        truncated = probe and len(rows) > ceiling
         return rows[:ceiling], truncated
 
     @asynccontextmanager

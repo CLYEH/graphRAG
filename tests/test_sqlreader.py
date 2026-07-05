@@ -250,6 +250,7 @@ async def test_ceiling_clips_and_flags_truncation() -> None:
     validated = validate_sql("SELECT * FROM orders", _ALLOWED, _BLOCKED)
     rows, truncated = await _reader(conn).run(validated, max_rows=3)
     assert len(rows) == 3 and truncated is True
+    assert "LIMIT 4" in conn.driver_sql[-1]  # one past the policy ceiling, to detect truncation
 
 
 async def test_within_ceiling_is_not_truncated() -> None:
@@ -262,11 +263,37 @@ async def test_within_ceiling_is_not_truncated() -> None:
 async def test_a_smaller_user_limit_is_not_a_policy_truncation() -> None:
     """When the query's own LIMIT (below max_rows) is the binding cap, clipping
     to it is the caller's choice — TRUNCATED (a §22 policy-ceiling signal) must
-    NOT fire even though more rows matched."""
+    NOT fire even though more rows matched — AND run() must fetch EXACTLY that
+    LIMIT, not one past it: the probe row exists only to detect the policy ceiling,
+    so past a user LIMIT it is pure downside (PG would evaluate WHERE/casts on a row
+    the query never asked for, which could degrade the whole result)."""
     conn = _FakeConn(["id"], [_row(str(i), id=str(i)) for i in range(5)])
     validated = validate_sql("SELECT * FROM orders LIMIT 2", _ALLOWED, _BLOCKED)
     rows, truncated = await _reader(conn).run(validated, max_rows=10)
     assert len(rows) == 2 and truncated is False
+    main_sql = conn.driver_sql[-1]
+    assert "LIMIT 2" in main_sql and "LIMIT 3" not in main_sql  # exactly the user LIMIT, no probe
+
+
+async def test_a_user_limit_equal_to_the_cap_is_treated_as_the_policy_ceiling() -> None:
+    """Boundary: when the query's LIMIT equals max_rows, the caller cap and the policy
+    cap coincide — run() treats it as the policy ceiling, probing one past and
+    reporting TRUNCATED if more matched (the policy would have clipped there anyway)."""
+    conn = _FakeConn(["id"], [_row(str(i), id=str(i)) for i in range(5)])
+    validated = validate_sql("SELECT * FROM orders LIMIT 3", _ALLOWED, _BLOCKED)
+    rows, truncated = await _reader(conn).run(validated, max_rows=3)
+    assert len(rows) == 3 and truncated is True
+    assert "LIMIT 4" in conn.driver_sql[-1]  # probes at the coinciding ceiling
+
+
+async def test_limit_zero_reads_no_probe_row() -> None:
+    """LIMIT 0 is the caller explicitly asking for NO rows; run() must emit LIMIT 0,
+    not a LIMIT 1 probe it would then read and discard."""
+    conn = _FakeConn(["id"], [_row("1", id="1")])
+    validated = validate_sql("SELECT * FROM orders LIMIT 0", _ALLOWED, _BLOCKED)
+    rows, truncated = await _reader(conn).run(validated, max_rows=10)
+    assert rows == [] and truncated is False
+    assert "LIMIT 0" in conn.driver_sql[-1]  # no probe row fetched
 
 
 async def test_for_active_build_refuses_a_dirty_connection() -> None:
