@@ -254,6 +254,22 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      came back one round later as a Codex P2 (no commit/comment records that
      local-review pass — only the session does; the fix landing one commit
      after the round-3 fix commit is the sole trace-visible corroboration).
+   - **Determinism claims need a discriminating fixture + a revert-probe**:
+     any value that anchors idempotency or reproducibility (a dedup/skip
+     identity, a partition, a capped sample fed to an LLM) must be a pure
+     function of its input SET — never of Postgres fetch order, which is not
+     rerun-stable. And the TEST for such a claim must be proven able to fail:
+     run the revert-probe (comment out the ordering, the test MUST fail)
+     BEFORE submitting, and pick a fixture that can discriminate — C7's
+     symmetric two-triangle graph was permutation-invariant (720/720 orders →
+     one partition), so two successive "determinism" tests were false-green
+     until a modularity-ambiguous ring-plus-chord fixture replaced it (that
+     two-FAIL progression is session-only — both fixes folded into the single
+     pre-push commit, so no trace distinguishes the false-green versions). The
+     sibling sweep applies at IMPLEMENTATION time, not review time: C7 sorted
+     the vertex numbering and shipped the unsorted prompt-sample slice in the
+     same pass — the identical class, one function apart, cost a Codex round
+     the day after the sweep rule was written down.
 
 ## Output (exactly this shape)
 ```
