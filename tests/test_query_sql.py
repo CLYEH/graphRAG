@@ -73,6 +73,7 @@ class _FakeReader:
         raise_bug: bool = False,
         raise_timeout: bool = False,
         raise_discovery: bool = False,
+        raise_guardrail: bool = False,
     ) -> None:
         self.project = "acme"
         self.build_id = _BUILD
@@ -83,6 +84,7 @@ class _FakeReader:
         self._bug = raise_bug
         self._timeout = raise_timeout
         self._discovery = raise_discovery
+        self._guardrail = raise_guardrail
         self.timeout_ms: int | None = None
         self.rolled_back = False
 
@@ -103,6 +105,12 @@ class _FakeReader:
     async def run(self, validated: Any, max_rows: int) -> tuple[list[dict[str, Any]], bool]:
         if self._bug:
             raise RuntimeError("a bug in SQL composition")
+        if self._guardrail:
+            # run() refuses a query it can't execute faithfully (e.g. a data column
+            # name past the identifier limit) — a typed guardrail rejection.
+            from core.query.sql_guard import GuardrailBlocked
+
+            raise GuardrailBlocked("a structured column name exceeds the identifier limit")
         if self._timeout:
             # a statement cancelled by statement_timeout (SQLSTATE 57014)
             raise OperationalError("SELECT ...", {}, _Canceled())
@@ -234,6 +242,17 @@ def test_a_successful_query_ends_each_phase_transaction() -> None:
     response = _run(reader, _FakeLLM("SELECT * FROM orders"))
     assert response.warnings == () and reader.rolled_back is True
     assert reader.timeout_ms == _POLICY.timeout_ms  # the deadline was plumbed into each phase
+
+
+def test_a_run_time_guardrail_rejection_degrades_to_guardrail_blocked() -> None:
+    """run() can refuse a query it can't execute FAITHFULLY (e.g. a data column name
+    past PostgreSQL's identifier limit); sql_query surfaces that as GUARDRAIL_BLOCKED
+    over an empty result — a typed rejection, never a 500 — and the phase txn ends."""
+    reader = _FakeReader(raise_guardrail=True)
+    response = _run(reader, _FakeLLM("SELECT * FROM orders"))
+    _VALIDATOR.validate(response.to_dict())
+    assert response.results == () and _codes(response) == ["GUARDRAIL_BLOCKED"]
+    assert reader.rolled_back is True  # the phase transaction still ends
 
 
 def test_a_timeout_degrades_to_partial_results() -> None:

@@ -46,12 +46,17 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlglot import exp
 
-from core.query.sql_guard import ValidatedSql
+from core.query.sql_guard import GuardrailBlocked, ValidatedSql
 from core.stores.repo import active_build_id
 from core.stores.tables import STRUCTURED_MIME
 
 _DIALECT = "postgres"
 _SQL_READER_TOKEN = object()
+
+#: PostgreSQL's identifier byte limit (NAMEDATALEN - 1). A column alias longer than
+#: this is truncated by the server, so a data column whose JSON key exceeds it cannot
+#: be exposed as a distinct, faithful SQL column.
+_MAX_IDENTIFIER_BYTES = 63
 
 
 def _json_text(column: str, key: str) -> exp.Expr:
@@ -182,6 +187,19 @@ class BuildScopedSqlReader:
         on exit — the rows are materialised into Python here, before that exit.
         """
         columns = await self.column_names(validated.table)
+        # A column name past PostgreSQL's 63-byte identifier limit would be truncated
+        # (or collide with another long key sharing its prefix) when the reconstruction
+        # aliases `raw->>'k' AS "k"`, so SELECT * would return the row under a
+        # truncated/wrong field name. Refuse rather than silently corrupt the data —
+        # a typed GUARDRAIL_BLOCKED, not a wrong answer (§27.6 over-block, never under).
+        overlong = next(
+            (c for c in columns if len(c.encode("utf-8")) > _MAX_IDENTIFIER_BYTES), None
+        )
+        if overlong is not None:
+            raise GuardrailBlocked(
+                f"a structured column name exceeds PostgreSQL's {_MAX_IDENTIFIER_BYTES}-byte "
+                f"identifier limit and cannot be safely queried: {overlong[:24]}…"
+            )
         if not columns and not await self._has_rows(validated.table):
             return [], False  # a genuinely empty table — nothing to reconstruct
 

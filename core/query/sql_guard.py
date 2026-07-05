@@ -57,6 +57,9 @@ _FORBIDDEN: tuple[tuple[type[exp.Expr], str], ...] = (
     (exp.Group, "a GROUP BY"),
     (exp.AggFunc, "an aggregate function"),
     (exp.Distinct, "DISTINCT"),
+    # TABLESAMPLE returns an arbitrary subset BEFORE the WHERE, so the result would
+    # silently omit matching rows — outside the frozen v1 shape (WHERE/ORDER BY/LIMIT).
+    (exp.TableSample, "TABLESAMPLE"),
     # bind placeholders (:x / ? / @x) are never legitimate in a literal NL→SQL
     # result, and the executor injects its OWN scope placeholders around this
     # query — a user placeholder would collide with that binding.

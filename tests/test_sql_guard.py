@@ -93,6 +93,8 @@ def test_rejects_writes_and_ddl(sql: str) -> None:
         "SELECT * FROM orders GROUP BY customer",  # group by
         "SELECT count(*) FROM orders",  # aggregate (also not star)
         "SELECT DISTINCT customer FROM orders",  # distinct (also not star)
+        "SELECT * FROM orders TABLESAMPLE SYSTEM (1)",  # samples a subset BEFORE WHERE
+        "SELECT * FROM orders TABLESAMPLE BERNOULLI (10)",  # any sampling method
     ],
 )
 def test_rejects_uncitable_constructs(sql: str) -> None:

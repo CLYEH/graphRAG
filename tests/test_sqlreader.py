@@ -16,7 +16,7 @@ from typing import Any, cast
 import pytest
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from core.query.sql_guard import validate_sql
+from core.query.sql_guard import GuardrailBlocked, validate_sql
 from core.stores.sqlreader import _SQL_READER_TOKEN, BuildScopedSqlReader
 from core.stores.tables import STRUCTURED_MIME
 
@@ -163,6 +163,18 @@ async def test_a_hostile_table_name_cannot_inject() -> None:
     main_sql = conn.driver_sql[-1]
     assert len(sqlglot.parse(main_sql, dialect="postgres")) == 1  # injection contained
     assert '"a"" ; drop table documents; --"' in main_sql  # the name is an escaped identifier
+
+
+async def test_a_column_name_past_the_identifier_limit_is_refused() -> None:
+    """A data column name longer than PostgreSQL's 63-byte identifier limit would be
+    truncated (or collide) as a reconstruction alias, so the row would come back
+    under a wrong field name. The reader refuses it (GUARDRAIL_BLOCKED upstream)
+    rather than silently corrupt the data — before running any reconstruction."""
+    conn = _FakeConn(["a" * 64], [{"__row_pk": "1"}])  # a 64-byte JSON key
+    validated = validate_sql("SELECT * FROM orders", _ALLOWED, _BLOCKED)
+    with pytest.raises(GuardrailBlocked, match="identifier limit"):
+        await _reader(conn).run(validated, max_rows=10)
+    assert conn.driver_sql == []  # refused before the reconstruction ran
 
 
 async def test_a_genuinely_empty_table_yields_no_results_without_a_query() -> None:

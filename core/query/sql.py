@@ -96,6 +96,10 @@ async def sql_query(
     try:
         async with reader.timed_transaction(policy.timeout_ms):
             rows, truncated = await reader.run(validated, max_rows)
+    except GuardrailBlocked as blocked:
+        # run() refuses a query it can't execute FAITHFULLY (e.g. a data column name
+        # past the identifier limit) — a typed rejection, not a wrong answer.
+        return _response(reader, query, (), (_warn(GUARDRAIL_WARNING_CODE, blocked.reason),))
     except DBAPIError as exc:
         return _degrade(reader, query, exc, policy.timeout_ms)
 
