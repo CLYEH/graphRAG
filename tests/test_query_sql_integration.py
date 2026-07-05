@@ -209,8 +209,12 @@ async def test_an_expensive_query_is_cancelled_at_the_deadline(conn: AsyncConnec
         )
         _VALIDATOR.validate(response.to_dict())
         assert response.results == () and response.warnings[0].code == "PARTIAL_RESULTS"
+        # the degradation rolled the aborted transaction back — the SAME connection
+        # is immediately reusable (a hybrid follow-up read would not 500). Without
+        # the rollback this raises "current transaction is aborted".
+        reusable = (await conn.execute(text("SELECT 1"))).scalar_one()
+        assert reusable == 1
     finally:
-        await conn.rollback()  # clear the cancelled transaction before cleanup
         await _cleanup(project)
 
 

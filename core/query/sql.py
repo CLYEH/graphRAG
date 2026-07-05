@@ -74,51 +74,59 @@ async def sql_query(
     if not policy.enabled:
         return _response(reader, query, (), (_warn("MODE_SKIPPED", "sql mode is disabled"),))
 
-    schema = await _schema_prompt(reader, policy.allowed_tables)
-    candidate = _extract_sql(await _ask_llm(llm, schema, query))
+    # Bind the policy deadline BEFORE the first read, so schema discovery (a
+    # JSON-key scan over a possibly large table) is bounded too — not just the
+    # generated query — and a discovery timeout degrades rather than 500s.
+    try:
+        await reader.apply_timeout(policy.timeout_ms)
+        schema = await _schema_prompt(reader, policy.allowed_tables)
+    except DBAPIError as exc:
+        return await _degrade(reader, query, exc, policy.timeout_ms)
 
+    candidate = _extract_sql(await _ask_llm(llm, schema, query))
     try:
         validated = validate_sql(candidate, policy.allowed_tables, policy.blocked_keywords)
     except GuardrailBlocked as blocked:
+        # no query ran — the transaction is clean, nothing to roll back.
         return _response(reader, query, (), (_warn(GUARDRAIL_WARNING_CODE, blocked.reason),))
 
     try:
-        rows, truncated = await reader.run(validated, max_rows, policy.timeout_ms)
+        rows, truncated = await reader.run(validated, max_rows)
     except DBAPIError as exc:
-        # a guardrail-valid query the DB still rejects degrades (§22); a bug in
-        # our own SQL composition is NOT a DBAPIError, so it fails loud (Rule 12).
-        if _is_timeout(exc):
-            # the policy deadline cancelled it — the answer is incomplete (§22
-            # "逾時：回部分結果 + warning"), distinct from an invalid query.
-            return _response(
-                reader,
-                query,
-                (),
-                (
-                    _warn(
-                        "PARTIAL_RESULTS",
-                        f"query exceeded the {policy.timeout_ms}ms deadline (§21)",
-                    ),
-                ),
-            )
-        # otherwise an LLM-hallucinated column / bad cast — the query is unusable.
-        return _response(
-            reader,
-            query,
-            (),
-            (
-                _warn(
-                    GUARDRAIL_WARNING_CODE,
-                    f"the query could not be executed ({type(exc).__name__})",
-                ),
-            ),
-        )
+        return await _degrade(reader, query, exc, policy.timeout_ms)
 
     results = _to_results(rows, validated.table)
     warnings: tuple[QueryWarning, ...] = ()
     if truncated:
         warnings = (_warn("TRUNCATED", f"result truncated to the {max_rows}-row ceiling (§21)"),)
     return _response(reader, query, results, warnings)
+
+
+async def _degrade(
+    reader: BuildScopedSqlReader, query: str, exc: DBAPIError, timeout_ms: int
+) -> McpResponse:
+    """Map a DB failure to a typed degradation (§22), never a 500. First roll
+    back: the failed statement left the transaction ABORTED, and leaving it so
+    would turn the degradation into a failure for a caller that reuses the
+    connection. A bug in our own SQL composition is NOT a DBAPIError, so it never
+    reaches here — it propagates and fails loud (Rule 12)."""
+    await reader.rollback()
+    if _is_timeout(exc):
+        # the policy deadline cancelled it — the answer is incomplete (§22
+        # "逾時：回部分結果 + warning"), distinct from an invalid query.
+        return _response(
+            reader,
+            query,
+            (),
+            (_warn("PARTIAL_RESULTS", f"query exceeded the {timeout_ms}ms deadline (§21)"),),
+        )
+    # otherwise an LLM-hallucinated column / bad cast — the query is unusable.
+    return _response(
+        reader,
+        query,
+        (),
+        (_warn(GUARDRAIL_WARNING_CODE, f"the query could not be executed ({type(exc).__name__})"),),
+    )
 
 
 async def _ask_llm(llm: LLM, schema: str, query: str) -> str:

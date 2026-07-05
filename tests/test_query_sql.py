@@ -70,6 +70,7 @@ class _FakeReader:
         raise_run: bool = False,
         raise_bug: bool = False,
         raise_timeout: bool = False,
+        raise_discovery: bool = False,
     ) -> None:
         self.project = "acme"
         self.build_id = _BUILD
@@ -79,15 +80,23 @@ class _FakeReader:
         self._raise = raise_run
         self._bug = raise_bug
         self._timeout = raise_timeout
+        self._discovery = raise_discovery
         self.timeout_ms: int | None = None
+        self.rolled_back = False
+
+    async def apply_timeout(self, timeout_ms: int) -> None:
+        self.timeout_ms = timeout_ms  # capture the deadline the tool plumbed through
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
 
     async def column_names(self, table: str) -> tuple[str, ...]:
+        if self._discovery:
+            # a schema-discovery scan cancelled by statement_timeout (SQLSTATE 57014)
+            raise OperationalError("SELECT jsonb_object_keys ...", {}, _Canceled())
         return self._columns
 
-    async def run(
-        self, validated: Any, max_rows: int, timeout_ms: int
-    ) -> tuple[list[dict[str, Any]], bool]:
-        self.timeout_ms = timeout_ms  # capture what the tool passed through
+    async def run(self, validated: Any, max_rows: int) -> tuple[list[dict[str, Any]], bool]:
         if self._bug:
             raise RuntimeError("a bug in SQL composition")
         if self._timeout:
@@ -199,12 +208,33 @@ def test_a_timeout_degrades_to_partial_results() -> None:
     """A statement cancelled at the policy deadline (§21 timeout_ms) is the §22
     timeout degradation — PARTIAL_RESULTS (the answer is incomplete), distinct
     from GUARDRAIL_BLOCKED (the query was invalid) — and the tool passes the
-    policy's timeout through to the executor."""
+    policy's timeout through and rolls the aborted transaction back."""
     reader = _FakeReader(raise_timeout=True)
     response = _run(reader, _FakeLLM("SELECT * FROM orders WHERE pg_sleep(9) IS NULL"))
     _VALIDATOR.validate(response.to_dict())
     assert response.results == () and _codes(response) == ["PARTIAL_RESULTS"]
     assert reader.timeout_ms == _POLICY.timeout_ms  # the deadline was actually plumbed through
+    assert reader.rolled_back is True  # the aborted transaction is cleared before degrading
+
+
+def test_a_schema_discovery_timeout_degrades_not_500s() -> None:
+    """The deadline binds schema discovery too: a JSON-key scan over a large table
+    that exceeds it degrades to PARTIAL_RESULTS (rolled back), never an unhandled
+    500 before any guarded query runs — the timeout covers the whole path."""
+    reader = _FakeReader(raise_discovery=True)
+    response = _run(reader, _FakeLLM("SELECT * FROM orders"))
+    _VALIDATOR.validate(response.to_dict())
+    assert response.results == () and _codes(response) == ["PARTIAL_RESULTS"]
+    assert reader.rolled_back is True
+
+
+def test_an_invalid_query_rolls_back_before_degrading() -> None:
+    """A guardrail-valid query the DB rejects (unknown column) also leaves the
+    transaction aborted — it is rolled back so a connection-reusing caller (the
+    hybrid router) doesn't inherit a poisoned transaction (§22)."""
+    reader = _FakeReader(raise_run=True)
+    response = _run(reader, _FakeLLM("SELECT * FROM orders WHERE nope = '1'"))
+    assert _codes(response) == ["GUARDRAIL_BLOCKED"] and reader.rolled_back is True
 
 
 def test_a_code_bug_is_not_masked_as_a_warning() -> None:
