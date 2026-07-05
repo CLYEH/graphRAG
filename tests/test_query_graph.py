@@ -227,6 +227,14 @@ def _codes(response: McpResponse) -> list[str]:
     [
         (GraphQueryParams(template="drop_all", entity="acme"), "unknown graph template"),
         (GraphQueryParams(template="neighbors", entity="   "), "non-blank canonical name"),
+        (
+            GraphQueryParams(template="neighbors", entity=123),  # type: ignore[arg-type]
+            "non-blank canonical name string",
+        ),
+        (
+            GraphQueryParams(template="path", entity="acme", other_entity=123),  # type: ignore[arg-type]
+            "non-blank name string",
+        ),
         (GraphQueryParams(template="neighbors", entity="acme", hops=0), "outside the policy"),
         (GraphQueryParams(template="neighbors", entity="acme", hops=4), "outside the policy"),
         (GraphQueryParams(template="path", entity="acme"), "needs other_entity"),

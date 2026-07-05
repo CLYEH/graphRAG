@@ -114,8 +114,11 @@ def _validate_params(params: GraphQueryParams, max_graph_hops: int) -> str | Non
             f"unknown graph template {params.template!r} — the §27.6 vocabulary "
             f"is {list(GRAPH_QUERY_TEMPLATES)}"
         )
-    if not params.entity.strip():
-        return "entity must be a non-blank canonical name"
+    if not isinstance(params.entity, str) or not params.entity.strip():
+        # the isinstance runs FIRST: a non-string (bad JSON tool input) would
+        # AttributeError on .strip() — out-of-contract input degrades typed
+        # (§22), it does not 500 (same rule as hops below)
+        return "entity must be a non-blank canonical name string"
     if type(params.hops) is not int:
         # bool <: int is annotation-silent, and a str would TypeError below —
         # an out-of-contract hops degrades typed (§22), it does not 500
@@ -126,8 +129,9 @@ def _validate_params(params: GraphQueryParams, max_graph_hops: int) -> str | Non
             "(§21 max_graph_hops) — rejected, not clamped"
         )
     if params.template == "path":
-        if params.other_entity is None or not params.other_entity.strip():
-            return "the path template needs other_entity (the destination)"
+        if not isinstance(params.other_entity, str) or not params.other_entity.strip():
+            # None and non-string both land here — isinstance first, like entity
+            return "the path template needs other_entity (a non-blank name string)"
     elif params.other_entity is not None:
         return f"other_entity is only meaningful for the path template, not {params.template!r}"
     return None
