@@ -183,6 +183,15 @@ class BuildScopedVectorRepo:
         build = await active_build_id(pg_conn, project)
         return BuildScopedVectorRepo(client, project, build, _token=_CONSTRUCTION_TOKEN)
 
+    @classmethod
+    def bound_to(
+        cls, client: AsyncQdrantClient, project: str, build_id: uuid.UUID
+    ) -> BuildScopedVectorRepo:
+        """Bind to a build the CALLER already resolved via ``active_build_id``
+        (§27.1: one lookup per request, every store bound to the same id — see
+        BuildScopedRepo.bound_to)."""
+        return BuildScopedVectorRepo(client, project, build_id, _token=_CONSTRUCTION_TOKEN)
+
     # -- scope plumbing --------------------------------------------------------
 
     def _scope_conditions(self) -> list[models.Condition]:

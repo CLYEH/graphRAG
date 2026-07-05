@@ -319,6 +319,17 @@ class BuildScopedRepo:
         build = await active_build_id(conn, project)
         return BuildScopedRepo(conn, project, build, _token=_CONSTRUCTION_TOKEN)
 
+    @classmethod
+    def bound_to(cls, conn: AsyncConnection, project: str, build_id: uuid.UUID) -> BuildScopedRepo:
+        """Bind to a build the CALLER already resolved via ``active_build_id``.
+
+        §27.1 reads the active id ONCE per request and binds every store to
+        that same id — per-factory lookups could split scopes across a
+        mid-request activation (each factory seeing a different 'active').
+        The id must come from ``active_build_id`` on the same request; this
+        factory only carries it, the scope injection below is unchanged."""
+        return BuildScopedRepo(conn, project, build_id, _token=_CONSTRUCTION_TOKEN)
+
     # -- scope plumbing (single-underscore: shared with the SQL-shape tests) --
 
     def _scope_columns(self, table: sa.Table) -> tuple[str, ...]:

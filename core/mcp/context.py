@@ -6,12 +6,14 @@ lifetime; every tool call binds a FRESH set of build-scoped stores off them
 calls is picked up; §27.1's "read once per request" — the bound repos ARE that
 cache for the duration of one call).
 
-Mint order is load-bearing (the C6e wiring lesson): the SQL reader's
-loaned-clean contract (C6b) refuses a connection another factory's lookup has
-already begun a transaction on, so it is minted FIRST on the fresh
-connection. The whole call runs read-only single-flight on that connection;
-hybrid's sql phase may roll back auto-begun READ transactions of sibling
-modes — harmless here by construction (nothing writes on this connection).
+Binding is a SINGLE active-build lookup followed by pure constructions
+(``bound_to``): the one ``active_build_id`` read is the request's §27.1
+snapshot, its auto-begun transaction is explicitly ended (``rollback``) so
+the SQL reader's loaned-clean contract (C6b) holds, and the four ``bound_to``
+calls — order-independent, no I/O — all carry that same id. The whole call
+runs read-only single-flight on the connection; hybrid's sql phase may roll
+back auto-begun READ transactions of sibling modes — harmless here by
+construction (nothing writes on this connection).
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from core.query.hybrid import HybridDeps
 from core.stores.graph import BuildScopedGraphRepo
-from core.stores.repo import BuildScopedRepo
+from core.stores.repo import BuildScopedRepo, active_build_id
 from core.stores.sqlreader import BuildScopedSqlReader
 from core.stores.vectors import BuildScopedVectorRepo
 
@@ -56,13 +58,17 @@ class ProjectContext:
         agreement DR-006 demands, and hybrid re-verifies it anyway). The
         connection and graph session live exactly as long as the call."""
         async with self.engine.connect() as conn, self.neo4j.session() as session:
-            # sql reader FIRST — its loaned-clean contract refuses a
-            # connection with an open transaction, and the other factories'
-            # lookups auto-begin one (C6b/C6e)
-            sql_reader = await BuildScopedSqlReader.for_active_build(conn, self.project)
-            repo = await BuildScopedRepo.for_active_build(conn, self.project)
-            vectors = await BuildScopedVectorRepo.for_active_build(conn, self.qdrant, self.project)
-            graph = await BuildScopedGraphRepo.for_active_build(conn, session, self.project)
+            # §27.1: the active build is resolved EXACTLY ONCE per call and
+            # every store binds to that same id — per-factory lookups could
+            # split scopes across a mid-call activation (one store on the old
+            # build, the next on the new). The lookup's transaction is ended
+            # so the sql reader's loaned-clean contract holds (C6b).
+            build_id = await active_build_id(conn, self.project)
+            await conn.rollback()  # end the lookup's auto-begun read txn
+            sql_reader = BuildScopedSqlReader.bound_to(conn, self.project, build_id)
+            repo = BuildScopedRepo.bound_to(conn, self.project, build_id)
+            vectors = BuildScopedVectorRepo.bound_to(self.qdrant, self.project, build_id)
+            graph = BuildScopedGraphRepo.bound_to(session, self.project, build_id)
             yield HybridDeps(
                 repo=repo,
                 vectors=vectors,

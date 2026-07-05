@@ -122,7 +122,7 @@ def build_server(project: str, config_path: Path) -> FastMCP:
             response = await run_graph(
                 deps.graph,
                 deps.repo,
-                rt.policy.text_to_cypher,
+                rt.policy.cypher_policy(),
                 params,
                 query or f"{template}({entity})",
                 rt.policy.max_graph_hops,
@@ -135,7 +135,7 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         rt = _rt()
         async with rt.context.bound() as deps:
             response = await run_sql(
-                deps.sql_reader, deps.llm, rt.policy.text_to_sql, query, rt.policy.sql_rows()
+                deps.sql_reader, deps.llm, rt.policy.sql_policy(), query, rt.policy.sql_rows()
             )
             return response.to_dict()
 

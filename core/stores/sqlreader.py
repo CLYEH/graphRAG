@@ -147,6 +147,22 @@ class BuildScopedSqlReader:
             build = await active_build_id(conn, project)
         return BuildScopedSqlReader(conn, project, build, _token=_SQL_READER_TOKEN)
 
+    @classmethod
+    def bound_to(
+        cls, conn: AsyncConnection, project: str, build_id: uuid.UUID
+    ) -> BuildScopedSqlReader:
+        """Bind to a build the CALLER already resolved via ``active_build_id``
+        (§27.1: one lookup per request — see BuildScopedRepo.bound_to). The
+        loaned-clean contract still holds: the connection must carry no open
+        transaction (the caller's single lookup must be ended before binding).
+        """
+        if conn.in_transaction():
+            raise RuntimeError(
+                "BuildScopedSqlReader.bound_to requires a connection with no open "
+                "transaction — end the active-build lookup's transaction first"
+            )
+        return BuildScopedSqlReader(conn, project, build_id, _token=_SQL_READER_TOKEN)
+
     def _scope_params(self, table: str) -> dict[str, Any]:
         return {
             "__g_project": self.__project,

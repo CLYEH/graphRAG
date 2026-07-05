@@ -106,3 +106,23 @@ def test_the_schema_is_the_first_gate_for_the_deny_all_contradiction(
     document["text_to_sql"]["allowed_tables"] = []  # enabled + empty
     with pytest.raises(PolicyError, match="allowed_tables"):
         load_query_policy(_write(tmp_path, document))
+
+
+def test_the_top_level_latency_cap_governs_mode_deadlines(tmp_path: Path) -> None:
+    """§21: max_latency_ms is THE query deadline — a mode-local timeout above
+    it would let one DB phase alone outlive the whole query's budget. C8 loads
+    both values, so C8 reconciles (the same min() contract as the row caps);
+    a mode timeout BELOW the cap is left alone."""
+    document = _valid_document()
+    document["max_latency_ms"] = 2000  # below both mode timeouts (5000)
+    policy = load_query_policy(_write(tmp_path, document))
+    assert policy.sql_policy().timeout_ms == 2000
+    assert policy.cypher_policy().timeout_ms == 2000
+    # everything else rides along unchanged
+    assert policy.sql_policy().allowed_tables == policy.text_to_sql.allowed_tables
+
+    document = _valid_document()
+    document["max_latency_ms"] = 60000  # above the mode timeouts
+    policy = load_query_policy(_write(tmp_path, document))
+    assert policy.sql_policy().timeout_ms == 5000  # the smaller mode value holds
+    assert policy.cypher_policy().timeout_ms == 5000

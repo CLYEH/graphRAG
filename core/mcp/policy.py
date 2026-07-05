@@ -17,6 +17,7 @@ clamps a request's ask to ``max_top_k``.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,6 +66,25 @@ class QueryPolicy:
         mode-local cap — the two can never disagree in the executor because
         only this reconciled value ever reaches it (C6b)."""
         return min(self.max_sql_rows, self.text_to_sql.max_rows)
+
+    def sql_policy(self) -> TextToSql:
+        """``text_to_sql`` with its per-phase deadline clamped to the
+        top-level ``max_latency_ms`` (§21: the query deadline GOVERNS — a
+        mode-local timeout above it would let one DB phase alone outlive the
+        whole query's budget; C8 is the caller that loads both, so C8
+        reconciles, the same min() contract as the row caps)."""
+        return dataclasses.replace(
+            self.text_to_sql,
+            timeout_ms=min(self.text_to_sql.timeout_ms, self.max_latency_ms),
+        )
+
+    def cypher_policy(self) -> TextToCypher:
+        """``text_to_cypher`` with its deadline clamped to ``max_latency_ms``
+        — same reconciliation as :meth:`sql_policy`."""
+        return dataclasses.replace(
+            self.text_to_cypher,
+            timeout_ms=min(self.text_to_cypher.timeout_ms, self.max_latency_ms),
+        )
 
 
 def load_query_policy(config_path: Path) -> QueryPolicy:
@@ -122,8 +142,8 @@ def hybrid_policy(policy: QueryPolicy, requested_top_k: int | None) -> Any:
     from core.query.hybrid import HybridPolicy
 
     return HybridPolicy(
-        text_to_sql=policy.text_to_sql,
-        text_to_cypher=policy.text_to_cypher,
+        text_to_sql=policy.sql_policy(),
+        text_to_cypher=policy.cypher_policy(),
         max_graph_hops=policy.max_graph_hops,
         top_k=policy.top_k(requested_top_k),
         max_sql_rows=policy.sql_rows(),

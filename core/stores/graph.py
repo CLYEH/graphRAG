@@ -237,6 +237,15 @@ class BuildScopedGraphRepo:
         build = await active_build_id(pg_conn, project)
         return BuildScopedGraphRepo(session, project, build, _token=_CONSTRUCTION_TOKEN)
 
+    @classmethod
+    def bound_to(
+        cls, session: AsyncSession, project: str, build_id: uuid.UUID
+    ) -> BuildScopedGraphRepo:
+        """Bind to a build the CALLER already resolved via ``active_build_id``
+        (§27.1: one lookup per request — see BuildScopedRepo.bound_to). Pinned
+        to the read-only type, like for_active_build."""
+        return BuildScopedGraphRepo(session, project, build_id, _token=_CONSTRUCTION_TOKEN)
+
     # -- scope plumbing --------------------------------------------------------
 
     def _scope_params(self) -> dict[str, str]:
