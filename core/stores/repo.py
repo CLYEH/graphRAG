@@ -436,6 +436,16 @@ class BuildScopedRepo:
         The ``entity_id.in_`` filter keeps it to the hits being enriched; the
         ``entities`` join filters the bound ``(project, build_id)`` so a mention
         of another build's entity can never leak in (DR-006).
+
+        Only ``status == 'active'`` entities are enriched: the index step
+        projects active entities only, but projection is forward-only, so a
+        point for an entity that resolution later moved OFF ``active`` (to any
+        of rejected/merged/needs_review/deprecated) can outlive its exclusion.
+        Re-checking the SoR here means such a stale hit resolves to zero
+        mentions, so :func:`_entity_result` drops it as projection drift
+        (§19/§22) rather than surfacing a non-active entity as a production
+        result — the same SoR re-verification chunk hits already get (their row
+        must still exist).
         """
         if not entity_ids:
             return {}
@@ -447,6 +457,7 @@ class BuildScopedRepo:
             .where(
                 entities.c.project == self.project,
                 entities.c.build_id == self.build_id,
+                entities.c.status == "active",
                 mentions.c.entity_id.in_(entity_ids),
             )
         )

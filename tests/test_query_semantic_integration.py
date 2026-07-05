@@ -273,6 +273,46 @@ async def test_semantic_search_over_an_unindexed_build_is_empty_not_an_error(
         await _cleanup(qdrant, project)
 
 
+async def test_a_rejected_entity_with_a_stale_point_is_dropped_not_surfaced(
+    qdrant: AsyncQdrantClient,
+) -> None:
+    """SoR re-verification for entity status: the index projects active
+    entities only, but projection is forward-only, so a point can outlive the
+    entity's exclusion when resolution later rejects/merges it. A semantic hit
+    on that stale point must be DROPPED as drift (§19/§22) — a rejected entity
+    must never reappear as a production result — surfaced as PARTIAL_RESULTS,
+    not emitted."""
+    engine = _engine()
+    project = f"qtest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            writer = await _new_build(conn, project)
+            entity_id = await _entity_with_mention(writer, "People Ops", "chunk:h1:0")
+            await conn.commit()
+            await _index(conn, qdrant, writer)  # point projected while active
+            await conn.commit()
+            # resolution rejects the entity AFTER indexing; the point survives
+            await conn.execute(
+                entities.update()
+                .where(entities.c.id == entity_id)
+                .values(status="rejected", review_status="rejected")
+            )
+            await conn.execute(
+                builds.update().where(builds.c.id == writer.build_id).values(status="active")
+            )
+            await conn.commit()
+
+            repo = await BuildScopedRepo.for_active_build(conn, project)
+            vectors = await BuildScopedVectorRepo.for_active_build(conn, qdrant, project)
+            resp = await semantic_search(repo, vectors, _embedder(), "People Ops", top_k=5)
+            _VALIDATOR.validate(resp.to_dict())
+            assert resp.results == ()  # the rejected entity is not surfaced
+            assert resp.warnings and resp.warnings[0].code == "PARTIAL_RESULTS"
+    finally:
+        await engine.dispose()
+        await _cleanup(qdrant, project)
+
+
 async def test_semantic_search_reads_only_the_active_build(
     qdrant: AsyncQdrantClient,
 ) -> None:
