@@ -39,7 +39,7 @@ Neo4j/Qdrant projections get the same treatment in C1c/C1d (DR-004's
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any
 
 import sqlalchemy as sa
@@ -491,7 +491,7 @@ class BuildScopedRepo:
         rows = (await self._execute(query)).fetchall()
         return [row.id for row in rows]
 
-    async def active_entity_ids(self, entity_ids: Sequence[uuid.UUID]) -> set[uuid.UUID]:
+    async def active_entity_ids(self, entity_ids: Collection[uuid.UUID]) -> set[uuid.UUID]:
         """The subset of ``entity_ids`` that is ACTIVE in the SoR — §19
         projection-drift re-verification for graph traversal results: the
         forward-only Neo4j projection can hold nodes whose entity resolution
@@ -508,6 +508,28 @@ class BuildScopedRepo:
         )
         rows = (await self._execute(query)).fetchall()
         return {row.id for row in rows}
+
+    async def active_relation_pairs_among(
+        self, entity_ids: Collection[uuid.UUID]
+    ) -> set[tuple[uuid.UUID, uuid.UUID]]:
+        """The ACTIVE relation endpoint pairs among ``entity_ids`` — the SoR
+        edge set C6c's reachability re-verification walks (§19): the projected
+        traversal can cross edges whose relation later moved off ``active``,
+        so which connections EXIST is re-decided here, not trusted from Neo4j.
+        Direction is returned as stored; the traversal semantics (undirected)
+        are the caller's."""
+        if len(entity_ids) < 2:
+            return set()
+        relations = tables.relations
+        query = sa.select(relations.c.src_entity_id, relations.c.dst_entity_id).where(
+            relations.c.project == self.project,
+            relations.c.build_id == self.build_id,
+            relations.c.status == "active",
+            relations.c.src_entity_id.in_(list(entity_ids)),
+            relations.c.dst_entity_id.in_(list(entity_ids)),
+        )
+        rows = (await self._execute(query)).fetchall()
+        return {(row.src_entity_id, row.dst_entity_id) for row in rows}
 
     async def relations_with_evidence(
         self, triples: Sequence[tuple[uuid.UUID, uuid.UUID, str]]

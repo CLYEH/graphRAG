@@ -143,9 +143,13 @@ async def _neighbors(
     params: GraphQueryParams,
     query: str,
 ) -> McpResponse:
-    entities, dropped, truncated = await _neighbor_entities(graph, repo, policy, params)
+    deadline = time.monotonic() + policy.timeout_ms / 1000.0
+    entities, dropped, truncated, timed_out = await _neighbor_entities(
+        graph, repo, policy, params, deadline
+    )
     results = _score(entities)
-    return _response(graph, query, results, _standard_warnings(policy, truncated, dropped))
+    warnings = _standard_warnings(policy, truncated, dropped, timed_out)
+    return _response(graph, query, results, warnings)
 
 
 async def _path(
@@ -248,8 +252,11 @@ async def _subgraph(
     params: GraphQueryParams,
     query: str,
 ) -> McpResponse:
-    entities, dropped, truncated = await _neighbor_entities(
-        graph, repo, policy, params, include_seeds=True
+    # the WHOLE subgraph phase — seed traversals AND the edge stage — shares
+    # ONE policy deadline (per-stage timeouts would stack, the C6b trap)
+    deadline = time.monotonic() + policy.timeout_ms / 1000.0
+    entities, dropped, truncated, timed_out = await _neighbor_entities(
+        graph, repo, policy, params, deadline, include_seeds=True
     )
     # §21: max_rows is the ceiling on the WHOLE response, entities AND
     # relations combined — a dense neighborhood has O(n²) edges, so both the
@@ -260,11 +267,14 @@ async def _subgraph(
     edge_budget = policy.max_rows - len(entities)
     relations: list[tuple[uuid.UUID, str, tuple[SourceRef, ...]]] = []
     edge_dropped = 0
-    if edge_budget > 0:
+    remaining_ms = int((deadline - time.monotonic()) * 1000)
+    if timed_out or remaining_ms < 1:
+        timed_out = True  # no budget left for the edge stage — surfaced below
+    elif edge_budget > 0:
         edges = await graph.edges_among(
             [str(entity_id) for entity_id in node_ids],
             limit=edge_budget + 1,  # the truncation probe (policy cap only)
-            timeout_ms=policy.timeout_ms,
+            timeout_ms=remaining_ms,
         )
         if len(edges) > edge_budget:
             # truncation is judged on the FETCHED count (like the neighbor
@@ -283,11 +293,11 @@ async def _subgraph(
             # intermediate, so direct edges may genuinely not exist — probe
             # (LIMIT 1) instead of asserting, keeping TRUNCATED exact
             probe = await graph.edges_among(
-                [str(entity_id) for entity_id in node_ids], limit=1, timeout_ms=policy.timeout_ms
+                [str(entity_id) for entity_id in node_ids], limit=1, timeout_ms=remaining_ms
             )
             truncated = truncated or bool(probe)
     results = _score(entities, relations)
-    warnings = _standard_warnings(policy, truncated, dropped + edge_dropped)
+    warnings = _standard_warnings(policy, truncated, dropped + edge_dropped, timed_out)
     return _response(graph, query, results, warnings)
 
 
@@ -299,37 +309,85 @@ async def _neighbor_entities(
     repo: BuildScopedRepo,
     policy: TextToCypher,
     params: GraphQueryParams,
+    deadline: float,
     *,
     include_seeds: bool = False,
-) -> tuple[list[tuple[uuid.UUID, int, tuple[SourceRef, ...]]], int, bool]:
+) -> tuple[list[tuple[uuid.UUID, int, tuple[SourceRef, ...]]], int, bool, bool]:
     """Traverse from every seed, merge, re-verify against the SoR.
 
-    Returns ``(kept, dropped, truncated)`` where ``kept`` is
+    Returns ``(kept, dropped, truncated, timed_out)`` where ``kept`` is
     ``[(entity_id, distance, mention_refs)]`` ordered nearest-first and capped
     at ``policy.max_rows`` — the probe row (one past the cap) exists only to
     detect the POLICY ceiling (TRUNCATED, §22); ``dropped`` counts hits the
-    SoR re-verification rejected (§19 drift / corrupt projection values)."""
+    SoR re-verification rejected (§19 drift / corrupt projection values).
+
+    Every seed traversal runs on the REMAINING budget of the caller's single
+    ``deadline`` — per-seed timeouts would stack to seeds × timeout_ms (the
+    C6b per-statement-vs-per-phase trap); running out mid-scan surfaces
+    ``timed_out``, never a silently smaller neighborhood.
+
+    The projection's TRAVERSAL is untrusted too, not just its values: an edge
+    whose SoR relation moved off ``active`` after projection still exists in
+    Neo4j and can reach an otherwise-active target. So reachability is
+    RECOMPUTED here over the SoR's active nodes and relations (an undirected
+    BFS bounded by ``hops``); candidates the active graph cannot reach are
+    dropped as drift. (A candidate clipped from the node set by the fetch cap
+    can make a genuinely-reachable node look unreachable — an over-drop, never
+    an under-verify, and the clip itself is surfaced as TRUNCATED.)"""
     seeds = await repo.entity_ids_by_name(params.entity)
     if not seeds:
-        return [], 0, False
+        return [], 0, False, False
 
-    best: dict[uuid.UUID, int] = {seed: 0 for seed in seeds} if include_seeds else {}
+    candidates: set[uuid.UUID] = set()
     dropped = 0
+    timed_out = False
     for seed in seeds:
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms < 1:
+            timed_out = True
+            break
         rows = await graph.neighbors(
             str(seed),
             hops=params.hops,
             limit=policy.max_rows + 1,  # the truncation probe (policy cap only)
-            timeout_ms=policy.timeout_ms,
+            timeout_ms=remaining_ms,
         )
         for row in rows:
             entity_id = _projected_uuid(row["entity"].get("canonical_id"))
             if entity_id is None:
                 dropped += 1  # corrupt projection value — uncitable
-                continue
-            distance = row["distance"]
-            hop = distance if isinstance(distance, int) else params.hops
-            best[entity_id] = min(best.get(entity_id, hop), hop)
+            else:
+                candidates.add(entity_id)
+
+    # SoR reachability: BFS from the active seeds over ACTIVE relations only,
+    # bounded by hops — the projected distances are recomputed, not trusted.
+    node_set = set(seeds) | candidates
+    active = await repo.active_entity_ids(node_set)
+    pairs = await repo.active_relation_pairs_among(active)
+    adjacency: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for src, dst in pairs:
+        adjacency.setdefault(src, set()).add(dst)
+        adjacency.setdefault(dst, set()).add(src)  # traversal is undirected
+    frontier = {seed for seed in seeds if seed in active}
+    distances: dict[uuid.UUID, int] = dict.fromkeys(frontier, 0)
+    for hop in range(1, params.hops + 1):
+        frontier = {
+            neighbor
+            for node in frontier
+            for neighbor in adjacency.get(node, ())
+            if neighbor not in distances
+        }
+        for neighbor in frontier:
+            distances[neighbor] = hop
+        if not frontier:
+            break
+
+    best = {eid: dist for eid, dist in distances.items() if eid in candidates}
+    if include_seeds:
+        for seed in seeds:
+            if seed in active:
+                best[seed] = 0
+    dropped += len(candidates - set(best))  # unreachable via the ACTIVE graph → drift
 
     ordered = sorted(best.items(), key=lambda item: (item[1], item[0]))
     truncated = len(ordered) > policy.max_rows
@@ -350,7 +408,7 @@ async def _neighbor_entities(
             kept.append((entity_id, distance, refs))
         else:
             dropped += 1
-    return kept, dropped, truncated
+    return kept, dropped, truncated, timed_out
 
 
 async def _relation_results(
@@ -503,7 +561,7 @@ def _display(node: dict[str, Any]) -> str:
 
 
 def _standard_warnings(
-    policy: TextToCypher, truncated: bool, dropped: int
+    policy: TextToCypher, truncated: bool, dropped: int, timed_out: bool = False
 ) -> tuple[QueryWarning, ...]:
     warnings: list[QueryWarning] = []
     if truncated:
@@ -512,6 +570,14 @@ def _standard_warnings(
         )
     if dropped:
         warnings.append(_partial(dropped, "graph"))
+    if timed_out:
+        warnings.append(
+            _warn(
+                "PARTIAL_RESULTS",
+                f"traversal exceeded the {policy.timeout_ms}ms deadline before every "
+                "stage completed (§21)",
+            )
+        )
     return tuple(warnings)
 
 

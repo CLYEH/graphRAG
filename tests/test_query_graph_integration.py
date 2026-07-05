@@ -331,12 +331,13 @@ async def test_a_drifted_entity_is_dropped_not_surfaced(
 ) -> None:
     """Forward-only projection: an entity moved OFF active in the SoR after
     projection still has a stale-active node in Neo4j. The SoR re-verification
-    must drop it and surface PARTIAL_RESULTS — never emit a non-active entity
-    as a production result (§19/§22, the C6a lesson on the graph face)."""
+    must drop it AND everything reachable only THROUGH it — in the active
+    graph, C hangs off the rejected B, so neither is a valid neighbor of A —
+    and surface PARTIAL_RESULTS (§19/§22, the C6a lesson on the graph face)."""
     conn, session = stores
     project = f"graphq-{uuid.uuid4().hex[:10]}"
     try:
-        _a, b, _c = await _chain_build(conn, session, project)
+        _a, b, c = await _chain_build(conn, session, project)
         # resolution moves B off active AFTER the projection was written
         await conn.execute(entities.update().where(entities.c.id == b).values(status="rejected"))
         await conn.commit()
@@ -353,6 +354,7 @@ async def test_a_drifted_entity_is_dropped_not_surfaced(
         _VALIDATOR.validate(response.to_dict())
         ids = {r.id for r in response.results}
         assert str(b) not in ids  # the drifted entity is gone
-        assert "PARTIAL_RESULTS" in [w.code for w in response.warnings]  # and the drop is surfaced
+        assert str(c) not in ids  # …and so is the node reachable only through it
+        assert "PARTIAL_RESULTS" in [w.code for w in response.warnings]  # the drops are surfaced
     finally:
         await _cleanup(session, project)

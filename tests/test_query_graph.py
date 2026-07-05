@@ -54,6 +54,7 @@ class _FakeGraph:
         edges: list[dict[str, Any]] | None = None,
         raise_exc: Exception | None = None,
         paths_by_pair: dict[tuple[str, str], dict[str, Any]] | None = None,
+        slow: bool = False,
     ) -> None:
         self.project = _PROJECT
         self.build_id = _BUILD
@@ -62,6 +63,7 @@ class _FakeGraph:
         self._paths_by_pair = paths_by_pair
         self._edges = edges or []
         self._raise = raise_exc
+        self._slow = slow
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def neighbors(
@@ -70,6 +72,8 @@ class _FakeGraph:
         self.calls.append(("neighbors", {"seed": seed, "hops": hops, "limit": limit}))
         if self._raise is not None:
             raise self._raise
+        if self._slow:
+            await asyncio.sleep(0.002)  # a real cost per scan, so the deadline test can bite
         return self._neighbors
 
     async def shortest_path(
@@ -106,6 +110,7 @@ class _FakeSoR:
         active: set[uuid.UUID] | None = None,
         relations: dict[tuple[uuid.UUID, uuid.UUID, str], tuple[uuid.UUID, list[dict[str, Any]]]]
         | None = None,
+        pairs: set[tuple[uuid.UUID, uuid.UUID]] | None = None,
     ) -> None:
         self.project = _PROJECT
         self.build_id = _BUILD
@@ -113,6 +118,11 @@ class _FakeSoR:
         self._mentions = mentions or {}
         self._active = active
         self._relations = relations or {}
+        # the SoR edge set for reachability; defaults to the relations' keys so
+        # relation-bearing fixtures stay consistent without repeating themselves
+        self._pairs = (
+            pairs if pairs is not None else {(src, dst) for (src, dst, _rtype) in self._relations}
+        )
 
     async def entity_ids_by_name(self, name: str) -> list[uuid.UUID]:
         return self._seeds.get(name.lower(), [])
@@ -131,6 +141,11 @@ class _FakeSoR:
         self, triples: list[tuple[uuid.UUID, uuid.UUID, str]]
     ) -> dict[tuple[uuid.UUID, uuid.UUID, str], tuple[uuid.UUID, list[dict[str, Any]]]]:
         return {t: self._relations[t] for t in triples if t in self._relations}
+
+    async def active_relation_pairs_among(
+        self, entity_ids: set[uuid.UUID]
+    ) -> set[tuple[uuid.UUID, uuid.UUID]]:
+        return {(s, d) for (s, d) in self._pairs if s in entity_ids and d in entity_ids}
 
 
 def _node(entity_id: uuid.UUID, name: str = "N") -> dict[str, Any]:
@@ -245,8 +260,9 @@ async def test_neighbors_returns_cited_entities_nearest_first() -> None:
             near: [("text", str(uuid.uuid4()))],
             far: [("structured", "6:orders:17")],
         },
+        pairs={(seed, near), (near, far)},  # the SoR agrees the traversal exists
     )
-    response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
+    response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme", hops=2))
     assert response.warnings == ()
     assert [r.id for r in response.results] == [str(near), str(far)]  # nearest first
     assert response.results[0].source_refs[0].source_type == "chunk"
@@ -265,7 +281,11 @@ async def test_a_hit_without_sor_mentions_is_dropped_as_drift() -> None:
             {"entity": _node(ok), "distance": 1},
         ]
     )
-    sor = _FakeSoR(seeds={"acme": [seed]}, mentions={ok: [("text", "c-1")]})
+    sor = _FakeSoR(
+        seeds={"acme": [seed]},
+        mentions={ok: [("text", "c-1")]},
+        pairs={(seed, ghost), (seed, ok)},
+    )
     response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
     assert [r.id for r in response.results] == [str(ok)]
     assert _codes(response) == ["PARTIAL_RESULTS"]
@@ -279,7 +299,7 @@ async def test_a_corrupt_projected_canonical_id_is_dropped_not_crashed() -> None
             {"entity": _node(ok), "distance": 1},
         ]
     )
-    sor = _FakeSoR(seeds={"acme": [seed]}, mentions={ok: [("text", "c-1")]})
+    sor = _FakeSoR(seeds={"acme": [seed]}, mentions={ok: [("text", "c-1")]}, pairs={(seed, ok)})
     response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
     assert [r.id for r in response.results] == [str(ok)]
     assert _codes(response) == ["PARTIAL_RESULTS"]
@@ -291,10 +311,70 @@ async def test_the_policy_row_cap_truncates_and_flags() -> None:
     seed = uuid.uuid4()
     ids = [uuid.uuid4() for _ in range(_POLICY.max_rows + 1)]
     graph = _FakeGraph(neighbor_rows=[{"entity": _node(eid), "distance": 1} for eid in ids])
-    sor = _FakeSoR(seeds={"acme": [seed]}, mentions={eid: [("text", f"c-{eid}")] for eid in ids})
+    sor = _FakeSoR(
+        seeds={"acme": [seed]},
+        mentions={eid: [("text", f"c-{eid}")] for eid in ids},
+        pairs={(seed, eid) for eid in ids},
+    )
     response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
     assert len(response.results) == _POLICY.max_rows
     assert _codes(response) == ["TRUNCATED"]
+
+
+async def test_a_neighbor_reached_only_through_a_stale_edge_is_dropped() -> None:
+    """The projection's TRAVERSAL is untrusted, not just its values: an edge
+    whose SoR relation was rejected after projection still exists in Neo4j and
+    can reach an otherwise-active target. Reachability is recomputed over the
+    SoR's active relations — a target with no active path is drift, dropped and
+    surfaced, never emitted as a valid graph neighbor."""
+    seed, via_stale, via_live = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    graph = _FakeGraph(
+        neighbor_rows=[  # the projection still reaches BOTH
+            {"entity": _node(via_stale), "distance": 1},
+            {"entity": _node(via_live), "distance": 1},
+        ]
+    )
+    sor = _FakeSoR(
+        seeds={"acme": [seed]},
+        mentions={
+            via_stale: [("text", "c-stale")],  # active entity, still mentioned…
+            via_live: [("text", "c-live")],
+        },
+        pairs={(seed, via_live)},  # …but the SoR edge to it is GONE
+    )
+    response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
+    assert [r.id for r in response.results] == [str(via_live)]
+    assert _codes(response) == ["PARTIAL_RESULTS"]
+
+
+async def test_the_seed_scan_shares_one_policy_deadline() -> None:
+    """A name resolving to many entities must not multiply the latency cap:
+    each seed traversal gets only the REMAINING budget of one deadline (the
+    C6b per-statement-vs-per-phase lesson), and running out surfaces
+    PARTIAL_RESULTS rather than a silently smaller neighborhood."""
+    seeds = [uuid.uuid4() for _ in range(5)]
+    tight = TextToCypher(
+        enabled=False,
+        allowed_clauses=CYPHER_ALLOWED_CLAUSES,
+        blocked=CYPHER_BLOCKED_MIN,
+        max_rows=10,
+        timeout_ms=1,  # the whole scan's budget — attempts cost ~2ms each
+    )
+    graph = _FakeGraph(neighbor_rows=[], slow=True)
+    sor = _FakeSoR(seeds={"s": sorted(seeds, key=str)})
+    response = await graph_query(
+        cast(BuildScopedGraphRepo, graph),
+        cast(BuildScopedRepo, sor),
+        tight,
+        GraphQueryParams(template="neighbors", entity="s"),
+        "q",
+        3,
+    )
+    _VALIDATOR.validate(response.to_dict())
+    assert "PARTIAL_RESULTS" in _codes(response)
+    assert "deadline" in response.warnings[-1].message
+    scans = [c for c in graph.calls if c[0] == "neighbors"]
+    assert len(scans) < 5  # the deadline stopped the seed scan early
 
 
 async def test_an_unknown_seed_yields_an_empty_result_not_an_error() -> None:
@@ -562,6 +642,7 @@ async def test_subgraph_caps_the_combined_response_at_max_rows() -> None:
         relations={
             (seed, others[0], f"t{i}"): (uuid.uuid4(), [_chunk_evidence()]) for i in range(9)
         },
+        pairs={(seed, others[0]), (seed, others[1])},
     )
     response = await _run(graph, sor, GraphQueryParams(template="subgraph", entity="acme"))
     assert len(response.results) == _POLICY.max_rows  # 3 entities + 7 relations = the ceiling
@@ -582,6 +663,7 @@ async def test_subgraph_with_no_edge_budget_skips_the_edge_query_and_flags() -> 
     sor = _FakeSoR(
         seeds={"acme": [seed]},
         mentions={eid: [("text", f"c-{eid}")] for eid in [seed, *others]},
+        pairs={(seed, o) for o in others},
     )
     response = await _run(graph, sor, GraphQueryParams(template="subgraph", entity="acme"))
     assert len(response.results) == _POLICY.max_rows
@@ -599,10 +681,11 @@ async def test_no_budget_at_multi_hop_probes_for_edges_instead_of_asserting() ->
     others = [uuid.uuid4() for _ in range(_POLICY.max_rows - 1)]
     mentions = {eid: [("text", f"c-{eid}")] for eid in [seed, *others]}
     rows = [{"entity": _node(o), "distance": 2} for o in others]
+    pairs = {(seed, o) for o in others}
 
     # no direct edges exist → the probe finds nothing → NOT truncated
     graph = _FakeGraph(neighbor_rows=rows)
-    sor = _FakeSoR(seeds={"acme": [seed]}, mentions=mentions)
+    sor = _FakeSoR(seeds={"acme": [seed]}, mentions=mentions, pairs=pairs)
     response = await _run(graph, sor, GraphQueryParams(template="subgraph", entity="acme", hops=2))
     assert "TRUNCATED" not in _codes(response)
     probe = next(c for c in graph.calls if c[0] == "edges_among")
