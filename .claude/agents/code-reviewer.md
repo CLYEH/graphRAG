@@ -270,6 +270,18 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      the vertex numbering and shipped the unsorted prompt-sample slice in the
      same pass — the identical class, one function apart, cost a Codex round
      the day after the sweep rule was written down.
+   - **The trust boundary is per-COLUMN, not per-store**: "read straight from
+     the SoR" does not make every value in the row authoritative — an
+     UNCONSTRAINED reference column (a bare uuid[] or text ref with no FK) is
+     as untrusted as a projection value, because nothing structural stops a
+     malformed/hand-written row from claiming any id. Ground such refs
+     against the table they claim to point at (build-scoped) before emitting
+     them (C6d: member_entity_ids minted cross-build-capable entity refs).
+     Two corollaries: the FIXTURE must satisfy the property the check
+     verifies (random uuids as members was the tell Codex read); and
+     protocol/representation limits are value domains — one bind per id hits
+     PostgreSQL's 32767-bind statement cap on large builds, so unbounded IN
+     lists get batched (the 63-byte-identifier lesson, on the wire protocol).
 
 ## Output (exactly this shape)
 ```
