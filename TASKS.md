@@ -54,7 +54,7 @@ Keep items small enough to finish in one loop.
 - [x] C6c Retrieval: graph (parameterized Cypher templates + guardrail per P5, §27.6)
 - [ ] C6d Retrieval: global (community_reports — needs C7)
 - [ ] C6e Hybrid router + fusion + routing trace (§8, §16 debug)
-- [ ] C7 Global summary (Leiden communities + reports)
+- [x] C7 Global summary (Leiden communities + reports)
 - [ ] C8 MCP server (per project) exposing the tool set
 - [ ] C9 builds/activate/rollback/diff/prune (CLI + core)
 - [ ] C10 Eval harness runner
