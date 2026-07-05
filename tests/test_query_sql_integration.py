@@ -36,7 +36,7 @@ from core.query.sql import sql_query
 from core.query.sql_guard import ValidatedSql
 from core.stores.repo import BuildScopedWriter
 from core.stores.sqlreader import BuildScopedSqlReader
-from core.stores.tables import builds, documents
+from core.stores.tables import STRUCTURED_MIME, builds, documents
 
 pytestmark = pytest.mark.integration
 
@@ -103,7 +103,7 @@ async def _row(writer: BuildScopedWriter, table: str, pk: str, **data: str) -> N
         id=uuid.uuid4(),
         source_uri=f"file:///{table}.csv#pk={pk}",
         content_hash=f"{table}:{pk}:{writer.build_id}",
-        mime="application/json",
+        mime=STRUCTURED_MIME,
         metadata={"table": table, "pk": pk},
         raw=json.dumps({"pk": pk, **data}, sort_keys=True),
         ingested_at=NOW,
@@ -217,6 +217,85 @@ async def test_statement_timeout_cancels_and_leaves_a_reusable_connection(
         await reader.rollback()  # what sql_query._degrade does before degrading
         reusable = (await conn.execute(text("SELECT 1"))).scalar_one()
         assert reusable == 1  # aborted transaction cleared → connection reusable
+    finally:
+        await _cleanup(project)
+
+
+async def test_reconstruction_reads_only_structured_documents(conn: AsyncConnection) -> None:
+    """A free-text document that happens to carry {"table": "orders"} metadata must
+    NOT leak into the logical orders table: its prose `raw` would break `raw::json`
+    and degrade the whole table's SQL, or be returned as a fake cited row. The mime
+    filter (structured rows only) excludes it, so the query stays clean."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", customer="acme", amount="50")
+        # a PROSE document masquerading with the same table metadata (mime differs)
+        await writer.insert(
+            documents,
+            id=uuid.uuid4(),
+            source_uri="file:///notes.txt",
+            content_hash=f"prose:{writer.build_id}",
+            mime="text/plain",
+            metadata={"table": "orders", "pk": "x"},
+            raw="this is prose, not json",
+            ingested_at=NOW,
+        )
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("SELECT * FROM orders")), _POLICY, "all orders", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert response.warnings == ()  # the prose `raw` never reached raw::json
+        pks = [r.source_refs[0].metadata["pk"] for r in response.results]
+        assert pks == ["1"]  # only the structured row, not the prose doc
+    finally:
+        await _cleanup(project)
+
+
+async def test_a_colon_in_a_key_and_a_predicate_literal_execute(conn: AsyncConnection) -> None:
+    """A JSON-key column with a colon (`http:status`) and an LLM predicate with a
+    colon literal (`= ':special'`) both execute and return the row — the colon
+    escaping stops text() mis-reading them as unbound binds (a 500 without it)."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await writer.insert(
+            documents,
+            id=uuid.uuid4(),
+            source_uri="file:///orders.csv#pk=1",
+            content_hash=f"orders:1:{writer.build_id}",
+            mime=STRUCTURED_MIME,
+            metadata={"table": "orders", "pk": "1"},
+            raw=json.dumps(
+                {"pk": "1", "customer": ":special", "http:status": "ok"}, sort_keys=True
+            ),
+            ingested_at=NOW,
+        )
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader,
+            cast(LLM, _FakeLLM("SELECT * FROM orders WHERE customer = ':special'")),
+            _POLICY,
+            "the special one",
+            100,
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert response.warnings == ()  # no unbound-parameter 500
+        (result,) = response.results
+        assert json.loads(result.text or "{}") == {
+            "pk": "1",
+            "customer": ":special",
+            "http:status": "ok",  # the colon key round-trips as a real column
+        }
     finally:
         await _cleanup(project)
 

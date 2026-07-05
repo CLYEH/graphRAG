@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.query.sql_guard import validate_sql
 from core.stores.sqlreader import _SQL_READER_TOKEN, BuildScopedSqlReader
+from core.stores.tables import STRUCTURED_MIME
 
 _PROJECT = "acme"
 _BUILD = __import__("uuid").UUID("7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d")
@@ -37,13 +38,15 @@ class _Result:
 
 
 class _FakeConn:
-    """Routes the two reads the reader makes — the jsonb_object_keys column probe
-    and the reconstructed query — and captures every SQL string + bound params."""
+    """Routes the reader's reads — the jsonb_object_keys column probe (bound
+    text() via ``execute``) and the reconstructed query (fully-literal raw SQL via
+    ``exec_driver_sql``) — capturing each so tests can inspect the composed SQL."""
 
     def __init__(self, columns: list[str], rows: list[dict[str, Any]]) -> None:
         self._columns = columns
         self._rows = rows
         self.executed: list[tuple[str, dict[str, Any]]] = []
+        self.driver_sql: list[str] = []
         self.rolled_back = False
 
     async def rollback(self) -> None:
@@ -55,6 +58,10 @@ class _FakeConn:
         self.executed.append((sql, params))
         if "jsonb_object_keys" in sql:
             return _Result([SimpleNamespace(k=col) for col in self._columns])
+        return _Result(self._rows)
+
+    async def exec_driver_sql(self, sql: str) -> _Result:
+        self.driver_sql.append(sql)
         return _Result(self._rows)
 
 
@@ -70,19 +77,21 @@ def _row(pk: str, **data: str) -> dict[str, Any]:
 
 async def test_reconstruction_is_build_scoped_and_never_a_base_table() -> None:
     """The executed query wraps the user SELECT in a CTE of the same name over
-    documents, filtered to the bound (project, build_id, table) — so the read is
+    documents, filtered to the active (project, build_id, mime, table) — injected
+    as escaped LITERALS (the whole query is bind-free, run raw) — so the read is
     structurally confined to the active build's structured rows, and
     `SELECT * FROM orders` can never reach a real base table."""
     conn = _FakeConn(["id", "amount"], [_row("1", id="1", amount="9")])
     validated = validate_sql("SELECT * FROM orders WHERE amount = '9'", _ALLOWED, _BLOCKED)
     await _reader(conn).run(validated, max_rows=10)
 
-    main_sql, params = conn.executed[-1]
+    main_sql = conn.driver_sql[-1]  # executed raw (no bind params), not via text()
     assert "WITH orders AS" in main_sql  # reconstructed, not the base table
     assert "FROM documents" in main_sql
-    assert ":__g_table" in main_sql and "'table')" in main_sql  # scoped to the logical table
-    assert ":__g_build" in main_sql  # scoped to the active build_id
-    assert params == {"__g_project": _PROJECT, "__g_build": str(_BUILD), "__g_table": "orders"}
+    assert str(_BUILD) in main_sql  # the active build_id, injected as a literal
+    assert f"'{_PROJECT}'" in main_sql  # project scope literal
+    assert f"'{STRUCTURED_MIME}'" in main_sql  # structured (row) documents only
+    assert "'table')" in main_sql and "= 'orders'" in main_sql  # the logical-table filter
     # every JSON-key column is projected as a safely quoted identifier
     assert "'id') AS \"id\"" in main_sql and "'amount') AS \"amount\"" in main_sql
 
@@ -98,7 +107,7 @@ async def test_untrusted_column_names_cannot_inject() -> None:
     conn = _FakeConn([evil], [{"__row_pk": "1", evil: "v"}])
     validated = validate_sql("SELECT * FROM orders", _ALLOWED, _BLOCKED)
     await _reader(conn).run(validated, max_rows=10)
-    main_sql = conn.executed[-1][0]
+    main_sql = conn.driver_sql[-1]
     assert len(sqlglot.parse(main_sql, dialect="postgres")) == 1  # injection contained
     assert "'k'' ; drop table documents; --'" in main_sql  # the key is an escaped literal
 
@@ -111,7 +120,7 @@ async def test_an_empty_logical_table_yields_no_results_without_a_query() -> Non
     validated = validate_sql("SELECT * FROM orders WHERE x = '1'", _ALLOWED, _BLOCKED)
     rows, truncated = await _reader(conn).run(validated, max_rows=10)
     assert rows == [] and truncated is False
-    assert not any("WITH orders" in sql for sql, _ in conn.executed)  # the query never ran
+    assert conn.driver_sql == []  # the reconstructed query never ran
 
 
 async def test_ceiling_clips_and_flags_truncation() -> None:

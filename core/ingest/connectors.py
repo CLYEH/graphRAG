@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.stores.tables import STRUCTURED_MIME
+
 #: Free-text suffixes the document connector accepts, mapped to their mime
 #: type. Extend as real projects need more formats (PDF etc. arrive with
 #: their own extraction dependencies — deliberately not in C2).
@@ -112,6 +114,6 @@ def read_csv_rows(path: Path, *, table: str, pk_column: str) -> Iterator[Documen
             yield DocumentPayload(
                 source_uri=f"{path.resolve().as_uri()}#{pk_column}={pk}",
                 raw=json.dumps(row, ensure_ascii=False, sort_keys=True),
-                mime="application/json",
+                mime=STRUCTURED_MIME,
                 metadata={"table": table, "pk": pk},
             )

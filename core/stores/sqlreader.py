@@ -28,7 +28,6 @@ are deferred infra — the executor takes an injected connection, C6a-style).
 
 from __future__ import annotations
 
-import re
 import uuid
 from collections.abc import Sequence
 from typing import Any
@@ -39,22 +38,10 @@ from sqlglot import exp
 
 from core.query.sql_guard import ValidatedSql
 from core.stores.repo import active_build_id
+from core.stores.tables import STRUCTURED_MIME
 
 _DIALECT = "postgres"
 _SQL_READER_TOKEN = object()
-
-#: The executor's own scope placeholders — a unique prefix so converting them to
-#: SQLAlchemy's ``:name`` style (sqlglot renders postgres params as ``%(name)s``)
-#: can never touch a user value; the guardrail rejects user placeholders anyway.
-_PARAM_RE = re.compile(r"%\((__g_[a-z_]+)\)s")
-
-
-def _to_named_params(sql: str) -> str:
-    """sqlglot renders postgres bind params as ``%(name)s``; SQLAlchemy
-    :func:`text` wants ``:name``. Only the executor's own ``__g_``-prefixed
-    params exist here (user placeholders are rejected upstream), so this
-    conversion is unambiguous."""
-    return _PARAM_RE.sub(r":\1", sql)
 
 
 def _json_text(column: str, key: str) -> exp.Expr:
@@ -114,6 +101,7 @@ class BuildScopedSqlReader:
             "__g_project": self.__project,
             "__g_build": str(self.__build_id),
             "__g_table": table,
+            "__g_mime": STRUCTURED_MIME,
         }
 
     async def column_names(self, table: str) -> tuple[str, ...]:
@@ -128,7 +116,7 @@ class BuildScopedSqlReader:
             text(
                 "SELECT DISTINCT jsonb_object_keys(raw::jsonb) AS k FROM documents "
                 "WHERE project = :__g_project AND build_id = CAST(:__g_build AS uuid) "
-                "AND metadata ->> 'table' = :__g_table"
+                "AND mime = :__g_mime AND metadata ->> 'table' = :__g_table"
             ).bindparams(**self._scope_params(table))
         )
         return tuple(sorted(row.k for row in result if not row.k.startswith("__")))
@@ -154,12 +142,16 @@ class BuildScopedSqlReader:
 
         ceiling = self._ceiling(validated.statement, max_rows)
         final = validated.statement.limit(ceiling + 1, copy=True).with_(
-            validated.table, as_=self._reconstruction(columns), copy=True
+            validated.table, as_=self._reconstruction(validated.table, columns), copy=True
         )
-        sql = _to_named_params(final.sql(dialect=_DIALECT))
-        result = await self.__conn.execute(
-            text(sql).bindparams(**self._scope_params(validated.table))
-        )
+        # The rendered SQL is fully self-contained — scope values and untrusted
+        # JSON keys alike are sqlglot-ESCAPED LITERALS (never string-concatenated),
+        # so it carries no bind params. Run it RAW via exec_driver_sql: text()
+        # would re-scan the whole string for `:name`/`%(x)s` binds and mis-read a
+        # DATA colon (`= ':new'`) or a `%(__g_x)s`-shaped literal as an (unbound)
+        # parameter; exec_driver_sql passes it to the driver verbatim (asyncpg
+        # binds by $N, so `:` and `%` in data are inert).
+        result = await self.__conn.exec_driver_sql(final.sql(dialect=_DIALECT))
         rows = [dict(row) for row in result.mappings()]
         # TRUNCATED means the POLICY ceiling clipped the set (§22) — not the
         # query's own smaller LIMIT, which is the caller's deliberate choice.
@@ -206,22 +198,27 @@ class BuildScopedSqlReader:
                 pass
         return max_rows
 
-    @staticmethod
-    def _reconstruction(columns: Sequence[str]) -> exp.Expr:
+    def _reconstruction(self, table: str, columns: Sequence[str]) -> exp.Expr:
         """A build-scoped SELECT over ``documents`` exposing this logical table's
-        pk + source_uri + one column per JSON key, scoped by bound params. Built
-        entirely from AST nodes — untrusted JSON-key columns become escaped
-        string literals inside :func:`_json_text`, never re-parsed SQL. The
-        logical-table filter is a bound param (``:__g_table``); the CTE takes its
-        NAME from the query's table in :meth:`run` (``.with_``)."""
+        pk + source_uri + one column per JSON key. Built entirely from AST nodes,
+        so EVERY value — the scope (project, build_id, table, mime) and the
+        untrusted JSON-key columns alike — is a sqlglot-ESCAPED literal, never
+        string-concatenated SQL; the whole reconstruction is bind-free, which is
+        what lets :meth:`run` execute it raw (see there). The scope is injected
+        STRUCTURALLY (every row seen carries the active build_id, DR-006); the CTE
+        takes its NAME from ``table`` in :meth:`run` (``.with_``)."""
         projections = [
             exp.alias_(_json_text("metadata", "pk"), "__row_pk"),
             exp.alias_(exp.column("source_uri"), "__source_uri"),
             *[exp.alias_(_json_text("raw", column), column, quoted=True) for column in columns],
         ]
         where = exp.and_(
-            exp.column("project").eq(exp.Placeholder(this="__g_project")),
-            exp.column("build_id").eq(exp.cast(exp.Placeholder(this="__g_build"), "uuid")),
-            _json_text("metadata", "table").eq(exp.Placeholder(this="__g_table")),
+            exp.column("project").eq(exp.Literal.string(self.__project)),
+            exp.column("build_id").eq(exp.cast(exp.Literal.string(str(self.__build_id)), "uuid")),
+            # only structured (row) documents — a free-text doc that happens to
+            # carry {"table": ...} metadata must not leak in (its prose `raw`
+            # would break `raw::json`, degrading the whole table's SQL).
+            exp.column("mime").eq(exp.Literal.string(STRUCTURED_MIME)),
+            _json_text("metadata", "table").eq(exp.Literal.string(table)),
         )
         return exp.select(*projections).from_("documents").where(where)
