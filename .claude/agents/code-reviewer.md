@@ -282,6 +282,18 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      protocol/representation limits are value domains — one bind per id hits
      PostgreSQL's 32767-bind statement cap on large builds, so unbounded IN
      lists get batched (the 63-byte-identifier lesson, on the wire protocol).
+   - **Partial validity of an untrusted selection is WHOLE-answer failure**:
+     when untrusted output selects from a vocabulary (an LLM picking modes,
+     categories, tools), a mixed answer — valid members alongside
+     out-of-vocabulary ones — must not be half-trusted: intersect-and-continue
+     silently narrows the result, which is the failure the fallback rule
+     exists to prevent. One bad member distrusts the whole answer → the
+     documented breadth fallback applies (C6e: ["semantic","teleport"] kept
+     semantic and silently skipped three modes; the docstring promised
+     whole-answer fallback and the implementation checked only the empty
+     intersection — a doc/impl divergence Codex read in one pass). Check the
+     documented failure rule WORD BY WORD against the implementation's
+     actual branch conditions.
 
 ## Output (exactly this shape)
 ```
