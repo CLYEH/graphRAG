@@ -44,9 +44,6 @@ from core.stores.repo import BuildScopedWriter
 _RULE_CONFIDENCE = 1.0
 _CREATED_BY = "rule"
 
-#: The mime the CSV/structured connector (C2) stamps on a tabular row.
-_STRUCTURED_MIME = "application/json"
-
 
 def row_source_ref(table: str, pk: str) -> str:
     """A LOSSLESS, splittable ``(table, pk)`` row ref (§27.2 cites table + pk).
@@ -105,7 +102,7 @@ async def extract_structured(
     outcomes: list[ItemOutcome] = []
 
     for doc in await writer.fetch_all(
-        tables.documents, tables.documents.c.mime == _STRUCTURED_MIME
+        tables.documents, tables.documents.c.mime == tables.STRUCTURED_MIME
     ):
         metadata = doc.metadata or {}
         table = metadata.get("table")

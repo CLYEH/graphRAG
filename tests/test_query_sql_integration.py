@@ -1,0 +1,584 @@
+"""Why: sql_query is only correct if a real NL→SQL query, run against a real
+build's structured rows, comes back as §16 `row` results cited by (table, pk) —
+and NEVER escapes the active build or the read-only shape. The guardrail + the
+mapping are unit-tested with fakes; here the whole path runs against live
+Postgres with a deterministic fake LLM (no OpenAI key): rows C2-shaped as JSON in
+`documents` are reconstructed into a build-scoped CTE, queried, and cited. Build
+isolation and end-to-end guardrail rejection are proven where they matter — on
+the database.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, cast
+
+import jsonschema
+import pytest
+import pytest_asyncio
+import sqlglot
+from alembic import command
+from alembic.config import Config
+from llama_index.core.llms import LLM
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
+from sqlglot import exp
+
+from core.config import get_settings
+from core.query.policy import SQL_BLOCKED_KEYWORDS_MIN, TextToSql
+from core.query.sql import sql_query
+from core.query.sql_guard import ValidatedSql
+from core.stores.repo import BuildScopedWriter
+from core.stores.sqlreader import BuildScopedSqlReader
+from core.stores.tables import STRUCTURED_MIME, builds, documents
+
+pytestmark = pytest.mark.integration
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+NOW = datetime.now(tz=UTC)
+
+_SCHEMA = json.loads((REPO_ROOT / "contracts" / "mcp_response.schema.json").read_text("utf-8"))
+_VALIDATOR = jsonschema.Draft202012Validator(
+    cast(dict[str, Any], _SCHEMA), format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER
+)
+
+_POLICY = TextToSql(
+    enabled=True,
+    allowed_tables=("orders",),
+    blocked_keywords=SQL_BLOCKED_KEYWORDS_MIN,
+    max_rows=100,
+    timeout_ms=5000,
+)
+
+
+class _FakeLLM:
+    """Returns a fixed SQL string — the NL→SQL step is exercised, deterministically
+    and without a key; the guardrail + executor are the real path under test."""
+
+    def __init__(self, sql: str) -> None:
+        self._sql = sql
+
+    async def achat(self, messages: Any, **kwargs: Any) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(message=SimpleNamespace(content=self._sql))
+
+
+@pytest.fixture()
+def migrated(require_services: None) -> None:
+    command.upgrade(Config(str(REPO_ROOT / "alembic.ini")), "head")
+
+
+def _engine() -> AsyncEngine:
+    dsn = get_settings().postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return create_async_engine(dsn, poolclass=NullPool)
+
+
+@pytest_asyncio.fixture()
+async def conn(migrated: None) -> AsyncIterator[AsyncConnection]:
+    engine = _engine()
+    async with engine.connect() as connection:
+        yield connection
+    await engine.dispose()
+
+
+async def _new_build(connection: AsyncConnection, project: str) -> BuildScopedWriter:
+    build_id: uuid.UUID = (
+        await connection.execute(
+            builds.insert().values(project=project, status="building").returning(builds.c.id)
+        )
+    ).scalar_one()
+    return await BuildScopedWriter.for_building_build(connection, project, build_id)
+
+
+async def _row(writer: BuildScopedWriter, table: str, pk: str, **data: str) -> None:
+    await writer.insert(
+        documents,
+        id=uuid.uuid4(),
+        source_uri=f"file:///{table}.csv#pk={pk}",
+        content_hash=f"{table}:{pk}:{writer.build_id}",
+        mime=STRUCTURED_MIME,
+        metadata={"table": table, "pk": pk},
+        raw=json.dumps({"pk": pk, **data}, sort_keys=True),
+        ingested_at=NOW,
+    )
+
+
+async def _activate(connection: AsyncConnection, build_id: uuid.UUID) -> None:
+    await connection.execute(builds.update().where(builds.c.id == build_id).values(status="active"))
+
+
+async def _cleanup(project: str) -> None:
+    engine = _engine()
+    async with engine.connect() as connection:
+        await connection.execute(documents.delete().where(documents.c.project == project))
+        await connection.execute(builds.delete().where(builds.c.project == project))
+        await connection.commit()
+    await engine.dispose()
+
+
+async def test_nl_sql_returns_cited_rows_end_to_end(conn: AsyncConnection) -> None:
+    """A real query over the reconstructed `orders` table returns the matching
+    source rows, each cited by (table, pk) with the document's source_uri, and
+    the payload validates against the frozen §16 schema."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", customer="acme", amount="50")
+        await _row(writer, "orders", "2", customer="acme", amount="150")
+        await _row(writer, "orders", "3", customer="globex", amount="200")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        llm = _FakeLLM("SELECT * FROM orders WHERE amount::numeric >= 150 ORDER BY amount::numeric")
+        response = await sql_query(reader, cast(LLM, llm), _POLICY, "big orders", 100)
+
+        payload = response.to_dict()
+        _VALIDATOR.validate(payload)
+        assert response.warnings == ()
+        pks = [r["source_refs"][0]["metadata"]["pk"] for r in payload["results"]]
+        assert pks == ["2", "3"]  # amount >= 150, in ORDER BY amount (150 then 200)
+        first = payload["results"][0]
+        assert first["result_type"] == "row"
+        assert first["source_refs"][0]["source_uri"] == "file:///orders.csv#pk=2"
+        assert json.loads(first["text"]) == {"pk": "2", "customer": "acme", "amount": "150"}
+    finally:
+        await _cleanup(project)
+
+
+async def test_query_reads_only_the_active_build(conn: AsyncConnection) -> None:
+    """The reconstruction is build-scoped: an archived build's row with the same
+    pk coexists in `documents`, but a query bound to the active build returns
+    only the active build's row (DR-006)."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        old = await _new_build(conn, project)
+        await _row(old, "orders", "1", customer="stale", amount="1")
+        await conn.commit()
+        new = await _new_build(conn, project)
+        await _row(new, "orders", "1", customer="fresh", amount="1")
+        await conn.commit()
+        await _activate(conn, new.build_id)
+        await conn.execute(
+            builds.update().where(builds.c.id == old.build_id).values(status="archived")
+        )
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("SELECT * FROM orders")), _POLICY, "all orders", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        customers = [json.loads(r.text or "{}")["customer"] for r in response.results]
+        assert customers == ["fresh"]  # never the archived build's row
+    finally:
+        await _cleanup(project)
+
+
+async def test_statement_timeout_cancels_and_releases_the_connection(
+    conn: AsyncConnection,
+) -> None:
+    """The reader enforces the policy deadline as a real Postgres statement_timeout;
+    when the cancel aborts the statement, timed_transaction's rollback clears it and
+    RELEASES the connection (deadline reset, no transaction held) so it is
+    immediately reusable. Tested at the reader seam because the guardrail (correctly)
+    rejects pg_sleep — the only deterministic way to make a query slow — so we hand
+    the reader a ValidatedSql directly to prove SET LOCAL + recovery on live PG."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", customer="acme", amount="9")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        slow = ValidatedSql(
+            statement=cast(
+                exp.Select,
+                sqlglot.parse_one(
+                    "SELECT * FROM orders WHERE pg_sleep(5) IS NOT NULL", dialect="postgres"
+                ),
+            ),
+            table="orders",
+        )
+        with pytest.raises(DBAPIError) as excinfo:
+            async with reader.timed_transaction(200):  # 200ms deadline vs a 5s sleep
+                await reader.run(slow, max_rows=100)
+        assert getattr(excinfo.value.orig, "sqlstate", None) == "57014"  # query_canceled
+
+        # timed_transaction's rollback cleared the abort and reset the deadline; the
+        # connection is released (not in a transaction) and immediately reusable.
+        assert conn.in_transaction() is False
+        timeout = (
+            await conn.exec_driver_sql("SELECT current_setting('statement_timeout')")
+        ).scalar_one()
+        assert timeout == "0"  # the deadline did not leak past the phase
+        reusable = (await conn.execute(text("SELECT 1"))).scalar_one()
+        assert reusable == 1  # aborted transaction cleared → connection reusable
+    finally:
+        await _cleanup(project)
+
+
+async def test_for_active_build_leaves_the_connection_clean(conn: AsyncConnection) -> None:
+    """The active-build lookup runs in its own committed transaction, so the reader
+    is handed back a CLEAN connection — a disabled (MODE_SKIPPED) query that returns
+    before any phase leaves no lookup transaction lingering idle."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", amount="9")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        await BuildScopedSqlReader.for_active_build(conn, project)
+        assert conn.in_transaction() is False  # lookup committed → nothing left open
+    finally:
+        await _cleanup(project)
+
+
+async def test_schema_discovery_batches_all_tables_in_one_probe(conn: AsyncConnection) -> None:
+    """columns_by_table discovers every whitelisted table's columns in ONE statement
+    (grouped per table), so schema discovery is bounded by a single statement_timeout
+    rather than one deadline per table (§21)."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", amount="9")
+        await _row(writer, "customers", "1", name="acme", city="ny")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        async with reader.timed_transaction(5000):
+            cols = await reader.columns_by_table(["orders", "customers"])
+        assert cols == {"orders": ("amount", "pk"), "customers": ("city", "name", "pk")}
+    finally:
+        await _cleanup(project)
+
+
+async def test_no_transaction_is_held_across_the_llm_call(conn: AsyncConnection) -> None:
+    """sql_query runs schema discovery and execution in SEPARATE timed transactions,
+    releasing the connection across the LLM call — so no session sits
+    idle-in-transaction for the model latency (§21). Proven by probing the live
+    connection's transaction state from inside the (fake) LLM call."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", customer="acme", amount="9")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        seen: dict[str, bool] = {}
+
+        class _ProbingLLM:
+            async def achat(self, messages: Any, **kwargs: Any) -> Any:
+                from types import SimpleNamespace
+
+                seen["in_txn"] = conn.in_transaction()  # captured DURING the LLM call
+                return SimpleNamespace(message=SimpleNamespace(content="SELECT * FROM orders"))
+
+        response = await sql_query(reader, cast(LLM, _ProbingLLM()), _POLICY, "all", 100)
+        _VALIDATOR.validate(response.to_dict())
+        assert response.warnings == ()
+        assert seen["in_txn"] is False  # the schema-discovery txn was released before the LLM
+    finally:
+        await _cleanup(project)
+
+
+async def test_reconstruction_reads_only_structured_documents(conn: AsyncConnection) -> None:
+    """A free-text document that happens to carry {"table": "orders"} metadata must
+    NOT leak into the logical orders table: its prose `raw` would break `raw::json`
+    and degrade the whole table's SQL, or be returned as a fake cited row. The mime
+    filter (structured rows only) excludes it, so the query stays clean."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", customer="acme", amount="50")
+        # a PROSE document masquerading with the same table metadata (mime differs)
+        await writer.insert(
+            documents,
+            id=uuid.uuid4(),
+            source_uri="file:///notes.txt",
+            content_hash=f"prose:{writer.build_id}",
+            mime="text/plain",
+            metadata={"table": "orders", "pk": "x"},
+            raw="this is prose, not json",
+            ingested_at=NOW,
+        )
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("SELECT * FROM orders")), _POLICY, "all orders", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert response.warnings == ()  # the prose `raw` never reached raw::json
+        pks = [r.source_refs[0].metadata["pk"] for r in response.results]
+        assert pks == ["1"]  # only the structured row, not the prose doc
+    finally:
+        await _cleanup(project)
+
+
+async def test_a_colon_in_a_key_and_a_predicate_literal_execute(conn: AsyncConnection) -> None:
+    """A JSON-key column with a colon (`http:status`) and an LLM predicate with a
+    colon literal (`= ':special'`) both execute and return the row — the colon
+    escaping stops text() mis-reading them as unbound binds (a 500 without it)."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await writer.insert(
+            documents,
+            id=uuid.uuid4(),
+            source_uri="file:///orders.csv#pk=1",
+            content_hash=f"orders:1:{writer.build_id}",
+            mime=STRUCTURED_MIME,
+            metadata={"table": "orders", "pk": "1"},
+            raw=json.dumps(
+                {"pk": "1", "customer": ":special", "http:status": "ok"}, sort_keys=True
+            ),
+            ingested_at=NOW,
+        )
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader,
+            cast(LLM, _FakeLLM("SELECT * FROM orders WHERE customer = ':special'")),
+            _POLICY,
+            "the special one",
+            100,
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert response.warnings == ()  # no unbound-parameter 500
+        (result,) = response.results
+        assert json.loads(result.text or "{}") == {
+            "pk": "1",
+            "customer": ":special",
+            "http:status": "ok",  # the colon key round-trips as a real column
+        }
+    finally:
+        await _cleanup(project)
+
+
+async def test_a_whitelisted_table_name_needing_quotes_works(conn: AsyncConnection) -> None:
+    """allowed_tables is not restricted to bare identifiers, so a real query over a
+    whitelisted `Order Details` (space → must be quoted) succeeds: the CTE and the
+    outer reference are the same quoted identifier. A raw `.with_(<str>)` would
+    raise a ParseError → an uncaught 500."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "Order Details", "1", amount="9")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        policy = TextToSql(
+            enabled=True,
+            allowed_tables=("Order Details",),
+            blocked_keywords=SQL_BLOCKED_KEYWORDS_MIN,
+            max_rows=100,
+            timeout_ms=5000,
+        )
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM('SELECT * FROM "Order Details"')), policy, "details", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert response.warnings == ()
+        (result,) = response.results
+        assert result.source_refs[0].metadata == {"table": "Order Details", "pk": "1"}
+    finally:
+        await _cleanup(project)
+
+
+async def test_a_successful_query_does_not_leak_the_statement_timeout(
+    conn: AsyncConnection,
+) -> None:
+    """sql_query ends its transaction on the success path too, so the SET LOCAL
+    statement_timeout (5000ms here) does NOT linger on the connection — a fresh
+    statement (a hybrid follow-up read) sees the default, not the SQL deadline."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", amount="9")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("SELECT * FROM orders")), _POLICY, "all", 100
+        )
+        assert response.warnings == ()
+        assert conn.in_transaction() is False  # each phase's transaction was ended → released
+        leftover = (
+            await conn.exec_driver_sql("SELECT current_setting('statement_timeout')")
+        ).scalar_one()
+        assert leftover == "0"  # reset by the transaction end, not the policy's 5000ms
+    finally:
+        await _cleanup(project)
+
+
+async def test_a_row_without_a_pk_is_dropped_and_surfaced_as_partial(
+    conn: AsyncConnection,
+) -> None:
+    """A structured row whose metadata carries no pk (a corrupt / hand-written
+    `documents` row) reconstructs a NULL `__row_pk`; it can't be cited (§27.2), so
+    it is dropped AND the response carries PARTIAL_RESULTS (§22) — the short answer
+    is not mistaken for a complete one."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", amount="9")  # citable
+        await writer.insert(  # a corrupt row: same logical table, but no pk in metadata
+            documents,
+            id=uuid.uuid4(),
+            source_uri="file:///orders.csv#corrupt",
+            content_hash=f"orders:corrupt:{writer.build_id}",
+            mime=STRUCTURED_MIME,
+            metadata={"table": "orders"},
+            raw=json.dumps({"amount": "5"}, sort_keys=True),
+            ingested_at=NOW,
+        )
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("SELECT * FROM orders")), _POLICY, "all", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert [r.source_refs[0].metadata["pk"] for r in response.results] == ["1"]  # citable only
+        assert [w.code for w in response.warnings] == ["PARTIAL_RESULTS"]  # the drop is surfaced
+    finally:
+        await _cleanup(project)
+
+
+async def test_a_nonstring_pk_is_dropped_not_forged_into_a_citation(
+    conn: AsyncConnection,
+) -> None:
+    """A structured row whose metadata.pk is a JSON number (not a string) must not be
+    cited by a coerced '123'. The reconstruction gates __row_pk on
+    jsonb_typeof(...) = 'string', so a non-string pk reconstructs NULL — the row is
+    dropped (§27.2 requires the source to carry a string (table, pk)) AND surfaced as
+    PARTIAL_RESULTS (§22), not silently emitted with a stringified pk."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", amount="9")  # citable (string pk)
+        await writer.insert(  # a corrupt row: pk is a JSON number, not a string
+            documents,
+            id=uuid.uuid4(),
+            source_uri="file:///orders.csv#numeric-pk",
+            content_hash=f"orders:numpk:{writer.build_id}",
+            mime=STRUCTURED_MIME,
+            metadata={"table": "orders", "pk": 123},
+            raw=json.dumps({"amount": "7"}, sort_keys=True),
+            ingested_at=NOW,
+        )
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("SELECT * FROM orders")), _POLICY, "all", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert [r.source_refs[0].metadata["pk"] for r in response.results] == [
+            "1"
+        ]  # string pk only
+        assert [w.code for w in response.warnings] == ["PARTIAL_RESULTS"]  # numeric-pk row dropped
+    finally:
+        await _cleanup(project)
+
+
+async def test_a_table_whose_only_column_is_a_reserved_key_still_returns_cited_rows(
+    conn: AsyncConnection,
+) -> None:
+    """A structured table whose only column is a ``__``-prefixed key (read_csv_rows
+    accepts a `__id` pk column) has no queryable DATA columns, but the rows exist
+    and are citable by pk. `SELECT * FROM t` must return them cited — not silently
+    drop every row as if the table were empty (§27.2)."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await writer.insert(  # only column is the reserved-name pk `__id`
+            documents,
+            id=uuid.uuid4(),
+            source_uri="file:///weird.csv#__id=1",
+            content_hash=f"weird:1:{writer.build_id}",
+            mime=STRUCTURED_MIME,
+            metadata={"table": "weird", "pk": "1"},
+            raw=json.dumps({"__id": "1"}, sort_keys=True),
+            ingested_at=NOW,
+        )
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        policy = TextToSql(
+            enabled=True,
+            allowed_tables=("weird",),
+            blocked_keywords=SQL_BLOCKED_KEYWORDS_MIN,
+            max_rows=100,
+            timeout_ms=5000,
+        )
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("SELECT * FROM weird")), policy, "all", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert response.warnings == ()
+        (result,) = response.results  # the row is returned, not dropped
+        assert result.source_refs[0].metadata == {"table": "weird", "pk": "1"}
+        assert result.text is not None and json.loads(result.text) == {}  # __id not a data column
+    finally:
+        await _cleanup(project)
+
+
+async def test_a_write_attempt_is_blocked_end_to_end(conn: AsyncConnection) -> None:
+    """If the LLM emits a write, the guardrail rejects it before execution: the
+    response is GUARDRAIL_BLOCKED and the documents table is untouched."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", customer="acme", amount="9")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("DROP TABLE documents")), _POLICY, "drop it", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert response.results == () and response.warnings[0].code == "GUARDRAIL_BLOCKED"
+        # documents is intact — the write never reached the database
+        survived = (
+            await conn.execute(
+                text("SELECT count(*) FROM documents WHERE project = :p"), {"p": project}
+            )
+        ).scalar_one()
+        assert survived == 1
+    finally:
+        await _cleanup(project)

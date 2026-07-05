@@ -39,6 +39,13 @@ MERGE_CANDIDATE_DECISIONS = ("approve", "reject", "defer")
 # DESIGN §4: builds.status lifecycle — frozen enum, enforced by CHECK constraint.
 BUILD_STATUSES = ("building", "ready", "active", "failed", "archived")
 
+#: The mime the structured (row) connector stamps on every row-document — the
+#: discriminator that separates structured rows from free-text documents in the
+#: shared `documents` table. C2 ingest writes it (`core.ingest.connectors`) and
+#: the SQL retrieval reconstruction filters on it (`core.stores.sqlreader`), so
+#: it is a small cross-module contract that lives with the table, not either end.
+STRUCTURED_MIME = "application/json"
+
 builds = sa.Table(
     "builds",
     metadata,
