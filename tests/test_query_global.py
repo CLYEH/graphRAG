@@ -200,3 +200,37 @@ async def test_a_report_with_no_grounded_members_drops_entirely() -> None:
     )
     assert [r.id for r in response.results] == [str(good.id)]
     assert _codes(response) == ["PARTIAL_RESULTS"]
+
+
+async def test_grounding_lookups_are_batched_under_the_bind_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The IN predicate binds one parameter per id and PostgreSQL caps a
+    statement at 32767 binds — a large build's collective member claims must
+    split into batches, or global retrieval fails outright on big graphs.
+    Every batch's hits union into the grounded set (nothing lost at seams)."""
+    import core.query.global_reports as module
+
+    monkeypatch.setattr(module, "_GROUNDING_BATCH", 2)
+    members = [uuid.uuid4() for _ in range(5)]  # → 3 batches at size 2
+    row = _report(5.0, member_ids=members)
+
+    batches: list[list[Any]] = []
+
+    class _BatchHonestRepo(_FakeRepo):
+        async def fetch_all(self, table: sa.Table, *where: Any) -> list[Any]:
+            if table is tables.entities:
+                asked = list(where[0].right.value)  # the batch the IN actually names
+                batches.append(asked)
+                # honest fake: answer ONLY for the ids this batch asked about,
+                # so the union-at-seams assertion below cannot be false-green
+                return [SimpleNamespace(id=i) for i in asked if i in self._known]
+            return await super().fetch_all(table, *where)
+
+    response = await global_summary(
+        cast(BuildScopedRepo, _BatchHonestRepo([row])), "the question", 10
+    )
+    _VALIDATOR.validate(response.to_dict())
+    assert [len(b) for b in batches] == [2, 2, 1]  # ceil(5 / 2) batched queries
+    assert len(response.results[0].source_refs) == 5  # all grounded across batches
+    assert response.warnings == ()

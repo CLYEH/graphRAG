@@ -111,15 +111,28 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
     return _response(repo, query, emitted, tuple(warnings))
 
 
+#: Grounding lookups run in batches of this many ids per query: the IN
+#: predicate binds one parameter per id, and PostgreSQL's extended protocol
+#: caps a statement at 32767 binds — a large build's collective member claims
+#: could exceed it and fail the whole query. 1000 stays far below the cap.
+_GROUNDING_BATCH = 1000
+
+
 async def _known_entity_ids(repo: BuildScopedRepo, claimed: set[Any]) -> set[Any]:
     """The subset of ``claimed`` ids that ARE entities of this build (any
     status — a member that was later rejected is still historically a member;
-    an id with no entity row here is ungrounded). One batched, build-scoped
-    read (DR-006: the repo injects the scope)."""
+    an id with no entity row here is ungrounded). Batched, build-scoped reads
+    (DR-006: the repo injects the scope); batch boundaries are deterministic
+    (sorted) though the result is order-independent either way."""
     if not claimed:
         return set()
-    rows = await repo.fetch_all(tables.entities, tables.entities.c.id.in_(list(claimed)))
-    return {row.id for row in rows}
+    ordered = sorted(claimed, key=str)
+    known: set[Any] = set()
+    for start in range(0, len(ordered), _GROUNDING_BATCH):
+        batch = ordered[start : start + _GROUNDING_BATCH]
+        rows = await repo.fetch_all(tables.entities, tables.entities.c.id.in_(batch))
+        known.update(row.id for row in rows)
+    return known
 
 
 def _report_result(row: Any, known: set[Any]) -> tuple[RetrievalResult | None, int]:
