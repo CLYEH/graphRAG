@@ -422,6 +422,37 @@ async def test_path_tries_every_endpoint_pair_until_one_connects() -> None:
     assert len(pair_calls) == 2  # first pair tried and missed, second connected
 
 
+async def test_a_stale_candidate_path_does_not_end_the_search() -> None:
+    """SoR re-verification rejects the CANDIDATE, not the search: if the first
+    pair's projection path is stale (edge gone in the SoR) but a later pair
+    holds a fully-active citable path, the valid path must be returned — not
+    PARTIAL_RESULTS for the stale one."""
+    miss, hit = sorted([uuid.uuid4(), uuid.uuid4()], key=str)  # tried in THIS order
+    d1 = uuid.uuid4()
+    rel = uuid.uuid4()
+    stale_path = {
+        "nodes": [_node(miss, "S1"), _node(d1, "D1")],
+        "rels": [{"type": "gone", "src": str(miss), "dst": str(d1)}],  # no SoR relation
+    }
+    valid_path = {
+        "nodes": [_node(hit, "S2"), _node(d1, "D1")],
+        "rels": [{"type": "works_at", "src": str(hit), "dst": str(d1)}],
+    }
+    graph = _FakeGraph(
+        paths_by_pair={(str(miss), str(d1)): stale_path, (str(hit), str(d1)): valid_path}
+    )
+    sor = _FakeSoR(
+        seeds={"s": [miss, hit], "d": [d1]},
+        relations={(hit, d1, "works_at"): (rel, [_chunk_evidence()])},  # only the SECOND resolves
+    )
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="s", other_entity="d", hops=3)
+    )
+    assert len(response.results) == 1
+    assert response.results[0].id == f"path:{hit}->{d1}"  # the verified pair, not the stale one
+    assert response.warnings == ()  # a verified answer is complete; the stale one was an alternate
+
+
 async def test_the_pair_search_shares_one_policy_deadline() -> None:
     """Per-pair timeouts would stack to pairs × timeout_ms (the C6b
     per-statement-vs-per-phase lesson) — the search gets ONE deadline: each

@@ -162,15 +162,15 @@ async def _path(
         return _response(graph, query, (), ())
     # A name can resolve to SEVERAL active entities (distinct disambiguators,
     # §27.3) — try every (src, dst) pair in deterministic order until one
-    # connects. The WHOLE search shares ONE policy deadline (each query gets
-    # only the remaining budget): per-pair timeouts would stack to
-    # pairs × timeout_ms — the same per-statement-vs-per-phase trap as C6b's
-    # schema discovery.
-    found: dict[str, Any] | None = None
-    src_id = src_ids[0]
-    dst_id = dst_ids[0]
+    # yields a path that SURVIVES SoR re-verification: a stale/corrupt
+    # projection path rejects the CANDIDATE, not the search (a later pair may
+    # hold a fully-active citable path). The WHOLE search shares ONE policy
+    # deadline (each query gets only the remaining budget): per-pair timeouts
+    # would stack to pairs × timeout_ms — the same per-statement-vs-per-phase
+    # trap as C6b's schema discovery.
     deadline = time.monotonic() + policy.timeout_ms / 1000.0
     timed_out = False
+    stale = 0
     for src_id, dst_id in itertools.product(src_ids, dst_ids):
         remaining_ms = int((deadline - time.monotonic()) * 1000)
         if remaining_ms < 1:
@@ -179,32 +179,46 @@ async def _path(
         found = await graph.shortest_path(
             str(src_id), str(dst_id), max_hops=params.hops, timeout_ms=remaining_ms
         )
-        if found is not None:
-            break
-    if found is None:
-        if timed_out:
-            warning = _warn(
-                "PARTIAL_RESULTS",
-                f"path search exceeded the {policy.timeout_ms}ms deadline before "
-                "every endpoint pair was tried (§21)",
-            )
-            return _response(graph, query, (), (warning,))
-        return _response(graph, query, (), ())
+        if found is None:
+            continue
+        result = await _verified_path_result(repo, found, src_id, dst_id)
+        if result is not None:
+            # a fully-verified path IS the complete answer — earlier stale
+            # candidates were alternates, not omitted results, so no warning
+            return _response(graph, query, ordered_results([result]), ())
+        stale += 1  # this candidate failed SoR re-verification — try the next pair
 
+    if timed_out:
+        warning = _warn(
+            "PARTIAL_RESULTS",
+            f"path search exceeded the {policy.timeout_ms}ms deadline before "
+            "every endpoint pair was tried (§21)",
+        )
+        return _response(graph, query, (), (warning,))
+    if stale:
+        return _response(graph, query, (), (_partial(stale, "path"),))
+    return _response(graph, query, (), ())
+
+
+async def _verified_path_result(
+    repo: BuildScopedRepo, found: dict[str, Any], src_id: uuid.UUID, dst_id: uuid.UUID
+) -> RetrievalResult | None:
+    """One projection path → a fully SoR-verified §16 path result, or None.
+
+    A path is ONE claim: every projected value must parse, every node must
+    still be active, and every edge must resolve to an active SoR relation —
+    ANY stale hop rejects the whole candidate (§27.2/§19)."""
     node_ids = [_projected_uuid(node.get("canonical_id")) for node in found["nodes"]]
     triples = [_edge_triple(rel) for rel in found["rels"]]
     if None in node_ids or None in triples:
-        # corrupt projection values — the path can't be traced to the SoR
-        return _response(graph, query, (), (_partial(1, "path"),))
+        return None  # corrupt projection values — the path can't be traced to the SoR
     ids = [node_id for node_id in node_ids if node_id is not None]
     clean = [triple for triple in triples if triple is not None]
 
-    # SoR re-verification: every node still active, every edge still an active
-    # relation — a path is one claim, so ANY stale hop drops the WHOLE path.
     active = await repo.active_entity_ids(ids)
     resolved = await repo.relations_with_evidence(clean)
     if len(active) != len(set(ids)) or any(triple not in resolved for triple in clean):
-        return _response(graph, query, (), (_partial(1, "path"),))
+        return None  # a node or edge went stale in the SoR after projection
 
     refs = tuple(SourceRef(source_type="relation", id=str(resolved[triple][0])) for triple in clean)
     names = [_display(node) for node in found["nodes"]]
@@ -218,15 +232,13 @@ async def _path(
             parts.append(f" -[{rel['type']}]-> {name}")
         else:
             parts.append(f" <-[{rel['type']}]- {name}")
-    text = "".join(parts)
-    result = RetrievalResult(
+    return RetrievalResult(
         result_type="path",
         id=f"path:{src_id}->{dst_id}",  # the pair that actually connected
         score=1.0,
         source_refs=refs,
-        text=text,
+        text="".join(parts),
     )
-    return _response(graph, query, ordered_results([result]), ())
 
 
 async def _subgraph(
