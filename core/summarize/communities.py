@@ -172,15 +172,26 @@ def _prompt(members: list[uuid.UUID], entities: dict[uuid.UUID, Any], relations:
         {"name": entities[m].canonical_name, "type": entities[m].type}
         for m in members[:_PROMPT_MEMBER_CAP]
     ]
+    # the cap slices a SORTED list: the relations arrive in Postgres fetch
+    # order (not rerun-stable — the same lesson as the vertex numbering above),
+    # so an unsorted slice would feed a different sample to the LLM on retries,
+    # yielding non-reproducible reports
+    internal_rows = sorted(
+        (
+            row
+            for row in relations
+            if row.src_entity_id in member_set and row.dst_entity_id in member_set
+        ),
+        key=lambda row: (str(row.src_entity_id), row.type, str(row.dst_entity_id)),
+    )
     internal = [
         {
             "src": entities[row.src_entity_id].canonical_name,
             "type": row.type,
             "dst": entities[row.dst_entity_id].canonical_name,
         }
-        for row in relations
-        if row.src_entity_id in member_set and row.dst_entity_id in member_set
-    ][:_PROMPT_RELATION_CAP]
+        for row in internal_rows[:_PROMPT_RELATION_CAP]
+    ]
     return json.dumps(
         {"members": listed, "relations": internal, "member_count": len(members)},
         ensure_ascii=False,

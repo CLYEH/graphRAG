@@ -192,6 +192,25 @@ async def test_singletons_and_inactive_endpoints_never_reach_the_llm() -> None:
     assert set(members) == {a, b}  # ghost and loner never surface
 
 
+async def test_the_prompt_is_deterministic_across_relation_fetch_orders() -> None:
+    """The relation sample the LLM sees is capped by SLICING — sliced unsorted,
+    a retry whose fetch order shifted would sample different evidence and
+    produce a non-reproducible report (the vertex-numbering lesson, on the
+    prompt's sibling surface). The prompt must be byte-identical under a
+    permuted relations input."""
+    ids = sorted((uuid.uuid4() for _ in range(4)), key=str)
+    entities = {eid: _entity_row(eid, name=f"E{i}") for i, eid in enumerate(ids)}
+    relations = [
+        _relation_row(ids[a], ids[b], rtype=f"r{a}{b}")
+        for a in range(4)
+        for b in range(4)
+        if a != b
+    ]
+    forward = _prompt(ids, entities, relations)
+    backward = _prompt(ids, entities, list(reversed(relations)))
+    assert forward == backward  # byte-identical evidence sample
+
+
 async def test_the_prompt_caps_members_but_counts_all() -> None:
     """A huge community must not blow the context window: the LLM sees a
     capped member sample, but member_count carries the real size (and the
