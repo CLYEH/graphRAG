@@ -39,7 +39,7 @@ Neo4j/Qdrant projections get the same treatment in C1c/C1d (DR-004's
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any
 
 import sqlalchemy as sa
@@ -466,6 +466,141 @@ class BuildScopedRepo:
         for row in rows:
             grouped.setdefault(row.entity_id, []).append((row.source_kind, row.source_ref))
         return grouped
+
+    async def entity_ids_by_name(self, name: str) -> list[uuid.UUID]:
+        """Active entity ids whose canonical_name matches ``name`` (SoR seed
+        resolution for C6c's graph templates — the traversal seed is resolved
+        in POSTGRES, never by trusting the projection).
+
+        Matching is case-insensitive via ``lower()`` — deliberately simpler
+        than the §27.3 fingerprint ``norm`` (NFKC + casefold), which exists for
+        identity minting, not lookup ergonomics. Several ids can share a name
+        (distinct disambiguators are distinct entities — §27.3); the caller
+        gets them all, deterministically ordered."""
+        entities = tables.entities
+        query = (
+            sa.select(entities.c.id)
+            .where(
+                entities.c.project == self.project,
+                entities.c.build_id == self.build_id,
+                entities.c.status == "active",
+                sa.func.lower(entities.c.canonical_name) == name.lower(),
+            )
+            .order_by(entities.c.id)
+        )
+        rows = (await self._execute(query)).fetchall()
+        return [row.id for row in rows]
+
+    async def active_entity_ids(self, entity_ids: Collection[uuid.UUID]) -> set[uuid.UUID]:
+        """The subset of ``entity_ids`` that is ACTIVE in the SoR — §19
+        projection-drift re-verification for graph traversal results: the
+        forward-only Neo4j projection can hold nodes whose entity resolution
+        later moved off ``active``, and those must read as drift, not results
+        (the C6a lesson, applied to the graph read face)."""
+        if not entity_ids:
+            return set()
+        entities = tables.entities
+        query = sa.select(entities.c.id).where(
+            entities.c.project == self.project,
+            entities.c.build_id == self.build_id,
+            entities.c.status == "active",
+            entities.c.id.in_(list(entity_ids)),
+        )
+        rows = (await self._execute(query)).fetchall()
+        return {row.id for row in rows}
+
+    async def active_relation_pairs_among(
+        self, entity_ids: Collection[uuid.UUID]
+    ) -> set[tuple[uuid.UUID, uuid.UUID]]:
+        """The ACTIVE relation endpoint pairs among ``entity_ids`` — the SoR
+        edge set C6c's reachability re-verification walks (§19): the projected
+        traversal can cross edges whose relation later moved off ``active``,
+        so which connections EXIST is re-decided here, not trusted from Neo4j.
+        Direction is returned as stored; the traversal semantics (undirected)
+        are the caller's."""
+        if len(entity_ids) < 2:
+            return set()
+        relations = tables.relations
+        query = sa.select(relations.c.src_entity_id, relations.c.dst_entity_id).where(
+            relations.c.project == self.project,
+            relations.c.build_id == self.build_id,
+            relations.c.status == "active",
+            relations.c.src_entity_id.in_(list(entity_ids)),
+            relations.c.dst_entity_id.in_(list(entity_ids)),
+        )
+        rows = (await self._execute(query)).fetchall()
+        return {(row.src_entity_id, row.dst_entity_id) for row in rows}
+
+    async def relations_with_evidence(
+        self, triples: Sequence[tuple[uuid.UUID, uuid.UUID, str]]
+    ) -> dict[tuple[uuid.UUID, uuid.UUID, str], tuple[uuid.UUID, list[dict[str, Any]]]]:
+        """Resolve projected edges back to their SoR relation + evidence rows.
+
+        Keyed by ``(src_entity_id, dst_entity_id, type)`` — the identity a
+        projected ``[:REL]`` edge carries (§4). Only ``status == 'active'``
+        relations resolve (the same drift rule as entities); an edge that
+        resolves to nothing is stale projection and the caller drops it. Each
+        value is ``(relation_id, evidence rows)`` — the §27.2/§27.4 citation
+        payload (evidence_type/evidence_ref/chunk_id/offsets/quote/source_uri),
+        build-aligned through the evidence's own ``build_id``."""
+        if not triples:
+            return {}
+        relations = tables.relations
+        evidence = tables.relation_evidence
+        match = sa.tuple_(
+            relations.c.src_entity_id, relations.c.dst_entity_id, relations.c.type
+        ).in_(list(triples))
+        rel_rows = (
+            await self._execute(
+                sa.select(
+                    relations.c.id,
+                    relations.c.src_entity_id,
+                    relations.c.dst_entity_id,
+                    relations.c.type,
+                ).where(
+                    relations.c.project == self.project,
+                    relations.c.build_id == self.build_id,
+                    relations.c.status == "active",
+                    match,
+                )
+            )
+        ).fetchall()
+        by_id: dict[uuid.UUID, tuple[uuid.UUID, uuid.UUID, str]] = {
+            row.id: (row.src_entity_id, row.dst_entity_id, row.type) for row in rel_rows
+        }
+        if not by_id:
+            return {}
+        ev_rows = (
+            await self._execute(
+                sa.select(
+                    evidence.c.relation_id,
+                    evidence.c.evidence_type,
+                    evidence.c.evidence_ref,
+                    evidence.c.chunk_id,
+                    evidence.c.start_offset,
+                    evidence.c.end_offset,
+                    evidence.c.quote,
+                    evidence.c.source_uri,
+                ).where(
+                    evidence.c.build_id == self.build_id,
+                    evidence.c.relation_id.in_(list(by_id.keys())),
+                )
+            )
+        ).fetchall()
+        grouped: dict[uuid.UUID, list[dict[str, Any]]] = {}
+        for row in ev_rows:
+            grouped.setdefault(row.relation_id, []).append(
+                {
+                    "evidence_type": row.evidence_type,
+                    "evidence_ref": row.evidence_ref,
+                    "chunk_id": row.chunk_id,
+                    "start_offset": row.start_offset,
+                    "end_offset": row.end_offset,
+                    "quote": row.quote,
+                    "source_uri": row.source_uri,
+                }
+            )
+        return {triple: (rel_id, grouped.get(rel_id, [])) for rel_id, triple in by_id.items()}
 
 
 class BuildScopedWriter(BuildScopedRepo):

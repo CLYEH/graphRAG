@@ -60,6 +60,22 @@ def row_source_ref(table: str, pk: str) -> str:
     return f"{len(table)}:{table}:{pk}"
 
 
+def split_row_source_ref(ref: str) -> tuple[str, str] | None:
+    """Split a :func:`row_source_ref` back into ``(table, pk)`` — the C6 read
+    side of the encoding above, feeding the contract's separate ``table`` and
+    ``pk`` fields (§27.2). Returns ``None`` for a string that is not a
+    well-formed ref (wrong prefix, truncated, missing separator): stored refs
+    are SoR data but the reader must not crash on a corrupt one — the caller
+    treats ``None`` as an uncitable ref and drops it (§22), never a 500."""
+    head, sep, rest = ref.partition(":")
+    if not sep or not head.isdigit():
+        return None
+    length = int(head)
+    if len(rest) < length + 1 or rest[length] != ":":
+        return None
+    return rest[:length], rest[length + 1 :]
+
+
 @dataclass(frozen=True)
 class GraphExtractReport:
     """The step result: rows written (new only) + the §18 item outcomes."""

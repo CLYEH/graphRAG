@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from core.query.policy import SQL_BLOCKED_KEYWORDS_MIN, TextToSql
+from core.query.policy import (
+    CYPHER_BLOCKED_MIN,
+    SQL_BLOCKED_KEYWORDS_MIN,
+    TextToCypher,
+    TextToSql,
+)
 
 _VALID = {
     "enabled": True,
@@ -69,3 +74,52 @@ def test_non_positive_caps_are_rejected(field: str) -> None:
     NO deadline — silently disabling the very guardrail §21/§22 relies on."""
     with pytest.raises(ValueError, match="timeout_ms"):
         TextToSql.from_mapping({**_VALID, field: 0})
+
+
+# -- TextToCypher (C6c): the same fail-loud discipline for the graph block ------
+
+_VALID_CYPHER = {
+    "enabled": False,
+    "readonly": True,
+    "allowed_clauses": ["MATCH", "WHERE", "RETURN", "LIMIT"],
+    "blocked": ["CREATE", "MERGE", "DELETE", "SET", "REMOVE", "CALL"],
+    "max_rows": 50,
+    "timeout_ms": 3000,
+}
+
+
+def test_cypher_from_mapping_round_trips_a_valid_block() -> None:
+    cypher = TextToCypher.from_mapping(_VALID_CYPHER)
+    assert cypher.enabled is False
+    assert cypher.allowed_clauses == ("MATCH", "WHERE", "RETURN", "LIMIT")
+    assert set(CYPHER_BLOCKED_MIN) <= set(cypher.blocked)
+    assert cypher.max_rows == 50 and cypher.timeout_ms == 3000
+
+
+def test_cypher_readonly_false_is_rejected() -> None:
+    with pytest.raises(ValueError, match="readonly"):
+        TextToCypher.from_mapping({**_VALID_CYPHER, "readonly": False})
+
+
+def test_a_clause_outside_the_frozen_universe_is_rejected() -> None:
+    """§21 freezes the widest whitelist at MATCH/WHERE/RETURN/LIMIT — CALL (and
+    with it every procedure, APOC included) can never be whitelisted in, so a
+    policy that tries is a config bug refused at construction."""
+    with pytest.raises(ValueError, match="frozen §21 universe"):
+        TextToCypher.from_mapping({**_VALID_CYPHER, "allowed_clauses": ["MATCH", "CALL"]})
+    with pytest.raises(ValueError, match="non-empty"):
+        TextToCypher.from_mapping({**_VALID_CYPHER, "allowed_clauses": []})
+
+
+def test_cypher_blocked_below_the_frozen_minimum_is_rejected() -> None:
+    short = [word for word in CYPHER_BLOCKED_MIN if word != "CALL"]
+    with pytest.raises(ValueError, match="minimum"):
+        TextToCypher.from_mapping({**_VALID_CYPHER, "blocked": short})
+
+
+@pytest.mark.parametrize("field", ["max_rows", "timeout_ms"])
+def test_cypher_non_positive_caps_are_rejected(field: str) -> None:
+    """The graph mode's deadline rides the Neo4j Query timeout — a non-positive
+    value would disable the §21/§22 ceiling, so the model refuses it."""
+    with pytest.raises(ValueError, match="timeout_ms"):
+        TextToCypher.from_mapping({**_VALID_CYPHER, field: 0})
