@@ -107,6 +107,26 @@ def test_rejects_uncitable_constructs(sql: str) -> None:
         _validate(sql)
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM orders LIMIT 2::int",  # a cast — passes _reject_side_effects
+        "SELECT * FROM orders LIMIT CAST(2 AS int)",  # the CAST() spelling
+        "SELECT * FROM orders LIMIT 1+1",  # a computed limit
+        "SELECT * FROM orders LIMIT 'x'",  # a string literal — not int-parseable
+        "SELECT * FROM orders LIMIT 2.5",  # a float literal — non-string but int() crashes
+        "SELECT * FROM orders LIMIT 1e3",  # scientific notation — same trap
+    ],
+)
+def test_rejects_a_nonliteral_limit_that_would_bypass_the_row_cap(sql: str) -> None:
+    """The row cap reads the LIMIT as a plain integer literal; a casted/computed
+    LIMIT is not a literal, so the cap falls through to the policy max_rows and the
+    query would silently return MORE rows than it asked for. Rejected, not
+    over-returned (§21 over-block)."""
+    with pytest.raises(GuardrailBlocked, match="LIMIT must be a plain integer literal"):
+        _validate(sql)
+
+
 # --- REJECT: side-effecting reads (§21 read-only — a SELECT can still mutate) --
 
 

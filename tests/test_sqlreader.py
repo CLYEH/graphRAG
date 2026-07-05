@@ -316,7 +316,6 @@ async def test_column_names_reserve_the_internal_namespace() -> None:
         ("SELECT * FROM orders LIMIT 2", 10, 2),  # smaller user LIMIT is honored
         ("SELECT * FROM orders LIMIT 50", 10, 10),  # user LIMIT above the cap is clamped
         ("SELECT * FROM orders", 10, 10),  # no LIMIT → the policy ceiling
-        ("SELECT * FROM orders LIMIT 'x'", 10, 10),  # a non-integer LIMIT falls back to the cap
     ],
 )
 def test_effective_ceiling(sql: str, max_rows: int, expected: int) -> None:

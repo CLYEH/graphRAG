@@ -294,16 +294,15 @@ class BuildScopedSqlReader:
 
     @staticmethod
     def _ceiling(statement: exp.Select, max_rows: int) -> int:
-        """The effective row ceiling: the policy ``max_rows`` unless the query's
-        own LIMIT asks for fewer (an explicit smaller LIMIT is the caller's
-        choice, not a policy truncation)."""
+        """The effective row ceiling: the policy ``max_rows`` unless the query's own
+        LIMIT asks for fewer (an explicit smaller LIMIT is the caller's choice, not a
+        policy truncation). The guardrail guarantees any LIMIT is a plain integer
+        literal (:func:`~core.query.sql_guard._reject_nonliteral_limit`) — a casted
+        or computed LIMIT is rejected upstream — so it parses cleanly here."""
         limit = statement.args.get("limit")
-        if limit is not None and isinstance(limit.expression, exp.Literal):
-            try:
-                return min(int(limit.expression.name), max_rows)
-            except ValueError:
-                pass
-        return max_rows
+        if limit is None:
+            return max_rows
+        return min(int(limit.expression.name), max_rows)
 
     def _reconstruction(self, table: str, columns: Sequence[str]) -> exp.Expr:
         """A build-scoped SELECT over ``documents`` exposing this logical table's

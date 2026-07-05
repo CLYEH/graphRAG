@@ -115,6 +115,7 @@ def validate_sql(
         if statement.find(node_type) is not None:
             raise GuardrailBlocked(f"{label} is not allowed in a SQL retrieval query")
     _reject_side_effects(statement)
+    _reject_nonliteral_limit(statement)
     if not _is_select_star(statement):
         raise GuardrailBlocked(
             "the projection must be SELECT * — whole source rows are returned so each "
@@ -160,6 +161,29 @@ def _reject_side_effects(statement: exp.Select) -> None:
         )
     if statement.args.get("into") is not None:
         raise GuardrailBlocked("SELECT INTO is not allowed — it writes a new table (§21 read-only)")
+
+
+def _reject_nonliteral_limit(statement: exp.Select) -> None:
+    """A LIMIT, if present, must be a plain non-negative integer literal. The row
+    cap (``BuildScopedSqlReader._ceiling``) reads that literal to clip results and
+    flag TRUNCATED; a casted or computed LIMIT (``LIMIT 2::int``,
+    ``LIMIT CAST(2 AS int)``, ``LIMIT 1+1``) is not a literal, so the cap would fall
+    through to the policy ``max_rows`` and the query would silently return MORE rows
+    than it asked for, unwarned. A cast passes ``_reject_side_effects`` (casts are
+    allowed), so this is checked explicitly. Reject rather than over-return (§21
+    over-block, never under)."""
+    limit = statement.args.get("limit")
+    if limit is None:
+        return
+    expression = limit.expression
+    # is_int (not merely non-string): a float/scientific literal (LIMIT 2.5, LIMIT
+    # 1e3) is also a non-string Literal, but int() would raise on it downstream —
+    # only a genuine integer literal is safe for the row cap.
+    if not (isinstance(expression, exp.Literal) and expression.is_int):
+        raise GuardrailBlocked(
+            "LIMIT must be a plain integer literal — a casted, computed, or "
+            "non-integer LIMIT (LIMIT 2::int, LIMIT 1+1, LIMIT 2.5) would bypass the row cap"
+        )
 
 
 def _is_select_star(statement: exp.Select) -> bool:
