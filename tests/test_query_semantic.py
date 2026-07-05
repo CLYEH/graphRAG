@@ -286,3 +286,34 @@ async def test_malformed_or_unmappable_hits_are_dropped_not_crashed_on() -> None
     assert response.results == ()
     assert response.warnings[0].code == "PARTIAL_RESULTS"
     assert "6 hit(s)" in response.warnings[0].message
+
+
+async def test_corrupt_payload_display_or_id_never_makes_the_response_invalid() -> None:
+    """A citable hit with a corrupt (non-string) `canonical_id` or `text` must
+    NOT poison the response: the id comes from the VALIDATED uuid (not the raw
+    payload), and a non-string text/title is coerced to None. The hit stays —
+    it's still citable — and the payload stays schema-valid, so one corrupt row
+    can't invalidate the whole answer (the exact P2 Codex flagged)."""
+    entity_id, chunk_id = uuid.uuid4(), uuid.uuid4()
+    repo = _FakeRepo()
+    _add_chunk(repo, chunk_id)
+    repo.mentions[entity_id] = [("text", "chunk:h:0")]
+    # entity: numeric canonical_id + object text; chunk: numeric text
+    entity_hit = SimpleNamespace(
+        id="e",
+        score=0.9,
+        payload={"type": "entity", "entity_id": str(entity_id), "canonical_id": 42, "text": {}},
+    )
+    chunk_hit = SimpleNamespace(
+        id="c",
+        score=0.8,
+        payload={"type": "chunk", "chunk_id": str(chunk_id), "text": 99},
+    )
+    response = await _run(repo, _FakeVectors([entity_hit, chunk_hit]))
+    payload = response.to_dict()
+    _VALIDATOR.validate(payload)  # would fail if a non-string id/text leaked through
+    by_type = {r["result_type"]: r for r in payload["results"]}
+    assert by_type["entity"]["id"] == str(entity_id)  # validated uuid, not 42
+    assert by_type["entity"]["title"] is None  # corrupt object text → None
+    assert by_type["chunk"]["text"] is None  # corrupt numeric text → None
+    assert response.warnings == ()  # both hits kept — they are citable

@@ -20,6 +20,13 @@ source id is corrupt (a non-UUID payload) — is DROPPED, not emitted uncited an
 not allowed to raise, and the drop is surfaced as a typed ``PARTIAL_RESULTS``
 warning (§22 degradation-not-failure) rather than silently swallowed.
 
+Every payload value that reaches the response is treated as untrusted (a
+projection can drift/corrupt): IDENTIFYING fields (result id, source ref ids)
+are derived from the VALIDATED UUID (never the raw ``canonical_id`` string) and
+Postgres columns, and OPTIONAL display fields (``text``/``title``) are coerced
+to None if non-string — so one corrupt hit can never make the whole §16
+response schema-invalid (see :func:`_payload_uuid` / :func:`_payload_str`).
+
 Ordering and the whole envelope shape are inherited from
 :mod:`core.query.results` (score desc, ties by id; ``graph_context``/``debug``
 null — semantic is single-mode, no router trace, and debug gating +
@@ -70,6 +77,20 @@ def _payload_uuid(raw: object) -> uuid.UUID | None:
         return uuid.UUID(raw)
     except ValueError:
         return None
+
+
+def _payload_str(raw: object) -> str | None:
+    """A payload DISPLAY field (text/title) as a str, or None if non-string.
+
+    Same untrusted-payload discipline as :func:`_payload_uuid`, but for the
+    OPTIONAL fields: a corrupt (non-string) ``text`` is coerced to None — the
+    hit stays citable (its source_refs come from Postgres, unaffected) and only
+    the display field is omitted — rather than emitted as a non-string that
+    would make the whole §16 response schema-invalid (result ``text``/``title``
+    are ``string|null``). The IDENTIFYING fields never come from an untrusted
+    payload string: they are derived from the validated UUID, so a corrupt
+    ``canonical_id`` can never reach ``RetrievalResult.id``."""
+    return raw if isinstance(raw, str) else None
 
 
 async def semantic_search(
@@ -216,7 +237,7 @@ def _chunk_result(
         id=str(chunk_id),
         score=score,
         source_refs=(ref,),
-        text=payload.get("text"),
+        text=_payload_str(payload.get("text")),
     )
 
 
@@ -237,8 +258,11 @@ def _entity_result(
         return None  # §27.2 entity ref needs ≥1 chunk/row mention; none survived
     return RetrievalResult(
         result_type="entity",
-        id=payload.get("canonical_id") or str(entity_id),
+        # id from the VALIDATED uuid, never the untrusted payload canonical_id:
+        # index writes canonical_id == str(entity_id), so this is the same value
+        # from a trusted source — a corrupt canonical_id cannot reach the id
+        id=str(entity_id),
         score=score,
         source_refs=refs,
-        title=payload.get("text"),
+        title=_payload_str(payload.get("text")),
     )
