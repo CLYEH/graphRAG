@@ -35,12 +35,21 @@ _BUILD = uuid.UUID("7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d")
 
 
 class _FakeRepo:
-    def __init__(self, rows: list[Any]) -> None:
+    def __init__(self, rows: list[Any], known: set[Any] | None = None) -> None:
         self.project = _PROJECT
         self.build_id = _BUILD
         self._rows = rows
+        # the build's entity ids (for member grounding); defaults to every id
+        # the fixtures claim, so tests not about grounding stay focused
+        self._known = (
+            known
+            if known is not None
+            else {m for row in rows for m in (row.member_entity_ids or []) if m is not None}
+        )
 
     async def fetch_all(self, table: sa.Table, *where: Any) -> list[Any]:
+        if table is tables.entities:
+            return [SimpleNamespace(id=entity_id) for entity_id in self._known]
         assert table is tables.community_reports
         return self._rows
 
@@ -64,8 +73,10 @@ def _report(
     )
 
 
-async def _run(rows: list[Any], top_k: int = 10) -> McpResponse:
-    response = await global_summary(cast(BuildScopedRepo, _FakeRepo(rows)), "the question", top_k)
+async def _run(rows: list[Any], top_k: int = 10, known: set[Any] | None = None) -> McpResponse:
+    response = await global_summary(
+        cast(BuildScopedRepo, _FakeRepo(rows, known)), "the question", top_k
+    )
     _VALIDATOR.validate(response.to_dict())
     return response
 
@@ -162,3 +173,30 @@ async def test_equal_and_unrated_reports_still_order_fetch_order_proof() -> None
     forward = await _run(rows)
     backward = await _run(list(reversed(rows)))
     assert [r.id for r in forward.results] == [r.id for r in backward.results]
+
+
+async def test_an_ungrounded_member_ref_is_dropped_not_emitted() -> None:
+    """member_entity_ids is a bare uuid[] with NO foreign key — an id that is
+    not an entity of THIS build (malformed or hand-written row) must never
+    become an authoritative entity ref (it could point anywhere, including
+    another build). The report survives on its grounded subset; the omission
+    is surfaced."""
+    real, bogus = uuid.uuid4(), uuid.uuid4()
+    row = _report(5.0, member_ids=[real, bogus])
+    response = await _run([row], known={real})
+    result = response.results[0]
+    assert [ref.id for ref in result.source_refs] == [str(real)]  # bogus never emitted
+    assert _codes(response) == ["PARTIAL_RESULTS"]
+
+
+async def test_a_report_with_no_grounded_members_drops_entirely() -> None:
+    """Zero grounded members = nothing citable — the whole report drops
+    (§27.2), it is not emitted with fabricated refs."""
+    good = _report(1.0)
+    orphan = _report(9.0, member_ids=[uuid.uuid4()])
+    response = await _run(
+        [good, orphan],
+        known={m for m in good.member_entity_ids},
+    )
+    assert [r.id for r in response.results] == [str(good.id)]
+    assert _codes(response) == ["PARTIAL_RESULTS"]

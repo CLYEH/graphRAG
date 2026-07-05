@@ -5,9 +5,12 @@ read straight from POSTGRES — the SoR itself, so the whole
 untrusted-projection re-verification apparatus of C6a/C6c does not apply
 here (there is no derived store between the data and the response). Each
 report becomes one ``community_report`` result cited by its member entity
-refs — the §27.2 minimum, structurally guaranteed by the table's
-citeable-members CHECK (and re-checked defensively on emission: a memberless
-row is dropped and surfaced, never emitted uncitable).
+refs — the §27.2 minimum. The member array is a bare ``uuid[]`` (non-empty
+CHECK, but NO foreign key), so the ids are re-verified against the
+build-scoped ``entities`` table before they become refs: an id that is not an
+entity of THIS build (a malformed or hand-written row) is dropped and
+surfaced, never emitted as an ungrounded or cross-build citation — and a
+report left with zero grounded members drops entirely (§22).
 
 Ranking (v1): ``rating`` descending (unrated last), id as the deterministic
 tiebreak — the LLM's own importance signal from §4. The query text is echoed
@@ -69,15 +72,25 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
         key=lambda row: (row.rating is None, -(row.rating or 0.0), str(row.id)),
     )
 
+    # member ids are a bare uuid[] with NO foreign key — ground every id
+    # against this build's entities (any status: membership is a historical
+    # claim, existence in the build is not) before it may become a ref
+    claimed = {
+        member for row in ordered for member in (row.member_entity_ids or []) if member is not None
+    }
+    known = await _known_entity_ids(repo, claimed)
+
     # citability is judged over EVERY row (not just up to the ceiling): a
     # memberless row past the break would otherwise count as "clipped" and
     # over-fire TRUNCATED — the flag must be exact in both directions (§22)
     citable: list[RetrievalResult] = []
     dropped = 0
+    ungrounded = 0
     for row in ordered:
-        result = _report_result(row)
+        result, bad_refs = _report_result(row, known)
+        ungrounded += bad_refs
         if result is None:
-            dropped += 1  # defensively: a memberless row cannot cite (§27.2)
+            dropped += 1  # no grounded members left — cannot cite (§27.2)
         else:
             citable.append(result)
 
@@ -87,27 +100,43 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
         warnings.append(
             QueryWarning("TRUNCATED", f"result truncated to the top_k={top_k} ceiling (§21)")
         )
-    if dropped:
+    if dropped or ungrounded:
         warnings.append(
             QueryWarning(
                 "PARTIAL_RESULTS",
-                f"{dropped} report(s) omitted — no citable members (§27.2)",
+                f"{dropped} report(s) and {ungrounded} member ref(s) omitted — "
+                "not grounded in this build's entities (§27.2)",
             )
         )
     return _response(repo, query, emitted, tuple(warnings))
 
 
-def _report_result(row: Any) -> RetrievalResult | None:
-    """One SoR report row → a §16 ``community_report`` result, or None.
+async def _known_entity_ids(repo: BuildScopedRepo, claimed: set[Any]) -> set[Any]:
+    """The subset of ``claimed`` ids that ARE entities of this build (any
+    status — a member that was later rejected is still historically a member;
+    an id with no entity row here is ungrounded). One batched, build-scoped
+    read (DR-006: the repo injects the scope)."""
+    if not claimed:
+        return set()
+    rows = await repo.fetch_all(tables.entities, tables.entities.c.id.in_(list(claimed)))
+    return {row.id for row in rows}
 
-    The members ARE the citation (§27.2) — the table CHECK forbids memberless
-    rows, but emission re-checks rather than trusts (a hand-written or
-    pre-CHECK row must drop, not crash ``RetrievalResult``'s non-empty-refs
-    invariant). ``title``/``summary`` are nullable display fields — emitted
-    as-is when strings, null otherwise (§16 allows null; no coerced reprs)."""
-    members = [m for m in (row.member_entity_ids or []) if m is not None]
+
+def _report_result(row: Any, known: set[Any]) -> tuple[RetrievalResult | None, int]:
+    """One SoR report row → ``(result-or-None, ungrounded-ref count)``.
+
+    The members ARE the citation (§27.2), and only ids GROUNDED in this
+    build's entities may become refs (the array has no FK — a malformed or
+    hand-written row must not mint cross-build or nonexistent citations).
+    A report with zero grounded members drops; one with some survives on the
+    grounded subset, with the omissions counted. ``title``/``summary`` are
+    nullable display fields — emitted as-is when strings, null otherwise
+    (§16 allows null; no coerced reprs)."""
+    claimed = [m for m in (row.member_entity_ids or []) if m is not None]
+    members = [m for m in claimed if m in known]
+    bad_refs = len(claimed) - len(members)
     if not members:
-        return None
+        return None, bad_refs
     refs = tuple(
         SourceRef(source_type="entity", id=str(entity_id)) for entity_id in sorted(members, key=str)
     )
@@ -120,7 +149,7 @@ def _report_result(row: Any) -> RetrievalResult | None:
         source_refs=refs,
         title=title,
         text=summary,
-    )
+    ), bad_refs
 
 
 def _scored(results: list[RetrievalResult]) -> tuple[RetrievalResult, ...]:
