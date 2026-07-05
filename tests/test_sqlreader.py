@@ -37,35 +37,30 @@ class _Result:
         return self._rows
 
 
-class _FakeSavepoint:
-    """A stand-in for the AsyncSavepointTransaction begin_nested() returns; its
-    rollback() is the ROLLBACK TO SAVEPOINT the reader's transaction() issues."""
-
-    def __init__(self, conn: _FakeConn) -> None:
-        self._conn = conn
-
-    async def rollback(self) -> None:
-        self._conn.savepoint_rolled_back = True
-
-
 class _FakeConn:
     """Routes the reader's reads — the jsonb_object_keys column probe (bound
     text() via ``execute``) and the reconstructed query (fully-literal raw SQL via
-    ``exec_driver_sql``) — capturing each so tests can inspect the composed SQL."""
+    ``exec_driver_sql``) — capturing each so tests can inspect the composed SQL. A
+    statement marks the connection in-transaction; rollback() ends it, so tests can
+    assert the reader's per-phase timed transaction is opened and closed."""
 
     def __init__(self, columns: list[str], rows: list[dict[str, Any]]) -> None:
         self._columns = columns
         self._rows = rows
         self.executed: list[tuple[str, dict[str, Any]]] = []
         self.driver_sql: list[str] = []
-        self.savepoint_began = False
-        self.savepoint_rolled_back = False
+        self.rolled_back = False
+        self._in_txn = False
 
-    async def begin_nested(self) -> _FakeSavepoint:
-        self.savepoint_began = True
-        return _FakeSavepoint(self)
+    def in_transaction(self) -> bool:
+        return self._in_txn
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
+        self._in_txn = False
 
     async def execute(self, clause: Any) -> _Result:
+        self._in_txn = True
         sql = str(clause)
         params = {name: bp.value for name, bp in clause._bindparams.items()}
         self.executed.append((sql, params))
@@ -74,6 +69,7 @@ class _FakeConn:
         return _Result(self._rows)
 
     async def exec_driver_sql(self, sql: str) -> _Result:
+        self._in_txn = True
         self.driver_sql.append(sql)
         return _Result(self._rows)
 
@@ -194,24 +190,16 @@ async def test_a_smaller_user_limit_is_not_a_policy_truncation() -> None:
     assert len(rows) == 2 and truncated is False
 
 
-async def test_apply_timeout_sets_the_statement_deadline() -> None:
-    """The policy deadline is enforced as a Postgres statement_timeout; the caller
-    applies it once before any read so every statement in the path — schema
-    discovery and the query alike — is bounded (§21/§22)."""
+async def test_timed_transaction_bounds_the_phase_and_ends_it() -> None:
+    """Each phase runs in its own short timed transaction: the FIRST statement is
+    the SET LOCAL binding the policy deadline (§21), and the exit rollback ends the
+    transaction (resetting the deadline, clearing any abort) so the connection is
+    released — never held across the LLM call between phases (§22)."""
     conn = _FakeConn(["id"], [])
-    await _reader(conn).apply_timeout(250)
-    assert conn.executed[-1][0] == "SET LOCAL statement_timeout = 250"
-
-
-async def test_transaction_scopes_cleanup_to_a_savepoint() -> None:
-    """The reader runs inside a SAVEPOINT it owns; exiting the context — success or
-    failure — rolls back TO the savepoint (undoing the SET LOCAL, clearing any
-    abort) rather than the whole transaction, so a caller-owned transaction and its
-    prior work survive (§22). The connection is never `rollback()`-ed by the reader."""
-    conn = _FakeConn([], [])
-    async with _reader(conn).transaction():
-        pass
-    assert conn.savepoint_began is True and conn.savepoint_rolled_back is True
+    async with _reader(conn).timed_transaction(250):
+        assert conn.executed[0][0] == "SET LOCAL statement_timeout = 250"  # deadline bound first
+        assert conn.in_transaction() is True  # the phase holds the transaction while working
+    assert conn.rolled_back is True and conn.in_transaction() is False  # released on exit
 
 
 async def test_column_names_reserve_the_internal_namespace() -> None:

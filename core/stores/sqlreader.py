@@ -24,6 +24,13 @@ through sqlglot (quoted/escaped), so an untrusted key like ``id"); drop`` become
 a safely quoted identifier, never SQL. This is a READER: it opens no write path,
 and in production runs under a dedicated read-only role (that role + its engine
 are deferred infra — the executor takes an injected connection, C6a-style).
+
+The connection is loaned to the reader CLEAN and the reader owns its transaction
+lifecycle: each phase (schema discovery, then execution) runs in its own short,
+deadline-bound :meth:`timed_transaction`, ended on exit. It deliberately holds NO
+transaction across the LLM call that turns the schema into SQL, so no session sits
+idle-in-transaction while the model runs — the C8 read pool hands out clean
+connections and takes them back between phases.
 """
 
 from __future__ import annotations
@@ -93,8 +100,12 @@ class BuildScopedSqlReader:
 
     @classmethod
     async def for_active_build(cls, conn: AsyncConnection, project: str) -> BuildScopedSqlReader:
-        """Bind to the project's active build (DR-001), like the read repo."""
+        """Bind to the project's active build (DR-001), like the read repo. Ends the
+        lookup's read transaction so the reader starts from a CLEAN connection: it
+        manages its own short per-phase transactions (:meth:`timed_transaction`) and
+        is loaned the connection transaction-free."""
         build = await active_build_id(conn, project)
+        await conn.rollback()  # release the lookup read — the reader owns per-phase txns
         return BuildScopedSqlReader(conn, project, build, _token=_SQL_READER_TOKEN)
 
     def _scope_params(self, table: str) -> dict[str, Any]:
@@ -133,9 +144,9 @@ class BuildScopedSqlReader:
         table with no rows in this build yields no columns and thus no results —
         nothing to reconstruct — rather than a query against an empty schema.
 
-        Assumes :meth:`apply_timeout` has bound the policy deadline on this
-        connection's transaction (the caller applies it once, before schema
-        discovery, so every statement in the path is bounded — not just this one).
+        Runs inside :meth:`timed_transaction` (the caller wraps this phase in it),
+        so the policy deadline bounds this statement and the transaction is ended
+        on exit — the rows are materialised into Python here, before that exit.
         """
         columns = await self.column_names(validated.table)
         if not columns:
@@ -169,49 +180,32 @@ class BuildScopedSqlReader:
         truncated = len(rows) > ceiling and ceiling == max_rows
         return rows[:ceiling], truncated
 
-    async def apply_timeout(self, timeout_ms: int) -> None:
-        """Bind the policy deadline (§21) to this transaction's statements. Apply
-        it ONCE, before any read (schema discovery AND the query), so EVERY
-        statement in the SQL path is bounded — an expensive predicate
-        (``pg_sleep``) or a broad JSON-key scan over a large table is cancelled at
-        the deadline rather than holding the connection to the server default.
-
-        ``SET LOCAL`` is transaction-scoped: it auto-resets at commit/rollback so
-        it never leaks to a reused connection, and it covers every subsequent
-        statement in the same transaction. ``timeout_ms`` is a validated positive
-        int (SET takes no bind params, so it is embedded; ``int()`` keeps it
-        non-injectable).
-
-        Assumes a non-AUTOCOMMIT connection: under AUTOCOMMIT ``SET LOCAL`` warns
-        and no-ops (each statement is its own transaction), silently re-disabling
-        this deadline — so the deferred read-only engine (C8) must not enable it.
-        """
-        await self.__conn.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
-
     @asynccontextmanager
-    async def transaction(self) -> AsyncIterator[None]:
-        """Run the SQL path's statements inside a SAVEPOINT the reader OWNS.
+    async def timed_transaction(self, timeout_ms: int) -> AsyncIterator[None]:
+        """Own ONE short, deadline-bound transaction for a single phase of the SQL
+        path — schema discovery, then (separately) execution — and END it on exit.
 
-        The connection is caller-owned (injected, like the read repo), so the
-        reader must not roll back a transaction it did not open — a caller that
-        wraps an audit-write + SQL retrieval in one unit would lose that work. A
-        savepoint scopes cleanup to the reader's own statements: on exit — success
-        OR failure — it rolls back TO the savepoint, which (a) undoes the
-        :meth:`apply_timeout` ``SET LOCAL`` so the deadline never leaks to a reused
-        connection, and (b) clears an ABORTED statement (a bad query / timeout
-        cancel) so a degradation doesn't become a ``current transaction is
-        aborted`` failure (§22) — while PRESERVING the surrounding transaction and
-        any work the caller did before it. :meth:`run` materialises rows into
-        Python before this exits, so rolling back the read loses nothing.
+        The connection is loaned to the reader CLEAN (no caller transaction; see
+        :meth:`for_active_build`), and the reader manages its own transactions so it
+        never holds one across non-DB work: the multi-second LLM call sits BETWEEN
+        two of these, with no session left idle-in-transaction (which a concurrent
+        C8 read pool — or an ``idle_in_transaction_session_timeout`` — would punish).
 
-        :meth:`apply_timeout` must run INSIDE this context: its ``SET LOCAL`` is
-        transaction-scoped but savepoint-captured, so only a rollback TO the
-        savepoint undoes it (a plain RELEASE would leave the deadline active)."""
-        savepoint = await self.__conn.begin_nested()
+        ``SET LOCAL statement_timeout`` binds the policy deadline (§21) to this
+        phase's statements; it auto-begins the transaction and covers every
+        statement until the exit ``rollback``, which ends the transaction (a read
+        persists nothing), resetting the deadline and clearing an aborted statement
+        (a timeout cancel / bad query) so the connection is immediately reusable
+        (§22). ``timeout_ms`` is a validated positive int (SET takes no bind params,
+        so it is embedded; ``int()`` keeps it non-injectable). Assumes a
+        non-AUTOCOMMIT connection — under AUTOCOMMIT ``SET LOCAL`` no-ops, silently
+        disabling the deadline, so the deferred read-only engine (C8) must not
+        enable it."""
+        await self.__conn.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
         try:
             yield
         finally:
-            await savepoint.rollback()  # ROLLBACK TO SAVEPOINT — the reader's unit only
+            await self.__conn.rollback()  # end the phase's txn — reset deadline, clear aborts
 
     @staticmethod
     def _ceiling(statement: exp.Select, max_rows: int) -> int:

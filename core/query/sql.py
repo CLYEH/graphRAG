@@ -74,41 +74,43 @@ async def sql_query(
     if not policy.enabled:
         return _response(reader, query, (), (_warn("MODE_SKIPPED", "sql mode is disabled"),))
 
-    # Run inside a reader-owned SAVEPOINT: on exit (success OR failure) it rolls
-    # back TO the savepoint, undoing the apply_timeout SET LOCAL (so the deadline
-    # never leaks to a reused connection) and clearing any aborted statement — WITHOUT
-    # touching the caller's surrounding transaction or the work it did before us.
-    async with reader.transaction():
-        try:
-            # Bind the policy deadline BEFORE the first read, so schema discovery (a
-            # JSON-key scan over a possibly large table) is bounded too — not just the
-            # generated query — and a discovery timeout degrades rather than 500s.
-            await reader.apply_timeout(policy.timeout_ms)
+    # Phase 1 — schema discovery in its OWN short timed transaction, ended before
+    # the LLM. The deadline bounds the JSON-key scan (a discovery timeout degrades,
+    # not 500s), and the connection is released so nothing sits idle-in-transaction
+    # across the model latency that follows.
+    try:
+        async with reader.timed_transaction(policy.timeout_ms):
             schema = await _schema_prompt(reader, policy.allowed_tables)
-            candidate = _extract_sql(await _ask_llm(llm, schema, query))
-            try:
-                validated = validate_sql(candidate, policy.allowed_tables, policy.blocked_keywords)
-            except GuardrailBlocked as blocked:
-                return _response(
-                    reader, query, (), (_warn(GUARDRAIL_WARNING_CODE, blocked.reason),)
-                )
+    except DBAPIError as exc:
+        return _degrade(reader, query, exc, policy.timeout_ms)
+
+    # The LLM call — NO transaction is held here.
+    candidate = _extract_sql(await _ask_llm(llm, schema, query))
+    try:
+        validated = validate_sql(candidate, policy.allowed_tables, policy.blocked_keywords)
+    except GuardrailBlocked as blocked:
+        return _response(reader, query, (), (_warn(GUARDRAIL_WARNING_CODE, blocked.reason),))
+
+    # Phase 2 — execution in a FRESH short timed transaction, ended on exit (which
+    # resets the deadline and clears any aborted statement).
+    try:
+        async with reader.timed_transaction(policy.timeout_ms):
             rows, truncated = await reader.run(validated, max_rows)
-            results = _to_results(rows, validated.table)
-            warnings: tuple[QueryWarning, ...] = ()
-            if truncated:
-                warnings = (
-                    _warn("TRUNCATED", f"result truncated to the {max_rows}-row ceiling (§21)"),
-                )
-            return _response(reader, query, results, warnings)
-        except DBAPIError as exc:
-            return _degrade(reader, query, exc, policy.timeout_ms)
+    except DBAPIError as exc:
+        return _degrade(reader, query, exc, policy.timeout_ms)
+
+    results = _to_results(rows, validated.table)
+    warnings: tuple[QueryWarning, ...] = ()
+    if truncated:
+        warnings = (_warn("TRUNCATED", f"result truncated to the {max_rows}-row ceiling (§21)"),)
+    return _response(reader, query, results, warnings)
 
 
 def _degrade(
     reader: BuildScopedSqlReader, query: str, exc: DBAPIError, timeout_ms: int
 ) -> McpResponse:
-    """Map a DB failure to a typed degradation (§22), never a 500 — the reader's
-    savepoint context rolls the (possibly aborted) statement back on the way out. A
+    """Map a DB failure to a typed degradation (§22), never a 500 — the phase's
+    timed_transaction rolls the (possibly aborted) statement back on the way out. A
     bug in our own SQL composition is NOT a DBAPIError, so it never reaches here —
     it propagates and fails loud (Rule 12)."""
     if _is_timeout(exc):

@@ -86,15 +86,13 @@ class _FakeReader:
         self.timeout_ms: int | None = None
         self.rolled_back = False
 
-    async def apply_timeout(self, timeout_ms: int) -> None:
-        self.timeout_ms = timeout_ms  # capture the deadline the tool plumbed through
-
     @asynccontextmanager
-    async def transaction(self) -> AsyncIterator[None]:
+    async def timed_transaction(self, timeout_ms: int) -> AsyncIterator[None]:
+        self.timeout_ms = timeout_ms  # capture the deadline the tool plumbed through
         try:
             yield
         finally:
-            self.rolled_back = True  # the savepoint is rolled back on every exit
+            self.rolled_back = True  # each phase's transaction is ended on exit
 
     async def column_names(self, table: str) -> tuple[str, ...]:
         if self._discovery:
@@ -214,15 +212,15 @@ def test_an_execution_error_degrades_not_raises() -> None:
     assert response.results == () and _codes(response) == ["GUARDRAIL_BLOCKED"]
 
 
-def test_a_successful_query_rolls_back_its_savepoint() -> None:
-    """Every path runs inside the reader's savepoint, and success included exits by
-    rolling back TO it — so the SET LOCAL statement_timeout never leaks to a caller
-    that reuses the connection, without ending the caller's own transaction (the
-    savepoint scopes cleanup to the reader's statements; see the integration test
-    that proves the caller's prior work survives)."""
+def test_a_successful_query_ends_each_phase_transaction() -> None:
+    """Schema discovery and execution each run in their OWN short timed transaction,
+    ended on exit — so the SET LOCAL statement_timeout never leaks to a reused
+    connection and nothing is held across the LLM call between the phases (the
+    integration test proves the connection is not in a transaction during the LLM)."""
     reader = _FakeReader(rows=[{"__row_pk": "1", "__source_uri": "s3://x", "id": "1"}])
     response = _run(reader, _FakeLLM("SELECT * FROM orders"))
     assert response.warnings == () and reader.rolled_back is True
+    assert reader.timeout_ms == _POLICY.timeout_ms  # the deadline was plumbed into each phase
 
 
 def test_a_timeout_degrades_to_partial_results() -> None:
@@ -267,7 +265,9 @@ def test_a_code_bug_is_not_masked_as_a_warning() -> None:
     reader = _FakeReader(raise_bug=True)
     with pytest.raises(RuntimeError):
         _run(reader, _FakeLLM("SELECT * FROM orders"))
-    assert reader.rolled_back is True  # the savepoint still rolls back as the bug propagates
+    assert (
+        reader.rolled_back is True
+    )  # each phase's transaction still rolls back as the bug propagates
 
 
 def test_a_fenced_llm_reply_is_unwrapped() -> None:
