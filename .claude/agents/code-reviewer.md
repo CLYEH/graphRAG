@@ -199,6 +199,33 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      crash, missing-collection 500, corrupt-`canonical_id` schema-invalid
      output, non-active entity surfaced — all missed by the local reviewer's
      narrow-property pass.)
+   - **Query-language guard = grammar sweep (the reject surface IS the
+     grammar)**: when the guarded surface is a query LANGUAGE (NL→SQL, user
+     Cypher), the dangerous-construct siblings are not library APIs but every
+     GRAMMAR CLAUSE — walk the clause list before first push: FROM modifiers
+     (TABLESAMPLE, alias column-lists that rename data columns onto reserved
+     fields, schema/catalog qualification), SELECT modifiers (DISTINCT, INTO,
+     FOR UPDATE/SHARE), row selection (OFFSET; LIMIT expression FORMS — the
+     value gate is the "Preflight the consumer's property" bullet above
+     applied to a grammar leaf: `is_int`, not the "not a string" proxy that
+     admits `LIMIT 2.5` → `int()` crash), ordering (positional ordinals
+     incl. parenthesized `ORDER BY (1)` — PG
+     honours it, sqlglot parses `Paren(Literal)`, so `.unnest()` before the
+     check), set-ops/CTE/subquery/join, function calls, placeholders — each ×
+     its over-block dual (a positive acceptance case per legitimate
+     neighbour). Prefer STRUCTURAL ELIMINATION over a guard when the design
+     allows it: C1c's parameterized Cypher templates removed the whole face
+     (0 rounds); C6b's NL→SQL guard faced the entire SQL grammar and burned
+     19 Codex rounds — the costliest PR in the loop, one clause per round
+     (Codex found every base bug; the local fix-review pass caught gaps in
+     two candidate fixes pre-push — `is_int`, paren-ordinal `.unnest()` —
+     folded into the same commits, so only the session records them). Two
+     adjacent rules from the same PR: a store's
+     REPRESENTATION LIMITS are value domains (a >63-byte column name silently
+     truncates as a PG identifier — reject, don't corrupt), and a type check
+     AFTER a coercing extraction sees only the coerced value — gate at the
+     layer where the coercion happens (`jsonb_typeof(...)='string'` inside
+     the SQL, not `isinstance` on the driver's already-stringified text).
 
 ## Output (exactly this shape)
 ```
