@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -87,8 +89,12 @@ class _FakeReader:
     async def apply_timeout(self, timeout_ms: int) -> None:
         self.timeout_ms = timeout_ms  # capture the deadline the tool plumbed through
 
-    async def rollback(self) -> None:
-        self.rolled_back = True
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            self.rolled_back = True  # the savepoint is rolled back on every exit
 
     async def column_names(self, table: str) -> tuple[str, ...]:
         if self._discovery:
@@ -146,9 +152,11 @@ def test_disabled_mode_skips_with_a_typed_warning() -> None:
 def test_a_blocked_query_degrades_to_guardrail_blocked() -> None:
     """The LLM emitting a write (the classic NL→SQL risk) is REJECTED by the real
     guardrail — GUARDRAIL_BLOCKED, empty results, never executed, never a 500."""
-    response = _run(_FakeReader(), _FakeLLM("DELETE FROM orders"))
+    reader = _FakeReader()
+    response = _run(reader, _FakeLLM("DELETE FROM orders"))
     _VALIDATOR.validate(response.to_dict())
     assert response.results == () and _codes(response) == ["GUARDRAIL_BLOCKED"]
+    assert reader.rolled_back is True  # the SET LOCAL is rolled back too (no deadline leak)
 
 
 def test_a_hit_is_a_row_result_cited_by_table_and_pk() -> None:
@@ -206,10 +214,12 @@ def test_an_execution_error_degrades_not_raises() -> None:
     assert response.results == () and _codes(response) == ["GUARDRAIL_BLOCKED"]
 
 
-def test_a_successful_query_ends_its_transaction() -> None:
-    """Every post-timeout path — success included — rolls the transaction back, so
-    the SET LOCAL statement_timeout never leaks to a caller that reuses the
-    connection (a hybrid follow-up read must not inherit the SQL deadline)."""
+def test_a_successful_query_rolls_back_its_savepoint() -> None:
+    """Every path runs inside the reader's savepoint, and success included exits by
+    rolling back TO it — so the SET LOCAL statement_timeout never leaks to a caller
+    that reuses the connection, without ending the caller's own transaction (the
+    savepoint scopes cleanup to the reader's statements; see the integration test
+    that proves the caller's prior work survives)."""
     reader = _FakeReader(rows=[{"__row_pk": "1", "__source_uri": "s3://x", "id": "1"}])
     response = _run(reader, _FakeLLM("SELECT * FROM orders"))
     assert response.warnings == () and reader.rolled_back is True
@@ -254,8 +264,10 @@ def test_a_code_bug_is_not_masked_as_a_warning() -> None:
     into a GUARDRAIL_BLOCKED warning that hides the defect."""
     import pytest
 
+    reader = _FakeReader(raise_bug=True)
     with pytest.raises(RuntimeError):
-        _run(_FakeReader(raise_bug=True), _FakeLLM("SELECT * FROM orders"))
+        _run(reader, _FakeLLM("SELECT * FROM orders"))
+    assert reader.rolled_back is True  # the savepoint still rolls back as the bug propagates
 
 
 def test_a_fenced_llm_reply_is_unwrapped() -> None:

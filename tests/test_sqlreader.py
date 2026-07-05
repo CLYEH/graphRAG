@@ -37,6 +37,17 @@ class _Result:
         return self._rows
 
 
+class _FakeSavepoint:
+    """A stand-in for the AsyncSavepointTransaction begin_nested() returns; its
+    rollback() is the ROLLBACK TO SAVEPOINT the reader's transaction() issues."""
+
+    def __init__(self, conn: _FakeConn) -> None:
+        self._conn = conn
+
+    async def rollback(self) -> None:
+        self._conn.savepoint_rolled_back = True
+
+
 class _FakeConn:
     """Routes the reader's reads — the jsonb_object_keys column probe (bound
     text() via ``execute``) and the reconstructed query (fully-literal raw SQL via
@@ -47,10 +58,12 @@ class _FakeConn:
         self._rows = rows
         self.executed: list[tuple[str, dict[str, Any]]] = []
         self.driver_sql: list[str] = []
-        self.rolled_back = False
+        self.savepoint_began = False
+        self.savepoint_rolled_back = False
 
-    async def rollback(self) -> None:
-        self.rolled_back = True
+    async def begin_nested(self) -> _FakeSavepoint:
+        self.savepoint_began = True
+        return _FakeSavepoint(self)
 
     async def execute(self, clause: Any) -> _Result:
         sql = str(clause)
@@ -190,12 +203,15 @@ async def test_apply_timeout_sets_the_statement_deadline() -> None:
     assert conn.executed[-1][0] == "SET LOCAL statement_timeout = 250"
 
 
-async def test_rollback_clears_the_transaction() -> None:
-    """After a failed statement the reader rolls back so the caller can reuse the
-    connection — the degradation path depends on this (§22)."""
+async def test_transaction_scopes_cleanup_to_a_savepoint() -> None:
+    """The reader runs inside a SAVEPOINT it owns; exiting the context — success or
+    failure — rolls back TO the savepoint (undoing the SET LOCAL, clearing any
+    abort) rather than the whole transaction, so a caller-owned transaction and its
+    prior work survive (§22). The connection is never `rollback()`-ed by the reader."""
     conn = _FakeConn([], [])
-    await _reader(conn).rollback()
-    assert conn.rolled_back is True
+    async with _reader(conn).transaction():
+        pass
+    assert conn.savepoint_began is True and conn.savepoint_rolled_back is True
 
 
 async def test_column_names_reserve_the_internal_namespace() -> None:

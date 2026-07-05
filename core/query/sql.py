@@ -74,45 +74,43 @@ async def sql_query(
     if not policy.enabled:
         return _response(reader, query, (), (_warn("MODE_SKIPPED", "sql mode is disabled"),))
 
-    try:
-        # Bind the policy deadline BEFORE the first read, so schema discovery (a
-        # JSON-key scan over a possibly large table) is bounded too — not just the
-        # generated query — and a discovery timeout degrades rather than 500s.
-        await reader.apply_timeout(policy.timeout_ms)
-        schema = await _schema_prompt(reader, policy.allowed_tables)
-        candidate = _extract_sql(await _ask_llm(llm, schema, query))
+    # Run inside a reader-owned SAVEPOINT: on exit (success OR failure) it rolls
+    # back TO the savepoint, undoing the apply_timeout SET LOCAL (so the deadline
+    # never leaks to a reused connection) and clearing any aborted statement — WITHOUT
+    # touching the caller's surrounding transaction or the work it did before us.
+    async with reader.transaction():
         try:
-            validated = validate_sql(candidate, policy.allowed_tables, policy.blocked_keywords)
-        except GuardrailBlocked as blocked:
-            return _response(reader, query, (), (_warn(GUARDRAIL_WARNING_CODE, blocked.reason),))
-        rows, truncated = await reader.run(validated, max_rows)
-        results = _to_results(rows, validated.table)
-        warnings: tuple[QueryWarning, ...] = ()
-        if truncated:
-            warnings = (
-                _warn("TRUNCATED", f"result truncated to the {max_rows}-row ceiling (§21)"),
-            )
-        return _response(reader, query, results, warnings)
-    except DBAPIError as exc:
-        return _degrade(reader, query, exc, policy.timeout_ms)
-    finally:
-        # End the transaction on EVERY post-timeout path: the SET LOCAL
-        # statement_timeout must not leak to a caller that reuses this connection
-        # (a hybrid follow-up read must not inherit the SQL deadline), and an
-        # aborted transaction (a bad query / timeout cancel) must be cleared so the
-        # degradation doesn't become a "current transaction is aborted" failure
-        # (§22). Results are already fetched into Python, so rolling back the read
-        # loses nothing; a non-DBAPIError (our own bug) still propagates after this.
-        await reader.rollback()
+            # Bind the policy deadline BEFORE the first read, so schema discovery (a
+            # JSON-key scan over a possibly large table) is bounded too — not just the
+            # generated query — and a discovery timeout degrades rather than 500s.
+            await reader.apply_timeout(policy.timeout_ms)
+            schema = await _schema_prompt(reader, policy.allowed_tables)
+            candidate = _extract_sql(await _ask_llm(llm, schema, query))
+            try:
+                validated = validate_sql(candidate, policy.allowed_tables, policy.blocked_keywords)
+            except GuardrailBlocked as blocked:
+                return _response(
+                    reader, query, (), (_warn(GUARDRAIL_WARNING_CODE, blocked.reason),)
+                )
+            rows, truncated = await reader.run(validated, max_rows)
+            results = _to_results(rows, validated.table)
+            warnings: tuple[QueryWarning, ...] = ()
+            if truncated:
+                warnings = (
+                    _warn("TRUNCATED", f"result truncated to the {max_rows}-row ceiling (§21)"),
+                )
+            return _response(reader, query, results, warnings)
+        except DBAPIError as exc:
+            return _degrade(reader, query, exc, policy.timeout_ms)
 
 
 def _degrade(
     reader: BuildScopedSqlReader, query: str, exc: DBAPIError, timeout_ms: int
 ) -> McpResponse:
-    """Map a DB failure to a typed degradation (§22), never a 500 — the caller's
-    ``finally`` rolls the (possibly aborted) transaction back. A bug in our own SQL
-    composition is NOT a DBAPIError, so it never reaches here — it propagates and
-    fails loud (Rule 12)."""
+    """Map a DB failure to a typed degradation (§22), never a 500 — the reader's
+    savepoint context rolls the (possibly aborted) statement back on the way out. A
+    bug in our own SQL composition is NOT a DBAPIError, so it never reaches here —
+    it propagates and fails loud (Rule 12)."""
     if _is_timeout(exc):
         # the policy deadline cancelled it — the answer is incomplete (§22
         # "逾時：回部分結果 + warning"), distinct from an invalid query.

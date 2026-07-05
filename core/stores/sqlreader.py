@@ -29,7 +29,8 @@ are deferred infra — the executor takes an injected connection, C6a-style).
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from typing import Any
 
 from sqlalchemy import text
@@ -187,13 +188,30 @@ class BuildScopedSqlReader:
         """
         await self.__conn.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
 
-    async def rollback(self) -> None:
-        """Roll back this connection's transaction. A failed statement (a bad
-        query or a ``statement_timeout`` cancel) leaves the transaction ABORTED;
-        the SQL path calls this before degrading (§22) so the caller can reuse the
-        connection (e.g. a hybrid follow-up read) instead of hitting ``current
-        transaction is aborted`` — a degradation must not become a failure."""
-        await self.__conn.rollback()
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        """Run the SQL path's statements inside a SAVEPOINT the reader OWNS.
+
+        The connection is caller-owned (injected, like the read repo), so the
+        reader must not roll back a transaction it did not open — a caller that
+        wraps an audit-write + SQL retrieval in one unit would lose that work. A
+        savepoint scopes cleanup to the reader's own statements: on exit — success
+        OR failure — it rolls back TO the savepoint, which (a) undoes the
+        :meth:`apply_timeout` ``SET LOCAL`` so the deadline never leaks to a reused
+        connection, and (b) clears an ABORTED statement (a bad query / timeout
+        cancel) so a degradation doesn't become a ``current transaction is
+        aborted`` failure (§22) — while PRESERVING the surrounding transaction and
+        any work the caller did before it. :meth:`run` materialises rows into
+        Python before this exits, so rolling back the read loses nothing.
+
+        :meth:`apply_timeout` must run INSIDE this context: its ``SET LOCAL`` is
+        transaction-scoped but savepoint-captured, so only a rollback TO the
+        savepoint undoes it (a plain RELEASE would leave the deadline active)."""
+        savepoint = await self.__conn.begin_nested()
+        try:
+            yield
+        finally:
+            await savepoint.rollback()  # ROLLBACK TO SAVEPOINT — the reader's unit only
 
     @staticmethod
     def _ceiling(statement: exp.Select, max_rows: int) -> int:

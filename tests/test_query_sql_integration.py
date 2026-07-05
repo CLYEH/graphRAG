@@ -183,14 +183,16 @@ async def test_query_reads_only_the_active_build(conn: AsyncConnection) -> None:
         await _cleanup(project)
 
 
-async def test_statement_timeout_cancels_and_leaves_a_reusable_connection(
+async def test_statement_timeout_cancels_but_the_savepoint_spares_the_caller(
     conn: AsyncConnection,
 ) -> None:
-    """The reader enforces the policy deadline as a real Postgres statement_timeout
-    and, after the cancel aborts the transaction, rolls back so the SAME connection
-    is reusable. Tested at the reader seam because the guardrail (correctly) rejects
-    pg_sleep — the only deterministic way to make a query slow — so we hand the
-    reader a ValidatedSql directly to prove the SET LOCAL + rollback on live PG."""
+    """The reader enforces the policy deadline as a real Postgres statement_timeout;
+    when the cancel aborts the statement, the reader's SAVEPOINT clears it and undoes
+    the SET LOCAL — WITHOUT rolling back the caller's surrounding transaction, so the
+    caller's uncommitted prior work survives and the connection stays reusable.
+    Tested at the reader seam because the guardrail (correctly) rejects pg_sleep —
+    the only deterministic way to make a query slow — so we hand the reader a
+    ValidatedSql directly to prove SET LOCAL + savepoint recovery on live PG."""
     project = f"sqltest-{uuid.uuid4().hex[:10]}"
     try:
         writer = await _new_build(conn, project)
@@ -200,7 +202,10 @@ async def test_statement_timeout_cancels_and_leaves_a_reusable_connection(
         await conn.commit()
 
         reader = await BuildScopedSqlReader.for_active_build(conn, project)
-        await reader.apply_timeout(200)  # 200ms deadline vs a 5s sleep
+        # the caller has UNCOMMITTED work in its transaction, before SQL retrieval
+        await conn.execute(text("CREATE TEMP TABLE caller_marker (x int) ON COMMIT DROP"))
+        await conn.execute(text("INSERT INTO caller_marker VALUES (42)"))
+
         slow = ValidatedSql(
             statement=cast(
                 exp.Select,
@@ -210,11 +215,20 @@ async def test_statement_timeout_cancels_and_leaves_a_reusable_connection(
             ),
             table="orders",
         )
-        with pytest.raises(DBAPIError) as excinfo:
-            await reader.run(slow, max_rows=100)
-        assert getattr(excinfo.value.orig, "sqlstate", None) == "57014"  # query_canceled
+        async with reader.transaction():
+            await reader.apply_timeout(200)  # 200ms deadline vs a 5s sleep, inside the savepoint
+            with pytest.raises(DBAPIError) as excinfo:
+                await reader.run(slow, max_rows=100)
+            assert getattr(excinfo.value.orig, "sqlstate", None) == "57014"  # query_canceled
 
-        await reader.rollback()  # what sql_query._degrade does before degrading
+        # exiting the context rolled back TO the savepoint: the abort is cleared and
+        # the SET LOCAL is undone, but the caller's uncommitted row is untouched.
+        marker = (await conn.execute(text("SELECT x FROM caller_marker"))).scalar_one()
+        assert marker == 42  # the caller's prior work survived the reader's cleanup
+        timeout = (
+            await conn.exec_driver_sql("SELECT current_setting('statement_timeout')")
+        ).scalar_one()
+        assert timeout == "0"  # the deadline did not leak past the savepoint
         reusable = (await conn.execute(text("SELECT 1"))).scalar_one()
         assert reusable == 1  # aborted transaction cleared → connection reusable
     finally:
