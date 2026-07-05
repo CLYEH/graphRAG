@@ -86,7 +86,7 @@ async def test_reconstruction_is_build_scoped_and_never_a_base_table() -> None:
     await _reader(conn).run(validated, max_rows=10)
 
     main_sql = conn.driver_sql[-1]  # executed raw (no bind params), not via text()
-    assert "WITH orders AS" in main_sql  # reconstructed, not the base table
+    assert 'WITH "orders" AS' in main_sql  # reconstructed (quoted CTE), not the base table
     assert "FROM documents" in main_sql
     assert str(_BUILD) in main_sql  # the active build_id, injected as a literal
     assert f"'{_PROJECT}'" in main_sql  # project scope literal
@@ -94,6 +94,22 @@ async def test_reconstruction_is_build_scoped_and_never_a_base_table() -> None:
     assert "'table')" in main_sql and "= 'orders'" in main_sql  # the logical-table filter
     # every JSON-key column is projected as a safely quoted identifier
     assert "'id') AS \"id\"" in main_sql and "'amount') AS \"amount\"" in main_sql
+
+
+async def test_a_table_name_needing_quotes_is_reconstructed_correctly() -> None:
+    """allowed_tables is not restricted to bare identifiers, so a whitelisted name
+    with a space (`Order Details`) must work: the CTE and the outer reference are
+    the SAME quoted identifier, so the CTE shadows the reference (a raw
+    `.with_(<str>)` would raise a ParseError → an uncaught 500)."""
+    conn = _FakeConn(["id"], [_row("1", id="1")])
+    validated = validate_sql('SELECT * FROM "Order Details"', ("Order Details",), _BLOCKED)
+    await _reader(conn).run(validated, max_rows=10)
+    main_sql = conn.driver_sql[-1]
+    assert 'WITH "Order Details" AS' in main_sql  # CTE quoted to match the reference
+    assert 'FROM "Order Details"' in main_sql  # the outer reference, same identifier
+    import sqlglot
+
+    assert len(sqlglot.parse(main_sql, dialect="postgres")) == 1  # still one statement
 
 
 async def test_untrusted_column_names_cannot_inject() -> None:
@@ -110,6 +126,22 @@ async def test_untrusted_column_names_cannot_inject() -> None:
     main_sql = conn.driver_sql[-1]
     assert len(sqlglot.parse(main_sql, dialect="postgres")) == 1  # injection contained
     assert "'k'' ; drop table documents; --'" in main_sql  # the key is an escaped literal
+
+
+async def test_a_hostile_table_name_cannot_inject() -> None:
+    """allowed_tables is operator-configured (a weaker threat than LLM output), but
+    defense in depth: even a whitelisted name carrying a quote-and-semicolon is
+    rendered as ONE escaped quoted identifier (both the CTE and the reference), so
+    it can't break out into a second statement — the same containment as columns."""
+    import sqlglot
+
+    evil = 'a" ; drop table documents; --'  # a double-quote break-out attempt
+    conn = _FakeConn(["id"], [_row("1", id="1")])
+    validated = validate_sql('SELECT * FROM "a"" ; drop table documents; --"', (evil,), _BLOCKED)
+    await _reader(conn).run(validated, max_rows=10)
+    main_sql = conn.driver_sql[-1]
+    assert len(sqlglot.parse(main_sql, dialect="postgres")) == 1  # injection contained
+    assert '"a"" ; drop table documents; --"' in main_sql  # the name is an escaped identifier
 
 
 async def test_an_empty_logical_table_yields_no_results_without_a_query() -> None:

@@ -136,9 +136,11 @@ def test_disabled_mode_skips_with_a_typed_warning() -> None:
         max_rows=100,
         timeout_ms=5000,
     )
-    response = _run(_FakeReader(), _FakeLLM("SELECT * FROM orders"), disabled)
+    reader = _FakeReader()
+    response = _run(reader, _FakeLLM("SELECT * FROM orders"), disabled)
     _VALIDATOR.validate(response.to_dict())
     assert response.results == () and _codes(response) == ["MODE_SKIPPED"]
+    assert reader.rolled_back is False  # nothing ran → the connection is untouched
 
 
 def test_a_blocked_query_degrades_to_guardrail_blocked() -> None:
@@ -202,6 +204,15 @@ def test_an_execution_error_degrades_not_raises() -> None:
     response = _run(reader, _FakeLLM("SELECT * FROM orders WHERE nope = '1'"))
     _VALIDATOR.validate(response.to_dict())
     assert response.results == () and _codes(response) == ["GUARDRAIL_BLOCKED"]
+
+
+def test_a_successful_query_ends_its_transaction() -> None:
+    """Every post-timeout path — success included — rolls the transaction back, so
+    the SET LOCAL statement_timeout never leaks to a caller that reuses the
+    connection (a hybrid follow-up read must not inherit the SQL deadline)."""
+    reader = _FakeReader(rows=[{"__row_pk": "1", "__source_uri": "s3://x", "id": "1"}])
+    response = _run(reader, _FakeLLM("SELECT * FROM orders"))
+    assert response.warnings == () and reader.rolled_back is True
 
 
 def test_a_timeout_degrades_to_partial_results() -> None:

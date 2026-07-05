@@ -300,6 +300,65 @@ async def test_a_colon_in_a_key_and_a_predicate_literal_execute(conn: AsyncConne
         await _cleanup(project)
 
 
+async def test_a_whitelisted_table_name_needing_quotes_works(conn: AsyncConnection) -> None:
+    """allowed_tables is not restricted to bare identifiers, so a real query over a
+    whitelisted `Order Details` (space → must be quoted) succeeds: the CTE and the
+    outer reference are the same quoted identifier. A raw `.with_(<str>)` would
+    raise a ParseError → an uncaught 500."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "Order Details", "1", amount="9")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        policy = TextToSql(
+            enabled=True,
+            allowed_tables=("Order Details",),
+            blocked_keywords=SQL_BLOCKED_KEYWORDS_MIN,
+            max_rows=100,
+            timeout_ms=5000,
+        )
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM('SELECT * FROM "Order Details"')), policy, "details", 100
+        )
+        _VALIDATOR.validate(response.to_dict())
+        assert response.warnings == ()
+        (result,) = response.results
+        assert result.source_refs[0].metadata == {"table": "Order Details", "pk": "1"}
+    finally:
+        await _cleanup(project)
+
+
+async def test_a_successful_query_does_not_leak_the_statement_timeout(
+    conn: AsyncConnection,
+) -> None:
+    """sql_query ends its transaction on the success path too, so the SET LOCAL
+    statement_timeout (5000ms here) does NOT linger on the connection — a fresh
+    statement (a hybrid follow-up read) sees the default, not the SQL deadline."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", amount="9")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        response = await sql_query(
+            reader, cast(LLM, _FakeLLM("SELECT * FROM orders")), _POLICY, "all", 100
+        )
+        assert response.warnings == ()
+        leftover = (
+            await conn.exec_driver_sql("SELECT current_setting('statement_timeout')")
+        ).scalar_one()
+        assert leftover == "0"  # reset by the transaction end, not the policy's 5000ms
+    finally:
+        await _cleanup(project)
+
+
 async def test_a_write_attempt_is_blocked_end_to_end(conn: AsyncConnection) -> None:
     """If the LLM emits a write, the guardrail rejects it before execution: the
     response is GUARDRAIL_BLOCKED and the documents table is untouched."""

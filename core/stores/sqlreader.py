@@ -141,8 +141,18 @@ class BuildScopedSqlReader:
             return [], False
 
         ceiling = self._ceiling(validated.statement, max_rows)
-        final = validated.statement.limit(ceiling + 1, copy=True).with_(
-            validated.table, as_=self._reconstruction(validated.table, columns), copy=True
+        # Name the CTE and the outer table reference with the SAME quoted
+        # identifier, so the CTE shadows the reference for ANY whitelisted name —
+        # a bare `orders` (folds to `"orders"`) or a `"Order Details"` that
+        # `.with_(<str>)` can't even parse — and the identifier escaping contains
+        # an injection in the name (allowed_tables is not restricted to bare idents).
+        alias = exp.to_identifier(validated.table, quoted=True)
+        statement = validated.statement.copy()
+        table_ref = statement.find(exp.Table)
+        assert table_ref is not None  # the guardrail guarantees exactly one table
+        table_ref.set("this", alias.copy())
+        final = statement.limit(ceiling + 1, copy=True).with_(
+            alias.copy(), as_=self._reconstruction(validated.table, columns), copy=True
         )
         # The rendered SQL is fully self-contained — scope values and untrusted
         # JSON keys alike are sqlglot-ESCAPED LITERALS (never string-concatenated),
