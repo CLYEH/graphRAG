@@ -52,7 +52,7 @@ Keep items small enough to finish in one loop.
 - [x] C6a Retrieval: semantic (Qdrant kNN, §16 contract)
 - [x] C6b Retrieval: sql (NLSQL + sqlglot guardrail per P5, §27.6)
 - [x] C6c Retrieval: graph (parameterized Cypher templates + guardrail per P5, §27.6)
-- [ ] C6d Retrieval: global (community_reports — needs C7)
+- [x] C6d Retrieval: global (community_reports — needs C7)
 - [ ] C6e Hybrid router + fusion + routing trace (§8, §16 debug)
 - [x] C7 Global summary (Leiden communities + reports)
 - [ ] C8 MCP server (per project) exposing the tool set
