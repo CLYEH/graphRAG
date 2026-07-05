@@ -40,6 +40,7 @@ def _validate(
         "select * from customers",  # lowercase keywords
         "SELECT * FROM orders WHERE note = 'please delete this order'",  # blocked word in a STRING
         'SELECT * FROM orders WHERE "select" = 1',  # blocked word as a QUOTED identifier
+        "SELECT * FROM orders o WHERE o.amount = '5'",  # a PLAIN table alias is harmless
     ],
 )
 def test_accepts_flat_single_table_reads(sql: str) -> None:
@@ -182,6 +183,25 @@ def test_rejects_a_schema_qualified_table() -> None:
         _validate("SELECT * FROM public.orders")
     with pytest.raises(GuardrailBlocked):
         _validate("SELECT * FROM pg_catalog.pg_tables")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM orders AS o(a, b, __row_pk)",  # renames a data column onto the pk
+        "SELECT * FROM orders o(c1, __source_uri)",  # forges the source_uri citation field
+        "SELECT * FROM orders AS o(id)",  # any column-alias list at all
+    ],
+)
+def test_rejects_a_column_alias_list_that_could_forge_citations(sql: str) -> None:
+    """A column-alias list (``FROM t AS a(c1, ...)``) renames the table's columns
+    positionally. Since the executor swaps in a reconstruction CTE whose leading
+    columns are the citation fields, a SELECT * over such a list could project a
+    DATA value under ``__row_pk``/``__source_uri`` — so the row would be cited by a
+    forged value, not its real pk (§27.2). The bare column-alias list is refused; a
+    plain table alias (no list) stays allowed (see the accept cases)."""
+    with pytest.raises(GuardrailBlocked, match="column-alias list"):
+        _validate(sql)
 
 
 # --- Blocked-keyword defense in depth (on top of the AST) ---------------------

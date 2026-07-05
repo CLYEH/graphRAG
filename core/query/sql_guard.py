@@ -179,6 +179,18 @@ def _single_allowed_table(statement: exp.Select, allowed_tables: Collection[str]
             f"a schema-qualified table name ({node.sql(dialect=_DIALECT)}) is not allowed — "
             "reference the whitelisted table by its bare name"
         )
+    # A column-alias list (``FROM t AS a(c1, c2, ...)``) RENAMES the table's columns
+    # positionally. The executor swaps the table for a reconstruction CTE whose first
+    # columns are the citation fields (``__row_pk``/``__source_uri``); a SELECT * over
+    # a column-alias list could rename a DATA column onto ``__row_pk``, so `_to_results`
+    # would cite the row by a forged data value, not its real pk. A plain table alias
+    # (no column list) is harmless and still allowed.
+    alias = node.args.get("alias")
+    if alias is not None and alias.columns:
+        raise GuardrailBlocked(
+            "a column-alias list on the table (FROM t AS a(c1, ...)) is not allowed — "
+            "it can rename a data column onto the __row_pk/__source_uri citation fields"
+        )
     name = node.name
     if name not in allowed_tables:
         raise GuardrailBlocked(f"table {name!r} is not in the allowed_tables whitelist")

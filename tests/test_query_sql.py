@@ -157,6 +157,16 @@ def test_a_blocked_query_degrades_to_guardrail_blocked() -> None:
     assert reader.rolled_back is True  # the SET LOCAL is rolled back too (no deadline leak)
 
 
+def test_a_column_alias_attack_is_blocked_before_it_can_forge_a_citation() -> None:
+    """An LLM emitting a column-alias list that would rename a data column onto
+    __row_pk is REJECTED by the (real) guardrail — GUARDRAIL_BLOCKED, the query is
+    never executed — so a forged (table, pk) can never reach _to_results (§27.2)."""
+    reader = _FakeReader(rows=[{"__row_pk": "forged", "id": "1"}])
+    response = _run(reader, _FakeLLM("SELECT * FROM orders AS o(id, __row_pk)"))
+    _VALIDATOR.validate(response.to_dict())
+    assert response.results == () and _codes(response) == ["GUARDRAIL_BLOCKED"]
+
+
 def test_a_hit_is_a_row_result_cited_by_table_and_pk() -> None:
     """A matched source row becomes a §16 `row` result: id + source_ref by
     (table, pk), the row's columns as text, validating against the frozen
