@@ -54,9 +54,15 @@ class _FakeConn:
     statement marks the connection in-transaction; rollback() ends it, so tests can
     assert the reader's per-phase timed transaction is opened and closed."""
 
-    def __init__(self, columns: list[str], rows: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        columns: list[str],
+        rows: list[dict[str, Any]],
+        by_table: dict[str, list[str]] | None = None,
+    ) -> None:
         self._columns = columns
         self._rows = rows
+        self._by_table = by_table or {}
         self.executed: list[tuple[str, dict[str, Any]]] = []
         self.driver_sql: list[str] = []
         self.rolled_back = False
@@ -74,7 +80,15 @@ class _FakeConn:
         sql = str(clause)
         params = {name: bp.value for name, bp in clause._bindparams.items()}
         self.executed.append((sql, params))
-        if "jsonb_object_keys" in sql:
+        if "AS tname" in sql:  # the batched columns_by_table probe (table, key) pairs
+            return _Result(
+                [
+                    SimpleNamespace(tname=t, k=col)
+                    for t, cols in self._by_table.items()
+                    for col in cols
+                ]
+            )
+        if "jsonb_object_keys" in sql:  # single-table column_names
             return _Result([SimpleNamespace(k=col) for col in self._columns])
         if "EXISTS" in sql:  # the _has_rows probe — the table has rows iff we seeded any
             return _ScalarResult(bool(self._rows))
@@ -249,6 +263,16 @@ async def test_timed_transaction_bounds_the_phase_and_ends_it() -> None:
         assert conn.executed[0][0] == "SET LOCAL statement_timeout = 250"  # deadline bound first
         assert conn.in_transaction() is True  # the phase holds the transaction while working
     assert conn.rolled_back is True and conn.in_transaction() is False  # released on exit
+
+
+async def test_columns_by_table_groups_each_tables_keys_in_one_probe() -> None:
+    """Schema discovery batches every whitelisted table into ONE statement (so it is
+    bounded by a single statement_timeout, not one per table); the result groups the
+    JSON keys per table, dropping the reserved __-prefixed ones."""
+    conn = _FakeConn([], [], by_table={"orders": ["amount", "pk", "__row_pk"], "cust": ["pk"]})
+    cols = await _reader(conn).columns_by_table(["orders", "cust"])
+    assert cols == {"orders": ("amount", "pk"), "cust": ("pk",)}  # per-table, __ dropped
+    assert sum("AS tname" in sql for sql, _ in conn.executed) == 1  # a single batched statement
 
 
 async def test_column_names_reserve_the_internal_namespace() -> None:

@@ -42,7 +42,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlglot import exp
 
@@ -152,6 +152,35 @@ class BuildScopedSqlReader:
             ).bindparams(**self._scope_params(table))
         )
         return tuple(sorted(row.k for row in result if not row.k.startswith("__")))
+
+    async def columns_by_table(self, tables: Sequence[str]) -> dict[str, tuple[str, ...]]:
+        """The queryable columns for EACH given table, discovered in ONE statement.
+
+        Schema discovery must probe every whitelisted table, but a per-table loop
+        would run N statements — and ``statement_timeout`` bounds each SEPARATELY,
+        so N large tables could run for N × the policy deadline before the LLM call
+        without a timeout ever firing. Batching into a single statement makes the
+        whole phase bounded by ONE ``statement_timeout``. Reserved (``__``-prefixed)
+        keys are dropped, as in :meth:`column_names`; a table with no rows maps to
+        an empty tuple."""
+        result = await self.__conn.execute(
+            text(
+                "SELECT DISTINCT metadata ->> 'table' AS tname, jsonb_object_keys(raw::jsonb) AS k "
+                "FROM documents WHERE project = :__g_project "
+                "AND build_id = CAST(:__g_build AS uuid) AND mime = :__g_mime "
+                "AND metadata ->> 'table' IN :__g_tables"
+            ).bindparams(
+                bindparam("__g_project", self.__project),
+                bindparam("__g_build", str(self.__build_id)),
+                bindparam("__g_mime", STRUCTURED_MIME),
+                bindparam("__g_tables", list(tables), expanding=True),
+            )
+        )
+        by_table: dict[str, set[str]] = {table: set() for table in tables}
+        for row in result:
+            if not row.k.startswith("__"):
+                by_table.setdefault(row.tname, set()).add(row.k)
+        return {table: tuple(sorted(by_table[table])) for table in tables}
 
     async def _has_rows(self, table: str) -> bool:
         """Whether this logical table has ANY row in the active build — distinct

@@ -96,11 +96,11 @@ class _FakeReader:
         finally:
             self.rolled_back = True  # each phase's transaction is ended on exit
 
-    async def column_names(self, table: str) -> tuple[str, ...]:
+    async def columns_by_table(self, tables: Any) -> dict[str, tuple[str, ...]]:
         if self._discovery:
             # a schema-discovery scan cancelled by statement_timeout (SQLSTATE 57014)
             raise OperationalError("SELECT jsonb_object_keys ...", {}, _Canceled())
-        return self._columns
+        return {t: self._columns for t in tables}
 
     async def run(self, validated: Any, max_rows: int) -> tuple[list[dict[str, Any]], bool]:
         if self._bug:

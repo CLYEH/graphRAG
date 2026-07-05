@@ -246,6 +246,27 @@ async def test_for_active_build_leaves_the_connection_clean(conn: AsyncConnectio
         await _cleanup(project)
 
 
+async def test_schema_discovery_batches_all_tables_in_one_probe(conn: AsyncConnection) -> None:
+    """columns_by_table discovers every whitelisted table's columns in ONE statement
+    (grouped per table), so schema discovery is bounded by a single statement_timeout
+    rather than one deadline per table (§21)."""
+    project = f"sqltest-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        await _row(writer, "orders", "1", amount="9")
+        await _row(writer, "customers", "1", name="acme", city="ny")
+        await conn.commit()
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        async with reader.timed_transaction(5000):
+            cols = await reader.columns_by_table(["orders", "customers"])
+        assert cols == {"orders": ("amount", "pk"), "customers": ("city", "name", "pk")}
+    finally:
+        await _cleanup(project)
+
+
 async def test_no_transaction_is_held_across_the_llm_call(conn: AsyncConnection) -> None:
     """sql_query runs schema discovery and execution in SEPARATE timed transactions,
     releasing the connection across the LLM call — so no session sits

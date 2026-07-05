@@ -152,11 +152,14 @@ async def _ask_llm(llm: LLM, schema: str, query: str) -> str:
 
 
 async def _schema_prompt(reader: BuildScopedSqlReader, allowed_tables: tuple[str, ...]) -> str:
-    """List each whitelisted table with the columns it actually has in this
-    build, so the LLM writes SQL against real column names."""
+    """List each whitelisted table with the columns it actually has in this build,
+    so the LLM writes SQL against real column names. Discovered in ONE batched
+    statement (not one per table) so the whole phase is bounded by a single
+    statement_timeout — N large tables can't run for N × the policy deadline."""
+    columns_by_table = await reader.columns_by_table(allowed_tables)
     lines = ["Tables (all columns are text):"]
     for table in allowed_tables:
-        columns = await reader.column_names(table)
+        columns = columns_by_table[table]
         lines.append(f"- {table}({', '.join(columns)})" if columns else f"- {table}()")
     return "\n".join(lines)
 

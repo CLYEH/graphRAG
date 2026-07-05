@@ -60,6 +60,9 @@ _FORBIDDEN: tuple[tuple[type[exp.Expr], str], ...] = (
     # TABLESAMPLE returns an arbitrary subset BEFORE the WHERE, so the result would
     # silently omit matching rows — outside the frozen v1 shape (WHERE/ORDER BY/LIMIT).
     (exp.TableSample, "TABLESAMPLE"),
+    # OFFSET skips leading matching rows — the answer would look complete while
+    # silently dropping the first N citable rows; not part of the v1 shape.
+    (exp.Offset, "an OFFSET clause"),
     # bind placeholders (:x / ? / @x) are never legitimate in a literal NL→SQL
     # result, and the executor injects its OWN scope placeholders around this
     # query — a user placeholder would collide with that binding.

@@ -95,6 +95,8 @@ def test_rejects_writes_and_ddl(sql: str) -> None:
         "SELECT DISTINCT customer FROM orders",  # distinct (also not star)
         "SELECT * FROM orders TABLESAMPLE SYSTEM (1)",  # samples a subset BEFORE WHERE
         "SELECT * FROM orders TABLESAMPLE BERNOULLI (10)",  # any sampling method
+        "SELECT * FROM orders ORDER BY amount OFFSET 10",  # OFFSET silently skips rows
+        "SELECT * FROM orders LIMIT 5 OFFSET 10",  # OFFSET even alongside a LIMIT
     ],
 )
 def test_rejects_uncitable_constructs(sql: str) -> None:
