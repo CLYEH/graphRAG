@@ -168,14 +168,22 @@ async def test_get_entity_returns_cited_entities_from_the_active_build(
 
 
 async def test_a_registered_tool_calls_through_on_live_stores(
-    context: ProjectContext,
+    context: ProjectContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One §9 tool exercised through FastMCP's own dispatch: build_server →
     lifespan (engines) → call_tool → per-call binding → live answer. Uses
     list_schema (no LLM, sql disabled in the demo config → an honest empty
-    introspection), proving the registration/wiring seam end-to-end."""
+    introspection), proving the registration/wiring seam end-to-end. The
+    model FACTORIES are faked — the real ones demand an API key the CI
+    runner deliberately does not have (§3: provider-blind; the seam under
+    test is dispatch/binding, not the vendor client)."""
+    import core.mcp.server as server_module
     from core.mcp.server import build_server
 
+    monkeypatch.setattr(server_module, "chat_model", lambda: cast(LLM, _FakeLLM()))
+    monkeypatch.setattr(
+        server_module, "embedding_model", lambda: cast(BaseEmbedding, _FakeEmbedder())
+    )
     await _activate_build(context.project, entity_name="Acme")
     server = build_server(context.project, REPO_ROOT / "projects" / "demo" / "config.yaml")
     lifespan = server.settings.lifespan
