@@ -585,3 +585,73 @@ async def test_activation_rechecks_drift_under_the_lock(project: str) -> None:
         await driver.close()
         await engine.dispose()
         await engine2.dispose()
+
+
+@pytest.mark.integration
+async def test_rollback_selects_its_target_under_the_lifecycle_lock(project: str) -> None:
+    """Class 10 on SELECTION: with B active and A archived, a rollback that
+    picks its target before a concurrent activate(C) commits would promote A
+    — jumping history back two versions instead of one. Target selection now
+    happens under the project lifecycle lock, in the same transaction as the
+    promotion. Interleaving (deterministic): conn2 holds the lifecycle lock
+    and activates C meanwhile; rollback blocks; on release it must select B
+    (the most recently displaced at COMMIT time), never A."""
+    import asyncio
+
+    from sqlalchemy import func, select
+
+    engine, engine2 = _engine(), _engine()
+    qdrant = vector_client()
+    driver = graph_driver()
+    try:
+        async with (
+            engine.connect() as conn,
+            engine2.connect() as conn2,
+            driver.session() as session,
+        ):
+            build_a = await _new_build(conn, project, age_days=9)
+            build_b = await _new_build(conn, project, age_days=5)
+            build_c = await _new_build(conn, project, age_days=1)
+            report = await activate(conn, qdrant, session, project, build_a)
+            assert report.ok
+            report = await activate(conn, qdrant, session, project, build_b)
+            assert report.ok  # now: A archived, B active, C ready
+
+            # conn2 takes the lifecycle lock (an in-flight activate(C))
+            txn2 = await conn2.begin()
+            await conn2.execute(
+                select(
+                    func.pg_advisory_xact_lock(
+                        func.hashtext("graphrag-lifecycle"), func.hashtext(project)
+                    )
+                )
+            )
+            rollback_task = asyncio.ensure_future(rollback(conn, qdrant, session, project))
+            done, _ = await asyncio.wait([rollback_task], timeout=1.0)
+            assert not done  # rollback waits for the lifecycle lock
+
+            # conn2 completes activate(C) while rollback waits
+            await conn2.execute(
+                tables.builds.update()
+                .where(tables.builds.c.project == project, tables.builds.c.status == "active")
+                .values(status="archived", activated_at=datetime.now(tz=UTC))
+            )
+            await conn2.execute(
+                tables.builds.update()
+                .where(tables.builds.c.id == build_c)
+                .values(status="active", activated_at=datetime.now(tz=UTC))
+            )
+            await txn2.commit()
+
+            target, report = await asyncio.wait_for(rollback_task, timeout=15)
+            # the target reflects COMMIT-time history: B (displaced by C),
+            # never the stale pre-selection A
+            assert target == build_b and report.ok
+            statuses = {b.id: b.status for b in await list_builds(conn, project)}
+            assert statuses[build_b] == "active"
+            assert statuses[build_a] == "archived"  # untouched
+    finally:
+        await qdrant.close()
+        await driver.close()
+        await engine.dispose()
+        await engine2.dispose()

@@ -62,6 +62,23 @@ _BUILD_TABLES: tuple[sa.Table, ...] = (
 _DRIFT_TOLERANCE = 0
 
 
+async def _take_project_lock(conn: AsyncConnection, project: str) -> None:
+    """Transaction-scoped advisory lock serializing LIFECYCLE operations per
+    project (activate / rollback / prune victims). Row locks alone cannot
+    order operations that first have to SELECT their target (rollback picks
+    "the most recently displaced build" — a selection made outside the
+    promotion's serialization can go stale and jump history). Auto-released
+    at commit/rollback; hashtext collisions across projects only cause
+    spurious serialization, never corruption."""
+    await conn.execute(
+        sa.select(
+            sa.func.pg_advisory_xact_lock(
+                sa.func.hashtext("graphrag-lifecycle"), sa.func.hashtext(project)
+            )
+        )
+    )
+
+
 class _DriftedUnderLock(Exception):
     """Raised inside the activation transaction when the post-lock drift
     re-check fails — converted to a refusal report (nothing committed)."""
@@ -326,14 +343,16 @@ async def activate(
     await conn.rollback()
     promotable = ("ready", "archived") if allow_archived else ("ready",)
     try:
-        return await _promote_under_lock(
-            conn, qdrant, graph_session, project, build_id, promotable, report
-        )
+        async with conn.begin():
+            await _take_project_lock(conn, project)
+            return await _promote_in_tx(
+                conn, qdrant, graph_session, project, build_id, promotable, report
+            )
     except _DriftedUnderLock as exc:
         return PreflightReport(tuple(exc.failures), report.deferred)
 
 
-async def _promote_under_lock(
+async def _promote_in_tx(
     conn: AsyncConnection,
     qdrant: AsyncQdrantClient,
     graph_session: AsyncSession,
@@ -342,49 +361,50 @@ async def _promote_under_lock(
     promotable: tuple[str, ...],
     report: PreflightReport,
 ) -> PreflightReport:
-    async with conn.begin():
-        # take the target's row lock FIRST: this serializes against prune
-        # (which sweeps under the same lock) — if prune committed, the row
-        # is gone; if prune ABORTED after deleting the projections (the
-        # crash window), the row is back but the projections may not be
-        locked = (
-            await conn.execute(
-                sa.select(tables.builds.c.status)
-                .where(tables.builds.c.id == build_id, tables.builds.c.project == project)
-                .with_for_update()
-            )
-        ).one_or_none()
-        if locked is None or locked.status not in promotable:
-            raise RuntimeError(
-                f"activation lost the race: build {build_id} was no longer promotable "
-                "inside the transaction — nothing committed"
-            )
-        # re-run the DRIFT check under the lock (post-lock preflight): the
-        # pre-lock preflight is bind-time knowledge — an aborted prune can
-        # have deleted the projections between it and this lock, and
-        # promoting then would point active at missing projections
-        drift = await _drift_failures(conn, qdrant, graph_session, project, build_id)
-        if drift:
-            raise _DriftedUnderLock(drift)
+    """The promotion body — runs inside the CALLER's transaction, which must
+    already hold the project lifecycle lock (activate/rollback both do)."""
+    # take the target's row lock FIRST: this serializes against prune
+    # (which sweeps under the same lock) — if prune committed, the row
+    # is gone; if prune ABORTED after deleting the projections (the
+    # crash window), the row is back but the projections may not be
+    locked = (
         await conn.execute(
-            tables.builds.update()
-            .where(tables.builds.c.project == project, tables.builds.c.status == "active")
-            .values(status="archived")
+            sa.select(tables.builds.c.status)
+            .where(tables.builds.c.id == build_id, tables.builds.c.project == project)
+            .with_for_update()
         )
-        promoted = await conn.execute(
-            tables.builds.update()
-            .where(
-                tables.builds.c.id == build_id,
-                tables.builds.c.project == project,
-                tables.builds.c.status.in_(promotable),  # belt: the lock is the mechanism
-            )
-            .values(status="active", activated_at=datetime.now(tz=UTC))
+    ).one_or_none()
+    if locked is None or locked.status not in promotable:
+        raise RuntimeError(
+            f"activation lost the race: build {build_id} was no longer promotable "
+            "inside the transaction — nothing committed"
         )
-        if promoted.rowcount != 1:
-            raise RuntimeError(
-                f"activation lost the race: build {build_id} was no longer promotable "
-                "inside the transaction — nothing committed"
-            )
+    # re-run the DRIFT check under the lock (post-lock preflight): the
+    # pre-lock preflight is bind-time knowledge — an aborted prune can
+    # have deleted the projections between it and this lock, and
+    # promoting then would point active at missing projections
+    drift = await _drift_failures(conn, qdrant, graph_session, project, build_id)
+    if drift:
+        raise _DriftedUnderLock(drift)
+    await conn.execute(
+        tables.builds.update()
+        .where(tables.builds.c.project == project, tables.builds.c.status == "active")
+        .values(status="archived")
+    )
+    promoted = await conn.execute(
+        tables.builds.update()
+        .where(
+            tables.builds.c.id == build_id,
+            tables.builds.c.project == project,
+            tables.builds.c.status.in_(promotable),  # belt: the lock is the mechanism
+        )
+        .values(status="active", activated_at=datetime.now(tz=UTC))
+    )
+    if promoted.rowcount != 1:
+        raise RuntimeError(
+            f"activation lost the race: build {build_id} was no longer promotable "
+            "inside the transaction — nothing committed"
+        )
     return report
 
 
@@ -395,36 +415,58 @@ async def rollback(
     project: str,
 ) -> tuple[uuid.UUID | None, PreflightReport]:
     """Activate the most recently PREVIOUSLY-active build (§14: instant,
-    atomic — it is just an activation of an archived build)."""
-    # archived ⇒ was displaced from active (activation is the ONLY archiving
-    # path in this lifecycle), so the predicate must not demand activated_at:
-    # a build created directly as active (schema-legal) archives with it
-    # still NULL and would otherwise vanish as a rollback target. Ordering
-    # falls back to started_at for those rows.
-    row = (
-        await conn.execute(
-            sa.select(tables.builds.c.id)
-            .where(
-                tables.builds.c.project == project,
-                tables.builds.c.status == "archived",
-            )
-            .order_by(
-                sa.desc(
-                    sa.func.coalesce(
-                        tables.builds.c.activated_at,
-                        tables.builds.c.started_at,
-                        sa.func.now(),
+    atomic — it is an activation of an archived build).
+
+    Target selection happens INSIDE the same transaction — and under the
+    same project lifecycle lock — as the promotion: selected outside it, a
+    concurrent activation could commit in between and the pre-selected
+    target would jump history back two versions instead of one (bind-time
+    selection ≠ invariant)."""
+    deferred = ("eval gate (§20) not run — the eval harness lands in C10",)
+    await conn.rollback()  # end any auto-begun read txn before OUR txn
+    try:
+        async with conn.begin():
+            await _take_project_lock(conn, project)
+            # archived ⇒ was displaced from active (activation is the ONLY
+            # archiving path in this lifecycle); activated_at can be NULL for
+            # builds created directly as active — order falls back to
+            # started_at for those rows. Stable under the project lock.
+            row = (
+                await conn.execute(
+                    sa.select(tables.builds.c.id)
+                    .where(
+                        tables.builds.c.project == project,
+                        tables.builds.c.status == "archived",
                     )
-                ),
-                sa.desc(tables.builds.c.id),
+                    .order_by(
+                        sa.desc(
+                            sa.func.coalesce(
+                                tables.builds.c.activated_at,
+                                tables.builds.c.started_at,
+                                sa.func.now(),
+                            )
+                        ),
+                        sa.desc(tables.builds.c.id),
+                    )
+                    .limit(1)
+                )
+            ).one_or_none()
+            if row is None:
+                return None, PreflightReport(
+                    ("no previously-active build to roll back to",), deferred
+                )
+            report = await _promote_in_tx(
+                conn,
+                qdrant,
+                graph_session,
+                project,
+                row.id,
+                ("ready", "archived"),
+                PreflightReport((), deferred),
             )
-            .limit(1)
-        )
-    ).one_or_none()
-    if row is None:
-        return None, PreflightReport(("no previously-active build to roll back to",), ())
-    report = await activate(conn, qdrant, graph_session, project, row.id, allow_archived=True)
-    return row.id, report
+            return row.id, report
+    except _DriftedUnderLock as exc:
+        return None, PreflightReport(tuple(exc.failures), deferred)
 
 
 async def diff(
@@ -518,6 +560,7 @@ async def prune(
         # but a session lock_timeout/statement_timeout is the mitigation if
         # this ever runs unattended
         async with conn.begin():
+            await _take_project_lock(conn, project)
             locked = (
                 await conn.execute(
                     sa.select(tables.builds.c.status)
