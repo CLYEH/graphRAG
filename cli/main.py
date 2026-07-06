@@ -133,7 +133,7 @@ async def _run(args: argparse.Namespace) -> int:
                     # actually call — a graph-only golden set must evaluate
                     # without an API key; an unconfigured-but-needed model
                     # is a REFUSAL, never a traceback
-                    needs_embedder, needs_llm = models_needed(golden)
+                    needs_embedder, needs_llm = models_needed(golden, policy)
                     embedder = embedding_model() if needs_embedder else None
                     llm = chat_model() if needs_llm else None
                     target_build = args.build or await active_build_id(conn, args.project)

@@ -54,14 +54,20 @@ from core.stores.sqlreader import BuildScopedSqlReader
 from core.stores.vectors import BuildScopedVectorRepo
 
 
-def models_needed(golden: GoldenSet) -> tuple[bool, bool]:
-    """(needs_embedder, needs_llm) for this golden set — graph/global cases
-    touch neither model client, sql needs only the LLM, semantic only the
-    embedder, hybrid both (its selector prompts the LLM and its semantic
-    mode embeds). Lets the CLI skip constructing clients the run will never
-    call, so a graph-only golden set evaluates without an API key."""
+def models_needed(golden: GoldenSet, policy: QueryPolicy) -> tuple[bool, bool]:
+    """(needs_embedder, needs_llm) for this golden set UNDER this policy —
+    graph/global cases touch neither model client; semantic needs only the
+    embedder; hybrid needs both (its selector prompts the LLM and its
+    semantic mode embeds; semantic+global are never gated, so the selector
+    is always consulted). An ``sql`` case needs the LLM only when the
+    policy actually ENABLES text_to_sql — disabled, sql_query returns
+    MODE_SKIPPED before touching the model, and a keyless project must
+    still be able to score and persist that (failing) report rather than
+    be refused into staying unscored."""
     needs_embedder = any(case.mode in ("semantic", "hybrid") for case in golden.cases)
-    needs_llm = any(case.mode in ("sql", "hybrid") for case in golden.cases)
+    needs_llm = any(case.mode == "hybrid" for case in golden.cases) or (
+        policy.text_to_sql.enabled and any(case.mode == "sql" for case in golden.cases)
+    )
     return needs_embedder, needs_llm
 
 

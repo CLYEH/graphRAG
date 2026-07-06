@@ -321,18 +321,23 @@ def test_eval_fingerprint_is_a_pure_function_of_the_suite() -> None:
 
 
 def test_models_needed_maps_modes_to_clients() -> None:
-    """A graph-only golden set must evaluate WITHOUT an API key (Codex round
-    10): only the clients the modes actually call get constructed."""
+    """A golden set must evaluate WITHOUT an API key whenever no case's mode
+    would actually call a model UNDER THIS POLICY (Codex rounds 10+13): an
+    sql case with text_to_sql DISABLED returns MODE_SKIPPED before touching
+    the LLM — a keyless project must still persist that (failing) report."""
     from core.eval.golden import GoldenSet
     from core.eval.runner import models_needed
 
     def _set(*modes: str) -> GoldenSet:
         return GoldenSet(cases=tuple(_case(m, {"must_contain_entities": ["Acme"]}) for m in modes))
 
-    assert models_needed(_set("graph", "global")) == (False, False)
-    assert models_needed(_set("sql")) == (False, True)
-    assert models_needed(_set("semantic")) == (True, False)
-    assert models_needed(_set("hybrid")) == (True, True)
+    sql_on = SimpleNamespace(text_to_sql=SimpleNamespace(enabled=True))
+    sql_off = SimpleNamespace(text_to_sql=SimpleNamespace(enabled=False))
+    assert models_needed(_set("graph", "global"), cast(Any, sql_on)) == (False, False)
+    assert models_needed(_set("sql"), cast(Any, sql_on)) == (False, True)
+    assert models_needed(_set("sql"), cast(Any, sql_off)) == (False, False)  # skipped pre-LLM
+    assert models_needed(_set("semantic"), cast(Any, sql_off)) == (True, False)
+    assert models_needed(_set("hybrid"), cast(Any, sql_off)) == (True, True)  # selector LLM
 
 
 async def test_run_eval_refuses_when_the_persist_hits_no_build(
