@@ -182,9 +182,12 @@ async def _pg_counts(conn: AsyncConnection, project: str, build_id: uuid.UUID) -
 async def _graph_counts(session: AsyncSession, project: str, build_id: uuid.UUID) -> dict[str, int]:
     params = {"project": project, "build_id": str(build_id)}
     entity_q = "MATCH (n:Entity {project: $project, build_id: $build_id}) RETURN count(n) AS c"
+    # NB: REL edges carry build_id/type but NO project property (the
+    # projector's write shape; the repo's own _RELATION_COUNT mirrors this) —
+    # scoping the edge by project would count zero on every real build
     relation_q = (
         "MATCH (:Entity {project: $project, build_id: $build_id})"
-        "-[r:REL {project: $project, build_id: $build_id}]->"
+        "-[r:REL {build_id: $build_id}]->"
         "(:Entity {project: $project, build_id: $build_id}) RETURN count(r) AS c"
     )
     out: dict[str, int] = {}

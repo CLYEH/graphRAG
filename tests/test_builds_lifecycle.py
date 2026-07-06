@@ -78,8 +78,6 @@ async def test_prune_refuses_a_zero_window() -> None:
 
 # ---------------------------------------------------------- integration ----
 
-pytestmark = pytest.mark.integration
-
 
 @pytest.fixture()
 def migrated(require_services: None) -> None:
@@ -121,6 +119,7 @@ async def _new_build(
     return build_id
 
 
+@pytest.mark.integration
 async def test_activation_flips_atomically_and_rollback_restores(project: str) -> None:
     """DR-001: exactly one active build ever exists; activation archives the
     old active in the SAME transaction that promotes the new one; rollback is
@@ -158,6 +157,7 @@ async def test_activation_flips_atomically_and_rollback_restores(project: str) -
         await engine.dispose()
 
 
+@pytest.mark.integration
 async def test_preflight_refuses_unpromotable_and_drifted_builds(project: str) -> None:
     """§14: a 'building' build cannot be activated; a build whose Postgres
     truth disagrees with the projections (entity in PG, nothing in Neo4j) is
@@ -205,6 +205,7 @@ async def test_preflight_refuses_unpromotable_and_drifted_builds(project: str) -
         await engine.dispose()
 
 
+@pytest.mark.integration
 async def test_diff_counts_per_table(project: str) -> None:
     engine = _engine()
     try:
@@ -241,6 +242,7 @@ async def test_diff_counts_per_table(project: str) -> None:
         await engine.dispose()
 
 
+@pytest.mark.integration
 async def test_prune_keeps_the_window_and_always_the_active(project: str) -> None:
     """§14 GC: newest ``keep`` survive; the ACTIVE build survives regardless
     of age; victims disappear from Postgres including their FK children
@@ -270,6 +272,7 @@ async def test_prune_keeps_the_window_and_always_the_active(project: str) -> Non
         await engine.dispose()
 
 
+@pytest.mark.integration
 async def test_a_resolved_and_projected_build_passes_preflight(project: str) -> None:
     """The over-block dual (local review blocker): the projections hold only
     the ACTIVE subset of the SoR — merged/rejected rows stay in Postgres by
@@ -314,24 +317,36 @@ async def test_a_resolved_and_projected_build_passes_preflight(project: str) -> 
                 return entity_id
 
             survivor = await _entity("Acme", "active")
+            partner = await _entity("Globex", "active")
             casualty = await _entity("Acme Corp", "merged")
-            await writer.insert(
-                tables.relations,
-                id=uuid.uuid4(),
-                src_entity_id=survivor,
-                dst_entity_id=casualty,
-                type="partners_with",
-                relation_signature=fingerprints.relation_signature(
-                    fingerprints.entity_key("org", "Acme"),
-                    "partners_with",
-                    fingerprints.entity_key("org", "Acme Corp"),
-                ),
-                status="active",
-                review_status="unreviewed",
-                created_by="rule",
-                created_at=NOW,
-                updated_at=NOW,
-            )
+
+            async def _relation(
+                src: uuid.UUID, dst: uuid.UUID, src_name: str, dst_name: str
+            ) -> None:
+                await writer.insert(
+                    tables.relations,
+                    id=uuid.uuid4(),
+                    src_entity_id=src,
+                    dst_entity_id=dst,
+                    type="partners_with",
+                    relation_signature=fingerprints.relation_signature(
+                        fingerprints.entity_key("org", src_name),
+                        "partners_with",
+                        fingerprints.entity_key("org", dst_name),
+                    ),
+                    status="active",
+                    review_status="unreviewed",
+                    created_by="rule",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+
+            # one PROJECTED edge (both endpoints active — would have caught
+            # the round-1 P1: an edge-count predicate that no real edge
+            # satisfies makes every relation-bearing build "drifted")...
+            await _relation(survivor, partner, "Acme", "Globex")
+            # ...and one SKIPPED edge (dst did not survive resolution)
+            await _relation(survivor, casualty, "Acme", "Acme Corp")
             await conn.commit()
 
             vectors = await BuildScopedVectorProjector.for_building_build(
@@ -342,7 +357,8 @@ async def test_a_resolved_and_projected_build_passes_preflight(project: str) -> 
             )
             report = await index_build(writer, cast(BaseEmbedding, _Embedder()), vectors, graph)
             await conn.commit()
-            assert report.entities_projected == 1  # the active one only
+            assert report.entities_projected == 2  # the active pair only
+            assert report.relations_projected == 1  # the active↔active edge
             assert report.relations_skipped == 1  # dst didn't survive
 
             await conn.execute(
