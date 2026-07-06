@@ -332,6 +332,18 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      vs PG now() on backfill — container clock skew reordered rollback
      history). Pick the DB clock for DB-ordered history.
 
+   - **A judge/scoring surface gets its SEMANTICS SPEC first**: when the
+     code SCORES or GATES other code (eval harnesses, ranking, acceptance
+     checks), write the complete matching semantics BEFORE implementing —
+     the identity model (what counts as the same endpoint/edge/answer),
+     which stores must AGREE (SoR ∧ projection), the degradation behavior
+     (§22 — a judge must never crash into "unmeasured"), and comparability
+     (what makes two scores comparable: suite + policy + model identity).
+     C10 spent 17 review rounds having these semantics extracted cell by
+     cell (direction → connecting segment → endpoint identity; lookup →
+     both-stores → exact probe → degrade guard) — reactive cell
+     patching is the anti-pattern; each fix invites the next question.
+
 ## Output (exactly this shape)
 ```
 VERDICT: PASS | FAIL
