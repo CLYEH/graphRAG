@@ -125,6 +125,29 @@ async def record_run(
         any(o.status == "failed" for o in step.outcomes) for step in steps
     )
     async with conn.begin():
+        if build_id is not None:
+            # pipeline_runs has NO FK — an unverified (project, build_id)
+            # pair would attribute observability rows to one project under
+            # another's (or a pruned) build. Verify the binding INSIDE the
+            # write txn, FOR SHARE, so a concurrent prune cannot delete the
+            # build row between check and insert (the class-10 lesson:
+            # bind-time checks alone are TOCTOU). Status is deliberately
+            # unconstrained: recording a FAILED build's run is §18's whole
+            # point, and the record may land right after the flip.
+            owner = (
+                await conn.execute(
+                    sa.select(tables.builds.c.project)
+                    .where(tables.builds.c.id == build_id)
+                    .with_for_update(read=True)
+                )
+            ).scalar_one_or_none()
+            if owner is None:
+                raise LookupError(f"build {build_id} does not exist — cannot record a run")
+            if owner != project:
+                raise LookupError(
+                    f"build {build_id} belongs to project {owner!r}, not {project!r} — "
+                    "refusing a misattributed run record"
+                )
         run_id: uuid.UUID = (
             await conn.execute(
                 tables.pipeline_runs.insert()

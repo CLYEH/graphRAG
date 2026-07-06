@@ -86,6 +86,40 @@ async def test_unknown_verbosity_falls_back_to_the_frozen_minimum() -> None:
     assert all(o.status in ("failed", "skipped") for o in kept)
 
 
+async def test_misattributed_build_ids_are_refused() -> None:
+    """pipeline_runs has NO FK (Codex round 5): a cross-project or pruned
+    build_id would write observability rows under the wrong build — the
+    binding is verified inside the write txn (FOR SHARE), refused loud."""
+    import uuid as _uuid
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    class _Txn:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *exc: Any) -> None:
+            return None
+
+    class _Conn:
+        def __init__(self, owner: str | None) -> None:
+            self._owner = owner
+
+        def in_transaction(self) -> bool:
+            return False
+
+        def begin(self) -> _Txn:
+            return _Txn()
+
+        async def execute(self, statement: Any, rows: Any = None) -> Any:
+            return SimpleNamespace(scalar_one_or_none=lambda: self._owner)
+
+    with pytest.raises(LookupError, match="does not exist"):
+        await record_run(cast(Any, _Conn(None)), "p", _uuid.uuid4(), "ingest", [])
+    with pytest.raises(LookupError, match="belongs to project"):
+        await record_run(cast(Any, _Conn("other")), "p", _uuid.uuid4(), "ingest", [])
+
+
 async def test_dirty_connections_are_refused_loaned_clean() -> None:
     """The C6b idiom (Codex round 2): a rollback here would silently destroy
     the CALLER's uncommitted pipeline writes — refuse the dirty connection
@@ -129,6 +163,8 @@ async def test_default_verbosity_comes_from_settings(
             return _Txn()
 
         async def execute(self, statement: Any, rows: Any = None) -> Any:
+            if not hasattr(statement, "table"):  # the build-binding SELECT
+                return SimpleNamespace(scalar_one_or_none=lambda: "p")
             if rows is not None:
                 captured_rows.extend(rows)
             return SimpleNamespace(scalar_one=lambda: _uuid.uuid4(), rowcount=1)
@@ -335,6 +371,8 @@ async def test_record_run_shapes_on_fakes() -> None:
             return _Txn()
 
         async def execute(self, statement: Any, rows: Any = None) -> Any:
+            if not hasattr(statement, "table"):  # the build-binding SELECT
+                return SimpleNamespace(scalar_one_or_none=lambda: "p")
             table = statement.table.name
             inserted.append((table, rows))
             return SimpleNamespace(scalar_one=lambda: _uuid.uuid4(), rowcount=1)
