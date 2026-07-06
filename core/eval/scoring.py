@@ -12,9 +12,11 @@ text (titles + texts) and their citations (source_refs):
 - ``answer_regex`` → 1/0: the pattern matches the concatenated result text
   in its ORIGINAL casing (case-sensitive, as regexes are by default).
 - ``must_include_relations`` → relation_hit_rate: a relation expectation
-  hits when one relation/path result's visible text carries the type and
-  src BEFORE dst with no reversed-arrow hop ("<-") between them (§27.3:
-  direction matters — a reversed edge or backward path hop does not hit).
+  hits when one relation/path result's visible text carries src BEFORE
+  dst with the expected type ON the connecting segment: an arrow-rendered
+  segment must be exactly one forward hop of that type (§27.3 — reversed
+  hops, intermediate nodes, and other types on the direct hop do not hit);
+  plain relation titles match the type between the endpoints.
 - ``must_have_valid_paths`` → path_validity: the share of path results whose
   per-edge relation refs all resolve against the SoR (the runner passes the
   resolution callback); asserting it with NO path results returned scores 0
@@ -98,10 +100,15 @@ def relation_hit_rate(response: McpResponse, expected: Sequence[Mapping[str, str
         dst = expectation["dst"].casefold()
         for text in texts:
             # direction matters (§27.3): src must appear BEFORE dst, and the
-            # SEGMENT BETWEEN them must not traverse a reversed edge — path
-            # results render backward hops as "<-[type]-" (graph.py), so
-            # "acme <-[t]- globex" has src before dst textually while the
-            # stored edge points the OTHER way
+            # expected TYPE must sit ON the segment CONNECTING them — not
+            # merely somewhere in the same result. Two renderings exist:
+            # graph paths write hops as "-[type]->" / "<-[type]-" (graph.py),
+            # so an arrow-bearing segment must be EXACTLY one forward hop of
+            # the expected type (an intermediate node or a different type on
+            # the direct hop is NOT the expected edge, and a reversed hop
+            # points the other way); plain relation titles ("src type dst")
+            # carry no arrows, so the type need only appear between the
+            # endpoints.
             src_at = text.find(src)
             if src_at < 0:
                 continue
@@ -109,7 +116,11 @@ def relation_hit_rate(response: McpResponse, expected: Sequence[Mapping[str, str
             if dst_at < 0:
                 continue
             between = text[src_at + len(src) : dst_at]
-            if rel_type in text and "<-" not in between:
+            if "-[" in between or "<-" in between or "->" in between:
+                if re.fullmatch(rf"\s*-\[{re.escape(rel_type)}\]->\s*", between):
+                    hits += 1
+                    break
+            elif rel_type in between:
                 hits += 1
                 break
     return hits / len(expected)

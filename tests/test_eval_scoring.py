@@ -81,6 +81,18 @@ def test_relation_hit_needs_all_three_in_one_result() -> None:
         _result(result_type="path", title="Initech -[owns]-> Acme -[partners_with]-> Globex")
     )
     assert scoring.relation_hit_rate(forward_hop, expected) == 1.0
+    # the TYPE must sit on the CONNECTING segment (Codex round 4): a path
+    # where the expected type belongs to a LATER hop is not the edge...
+    type_elsewhere = _response(
+        _result(result_type="path", title="Acme -[owns]-> Globex -[partners_with]-> Initech")
+    )
+    assert scoring.relation_hit_rate(type_elsewhere, expected) == 0.0
+    # ...nor is a two-hop span through an intermediate node (the round-2
+    # deferred cell — closed together with this)
+    intermediate = _response(
+        _result(result_type="path", title="Acme -[owns]-> Megacorp -[partners_with]-> Globex")
+    )
+    assert scoring.relation_hit_rate(intermediate, expected) == 0.0
 
 
 def test_relation_hits_only_count_relation_and_path_results() -> None:
