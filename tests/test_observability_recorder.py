@@ -86,9 +86,77 @@ async def test_unknown_verbosity_falls_back_to_the_frozen_minimum() -> None:
     assert all(o.status in ("failed", "skipped") for o in kept)
 
 
+async def test_dirty_connections_are_refused_loaned_clean() -> None:
+    """The C6b idiom (Codex round 2): a rollback here would silently destroy
+    the CALLER's uncommitted pipeline writes — refuse the dirty connection
+    loud instead."""
+    from typing import Any, cast
+
+    class _Dirty:
+        def in_transaction(self) -> bool:
+            return True
+
+    with pytest.raises(RuntimeError, match="no open transaction"):
+        await record_run(cast(Any, _Dirty()), "p", uuid.uuid4(), "ingest", [])
+    with pytest.raises(RuntimeError, match="no open transaction"):
+        await purge_expired_items(cast(Any, _Dirty()))
+
+
+async def test_default_verbosity_comes_from_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round 2: the 🔧 tunable must WORK without every caller wiring
+    it — verbosity=None reads observability_item_logging from settings; an
+    explicit argument overrides."""
+    import uuid as _uuid
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    captured_rows: list[Any] = []
+
+    class _Txn:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *exc: Any) -> None:
+            return None
+
+    class _Conn:
+        def in_transaction(self) -> bool:
+            return False
+
+        def begin(self) -> _Txn:
+            return _Txn()
+
+        async def execute(self, statement: Any, rows: Any = None) -> Any:
+            if rows is not None:
+                captured_rows.extend(rows)
+            return SimpleNamespace(scalar_one=lambda: _uuid.uuid4(), rowcount=1)
+
+    import core.config as config_module
+
+    monkeypatch.setattr(
+        config_module,
+        "get_settings",
+        lambda: SimpleNamespace(observability_item_logging="all"),
+    )
+    await record_run(
+        cast(Any, _Conn()),
+        "p",
+        _uuid.uuid4(),
+        "ingest",
+        [StepReport("chunk", (ItemOutcome("document", "hash-ok", "indexed"),))],
+    )
+    assert len(captured_rows) == 1  # "all" persisted the success row
+
+
 async def test_purge_refuses_a_zero_window() -> None:
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    clean = SimpleNamespace(in_transaction=lambda: False)
     with pytest.raises(ValueError, match="retention_days must be >= 1"):
-        await purge_expired_items(None, retention_days=0)  # type: ignore[arg-type]
+        await purge_expired_items(cast(Any, clean), retention_days=0)
 
 
 # ---------------------------------------------------------- integration ----
@@ -173,7 +241,10 @@ async def test_record_run_persists_three_layers_with_verbosity(project: str) -> 
             ]
 
             # §27.7 build binding: a non-validation kind with NULL build_id
-            # is refused by the CHECK, loud
+            # is refused by the CHECK, loud. (The reads above auto-began a
+            # txn — ending it is the CALLER's job under the loaned-clean
+            # contract, exactly what the fence enforces.)
+            await conn.rollback()
             with pytest.raises(Exception, match="pipeline_runs_build_binding"):
                 await record_run(conn, project, None, "ingest", [])
             await conn.rollback()
@@ -181,6 +252,7 @@ async def test_record_run_persists_three_layers_with_verbosity(project: str) -> 
             # the SUCCESS path must satisfy the frozen JobStatus CHECK
             # (queued/running/done/failed/cancelled) — the cell whose absence
             # let "succeeded" slip past every masked test (local blocker)
+            await conn.rollback()  # loaned-clean: end this test's read txn
             clean_run = await record_run(
                 conn,
                 project,
@@ -197,7 +269,9 @@ async def test_record_run_persists_three_layers_with_verbosity(project: str) -> 
             ).scalar_one()
             assert stored == "done"
 
-            # retention: nothing young enough is purged
+            # retention: nothing young enough is purged (loaned-clean: end
+            # the read txn our assertions auto-began first)
+            await conn.rollback()
             assert await purge_expired_items(conn, retention_days=30) == 0
     finally:
         await engine.dispose()
@@ -254,8 +328,8 @@ async def test_record_run_shapes_on_fakes() -> None:
             return None
 
     class _Conn:
-        async def rollback(self) -> None:
-            return None
+        def in_transaction(self) -> bool:
+            return False
 
         def begin(self) -> _Txn:
             return _Txn()
@@ -297,8 +371,8 @@ async def test_purge_composes_the_retention_cutoff_on_fakes() -> None:
             return None
 
     class _Conn:
-        async def rollback(self) -> None:
-            return None
+        def in_transaction(self) -> bool:
+            return False
 
         def begin(self) -> _Txn:
             return _Txn()

@@ -93,22 +93,37 @@ async def record_run(
     kind: str,
     steps: list[StepReport],
     *,
-    verbosity: str = "failures",
+    verbosity: str | None = None,
     created_by: str = "pipeline",
     error: str | None = None,
 ) -> uuid.UUID:
     """Persist one run with its steps and (verbosity-filtered) items.
 
-    Runs in the CALLER's transaction discipline: this opens one transaction
-    for the whole record (a half-written run would misreport §18's Console
-    line). Returns the run id."""
+    ``verbosity=None`` (the default) reads 🔧
+    ``observability.item_logging`` from settings — the tunable works without
+    every caller wiring it; an explicit argument overrides.
+
+    LOANED-CLEAN connection (the C6b idiom): the caller must hand a
+    connection with NO open transaction — rolling one back here would
+    silently destroy the caller's uncommitted pipeline writes, and
+    committing it would publish work the caller may still abort. This
+    module opens exactly one transaction for the whole record (a
+    half-written run would misreport §18's Console line)."""
+    if conn.in_transaction():
+        raise RuntimeError(
+            "record_run requires a connection with no open transaction — commit or "
+            "roll back the pipeline's own work first (a rollback here would destroy it)"
+        )
+    if verbosity is None:
+        from core.config import get_settings
+
+        verbosity = get_settings().observability_item_logging
     if verbosity not in ITEM_LOGGING_MODES:
         verbosity = "failures"  # fail-closed to the frozen minimum
     now = datetime.now(tz=UTC)
     run_failed = error is not None or any(
         any(o.status == "failed" for o in step.outcomes) for step in steps
     )
-    await conn.rollback()  # end any auto-begun read txn before OUR txn
     async with conn.begin():
         run_id: uuid.UUID = (
             await conn.execute(
@@ -163,19 +178,25 @@ async def record_run(
     return run_id
 
 
-async def purge_expired_items(conn: AsyncConnection, *, retention_days: int) -> int:
-    """§18 retention (🔧 ``observability.item_retention_days``): delete item
-    ROWS whose parent run finished more than ``retention_days`` ago. Runs and
-    steps (the counters) are kept — only the per-item detail expires; the
-    §27.7 retry boundary only ever replays the LATEST run's failures, which
-    a sane retention window never touches."""
+async def purge_expired_items(conn: AsyncConnection, *, retention_days: int | None = None) -> int:
+    """§18 retention (🔧 ``observability.item_retention_days``, the settings
+    default when the argument is omitted): delete item ROWS whose parent run
+    finished more than ``retention_days`` ago. Runs and steps (the counters)
+    are kept — only the per-item detail expires; the §27.7 retry boundary
+    only ever replays the LATEST run's failures, which a sane retention
+    window never touches. Loaned-clean connection, like record_run."""
+    if conn.in_transaction():
+        raise RuntimeError("purge_expired_items requires a connection with no open transaction")
+    if retention_days is None:
+        from core.config import get_settings
+
+        retention_days = get_settings().observability_item_retention_days
     if retention_days < 1:
         raise ValueError(
             "retention_days must be >= 1 — a zero window would erase "
             "the retry boundary's input as it is written"
         )
     cutoff = sa.text("now() - make_interval(days => :days)").bindparams(days=retention_days)
-    await conn.rollback()
     async with conn.begin():
         result = await conn.execute(
             tables.pipeline_step_items.delete().where(
