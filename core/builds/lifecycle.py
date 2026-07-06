@@ -51,6 +51,7 @@ from core.stores.vectors import collection_for
 _BUILD_TABLES: tuple[sa.Table, ...] = (
     tables.relation_evidence,
     tables.relations,
+    tables.merge_candidates,
     tables.community_reports,
     tables.entities,
     tables.chunks,
@@ -354,7 +355,24 @@ async def diff(
     conn: AsyncConnection, project: str, build_a: uuid.UUID, build_b: uuid.UUID
 ) -> dict[str, dict[str, int]]:
     """Row-count delta per build-scoped table between two builds (the CLI's
-    ``graphrag diff``): {table: {a, b, delta}}."""
+    ``graphrag diff``): {table: {a, b, delta}}.
+
+    Both builds must belong to ``project`` — the build-only tables (chunks,
+    relation_evidence) are scoped by build_id alone, so a foreign build id
+    (typo, copied uuid) would otherwise produce a MIXED cross-project diff
+    instead of a refusal."""
+    known = {
+        row.id
+        for row in await conn.execute(
+            sa.select(tables.builds.c.id).where(
+                tables.builds.c.project == project,
+                tables.builds.c.id.in_([build_a, build_b]),
+            )
+        )
+    }
+    for label, build in (("a", build_a), ("b", build_b)):
+        if build not in known:
+            raise ValueError(f"build {label}={build} does not belong to project {project}")
     out: dict[str, dict[str, int]] = {}
     for table in reversed(_BUILD_TABLES):  # parent-first reads nicer
         counts: dict[str, int] = {}

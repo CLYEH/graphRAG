@@ -82,7 +82,13 @@ async def _run(args: argparse.Namespace) -> int:
                     print(f"rolled back to {target}")
                 return _print_report(report)
             if args.command == "diff":
-                table_diff = await lifecycle.diff(conn, args.project, args.build_a, args.build_b)
+                try:
+                    table_diff = await lifecycle.diff(
+                        conn, args.project, args.build_a, args.build_b
+                    )
+                except ValueError as exc:
+                    print(f"REFUSED: {exc}", file=sys.stderr)
+                    return 1
                 for table, counts in table_diff.items():
                     print(
                         f"{table:20s} a={counts['a']:8d}  b={counts['b']:8d}  "

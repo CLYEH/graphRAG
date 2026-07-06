@@ -234,10 +234,38 @@ async def test_diff_counts_per_table(project: str) -> None:
                 confidence=1.0,
             )
             await conn.commit()
+            partner_id = uuid.uuid4()
+            await writer.insert(
+                tables.entities,
+                id=partner_id,
+                type="org",
+                canonical_name="Globex",
+                entity_key=fingerprints.entity_key("org", "Globex"),
+                status="active",
+                review_status="unreviewed",
+                created_by="rule",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            await writer.insert(
+                tables.merge_candidates,
+                id=uuid.uuid4(),
+                left_entity_id=entity_id,
+                right_entity_id=partner_id,
+                score=0.9,
+                status="pending",
+            )
+            await conn.commit()
             table_diff = await diff(conn, project, empty, full)
-            assert table_diff["entities"] == {"a": 0, "b": 1, "delta": 1}
+            assert table_diff["entities"] == {"a": 0, "b": 2, "delta": 2}
             assert table_diff["entity_mentions"] == {"a": 0, "b": 1, "delta": 1}
+            # merge-review work is build state too — it must show in the diff
+            assert table_diff["merge_candidates"] == {"a": 0, "b": 1, "delta": 1}
             assert table_diff["documents"]["delta"] == 0
+
+            # a foreign build id must be REFUSED, not mixed cross-project
+            with pytest.raises(ValueError, match="does not belong to project"):
+                await diff(conn, project, empty, uuid.uuid4())
     finally:
         await engine.dispose()
 
