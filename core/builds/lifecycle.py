@@ -62,6 +62,15 @@ _BUILD_TABLES: tuple[sa.Table, ...] = (
 _DRIFT_TOLERANCE = 0
 
 
+class _DriftedUnderLock(Exception):
+    """Raised inside the activation transaction when the post-lock drift
+    re-check fails — converted to a refusal report (nothing committed)."""
+
+    def __init__(self, failures: list[str]) -> None:
+        super().__init__("; ".join(failures))
+        self.failures = failures
+
+
 @dataclass(frozen=True)
 class BuildInfo:
     """One row of ``graphrag builds``."""
@@ -218,6 +227,36 @@ async def _vector_count(client: AsyncQdrantClient, project: str, build_id: uuid.
     return int(result.count)
 
 
+async def _drift_failures(
+    conn: AsyncConnection,
+    qdrant: AsyncQdrantClient,
+    graph_session: AsyncSession,
+    project: str,
+    build_id: uuid.UUID,
+) -> list[str]:
+    """§19 drift: the projections must hold exactly the projected subset of
+    the Postgres truth (see _pg_counts). Shared by preflight AND activate's
+    post-lock re-check."""
+    failures: list[str] = []
+    pg = await _pg_counts(conn, project, build_id)
+    graph = await _graph_counts(graph_session, project, build_id)
+    if abs(pg["entities"] - graph["entities"]) > _DRIFT_TOLERANCE:
+        failures.append(
+            f"graph drift: postgres has {pg['entities']} entities, neo4j {graph['entities']}"
+        )
+    if abs(pg["relations"] - graph["relations"]) > _DRIFT_TOLERANCE:
+        failures.append(
+            f"graph drift: postgres has {pg['relations']} relations, neo4j {graph['relations']}"
+        )
+    # the vector projection holds exactly the EMBEDDED chunk+entity points
+    points = await _vector_count(qdrant, project, build_id)
+    if abs(points - pg["points"]) > _DRIFT_TOLERANCE:
+        failures.append(
+            f"vector drift: postgres implies {pg['points']} embedded points, qdrant has {points}"
+        )
+    return failures
+
+
 async def preflight(
     conn: AsyncConnection,
     qdrant: AsyncQdrantClient,
@@ -253,22 +292,7 @@ async def preflight(
             f"build status is '{status}' — promotable statuses here: {', '.join(promotable)}"
         )
 
-    pg = await _pg_counts(conn, project, build_id)
-    graph = await _graph_counts(graph_session, project, build_id)
-    if abs(pg["entities"] - graph["entities"]) > _DRIFT_TOLERANCE:
-        failures.append(
-            f"graph drift: postgres has {pg['entities']} entities, neo4j {graph['entities']}"
-        )
-    if abs(pg["relations"] - graph["relations"]) > _DRIFT_TOLERANCE:
-        failures.append(
-            f"graph drift: postgres has {pg['relations']} relations, neo4j {graph['relations']}"
-        )
-    # the vector projection holds exactly the EMBEDDED chunk+entity points
-    points = await _vector_count(qdrant, project, build_id)
-    if abs(points - pg["points"]) > _DRIFT_TOLERANCE:
-        failures.append(
-            f"vector drift: postgres implies {pg['points']} embedded points, qdrant has {points}"
-        )
+    failures.extend(await _drift_failures(conn, qdrant, graph_session, project, build_id))
 
     return PreflightReport(
         tuple(failures),
@@ -300,7 +324,48 @@ async def activate(
     # activation transaction below is the connection's ONLY one (the same
     # explicit-rollback idiom as the MCP binding path)
     await conn.rollback()
+    promotable = ("ready", "archived") if allow_archived else ("ready",)
+    try:
+        return await _promote_under_lock(
+            conn, qdrant, graph_session, project, build_id, promotable, report
+        )
+    except _DriftedUnderLock as exc:
+        return PreflightReport(tuple(exc.failures), report.deferred)
+
+
+async def _promote_under_lock(
+    conn: AsyncConnection,
+    qdrant: AsyncQdrantClient,
+    graph_session: AsyncSession,
+    project: str,
+    build_id: uuid.UUID,
+    promotable: tuple[str, ...],
+    report: PreflightReport,
+) -> PreflightReport:
     async with conn.begin():
+        # take the target's row lock FIRST: this serializes against prune
+        # (which sweeps under the same lock) — if prune committed, the row
+        # is gone; if prune ABORTED after deleting the projections (the
+        # crash window), the row is back but the projections may not be
+        locked = (
+            await conn.execute(
+                sa.select(tables.builds.c.status)
+                .where(tables.builds.c.id == build_id, tables.builds.c.project == project)
+                .with_for_update()
+            )
+        ).one_or_none()
+        if locked is None or locked.status not in promotable:
+            raise RuntimeError(
+                f"activation lost the race: build {build_id} was no longer promotable "
+                "inside the transaction — nothing committed"
+            )
+        # re-run the DRIFT check under the lock (post-lock preflight): the
+        # pre-lock preflight is bind-time knowledge — an aborted prune can
+        # have deleted the projections between it and this lock, and
+        # promoting then would point active at missing projections
+        drift = await _drift_failures(conn, qdrant, graph_session, project, build_id)
+        if drift:
+            raise _DriftedUnderLock(drift)
         await conn.execute(
             tables.builds.update()
             .where(tables.builds.c.project == project, tables.builds.c.status == "active")
@@ -311,9 +376,7 @@ async def activate(
             .where(
                 tables.builds.c.id == build_id,
                 tables.builds.c.project == project,
-                # re-check INSIDE the transaction: the status may have moved
-                # since preflight (bind-time check ≠ invariant — class 10)
-                tables.builds.c.status.in_(("ready", "archived") if allow_archived else ("ready",)),
+                tables.builds.c.status.in_(promotable),  # belt: the lock is the mechanism
             )
             .values(status="active", activated_at=datetime.now(tz=UTC))
         )

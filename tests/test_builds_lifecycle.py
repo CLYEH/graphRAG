@@ -488,3 +488,100 @@ async def test_prune_skips_a_victim_promoted_after_the_snapshot(project: str) ->
         await driver.close()
         await engine.dispose()
         await engine2.dispose()
+
+
+@pytest.mark.integration
+async def test_activation_rechecks_drift_under_the_lock(project: str) -> None:
+    """The prune crash window: projections deleted, PG rolled back — an
+    activate that passed preflight BEFORE the deletion and then waited on
+    the row lock must NOT promote blindly. Interleaving (deterministic):
+    conn2 pre-locks the target; activate passes preflight (projections
+    intact) and blocks; the projections are deleted while it waits; on
+    release, the POST-LOCK drift re-check refuses and nothing commits.
+    Reverting the post-lock re-check promotes a build whose projections are
+    gone → this test fails."""
+    import asyncio
+    from typing import cast
+
+    from llama_index.core.base.embeddings.base import BaseEmbedding
+    from sqlalchemy import select
+
+    from core.index.indexing import index_build
+    from core.stores.graph import BuildScopedGraphProjector
+    from core.stores.vectors import BuildScopedVectorProjector
+
+    class _Embedder:
+        async def aget_text_embedding(self, text: str) -> list[float]:
+            return [float(len(text)), 1.0, 0.0, 0.0]
+
+    engine, engine2 = _engine(), _engine()
+    qdrant = vector_client()
+    driver = graph_driver()
+    try:
+        async with (
+            engine.connect() as conn,
+            engine2.connect() as conn2,
+            driver.session() as session,
+            driver.session() as session2,
+        ):
+            build_id = await _new_build(conn, project, status="building")
+            writer = await BuildScopedWriter.for_building_build(conn, project, build_id)
+            await writer.insert(
+                tables.entities,
+                id=uuid.uuid4(),
+                type="org",
+                canonical_name="Acme",
+                entity_key=fingerprints.entity_key("org", "Acme"),
+                status="active",
+                review_status="unreviewed",
+                created_by="rule",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            await conn.commit()
+            vectors = await BuildScopedVectorProjector.for_building_build(
+                conn, qdrant, project, build_id
+            )
+            graph = await BuildScopedGraphProjector.for_building_build(
+                conn, session, project, build_id
+            )
+            await index_build(writer, cast(BaseEmbedding, _Embedder()), vectors, graph)
+            await conn.commit()
+            await conn.execute(
+                tables.builds.update().where(tables.builds.c.id == build_id).values(status="ready")
+            )
+            await conn.commit()
+
+            # conn2 pre-locks the target row, so activate passes preflight
+            # (projections still intact) and then BLOCKS inside its tx
+            txn2 = await conn2.begin()
+            await conn2.execute(
+                select(tables.builds.c.status)
+                .where(tables.builds.c.id == build_id)
+                .with_for_update()
+            )
+            activate_task = asyncio.ensure_future(
+                activate(conn, qdrant, session, project, build_id)
+            )
+            done, _ = await asyncio.wait([activate_task], timeout=1.5)
+            assert not done  # blocked post-preflight, pre-promote
+
+            # the crash window: projections vanish while activate waits
+            await (
+                await session2.run(
+                    "MATCH (n:Entity {project: $project, build_id: $build_id}) DETACH DELETE n",
+                    {"project": project, "build_id": str(build_id)},
+                )
+            ).consume()
+            await txn2.commit()  # release the lock
+
+            report = await asyncio.wait_for(activate_task, timeout=15)
+            assert not report.ok  # the post-lock re-check REFUSED
+            assert any("drift" in f for f in report.failures)
+            statuses = {b.id: b.status for b in await list_builds(conn, project)}
+            assert statuses[build_id] == "ready"  # nothing committed
+    finally:
+        await qdrant.close()
+        await driver.close()
+        await engine.dispose()
+        await engine2.dispose()
