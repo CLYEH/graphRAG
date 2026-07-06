@@ -302,7 +302,7 @@ async def _subgraph(
     # edge FETCH (LIMIT in the store, +1 as the truncation probe) and the
     # emitted result list are capped; entities keep priority (nearest-first),
     # relations fill the remainder.
-    node_ids = [entity_id for entity_id, _, _ in entities]
+    node_ids = [entity_id for entity_id, _, _, _ in entities]
     edge_budget = policy.max_rows - len(entities)
     relations: list[tuple[uuid.UUID, str, tuple[SourceRef, ...]]] = []
     edge_dropped = 0
@@ -351,7 +351,7 @@ async def _neighbor_entities(
     deadline: float,
     *,
     include_seeds: bool = False,
-) -> tuple[list[tuple[uuid.UUID, int, tuple[SourceRef, ...]]], int, bool, bool]:
+) -> tuple[list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]], int, bool, bool]:
     """Traverse from every seed, merge, re-verify against the SoR.
 
     Returns ``(kept, dropped, truncated, timed_out)`` where ``kept`` is
@@ -443,7 +443,8 @@ async def _neighbor_entities(
     # still-active entity; mentions_by_entity filters status='active', so a
     # drifted (non-active) node resolves to zero mentions and is dropped.
     mentions = await repo.mentions_by_entity([entity_id for entity_id, _ in ordered])
-    kept: list[tuple[uuid.UUID, int, tuple[SourceRef, ...]]] = []
+    names = await repo.active_entity_names([entity_id for entity_id, _ in ordered])
+    kept: list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]] = []
     for entity_id, distance in ordered:
         refs = tuple(
             SourceRef(source_type=source_type, id=source_ref)
@@ -451,7 +452,7 @@ async def _neighbor_entities(
             if (source_type := _MENTION_SOURCE_TYPE.get(kind)) is not None
         )
         if refs:
-            kept.append((entity_id, distance, refs))
+            kept.append((entity_id, distance, refs, names.get(entity_id)))
         else:
             dropped += 1
     return kept, dropped, truncated, timed_out
@@ -469,21 +470,28 @@ async def _relation_results(
     clean = [triple for triple in triples if triple is not None]
     dropped = len(triples) - len(clean)
     resolved = await repo.relations_with_evidence(clean)
+    endpoint_ids = {t[0] for t in clean} | {t[1] for t in clean}
+    names = await repo.active_entity_names(endpoint_ids)
     kept: list[tuple[uuid.UUID, str, tuple[SourceRef, ...]]] = []
     for triple in clean:
         if triple not in resolved:
             dropped += 1  # stale projection edge — no active SoR relation
             continue
         relation_id, evidence_rows = resolved[triple]
-        refs = tuple(ref for row in evidence_rows if (ref := _evidence_ref(row)) is not None)
+        refs = tuple(ref for row in evidence_rows if (ref := evidence_ref(row)) is not None)
         if not refs:
             dropped += 1  # §27.2: a relation result cites ≥1 evidence; none survived
             continue
-        kept.append((relation_id, triple[2], refs))
+        # rendered like a one-hop path ("src -[type]-> dst") so consumers —
+        # agents and §20 relation_hit_rate alike — read the edge from the
+        # visible text; bare ids are unreadable to both
+        src_name = names.get(triple[0], str(triple[0]))
+        dst_name = names.get(triple[1], str(triple[1]))
+        kept.append((relation_id, f"{src_name} -[{triple[2]}]-> {dst_name}", refs))
     return kept, dropped
 
 
-def _evidence_ref(row: dict[str, Any]) -> SourceRef | None:
+def evidence_ref(row: dict[str, Any]) -> SourceRef | None:
     """One relation_evidence row → a §16 evidence-backed ref, or None.
 
     The SoR columns are nullable where the frozen contract shapes are not
@@ -544,7 +552,7 @@ def _evidence_ref(row: dict[str, Any]) -> SourceRef | None:
 
 
 def _score(
-    entities: list[tuple[uuid.UUID, int, tuple[SourceRef, ...]]],
+    entities: list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]],
     relations: list[tuple[uuid.UUID, str, tuple[SourceRef, ...]]] | None = None,
 ) -> tuple[RetrievalResult, ...]:
     """Positional scores across [entities…, relations…] — graph hits carry no
@@ -554,24 +562,27 @@ def _score(
     if total == 0:
         return ()
     results: list[RetrievalResult] = []
-    for index, (entity_id, _, refs) in enumerate(entities):
+    for index, (entity_id, _, refs, name) in enumerate(entities):
         results.append(
             RetrievalResult(
                 result_type="entity",
                 id=str(entity_id),
                 score=(total - index) / total,
                 source_refs=refs,
+                # the SoR's canonical name — visible text for consumers and
+                # for §20 entity_recall (a bare uuid is unreadable to both)
+                title=name,
             )
         )
-    for offset, (relation_id, rel_type, refs) in enumerate(relations or []):
+    for offset, (relation_id, rendered, refs) in enumerate(relations or []):
         index = len(entities) + offset
         results.append(
             RetrievalResult(
                 result_type="relation",
                 id=str(relation_id),
+                title=rendered,
                 score=(total - index) / total,
                 source_refs=refs,
-                title=rel_type,
             )
         )
     return ordered_results(results)

@@ -197,6 +197,32 @@ async def resolve_active_binding(conn: AsyncConnection, project: str) -> ActiveB
     return ActiveBinding(project, build, _token=_BINDING_TOKEN)
 
 
+async def resolve_eval_binding(
+    conn: AsyncConnection, project: str, build_id: uuid.UUID
+) -> ActiveBinding:
+    """The §20 eval path: mint a binding for a CANDIDATE build.
+
+    Evaluation gates activation (§14), so it must read builds that are not
+    yet active — the ONLY relaxation: the named build must exist in this
+    project with status ``ready`` or ``active`` (a building build has no
+    stable content to score; archived history is not what the gate is for).
+    Everything else about the fence is unchanged — the proof still cannot be
+    forged or rebound, and query/MCP surfaces never call this."""
+    row = (
+        await conn.execute(
+            sa.select(tables.builds.c.status).where(
+                tables.builds.c.id == build_id, tables.builds.c.project == project
+            )
+        )
+    ).one_or_none()
+    if row is None or row.status not in ("ready", "active"):
+        raise LookupError(
+            f"build {build_id} is not evaluable in project {project} "
+            f"(status={'missing' if row is None else row.status}; needs ready|active)"
+        )
+    return ActiveBinding(project, build_id, _token=_BINDING_TOKEN)
+
+
 #: The characters a PostgreSQL operator name may contain (PG manual §4.1.3).
 #: SQLAlchemy renders dialect operators (JSONB ``->>``/``@>``/``?``, array
 #: ``&&`` …) as ``custom_op`` nodes whose opstring is drawn ENTIRELY from this
@@ -511,6 +537,22 @@ class BuildScopedRepo:
         for row in rows:
             grouped.setdefault(row.entity_id, []).append((row.source_kind, row.source_ref))
         return grouped
+
+    async def active_entity_names(self, entity_ids: Collection[uuid.UUID]) -> dict[uuid.UUID, str]:
+        """canonical_name per ACTIVE entity id (scoped) — the inverse of
+        entity_ids_by_name; lets graph results carry the human-readable name
+        the SoR holds (C10: eval recall reads visible text; agents too)."""
+        if not entity_ids:
+            return {}
+        entities = tables.entities
+        query = sa.select(entities.c.id, entities.c.canonical_name).where(
+            entities.c.project == self.project,
+            entities.c.build_id == self.build_id,
+            entities.c.status == "active",
+            entities.c.id.in_(list(entity_ids)),
+        )
+        rows = (await self._execute(query)).fetchall()
+        return {row.id: row.canonical_name for row in rows}
 
     async def entity_ids_by_name(self, name: str) -> list[uuid.UUID]:
         """Active entity ids whose canonical_name matches ``name`` (SoR seed

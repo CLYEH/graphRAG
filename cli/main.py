@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import sys
 import uuid
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -44,6 +45,24 @@ def _parser() -> argparse.ArgumentParser:
     diff.add_argument("project")
     diff.add_argument("build_a", type=uuid.UUID)
     diff.add_argument("build_b", type=uuid.UUID)
+
+    evalp = sub.add_parser("eval", help="score a build against eval/golden.yaml (§20)")
+    evalp.add_argument("project")
+    evalp.add_argument(
+        "--build", type=uuid.UUID, default=None, help="build to score (default: the active build)"
+    )
+    evalp.add_argument(
+        "--golden",
+        type=Path,
+        default=None,
+        help="golden set path (default: projects/<project>/eval/golden.yaml)",
+    )
+    evalp.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="project config with query_policy (default: projects/<project>/config.yaml)",
+    )
 
     prune = sub.add_parser("prune", help="GC builds beyond the retention window")
     prune.add_argument("project")
@@ -95,6 +114,56 @@ async def _run(args: argparse.Namespace) -> int:
                         f"delta={counts['delta']:+d}"
                     )
                 return 0
+            if args.command == "eval":
+                from core.eval.golden import GoldenError, load_golden
+                from core.eval.runner import models_needed, run_eval
+                from core.llm.factory import LLMNotConfiguredError, chat_model, embedding_model
+                from core.mcp.policy import PolicyError, load_query_policy
+                from core.stores.repo import active_build_id
+
+                root = Path("projects") / args.project
+                try:
+                    golden = load_golden(args.golden or root / "eval" / "golden.yaml")
+                    policy = load_query_policy(args.config or root / "config.yaml")
+                except (GoldenError, PolicyError) as exc:
+                    print(f"REFUSED: {exc}", file=sys.stderr)
+                    return 1
+                try:
+                    # only the model clients the golden set's modes will
+                    # actually call — a graph-only golden set must evaluate
+                    # without an API key; an unconfigured-but-needed model
+                    # is a REFUSAL, never a traceback
+                    needs_embedder, needs_llm = models_needed(golden, policy)
+                    embedder = embedding_model() if needs_embedder else None
+                    llm = chat_model() if needs_llm else None
+                    target_build = args.build or await active_build_id(conn, args.project)
+                    await conn.rollback()  # end the lookup's read txn
+                    eval_report = await run_eval(
+                        conn,
+                        qdrant,
+                        session,
+                        embedder,
+                        llm,
+                        args.project,
+                        target_build,
+                        golden,
+                        policy,
+                    )
+                except (LookupError, LLMNotConfiguredError) as exc:
+                    print(f"REFUSED: {exc}", file=sys.stderr)
+                    return 1
+                for case_result in eval_report.cases:
+                    mark = "PASS" if case_result.passed else "FAIL"
+                    note = f"  ({case_result.note})" if case_result.note else ""
+                    print(
+                        f"{mark}  {case_result.score:.3f}  "
+                        f"[{case_result.mode}] {case_result.question}{note}"
+                    )
+                print(
+                    f"score={eval_report.score:.4f}  "
+                    f"passed={eval_report.passed}  failed={eval_report.failed}"
+                )
+                return 0 if eval_report.failed == 0 else 1
             if args.command == "prune":
                 keep = args.keep if args.keep is not None else settings.retention_keep_builds
                 victims = await lifecycle.prune(conn, qdrant, session, args.project, keep=keep)

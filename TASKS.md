@@ -57,7 +57,7 @@ Keep items small enough to finish in one loop.
 - [x] C7 Global summary (Leiden communities + reports)
 - [x] C8 MCP server (per project) exposing the tool set
 - [x] C9 builds/activate/rollback/diff/prune (CLI + core)
-- [ ] C10 Eval harness runner
+- [x] C10 Eval harness runner
 - [ ] C11 Observability wiring + drift detection
 
 ## Track 2 — Console backend (FastAPI + arq)  *(needs Track 0 P0; C-items as they land)*

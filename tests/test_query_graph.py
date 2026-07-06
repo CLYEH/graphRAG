@@ -159,6 +159,10 @@ class _FakeSoR:
     ) -> dict[uuid.UUID, list[tuple[str, str]]]:
         return {eid: refs for eid, refs in self._mentions.items() if eid in entity_ids}
 
+    async def active_entity_names(self, entity_ids: list[uuid.UUID]) -> dict[uuid.UUID, str]:
+        # names mirror ids in the fake — presence is what the tests pin
+        return {eid: f"name-{eid}" for eid in entity_ids}
+
     async def active_entity_ids(self, entity_ids: list[uuid.UUID]) -> set[uuid.UUID]:
         if self._active is not None:
             return {eid for eid in entity_ids if eid in self._active}
@@ -303,6 +307,10 @@ async def test_neighbors_returns_cited_entities_nearest_first() -> None:
     assert response.results[0].source_refs[0].source_type == "chunk"
     assert response.results[1].source_refs[0].source_type == "row"
     assert response.results[0].result_type == "entity"
+    # the SoR canonical name rides as title (C10: §20 entity_recall reads
+    # visible text; agents read names, not bare uuids) — the fake returns
+    # name-{id}, so a reverted title emission fails here
+    assert response.results[0].title == f"name-{near}"
 
 
 async def test_a_hit_without_sor_mentions_is_dropped_as_drift() -> None:
@@ -708,6 +716,10 @@ async def test_subgraph_emits_cited_entities_and_evidence_backed_relations() -> 
     assert kinds == ["chunk", "document", "row"]  # all three evidence shapes emitted
     row_ref = next(ref for ref in relation.source_refs if ref.source_type == "row")
     assert row_ref.metadata == {"table": "orders", "pk": "17"}  # split losslessly
+    # the relation renders as a one-hop path with SoR names — visible text
+    # for agents and §20 relation_hit_rate (a reverted emission fails here;
+    # the fake's active_entity_names returns name-{id})
+    assert relation.title == f"name-{seed} -[works_at]-> name-{other}"
     # the SEED entity is part of the subgraph (unlike plain neighbors)
     assert {r.id for r in response.results if r.result_type == "entity"} == {
         str(seed),

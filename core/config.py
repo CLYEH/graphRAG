@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     # `graphrag prune` — the active build is always kept regardless
     retention_keep_builds: int = 5
 
+    # §20 eval gate (tunable 🟡 eval.regression_threshold): a candidate whose
+    # eval score falls below the active build's by MORE than this blocks
+    # activation
+    eval_regression_threshold: float = 0.05
+
     # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-nano"

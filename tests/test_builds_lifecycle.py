@@ -13,6 +13,7 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import pytest_asyncio
@@ -46,9 +47,9 @@ NOW = datetime.now(tz=UTC)
 
 
 def test_preflight_report_semantics() -> None:
-    """ok == no failures; deferred checks alone do NOT block (they are
-    surfaced, §20's eval gate waits for C10 — but must not freeze the §14
-    lifecycle until then)."""
+    """ok == no failures; deferred checks alone do NOT block — they mark the
+    genuinely inapplicable (no active build to regress against; rollback's
+    history exemption), surfaced but never blocking."""
     assert PreflightReport((), ("eval gate not run",)).ok
     assert not PreflightReport(("drift",), ()).ok
 
@@ -68,7 +69,7 @@ def test_cli_surface_is_the_frozen_14_set() -> None:
     sub = next(
         a for a in _parser()._actions if isinstance(a, __import__("argparse")._SubParsersAction)
     )
-    assert set(sub.choices) == {"builds", "activate", "rollback", "diff", "prune"}
+    assert set(sub.choices) == {"builds", "activate", "rollback", "diff", "eval", "prune"}
 
 
 async def test_prune_refuses_a_zero_window() -> None:
@@ -102,7 +103,12 @@ async def project(migrated: None) -> AsyncIterator[str]:
 
 
 async def _new_build(
-    conn: AsyncConnection, project: str, *, status: str = "ready", age_days: int = 0
+    conn: AsyncConnection,
+    project: str,
+    *,
+    status: str = "ready",
+    age_days: int = 0,
+    score: float = 1.0,
 ) -> uuid.UUID:
     build_id: uuid.UUID = (
         await conn.execute(
@@ -111,6 +117,10 @@ async def _new_build(
                 project=project,
                 status=status,
                 started_at=NOW - timedelta(days=age_days),
+                # these tests exercise SWITCH semantics, not the §20 gate:
+                # a stub score keeps the (fail-closed) eval gate green; the
+                # unscored cells are exercised in the eval integration suite
+                eval={"score": score, "failed": 0, "fingerprint": "test-suite"},
             )
             .returning(tables.builds.c.id)
         )
@@ -677,6 +687,183 @@ async def test_rollback_selects_its_target_under_the_lifecycle_lock(project: str
             statuses = {b.id: b.status for b in await list_builds(conn, project)}
             assert statuses[build_b] == "active"
             assert statuses[build_a] == "archived"  # untouched
+    finally:
+        await qdrant.close()
+        await driver.close()
+        await engine.dispose()
+        await engine2.dispose()
+
+
+async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """§20's gate logic without stores: unscored candidate (or unscored
+    active) with an active build present → FAIL-CLOSED (a deferral would be
+    ignored by report.ok — the gate's own target case would promote); no
+    active build → the one genuinely vacuous cell (bootstrap); regression
+    beyond threshold → FAILURE; within threshold → clean. The live path is
+    walked in the eval integration suite."""
+    from types import SimpleNamespace
+
+    from core.builds.lifecycle import _eval_gate
+
+    class _Conn:
+        def __init__(
+            self, eval_by_id: dict[uuid.UUID, dict[str, Any] | None], active: uuid.UUID | None
+        ):
+            self._evals = eval_by_id
+            self._active = active
+
+        async def execute(self, statement: Any) -> Any:
+            sql = str(statement)
+            if "eval" in sql:
+                bid = statement.compile().params["id_1"]
+                if bid not in self._evals:
+                    return SimpleNamespace(one_or_none=lambda: None)
+                block = self._evals[bid]
+                return SimpleNamespace(one_or_none=lambda: SimpleNamespace(eval=block))
+            row = None if self._active is None else SimpleNamespace(id=self._active)
+            return SimpleNamespace(one_or_none=lambda: row)
+
+    candidate, active = uuid.uuid4(), uuid.uuid4()
+
+    # unscored candidate → FAIL-CLOSED with or without an active build:
+    # measuring the candidate is a standalone requirement — the first-ever
+    # activation must not bypass it (Codex round 12)
+    conn = _Conn({candidate: None, active: {"score": 0.9}}, active)
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("graphrag eval" in f for f in failures) and deferred == []
+    conn = _Conn({candidate: None}, None)  # bootstrap, unscored → still blocked
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("graphrag eval" in f for f in failures) and deferred == []
+
+    # no active build + candidate scored clean → ONLY the regression
+    # comparison is vacuous
+    conn = _Conn({candidate: {"score": 0.9}}, None)
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert failures == [] and any("no active build" in d for d in deferred)
+
+    # active unscored → FAIL-CLOSED too (score the active first — actionable)
+    conn = _Conn({candidate: {"score": 0.9}, active: None}, active)
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("active build has no eval score" in f for f in failures) and deferred == []
+
+    # regression beyond threshold → blocks (same-suite fingerprints)
+    conn = _Conn(
+        {
+            candidate: {"score": 0.5, "fingerprint": "fp"},
+            active: {"score": 0.9, "fingerprint": "fp"},
+        },
+        active,
+    )
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("eval regression" in f for f in failures)
+
+    # within threshold → clean
+    conn = _Conn(
+        {
+            candidate: {"score": 0.88, "fingerprint": "fp"},
+            active: {"score": 0.9, "fingerprint": "fp"},
+        },
+        active,
+    )
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert failures == [] and deferred == []
+
+    # DIFFERENT suites are not comparable — fail-closed naming the reason
+    conn = _Conn(
+        {
+            candidate: {"score": 0.95, "fingerprint": "fp-easy"},
+            active: {"score": 0.9, "fingerprint": "fp-hard"},
+        },
+        active,
+    )
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("DIFFERENT golden sets" in f for f in failures)
+
+    # missing fingerprint (pre-fingerprint report) → fail-closed, actionable
+    conn = _Conn(
+        {
+            candidate: {"score": 0.95},
+            active: {"score": 0.9, "fingerprint": "fp"},
+        },
+        active,
+    )
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("no suite fingerprint" in f for f in failures)
+
+    # failed cases block OUTRIGHT — before regression compare AND before the
+    # vacuous no-active branch (the CLI exits 1 on the same report; the
+    # first-ever activation must not bypass the per-case min_score bar)
+    conn = _Conn({candidate: {"score": 0.95, "failed": 2}}, None)
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("2 golden case(s)" in f for f in failures)
+    conn = _Conn(
+        {candidate: {"score": 0.95, "failed": 1}, active: {"score": 0.9}},
+        active,
+    )
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("golden case(s) below their min_score" in f for f in failures)
+
+
+@pytest.mark.integration
+async def test_eval_gate_recheck_binds_to_the_promotion_time_active(project: str) -> None:
+    """P2 (class 10): two racing scored activations — the pre-lock preflight
+    compared candidate C (0.87) against active A (0.9): within the 0.05
+    threshold, passes. While C waits on the lifecycle lock, a racing
+    activation promotes B (0.99) and commits. The UNDER-LOCK re-check must
+    compare against B — 0.12 gap → eval regression → refusal; C stays ready,
+    B stays active. Reverting the under-lock eval re-check promotes C over a
+    strictly better active — this test fails."""
+    import asyncio
+
+    from sqlalchemy import func, select
+
+    engine, engine2 = _engine(), _engine()
+    qdrant = vector_client()
+    driver = graph_driver()
+    try:
+        async with (
+            engine.connect() as conn,
+            engine2.connect() as conn2,
+            driver.session() as session,
+        ):
+            build_a = await _new_build(conn, project, score=0.9)
+            build_b = await _new_build(conn, project, score=0.99)
+            candidate = await _new_build(conn, project, score=0.87)
+            report = await activate(conn, qdrant, session, project, build_a)
+            assert report.ok  # A active at preflight time
+
+            # conn2 = the racing activation, holding the lifecycle lock
+            txn2 = await conn2.begin()
+            await conn2.execute(
+                select(
+                    func.pg_advisory_xact_lock(
+                        func.hashtext("graphrag-lifecycle"), func.hashtext(project)
+                    )
+                )
+            )
+            task = asyncio.ensure_future(activate(conn, qdrant, session, project, candidate))
+            done, _ = await asyncio.wait([task], timeout=1.5)
+            assert not done  # preflight passed vs A (0.03 < 0.05); blocked on the lock
+
+            # the racing activation promotes B and commits
+            await conn2.execute(
+                tables.builds.update()
+                .where(tables.builds.c.project == project, tables.builds.c.status == "active")
+                .values(status="archived", activated_at=datetime.now(tz=UTC))
+            )
+            await conn2.execute(
+                tables.builds.update()
+                .where(tables.builds.c.id == build_b)
+                .values(status="active", activated_at=datetime.now(tz=UTC))
+            )
+            await txn2.commit()
+
+            report = await asyncio.wait_for(task, timeout=15)
+            assert not report.ok  # the under-lock re-check bound to B
+            assert any("eval regression" in f for f in report.failures)
+            statuses = {b.id: b.status for b in await list_builds(conn, project)}
+            assert statuses[candidate] == "ready"  # nothing committed
+            assert statuses[build_b] == "active"  # the better build stays
     finally:
         await qdrant.close()
         await driver.close()
