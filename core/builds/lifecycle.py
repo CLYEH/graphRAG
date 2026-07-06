@@ -250,7 +250,7 @@ async def _vector_count(client: AsyncQdrantClient, project: str, build_id: uuid.
     return int(result.count)
 
 
-async def _drift_failures(
+async def drift_failures(
     conn: AsyncConnection,
     qdrant: AsyncQdrantClient,
     graph_session: AsyncSession,
@@ -418,7 +418,7 @@ async def preflight(
             f"build status is '{status}' — promotable statuses here: {', '.join(promotable)}"
         )
 
-    failures.extend(await _drift_failures(conn, qdrant, graph_session, project, build_id))
+    failures.extend(await drift_failures(conn, qdrant, graph_session, project, build_id))
 
     eval_failures, eval_deferred = await _eval_gate(conn, project, build_id)
     failures.extend(eval_failures)
@@ -496,7 +496,7 @@ async def _promote_in_tx(
     # pre-lock preflight is bind-time knowledge — an aborted prune can
     # have deleted the projections between it and this lock, and
     # promoting then would point active at missing projections
-    drift = await _drift_failures(conn, qdrant, graph_session, project, build_id)
+    drift = await drift_failures(conn, qdrant, graph_session, project, build_id)
     if drift:
         raise _DriftedUnderLock(drift)
     if apply_eval_gate:
