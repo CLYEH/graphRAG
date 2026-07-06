@@ -141,6 +141,16 @@ ORDER BY src, dst, type
 LIMIT $limit
 """
 
+_HAS_EDGE: Final = """\
+MATCH (x:Entity {build_id: $build_id, project: $project, status: 'active',
+                 canonical_id: $src})
+      -[r:REL {build_id: $build_id, type: $rel_type}]->
+      (y:Entity {build_id: $build_id, project: $project, status: 'active',
+                 canonical_id: $dst})
+RETURN 1 AS hit
+LIMIT 1
+"""
+
 _PROJECT_ENTITY: Final = """\
 MERGE (n:Entity {canonical_id: $canonical_id, build_id: $build_id, project: $project})
 SET n.type = $entity_type, n.status = $status, n.name = $name
@@ -361,6 +371,19 @@ class BuildScopedGraphRepo:
             timeout_ms,
         )
         return rows[0] if rows else None
+
+    async def has_edge(self, src: str, dst: str, rel_type: str, *, timeout_ms: int) -> bool:
+        """EXACT existence of one typed projected edge (src, dst, type) —
+        unclippable by design (LIMIT 1 on the single triple): the eval
+        harness verifies expected edges against the projection, and a
+        row-budgeted subgraph fetch could push the target past its cap
+        (C10). Same scoping as every read template."""
+        rows = await self._run_read(
+            _HAS_EDGE,
+            {"src": src, "dst": dst, "rel_type": rel_type},
+            timeout_ms,
+        )
+        return bool(rows)
 
     async def edges_among(
         self, canonical_ids: Sequence[str], *, limit: int, timeout_ms: int

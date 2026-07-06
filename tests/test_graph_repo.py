@@ -77,7 +77,7 @@ def test_every_cypher_template_filters_every_pattern_by_the_scope() -> None:
     every hop."""
     templates = _all_cypher_templates()
     # keep the scan honest: it must actually find the module's templates
-    assert len(templates) == 8, sorted(templates)
+    assert len(templates) == 9, sorted(templates)  # +_HAS_EDGE (C10)
     inline_rel = re.compile(r":REL[^\]]*\{build_id: \$build_id")
     # no closing paren: the guard may carry further AND-ed rel-local predicates
     # (e.g. the shortestPath exclusion pushdown) after the scope condition
@@ -109,6 +109,7 @@ def test_public_surface_accepts_no_query_text() -> None:
         "neighbors",
         "shortest_path",
         "edges_among",
+        "has_edge",  # C10: the eval harness's exact projection probe
     }
     projector_public = {name for name in dir(BuildScopedGraphProjector) if not name.startswith("_")}
     assert projector_public == reader_public | {

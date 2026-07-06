@@ -209,19 +209,18 @@ async def _expected_edges(
         resolved = await repo.relations_with_evidence(triples)
         if not resolved:
             continue
-        # the PROJECTION must hold the same typed edge — §19 counts alone
-        # cannot see a wrong-type/stale edge
-        endpoint_ids = sorted({str(t[0]) for t in resolved} | {str(t[1]) for t in resolved})
-        projected = await graph.edges_among(
-            endpoint_ids,
-            limit=policy.cypher_policy().max_rows,
-            timeout_ms=policy.cypher_policy().timeout_ms,
-        )
-        projected_triples = {
-            (edge.get("src"), edge.get("dst"), edge.get("type")) for edge in projected
-        }
         for triple, (relation_id, evidence_rows) in resolved.items():
-            if (str(triple[0]), str(triple[1]), triple[2]) not in projected_triples:
+            # the PROJECTION must hold the same typed edge — §19 counts
+            # alone cannot see a wrong-type/stale edge; the lookup is an
+            # EXACT single-triple probe (has_edge, LIMIT 1), so no row
+            # budget can clip the target out of the answer
+            projected = await graph.has_edge(
+                str(triple[0]),
+                str(triple[1]),
+                triple[2],
+                timeout_ms=policy.cypher_policy().timeout_ms,
+            )
+            if not projected:
                 continue  # SoR holds it, the projection does not — not retrievable
             refs = tuple(ref for row in evidence_rows if (ref := evidence_ref(row)) is not None)
             if not refs:

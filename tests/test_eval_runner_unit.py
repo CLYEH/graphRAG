@@ -449,8 +449,10 @@ async def test_expected_edges_synthesizes_cited_typed_relations() -> None:
         def __init__(self, edges: list[dict[str, str]]) -> None:
             self._edges = edges
 
-        async def edges_among(self, ids: Any, *, limit: int, timeout_ms: int) -> Any:
-            return self._edges
+        async def has_edge(self, src: str, dst: str, rel_type: str, *, timeout_ms: int) -> bool:
+            return any(
+                e["src"] == src and e["dst"] == dst and e["type"] == rel_type for e in self._edges
+            )
 
     projected = _Graph([{"src": str(src_id), "dst": str(dst_id), "type": "partners_with"}])
     policy = SimpleNamespace(cypher_policy=lambda: SimpleNamespace(max_rows=100, timeout_ms=5000))
