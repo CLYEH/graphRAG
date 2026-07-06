@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     redis_url: str = "redis://localhost:6379/0"
 
+    # §14 GC (tunable 🔧 retention.keep_builds): builds kept per project by
+    # `graphrag prune` — the active build is always kept regardless
+    retention_keep_builds: int = 5
+
     # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-nano"
