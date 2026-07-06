@@ -116,8 +116,8 @@ async def _run(args: argparse.Namespace) -> int:
                 return 0
             if args.command == "eval":
                 from core.eval.golden import GoldenError, load_golden
-                from core.eval.runner import run_eval
-                from core.llm.factory import chat_model, embedding_model
+                from core.eval.runner import models_needed, run_eval
+                from core.llm.factory import LLMNotConfiguredError, chat_model, embedding_model
                 from core.mcp.policy import PolicyError, load_query_policy
                 from core.stores.repo import active_build_id
 
@@ -129,20 +129,27 @@ async def _run(args: argparse.Namespace) -> int:
                     print(f"REFUSED: {exc}", file=sys.stderr)
                     return 1
                 try:
+                    # only the model clients the golden set's modes will
+                    # actually call — a graph-only golden set must evaluate
+                    # without an API key; an unconfigured-but-needed model
+                    # is a REFUSAL, never a traceback
+                    needs_embedder, needs_llm = models_needed(golden)
+                    embedder = embedding_model() if needs_embedder else None
+                    llm = chat_model() if needs_llm else None
                     target_build = args.build or await active_build_id(conn, args.project)
                     await conn.rollback()  # end the lookup's read txn
                     eval_report = await run_eval(
                         conn,
                         qdrant,
                         session,
-                        embedding_model(),
-                        chat_model(),
+                        embedder,
+                        llm,
                         args.project,
                         target_build,
                         golden,
                         policy,
                     )
-                except LookupError as exc:
+                except (LookupError, LLMNotConfiguredError) as exc:
                     print(f"REFUSED: {exc}", file=sys.stderr)
                     return 1
                 for case_result in eval_report.cases:

@@ -28,7 +28,7 @@ from __future__ import annotations
 import contextlib
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import sqlalchemy as sa
 from llama_index.core.base.embeddings.base import BaseEmbedding
@@ -52,6 +52,17 @@ from core.stores.graph import BuildScopedGraphRepo
 from core.stores.repo import BuildScopedRepo, resolve_eval_binding
 from core.stores.sqlreader import BuildScopedSqlReader
 from core.stores.vectors import BuildScopedVectorRepo
+
+
+def models_needed(golden: GoldenSet) -> tuple[bool, bool]:
+    """(needs_embedder, needs_llm) for this golden set — graph/global cases
+    touch neither model client, sql needs only the LLM, semantic only the
+    embedder, hybrid both (its selector prompts the LLM and its semantic
+    mode embeds). Lets the CLI skip constructing clients the run will never
+    call, so a graph-only golden set evaluates without an API key."""
+    needs_embedder = any(case.mode in ("semantic", "hybrid") for case in golden.cases)
+    needs_llm = any(case.mode in ("sql", "hybrid") for case in golden.cases)
+    return needs_embedder, needs_llm
 
 
 def eval_fingerprint(golden: GoldenSet, policy: QueryPolicy) -> str:
@@ -274,8 +285,8 @@ async def run_eval(
     conn: AsyncConnection,
     qdrant: AsyncQdrantClient,
     graph_session: AsyncSession,
-    embedder: BaseEmbedding,
-    llm: LLM,
+    embedder: BaseEmbedding | None,
+    llm: LLM | None,
     project: str,
     build_id: uuid.UUID,
     golden: GoldenSet,
@@ -285,13 +296,15 @@ async def run_eval(
     the report to ``builds.metrics['eval']``."""
     binding = await resolve_eval_binding(conn, project, build_id)
     await conn.rollback()  # loaned-clean for the sql reader (C6b)
+    # None model clients are legal when no case's mode calls them
+    # (models_needed) — reaching one anyway is a loud bug, never silent
     deps = HybridDeps(
         repo=BuildScopedRepo.bound_to(conn, binding),
         vectors=BuildScopedVectorRepo.bound_to(qdrant, binding),
-        embedder=embedder,
+        embedder=cast(BaseEmbedding, embedder),
         sql_reader=BuildScopedSqlReader.bound_to(conn, binding),
         graph=BuildScopedGraphRepo.bound_to(graph_session, binding),
-        llm=llm,
+        llm=cast(LLM, llm),
     )
 
     results: list[CaseResult] = []
@@ -340,7 +353,7 @@ async def run_eval(
 
     await conn.rollback()  # end any read txn before OUR write txn
     async with conn.begin():
-        await conn.execute(
+        stored = await conn.execute(
             tables.builds.update()
             .where(tables.builds.c.id == build_id)
             .values(
@@ -349,4 +362,13 @@ async def run_eval(
                 )
             )
         )
+        if stored.rowcount != 1:
+            # the binding was valid at resolve time, but a concurrent prune
+            # can delete a ready build before this persist — a report the
+            # gate can never read must not print as success (bind-time
+            # check ≠ invariant)
+            raise LookupError(
+                f"build {build_id} disappeared before the eval report could be "
+                "stored (pruned concurrently?) — nothing persisted"
+            )
     return report

@@ -213,8 +213,9 @@ async def test_run_eval_dispatches_scores_and_persists(
         def begin(self) -> _Txn:
             return _Txn()
 
-        async def execute(self, statement: Any) -> None:
+        async def execute(self, statement: Any) -> Any:
             self.executed.append(statement)
+            return SimpleNamespace(rowcount=1)  # the persist finds its build
 
     conn = _Conn()
     policy = SimpleNamespace(
@@ -317,3 +318,88 @@ def test_eval_fingerprint_is_a_pure_function_of_the_suite() -> None:
     assert fp1 != fp3  # different golden set → different identity
     assert fp1 != fp4  # different policy → different identity
     _ = _NS  # keep import local-scope tidy
+
+
+def test_models_needed_maps_modes_to_clients() -> None:
+    """A graph-only golden set must evaluate WITHOUT an API key (Codex round
+    10): only the clients the modes actually call get constructed."""
+    from core.eval.golden import GoldenSet
+    from core.eval.runner import models_needed
+
+    def _set(*modes: str) -> GoldenSet:
+        return GoldenSet(cases=tuple(_case(m, {"must_contain_entities": ["Acme"]}) for m in modes))
+
+    assert models_needed(_set("graph", "global")) == (False, False)
+    assert models_needed(_set("sql")) == (False, True)
+    assert models_needed(_set("semantic")) == (True, False)
+    assert models_needed(_set("hybrid")) == (True, True)
+
+
+async def test_run_eval_refuses_when_the_persist_hits_no_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bind-time check ≠ invariant: a concurrent prune can delete the build
+    between binding and the persist UPDATE — a report the gate can never
+    read must not print as success (rowcount 0 → LookupError, nothing
+    persisted)."""
+    import core.eval.runner as runner_module
+    from core.eval.golden import GoldenSet
+    from core.eval.runner import run_eval
+
+    binding = SimpleNamespace(project="p", build_id=uuid.uuid4())
+    monkeypatch.setattr(
+        runner_module, "resolve_eval_binding", lambda conn, project, build_id: _async(binding)
+    )
+    for cls_name in (
+        "BuildScopedRepo",
+        "BuildScopedVectorRepo",
+        "BuildScopedSqlReader",
+        "BuildScopedGraphRepo",
+    ):
+        monkeypatch.setattr(
+            runner_module, cls_name, SimpleNamespace(bound_to=lambda *a, **k: SimpleNamespace())
+        )
+
+    async def _global(*args: Any, **kwargs: Any) -> McpResponse:
+        return McpResponse(
+            query="q",
+            tool="global_summary",
+            project="p",
+            build_id="b",
+            results=(),
+            warnings=(),
+        )
+
+    monkeypatch.setattr(runner_module, "global_summary", _global)
+
+    class _Txn:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *exc: Any) -> None:
+            return None
+
+    class _Conn:
+        async def rollback(self) -> None:
+            return None
+
+        def begin(self) -> _Txn:
+            return _Txn()
+
+        async def execute(self, statement: Any) -> Any:
+            return SimpleNamespace(rowcount=0)  # the build vanished
+
+    policy = SimpleNamespace(top_k=lambda requested: 5)
+    golden = GoldenSet(cases=(_case("global", {"must_contain_entities": ["Acme"]}),))
+    with pytest.raises(LookupError, match="disappeared before the eval report"):
+        await run_eval(
+            cast(Any, _Conn()),
+            cast(Any, None),
+            cast(Any, None),
+            None,
+            None,
+            "p",
+            binding.build_id,
+            golden,
+            cast(Any, policy),
+        )
