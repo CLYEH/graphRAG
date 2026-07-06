@@ -53,7 +53,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.config import get_settings
 from core.stores import tables
-from core.stores.repo import BuildNotWritableError, active_build_id
+from core.stores.repo import ActiveBinding, BuildNotWritableError, active_build_id
 
 
 def vector_client() -> AsyncQdrantClient:
@@ -182,6 +182,15 @@ class BuildScopedVectorRepo:
         """
         build = await active_build_id(pg_conn, project)
         return BuildScopedVectorRepo(client, project, build, _token=_CONSTRUCTION_TOKEN)
+
+    @classmethod
+    def bound_to(cls, client: AsyncQdrantClient, binding: ActiveBinding) -> BuildScopedVectorRepo:
+        """Bind to the build named by an :class:`ActiveBinding` proof (§27.1:
+        one lookup per request; the proof is mintable only by
+        resolve_active_binding — see BuildScopedRepo.bound_to)."""
+        return BuildScopedVectorRepo(
+            client, binding.project, binding.build_id, _token=_CONSTRUCTION_TOKEN
+        )
 
     # -- scope plumbing --------------------------------------------------------
 

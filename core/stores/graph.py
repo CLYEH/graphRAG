@@ -62,7 +62,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.config import get_settings
 from core.stores import tables
-from core.stores.repo import BuildNotWritableError, active_build_id
+from core.stores.repo import ActiveBinding, BuildNotWritableError, active_build_id
 
 #: Every template filters BOTH ``:Entity`` endpoints by ``{build_id, project}``
 #: and every ``:REL`` by ``{build_id}`` — the §4 projection rule. They are
@@ -236,6 +236,15 @@ class BuildScopedGraphRepo:
         """
         build = await active_build_id(pg_conn, project)
         return BuildScopedGraphRepo(session, project, build, _token=_CONSTRUCTION_TOKEN)
+
+    @classmethod
+    def bound_to(cls, session: AsyncSession, binding: ActiveBinding) -> BuildScopedGraphRepo:
+        """Bind to the build named by an :class:`ActiveBinding` proof (§27.1;
+        see BuildScopedRepo.bound_to). Pinned to the read-only type, like
+        for_active_build."""
+        return BuildScopedGraphRepo(
+            session, binding.project, binding.build_id, _token=_CONSTRUCTION_TOKEN
+        )
 
     # -- scope plumbing --------------------------------------------------------
 

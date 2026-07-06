@@ -102,6 +102,7 @@ def test_public_surface_accepts_no_query_text() -> None:
         "project",
         "build_id",
         "for_active_build",
+        "bound_to",  # C8: the §27.1 one-lookup-per-request binding
         "fetch_entities",
         "entity_count",
         "relation_count",

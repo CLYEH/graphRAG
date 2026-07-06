@@ -30,6 +30,7 @@ are aggregated into the hybrid response.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass
@@ -123,6 +124,11 @@ class HybridPolicy:
     top_k: int
     max_sql_rows: int
     expose_debug: bool
+    #: the WHOLE-call wall-clock budget (§21 max_latency_ms): per-mode DB
+    #: timeouts alone don't bound the request — modes run sequentially and
+    #: selector/embedding work carries no DB deadline, so the router enforces
+    #: one shared deadline across everything it does
+    max_latency_ms: int = 30_000
 
 
 async def hybrid_query(
@@ -146,16 +152,41 @@ async def hybrid_query(
         return _response(deps, query, (), (warning,), None)
 
     available, gated = _available_modes(policy, graph_params)
-    selected, unselected, reason = await _select_modes(deps.llm, query, available)
+
+    # ONE wall-clock deadline for the WHOLE call (§21 max_latency_ms): the
+    # per-mode DB timeouts are already clamped to it, but modes run
+    # SEQUENTIALLY and the selector/embedding work has no DB deadline — so
+    # every stage below runs on the remaining budget (the C6b/C6c per-phase
+    # lesson, applied to the router itself).
+    deadline = started + policy.max_latency_ms / 1000.0
+
+    def _remaining() -> float:
+        return deadline - time.monotonic()
+
+    try:
+        async with asyncio.timeout(max(_remaining(), 0.001)):
+            selected, unselected, reason = await _select_modes(deps.llm, query, available)
+    except TimeoutError:
+        selected, unselected, reason = (
+            list(available),
+            [],
+            "selector timed out — ran every available mode",
+        )
 
     mode_responses: dict[str, McpResponse] = {}
     warnings: list[QueryWarning] = []
-    failed: list[str] = []
+    deadline_cut: list[str] = []
     for mode in selected:
+        remaining = _remaining()
+        if remaining <= 0:
+            deadline_cut.append(mode)
+            continue
         try:
-            mode_responses[mode] = await _run_mode(mode, deps, policy, query, graph_params)
+            async with asyncio.timeout(remaining):
+                mode_responses[mode] = await _run_mode(mode, deps, policy, query, graph_params)
+        except TimeoutError:
+            deadline_cut.append(mode)
         except Exception as exc:  # noqa: BLE001 — §22: one store down ≠ hybrid down
-            failed.append(mode)
             warnings.append(
                 QueryWarning(
                     "STORE_UNAVAILABLE",
@@ -163,6 +194,14 @@ async def hybrid_query(
                     "remaining modes (§22)",
                 )
             )
+    if deadline_cut:
+        warnings.append(
+            QueryWarning(
+                "PARTIAL_RESULTS",
+                f"query exceeded the {policy.max_latency_ms}ms deadline — "
+                f"mode(s) {deadline_cut} did not complete (§21/§22)",
+            )
+        )
 
     for mode, response in mode_responses.items():
         for mode_warning in response.warnings:
@@ -181,7 +220,7 @@ async def hybrid_query(
 
     debug: dict[str, Any] | None = None
     if policy.expose_debug:
-        ran = [mode for mode in selected if mode not in failed]
+        ran = [mode for mode in selected if mode in mode_responses]  # completed only
         stores: list[str] = []
         for mode in ran:
             for store in _MODE_STORES[mode]:

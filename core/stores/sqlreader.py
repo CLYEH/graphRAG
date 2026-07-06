@@ -47,7 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlglot import exp
 
 from core.query.sql_guard import GuardrailBlocked, ValidatedSql
-from core.stores.repo import active_build_id
+from core.stores.repo import ActiveBinding, active_build_id
 from core.stores.tables import STRUCTURED_MIME
 
 _DIALECT = "postgres"
@@ -146,6 +146,21 @@ class BuildScopedSqlReader:
         async with conn.begin():  # the lookup's OWN txn, committed on exit → clean out
             build = await active_build_id(conn, project)
         return BuildScopedSqlReader(conn, project, build, _token=_SQL_READER_TOKEN)
+
+    @classmethod
+    def bound_to(cls, conn: AsyncConnection, binding: ActiveBinding) -> BuildScopedSqlReader:
+        """Bind to the build named by an :class:`ActiveBinding` proof (§27.1;
+        see BuildScopedRepo.bound_to). The loaned-clean contract still holds:
+        the connection must carry no open transaction (the caller's single
+        lookup must be ended before binding)."""
+        if conn.in_transaction():
+            raise RuntimeError(
+                "BuildScopedSqlReader.bound_to requires a connection with no open "
+                "transaction — end the active-build lookup's transaction first"
+            )
+        return BuildScopedSqlReader(
+            conn, binding.project, binding.build_id, _token=_SQL_READER_TOKEN
+        )
 
     def _scope_params(self, table: str) -> dict[str, Any]:
         return {

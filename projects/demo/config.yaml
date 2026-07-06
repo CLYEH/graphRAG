@@ -1,0 +1,25 @@
+# Demo project configuration. The query_policy block is validated against the
+# frozen contracts/query_policy.schema.json at server startup (DR-002).
+query_policy:
+  schema_version: "1.0"
+  default_mode: hybrid
+  max_top_k: 20
+  max_graph_hops: 3
+  max_sql_rows: 100
+  max_latency_ms: 10000
+  require_sources: true
+  expose_debug: true
+  text_to_sql:
+    enabled: false        # enable after whitelisting this project's tables
+    readonly: true
+    allowed_tables: []
+    blocked_keywords: [insert, update, delete, drop, alter, truncate]
+    max_rows: 100
+    timeout_ms: 5000
+  text_to_cypher:
+    enabled: false        # templates are the default graph path either way (§27.6)
+    readonly: true
+    allowed_clauses: [MATCH, WHERE, RETURN, LIMIT]
+    blocked: [CREATE, MERGE, DELETE, SET, REMOVE, CALL]
+    max_rows: 100
+    timeout_ms: 5000
