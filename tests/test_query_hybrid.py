@@ -10,6 +10,7 @@ validated against the frozen §16 schema — including the debug shape.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -76,6 +77,7 @@ def _policy(
     sql_enabled: bool = True,
     top_k: int = 10,
     expose_debug: bool = True,
+    max_latency_ms: int = 30_000,
 ) -> HybridPolicy:
     return HybridPolicy(
         text_to_sql=TextToSql(
@@ -96,6 +98,7 @@ def _policy(
         top_k=top_k,
         max_sql_rows=50,
         expose_debug=expose_debug,
+        max_latency_ms=max_latency_ms,
     )
 
 
@@ -383,3 +386,34 @@ async def test_a_mode_outside_the_offered_set_distrusts_the_whole_answer(
     assert len(calls["semantic"]) == 1 and len(calls["graph"]) == 1 and len(calls["global"]) == 1
     assert response.debug is not None
     assert "unavailable mode" in response.debug["routing_decision"]["reason"]
+
+
+async def test_the_whole_call_shares_one_wall_clock_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§21: max_latency_ms bounds the WHOLE hybrid call — per-mode DB timeouts
+    alone don't, because modes run sequentially and selector/embedding work
+    has no DB deadline. A mode that overruns the remaining budget is cut
+    (typed PARTIAL_RESULTS naming the deadline), later modes past the budget
+    never start, and the trace reports only what ran."""
+    calls = _patch_modes(monkeypatch)
+
+    async def slow_semantic(*args: Any, **kwargs: Any) -> McpResponse:
+        calls["semantic"].append(args)
+        await asyncio.sleep(0.2)  # far past the 50ms budget below
+        return _mode_response("semantic_search")
+
+    monkeypatch.setattr(hybrid_module, "semantic_search", slow_semantic)
+    response = await _run(_deps(), _policy(max_latency_ms=50))
+    partials = [w for w in response.warnings if w.code == "PARTIAL_RESULTS"]
+    assert any("deadline" in w.message and "semantic" in w.message for w in partials)
+    assert response.debug is not None
+    # the overrunning mode never completed — the plan reports only what ran
+    assert not any(plan.startswith("semantic") for plan in response.debug["retrieval_plan"])
+
+
+async def test_a_generous_deadline_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _patch_modes(monkeypatch)
+    response = await _run(_deps(), _policy(max_latency_ms=30_000))
+    assert all(len(calls[mode]) == 1 for mode in ("semantic", "graph", "sql", "global"))
+    assert not any("deadline" in w.message for w in response.warnings)

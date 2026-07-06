@@ -164,4 +164,5 @@ def hybrid_policy(policy: QueryPolicy, requested_top_k: int | None) -> Any:
         top_k=policy.top_k(requested_top_k),
         max_sql_rows=policy.sql_rows(),
         expose_debug=policy.expose_debug,
+        max_latency_ms=policy.max_latency_ms,
     )
