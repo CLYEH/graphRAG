@@ -295,6 +295,26 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      documented failure rule WORD BY WORD against the implementation's
      actual branch conditions.
 
+   - **A request-scoped invariant is swept over the WHOLE lifecycle, once**:
+     when a requirement is an invariant over a REQUEST (a latency budget, a
+     quota, a trace), enumerate every phase of the request's lifecycle —
+     binding/acquisition, selection, each mode/phase, discovery, assembly —
+     and check each against the invariant IN ONE PASS. "Every phase has a
+     cap" does not give "the request has a cap": phases that each run to
+     their own full budget, or restart a fresh one, compound past the
+     request-level bound (C8: the §21 deadline took FIVE review rounds to
+     converge — reconcile, hybrid wall-clock, standalone sweep, binding
+     coverage, remaining-budget threading — each a lifecycle phase found
+     one round at a time).
+   - **A new entry point to a fenced surface must carry the fence**: adding
+     a convenience path (factory overload, bypass constructor, admin hook)
+     to a construction-fenced surface demotes the guarantee from structure
+     to caller discipline unless the new path demands equally strong proof
+     (C8: `bound_to(raw uuid)` let anyone bind an archived build — DR-001
+     held only by convention until the ActiveBinding capability proof,
+     mintable solely by the active-build lookup, restored the fence; mind
+     `dataclasses.replace` forgeries — tokens live in InitVar).
+
 ## Output (exactly this shape)
 ```
 VERDICT: PASS | FAIL
