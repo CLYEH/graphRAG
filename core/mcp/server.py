@@ -29,7 +29,6 @@ the tools). Entry point: ``projects/<name>/mcp_entrypoint.py`` calls
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -37,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -54,6 +54,17 @@ from core.query.sql import sql_query as run_sql
 from core.stores.graph import graph_driver
 from core.stores.vectors import vector_client
 
+#: §16 build_id is format:uuid — when the deadline fires DURING scope
+#: binding no build was ever resolved; the nil uuid is the honest,
+#: format-legal sentinel (the warning message says which case happened).
+_NIL_BUILD = "00000000-0000-0000-0000-000000000000"
+
+#: extra outer-bound budget for the hybrid tools: their INTERNAL deadline
+#: (same max_latency_ms, started after binding) must win the terminal cut so
+#: its partial-results assembly is what the caller sees; the outer bound then
+#: only fires on what the inner one cannot see — a binding stall.
+_HYBRID_GRACE_MS = 2_000
+
 #: entity_mentions.source_kind → §16 source_type (the C6a mapping).
 _MENTION_SOURCE_TYPE = {"text": "chunk", "structured": "row"}
 
@@ -63,48 +74,62 @@ async def _bounded(
     tool: str,
     query: str,
     runner: Any,
+    grace_ms: int = 0,
 ) -> dict[str, Any]:
     """Run one single-mode tool under the project's §21 wall-clock deadline.
 
-    The clock starts BEFORE the per-call binding, so scope resolution counts
-    against the budget and the mode runs on the REMAINDER (the hybrid router
-    enforces its own internal deadline — this is the same rule for the
-    standalone tools, which otherwise had no wall-clock bound at all: a slow
-    embedding or store call could outlive max_latency_ms). A timeout is the
+    The timeout covers the per-call binding TOO — connection acquisition or
+    the active-build lookup can itself stall under DB/network pressure, and a
+    §21 deadline that starts after binding would let the call overrun before
+    the typed degradation (this is the same rule for every tool; hybrid keeps
+    its own richer internal deadline for the mode loop). A timeout is the
     typed §22 degradation, never a hung call or an unhandled cancellation;
     the sql reader's phase transactions roll back under the single
     cancellation (finally runs), and the per-call connection closes with the
     context manager either way."""
-    deadline = time.monotonic() + runtime.policy.max_latency_ms / 1000.0
-    async with runtime.context.bound() as deps:
-        try:
-            async with asyncio.timeout(max(deadline - time.monotonic(), 0.001)):
+    bound_build: str | None = None
+    try:
+        async with asyncio.timeout((runtime.policy.max_latency_ms + grace_ms) / 1000.0):
+            async with runtime.context.bound() as deps:
+                bound_build = str(deps.repo.build_id)
                 response: McpResponse = await runner(deps)
                 return response.to_dict()
-        except TimeoutError:
-            return McpResponse(
-                query=query,
-                tool=tool,
-                project=runtime.context.project,
-                build_id=str(deps.repo.build_id),
-                results=(),
-                warnings=(
-                    QueryWarning(
-                        "PARTIAL_RESULTS",
-                        f"query exceeded the {runtime.policy.max_latency_ms}ms deadline (§21)",
-                    ),
+    except TimeoutError:
+        detail = "" if bound_build else " during scope binding"
+        return McpResponse(
+            query=query,
+            tool=tool,
+            project=runtime.context.project,
+            # binding may itself be what stalled — then no build was ever
+            # resolved and the nil uuid marks that honestly (format-legal)
+            build_id=bound_build or _NIL_BUILD,
+            results=(),
+            warnings=(
+                QueryWarning(
+                    "PARTIAL_RESULTS",
+                    f"query exceeded the {runtime.policy.max_latency_ms}ms deadline{detail} (§21)",
                 ),
-            ).to_dict()
+            ),
+        ).to_dict()
 
 
-def _introspection_timeout(runtime: _Runtime, deps: Any, subject: str) -> dict[str, Any]:
+def _is_statement_timeout(exc: DBAPIError) -> bool:
+    """Postgres cancels a statement past ``statement_timeout`` with sqlstate
+    57014 (query_canceled) — the DB-side face of the §21 deadline."""
+    return getattr(exc.orig, "sqlstate", None) == "57014"
+
+
+def _introspection_timeout(runtime: _Runtime, build_id: str | None, subject: str) -> dict[str, Any]:
     """The introspection tools' §22 timeout shape (they are not §16 responses,
-    so the degradation is an explicit error field, never a hung call)."""
+    so the degradation is an explicit error field, never a hung call). A None
+    build_id means the deadline fired during scope binding — nil-uuid
+    sentinel, same convention as the §16 tools."""
+    detail = "" if build_id else " during scope binding"
     return {
         "project": runtime.context.project,
-        "build_id": str(deps.repo.build_id),
+        "build_id": build_id or _NIL_BUILD,
         "subject": subject,
-        "error": f"query exceeded the {runtime.policy.max_latency_ms}ms deadline (§21)",
+        "error": f"query exceeded the {runtime.policy.max_latency_ms}ms deadline{detail} (§21)",
     }
 
 
@@ -229,9 +254,16 @@ def build_server(project: str, config_path: Path) -> FastMCP:
                 other_entity=graph_other_entity,
                 hops=graph_hops,
             )
-        async with rt.context.bound() as deps:
-            response = await run_hybrid(deps, hybrid_policy(rt.policy, top_k), query, params)
-            return response.to_dict()
+
+        async def _run(deps: Any) -> McpResponse:
+            return await run_hybrid(deps, hybrid_policy(rt.policy, top_k), query, params)
+
+        # hybrid's INTERNAL deadline paces the mode loop and assembles
+        # partial results; the outer bound exists for what it cannot see (a
+        # stall during scope binding) and gets a GRACE so the inner deadline
+        # always wins the terminal cut — without it the outer timer (started
+        # before binding) would fire first and discard completed modes
+        return await _bounded(rt, "hybrid_query", query, _run, grace_ms=_HYBRID_GRACE_MS)
 
     @server.tool()
     async def get_entity(name: str) -> dict[str, Any]:
@@ -240,13 +272,14 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         response (the frozen tool enum covers only the five retrieval tools)
         — but each entity still carries its §27.2-spirit mention citations."""
         rt = _rt()
-        deadline = time.monotonic() + rt.policy.max_latency_ms / 1000.0
-        async with rt.context.bound() as deps:
-            try:
-                async with asyncio.timeout(max(deadline - time.monotonic(), 0.001)):
+        bound_build: str | None = None
+        try:
+            async with asyncio.timeout(rt.policy.max_latency_ms / 1000.0):
+                async with rt.context.bound() as deps:
+                    bound_build = str(deps.repo.build_id)
                     return await _get_entity(deps.repo, rt.context.project, name)
-            except TimeoutError:
-                return _introspection_timeout(rt, deps, name)
+        except TimeoutError:
+            return _introspection_timeout(rt, bound_build, name)
 
     @server.tool()
     async def list_schema() -> dict[str, Any]:
@@ -254,30 +287,7 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         the columns it actually has in the ACTIVE build (empty when the sql
         mode is disabled). Deliberately NOT a §16 response — there is no
         retrieval result to cite; this is introspection."""
-        rt = _rt()
-        deadline = time.monotonic() + rt.policy.max_latency_ms / 1000.0
-        async with rt.context.bound() as deps:
-            try:
-                async with asyncio.timeout(max(deadline - time.monotonic(), 0.001)):
-                    tables: dict[str, list[str]] = {}
-                    if rt.policy.text_to_sql.enabled:
-                        # the same JSON-key discovery sql_query runs — under
-                        # the same reconciled statement deadline (§21), plus
-                        # the wall-clock bound above
-                        async with deps.sql_reader.timed_transaction(
-                            rt.policy.sql_policy().timeout_ms
-                        ):
-                            columns = await deps.sql_reader.columns_by_table(
-                                list(rt.policy.text_to_sql.allowed_tables)
-                            )
-                        tables = {table: list(cols) for table, cols in columns.items()}
-                    return {
-                        "project": rt.context.project,
-                        "sql_enabled": rt.policy.text_to_sql.enabled,
-                        "tables": tables,
-                    }
-            except TimeoutError:
-                return _introspection_timeout(rt, deps, "list_schema")
+        return await _list_schema(_rt())
 
     @server.tool()
     async def explain_retrieval(query: str, top_k: int | None = None) -> dict[str, Any]:
@@ -286,20 +296,64 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         debug emission (§21): when expose_debug is off, the query still runs
         but the trace stays null and a typed warning says why."""
         rt = _rt()
-        async with rt.context.bound() as deps:
-            response = await run_hybrid(deps, hybrid_policy(rt.policy, top_k), query, None)
-            payload = response.to_dict()
-            if not rt.policy.expose_debug:
-                payload["warnings"] = [
-                    *payload["warnings"],
-                    {
-                        "code": "GUARDRAIL_BLOCKED",
-                        "message": "expose_debug is disabled by policy — no trace emitted (§21)",
-                    },
-                ]
-            return payload
+
+        async def _run(deps: Any) -> McpResponse:
+            return await run_hybrid(deps, hybrid_policy(rt.policy, top_k), query, None)
+
+        payload = await _bounded(rt, "hybrid_query", query, _run, grace_ms=_HYBRID_GRACE_MS)
+        if not rt.policy.expose_debug:
+            payload["warnings"] = [
+                *payload["warnings"],
+                {
+                    "code": "GUARDRAIL_BLOCKED",
+                    "message": "expose_debug is disabled by policy — no trace emitted (§21)",
+                },
+            ]
+        return payload
 
     return server
+
+
+async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
+    """§9 ``list_schema``: the whitelisted sql tables with their live columns
+    (introspection shape). The wall clock covers binding + discovery; the
+    STATEMENT deadline fires as a DB error (sqlstate 57014), not
+    asyncio.TimeoutError — sql_query already maps this (§22) — and any other
+    DB failure degrades with its class named rather than erroring the MCP
+    call. A non-DB bug still propagates loud (never laundered as §22)."""
+    bound_build: str | None = None
+    try:
+        async with asyncio.timeout(runtime.policy.max_latency_ms / 1000.0):
+            async with runtime.context.bound() as deps:
+                bound_build = str(deps.repo.build_id)
+                tables: dict[str, list[str]] = {}
+                if runtime.policy.text_to_sql.enabled:
+                    # the same JSON-key discovery sql_query runs — under the
+                    # same reconciled statement deadline (§21), plus the
+                    # wall-clock bound around the whole call
+                    async with deps.sql_reader.timed_transaction(
+                        runtime.policy.sql_policy().timeout_ms
+                    ):
+                        columns = await deps.sql_reader.columns_by_table(
+                            list(runtime.policy.text_to_sql.allowed_tables)
+                        )
+                    tables = {table: list(cols) for table, cols in columns.items()}
+                return {
+                    "project": runtime.context.project,
+                    "sql_enabled": runtime.policy.text_to_sql.enabled,
+                    "tables": tables,
+                }
+    except TimeoutError:
+        return _introspection_timeout(runtime, bound_build, "list_schema")
+    except DBAPIError as exc:
+        if _is_statement_timeout(exc):
+            return _introspection_timeout(runtime, bound_build, "list_schema")
+        return {
+            "project": runtime.context.project,
+            "build_id": bound_build or _NIL_BUILD,
+            "subject": "list_schema",
+            "error": f"schema discovery failed ({type(exc).__name__}) — §22",
+        }
 
 
 async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:

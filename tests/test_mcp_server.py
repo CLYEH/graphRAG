@@ -104,6 +104,20 @@ async def test_bounded_tools_degrade_typed_at_the_wall_clock_deadline() -> None:
     ok = await _bounded(runtime, "semantic_search", "q", fast)
     assert ok["warnings"] == []  # a fast tool is untouched
 
+    class _StalledCtx:
+        project = "p"
+
+        @asynccontextmanager
+        async def bound(self):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(0.3)  # binding itself stalls past the budget
+            yield deps
+
+    stalled = _Runtime(context=_StalledCtx(), policy=policy)  # type: ignore[arg-type]
+    payload = await _bounded(stalled, "semantic_search", "q", fast)
+    # the deadline covers BINDING too — no build resolved → nil-uuid sentinel
+    assert payload["build_id"] == "00000000-0000-0000-0000-000000000000"
+    assert "during scope binding" in payload["warnings"][0]["message"]
+
 
 def test_the_introspection_timeout_shape_is_explicit() -> None:
     """The introspection tools are not §16 responses, so their §22 deadline
@@ -119,11 +133,71 @@ def test_the_introspection_timeout_shape_is_explicit() -> None:
         context=SimpleNamespace(project="p"),  # type: ignore[arg-type]
         policy=SimpleNamespace(max_latency_ms=1000),  # type: ignore[arg-type]
     )
-    deps = SimpleNamespace(repo=SimpleNamespace(build_id=build_id))
-    payload = _introspection_timeout(runtime, deps, "list_schema")
+    payload = _introspection_timeout(runtime, str(build_id), "list_schema")
     assert payload == {
         "project": "p",
         "build_id": str(build_id),
         "subject": "list_schema",
         "error": "query exceeded the 1000ms deadline (§21)",
     }
+    # the deadline can fire DURING scope binding — no build was resolved,
+    # and the nil-uuid sentinel + message detail say so honestly
+    unbound = _introspection_timeout(runtime, None, "list_schema")
+    assert unbound["build_id"] == "00000000-0000-0000-0000-000000000000"
+    assert "during scope binding" in unbound["error"]
+
+
+async def test_list_schema_maps_db_deadline_and_failures_typed() -> None:
+    """Codex round-5: the STATEMENT deadline fires as a DB error (sqlstate
+    57014), not asyncio.TimeoutError — uncaught it turned list_schema into an
+    MCP error instead of the §22 shape. 57014 → the introspection timeout;
+    any other DBAPIError → an explicit error naming the class; a non-DB bug
+    still propagates LOUD (§22 degrades store trouble, never code bugs)."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from sqlalchemy.exc import DBAPIError
+
+    from core.mcp.server import _list_schema, _Runtime
+
+    class _PgTimeout(Exception):
+        sqlstate = "57014"
+
+    class _PgOther(Exception):
+        sqlstate = "42P01"
+
+    def _runtime(raising: BaseException) -> _Runtime:
+        class _Reader:
+            @asynccontextmanager
+            async def timed_transaction(self, timeout_ms: int):  # type: ignore[no-untyped-def]
+                raise raising
+                yield
+
+        deps = SimpleNamespace(
+            repo=SimpleNamespace(build_id="b-1"),
+            sql_reader=_Reader(),
+        )
+
+        class _Ctx:
+            project = "p"
+
+            @asynccontextmanager
+            async def bound(self):  # type: ignore[no-untyped-def]
+                yield deps
+
+        policy = SimpleNamespace(
+            max_latency_ms=1000,
+            text_to_sql=SimpleNamespace(enabled=True, allowed_tables=("orders",)),
+            sql_policy=lambda: SimpleNamespace(timeout_ms=500),
+        )
+        return _Runtime(context=_Ctx(), policy=policy)  # type: ignore[arg-type]
+
+    timed_out = await _list_schema(_runtime(DBAPIError("q", None, _PgTimeout())))
+    assert "deadline" in timed_out["error"]  # 57014 IS the §21 deadline
+
+    failed = await _list_schema(_runtime(DBAPIError("q", None, _PgOther())))
+    assert failed["error"] == "schema discovery failed (DBAPIError) — §22"
+    assert failed["build_id"] == "b-1"
+
+    with pytest.raises(ValueError, match="in-code bug"):
+        await _list_schema(_runtime(ValueError("in-code bug")))
