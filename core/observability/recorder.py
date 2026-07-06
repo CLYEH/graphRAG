@@ -58,18 +58,32 @@ class StepReport:
 
 
 def _persistable(outcomes: tuple[ItemOutcome, ...], verbosity: str) -> list[ItemOutcome]:
+    """Filter by verbosity, then DEDUPE by (item_kind, item_ref) keeping the
+    FIRST occurrence — §18/§27.7's own dedup rule, and the table's
+    ``pipeline_step_items_dedup`` unique index makes a duplicate row roll
+    the WHOLE run record back (reachable under default verbosity: ingest
+    emits one skipped outcome per duplicate payload)."""
+    filtered: list[ItemOutcome]
     if verbosity == "all":
-        return list(outcomes)
-    kept: list[ItemOutcome] = []
-    success_seen = 0
-    for outcome in outcomes:
-        if outcome.status in ("failed", "skipped"):
-            kept.append(outcome)
-        elif verbosity == "sampled":
-            success_seen += 1
-            if success_seen % _SAMPLE_EVERY == 1:  # 1st, 11th, 21st …
-                kept.append(outcome)
-    return kept
+        filtered = list(outcomes)
+    else:
+        filtered = []
+        success_seen = 0
+        for outcome in outcomes:
+            if outcome.status in ("failed", "skipped"):
+                filtered.append(outcome)
+            elif verbosity == "sampled":
+                success_seen += 1
+                if success_seen % _SAMPLE_EVERY == 1:  # 1st, 11th, 21st …
+                    filtered.append(outcome)
+    seen: set[tuple[str, str]] = set()
+    deduped: list[ItemOutcome] = []
+    for outcome in filtered:
+        key = (outcome.item_kind, outcome.item_ref)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(outcome)
+    return deduped
 
 
 async def record_run(

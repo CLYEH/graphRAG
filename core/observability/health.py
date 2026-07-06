@@ -55,6 +55,17 @@ STATUS_LIGHTS = (
     "Healthy",
 )
 
+#: §19's display names → the FROZEN HealthStatus enum (openapi.yaml, lower
+#: snake_case). to_payload speaks the contract; the display strings are the
+#: Console's concern.
+_CONTRACT_STATUS = {
+    "Build failed": "build_failed",
+    "Index drift": "index_drift",
+    "Eval regression": "eval_regression",
+    "Needs review": "needs_review",
+    "Healthy": "healthy",
+}
+
 
 @dataclass(frozen=True)
 class HealthReport:
@@ -65,11 +76,21 @@ class HealthReport:
     metrics: dict[str, Any]
 
     def to_payload(self) -> dict[str, Any]:
+        """The FROZEN HealthReport contract shape (openapi.yaml): status is
+        the lower-snake HealthStatus enum, ``drift`` is object-or-null
+        (null = no drift; details keyed when present), counts/pending_review
+        as typed. Extra keys ride under additionalProperties: true."""
         return {
             "project": self.project,
-            "status": self.status,
+            "status": _CONTRACT_STATUS[self.status],
             "active_build_id": str(self.active_build_id) if self.active_build_id else None,
-            "drift": list(self.drift),
+            "drift": {"failures": list(self.drift)} if self.drift else None,
+            "pending_review": int(self.metrics.get("pending_review", 0)),
+            "counts": {
+                key: value
+                for key, value in self.metrics.items()
+                if isinstance(value, int) and key != "pending_review"
+            },
             "metrics": self.metrics,
         }
 

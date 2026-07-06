@@ -60,6 +60,25 @@ def test_all_mode_keeps_everything() -> None:
     assert len(_persistable(_outcomes(), "all")) == 25
 
 
+def test_duplicate_item_refs_dedupe_first_kept() -> None:
+    """§27.7's own dedup rule at the write path: the table's unique index
+    (step_id, item_kind, item_ref) would roll the WHOLE run back on a
+    duplicate row — reachable under default verbosity when ingest emits one
+    skipped outcome per duplicate payload."""
+    outcomes = (
+        ItemOutcome("document", "hash-dup", "skipped"),
+        ItemOutcome("document", "hash-dup", "skipped"),
+        ItemOutcome("document", "hash-dup", "failed"),  # later status dropped
+        ItemOutcome("entity", "hash-dup", "failed"),  # different kind — kept
+    )
+    kept = _persistable(outcomes, "failures")
+    assert [(o.item_kind, o.item_ref, o.status) for o in kept] == [
+        ("document", "hash-dup", "skipped"),
+        ("entity", "hash-dup", "failed"),
+    ]
+    assert len(_persistable(outcomes, "all")) == 2  # dedup applies in every mode
+
+
 async def test_unknown_verbosity_falls_back_to_the_frozen_minimum() -> None:
     """A typo'd config must not widen (or lose) the persisted set — the
     §27.7 retry input is exactly the failures rows."""
@@ -182,6 +201,14 @@ async def test_record_run_persists_three_layers_with_verbosity(project: str) -> 
             assert await purge_expired_items(conn, retention_days=30) == 0
     finally:
         await engine.dispose()
+
+
+def test_contract_status_map_is_lockstep_with_the_lights() -> None:
+    """A sixth light without a contract mapping would KeyError at report
+    time — the map must stay total over STATUS_LIGHTS (reviewer nit)."""
+    from core.observability.health import _CONTRACT_STATUS, STATUS_LIGHTS
+
+    assert set(_CONTRACT_STATUS) == set(STATUS_LIGHTS)
 
 
 def test_status_light_precedence_is_total() -> None:
@@ -330,16 +357,23 @@ async def test_eval_regressed_cells_on_fakes() -> None:
         cast(Any, _Conn({"score": 0.5, "fingerprint": "fp"}, None)), "p", active_id
     )
 
+    # the payload speaks the FROZEN contract: lower-snake HealthStatus,
+    # drift object-or-null, integer counts split out
     payload = HealthReport(
-        project="p", status="Healthy", active_build_id=None, drift=(), metrics={"x": 1}
+        project="p",
+        status="Index drift",
+        active_build_id=None,
+        drift=("graph drift: 1 vs 0",),
+        metrics={"pending_review": 2, "entities": 5, "eval": {"score": 0.9}},
     ).to_payload()
-    assert payload == {
-        "project": "p",
-        "status": "Healthy",
-        "active_build_id": None,
-        "drift": [],
-        "metrics": {"x": 1},
-    }
+    assert payload["status"] == "index_drift"
+    assert payload["drift"] == {"failures": ["graph drift: 1 vs 0"]}
+    assert payload["pending_review"] == 2
+    assert payload["counts"] == {"entities": 5}
+    healthy = HealthReport(
+        project="p", status="Healthy", active_build_id=None, drift=(), metrics={}
+    ).to_payload()
+    assert healthy["status"] == "healthy" and healthy["drift"] is None
 
 
 async def test_health_report_shape_without_an_active_build_on_fakes() -> None:
