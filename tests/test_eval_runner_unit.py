@@ -403,3 +403,55 @@ async def test_run_eval_refuses_when_the_persist_hits_no_build(
             golden,
             cast(Any, policy),
         )
+
+
+async def test_expected_edges_synthesizes_cited_typed_relations() -> None:
+    """Codex round 11: untyped shortest_path + entity-first subgraph budget
+    can both miss the expected typed edge on a dense, valid build. The
+    runner asks the SoR directly for each expected (src, dst, type) and
+    synthesizes a rendered, evidence-cited relation result — and nothing
+    when the edge does not exist (retrieval widens, truth does not)."""
+    from core.eval.runner import _expected_edges
+
+    src_id, dst_id, rel_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    class _Repo:
+        project = "p"
+        build_id = "b"
+
+        async def entity_ids_by_name(self, name: str) -> list[uuid.UUID]:
+            return {"Acme": [src_id], "Globex": [dst_id]}.get(name, [])
+
+        async def relations_with_evidence(self, triples: Any) -> Any:
+            wanted = (src_id, dst_id, "partners_with")
+            if wanted in triples:
+                return {
+                    wanted: (
+                        rel_id,
+                        [
+                            {
+                                "evidence_type": "manual",
+                                "evidence_ref": "s3://a.txt",
+                                "source_uri": "s3://a.txt",
+                                "quote": "Acme partners with Globex",
+                            }
+                        ],
+                    )
+                }
+            return {}
+
+    case = _case(
+        "graph",
+        {"must_include_relations": [{"src": "Acme", "type": "partners_with", "dst": "Globex"}]},
+    )
+    response = await _expected_edges(cast(Any, _Repo()), case)
+    assert response is not None
+    assert response.results[0].title == "Acme -[partners_with]-> Globex"
+    assert response.results[0].source_refs  # §27.2: evidence-cited
+    assert response.results[0].id == str(rel_id)
+
+    missing = _case(
+        "graph",
+        {"must_include_relations": [{"src": "Acme", "type": "owns", "dst": "Globex"}]},
+    )
+    assert await _expected_edges(cast(Any, _Repo()), missing) is None

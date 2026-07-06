@@ -172,6 +172,56 @@ def _derive_graph_params(case: GoldenCase, max_hops: int) -> list[GraphQueryPara
     return derived
 
 
+async def _expected_edges(repo: Any, case: GoldenCase) -> McpResponse | None:
+    """Targeted SoR lookup for the case's expected typed edges (§27.2-cited).
+
+    The derived queries can miss the expected type through no fault of the
+    build: shortest_path is untyped, and a dense 1-hop subgraph spends its
+    row budget entities-first, starving the edge stage. The expectation
+    names an exact (src, dst, type) — ask the SoR directly and synthesize a
+    rendered, evidence-cited relation result for each edge that exists.
+    Nothing is synthesized for edges the SoR does not hold (an absent edge
+    still scores 0 — this widens RETRIEVAL, never the truth)."""
+    from core.query.graph import evidence_ref
+
+    expectations = case.expects.get("must_include_relations")
+    if not expectations:
+        return None
+    results: list[RetrievalResult] = []
+    for expectation in expectations:
+        src_ids = await repo.entity_ids_by_name(expectation["src"])
+        dst_ids = await repo.entity_ids_by_name(expectation["dst"])
+        triples = [
+            (src_id, dst_id, expectation["type"]) for src_id in src_ids for dst_id in dst_ids
+        ]
+        if not triples:
+            continue
+        resolved = await repo.relations_with_evidence(triples)
+        for _triple, (relation_id, evidence_rows) in resolved.items():
+            refs = tuple(ref for row in evidence_rows if (ref := evidence_ref(row)) is not None)
+            if not refs:
+                continue  # §27.2: a relation result cites ≥1 evidence
+            results.append(
+                RetrievalResult(
+                    result_type="relation",
+                    id=str(relation_id),
+                    score=1.0,
+                    source_refs=refs,
+                    title=(f"{expectation['src']} -[{expectation['type']}]-> {expectation['dst']}"),
+                )
+            )
+    if not results:
+        return None
+    return McpResponse(
+        query=case.question,
+        tool="graph_query",
+        project=repo.project,
+        build_id=str(repo.build_id),
+        results=tuple(results),
+        warnings=(),
+    )
+
+
 async def _path_validity(repo: BuildScopedRepo, response: McpResponse) -> float | None:
     """Share of path results whose per-edge relation refs all resolve to
     ACTIVE relations in the SoR. None when the response has no path results
@@ -245,6 +295,9 @@ async def _run_case(
             )
             for params in param_list
         ]
+        targeted = await _expected_edges(deps.repo, case)
+        if targeted is not None:
+            responses.append(targeted)
         return _merge_responses(responses), None
     # hybrid — the default entry; the FIRST derived anchor makes the graph
     # mode available. Hybrid runs ONE query per mode by design, so a

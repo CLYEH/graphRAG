@@ -478,7 +478,7 @@ async def _relation_results(
             dropped += 1  # stale projection edge — no active SoR relation
             continue
         relation_id, evidence_rows = resolved[triple]
-        refs = tuple(ref for row in evidence_rows if (ref := _evidence_ref(row)) is not None)
+        refs = tuple(ref for row in evidence_rows if (ref := evidence_ref(row)) is not None)
         if not refs:
             dropped += 1  # §27.2: a relation result cites ≥1 evidence; none survived
             continue
@@ -491,7 +491,7 @@ async def _relation_results(
     return kept, dropped
 
 
-def _evidence_ref(row: dict[str, Any]) -> SourceRef | None:
+def evidence_ref(row: dict[str, Any]) -> SourceRef | None:
     """One relation_evidence row → a §16 evidence-backed ref, or None.
 
     The SoR columns are nullable where the frozen contract shapes are not
