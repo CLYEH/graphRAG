@@ -289,9 +289,10 @@ async def _eval_gate(
     Scores come from builds.metrics['eval'] as written by the C10 runner.
     A candidate whose report carries failed>0 (per-case min_score misses) is
     blocked outright — before and independent of the regression comparison
-    (the CLI exits 1 on the same report; activation must agree). Unscored
-    candidate/active with an active present ⇒ fail-closed; no active build
-    (and no per-case failures) ⇒ the one vacuous, deferred cell."""
+    (the CLI exits 1 on the same report; activation must agree). An unscored
+    candidate fails closed ALWAYS (bootstrap included — measuring the
+    candidate is a standalone requirement); an unscored active fails closed;
+    only the REGRESSION comparison is vacuous when no active build exists."""
     from core.config import get_settings
     from core.eval.spec import is_eval_regression
 
@@ -320,6 +321,16 @@ async def _eval_gate(
             f"eval gate (§20): {failed_cases} golden case(s) below their min_score "
             "in the candidate's eval report — activation blocked"
         ], []
+    if candidate is None:
+        # FAIL-CLOSED, bootstrap included: the candidate's own eval (scored,
+        # no failed cases) is a standalone §20 requirement — only the
+        # REGRESSION comparison can be vacuous, never the requirement to
+        # have measured the candidate at all. Deferred would be ignored by
+        # report.ok and the unscored first build would promote.
+        return [
+            "eval gate (§20): candidate build has no eval score — run `graphrag eval` "
+            "on it first; an unmeasured candidate cannot pass the gate"
+        ], []
     active_row = (
         await conn.execute(
             sa.select(tables.builds.c.id).where(
@@ -328,17 +339,9 @@ async def _eval_gate(
         )
     ).one_or_none()
     if active_row is None:
-        # bootstrap: nothing to regress against — the only genuinely vacuous
-        # cell (still surfaced, never silent)
+        # bootstrap: the candidate IS scored (above) with no failed cases
+        # (further above) — only the regression comparison is vacuous
         return [], ["eval gate (§20): no active build to regress against — gate vacuous"]
-    if candidate is None:
-        # FAIL-CLOSED (P1): deferred would be ignored by report.ok and the
-        # unscored candidate would promote — bypassing the gate for exactly
-        # its target case. The fix the message names is actionable.
-        return [
-            "eval gate (§20): candidate build has no eval score — run `graphrag eval` "
-            "on it first; an unmeasured candidate cannot pass the regression gate"
-        ], []
     active_block = await _eval_block(active_row.id)
     active_score = _score_of(active_block)
     if active_score is None:
@@ -388,8 +391,9 @@ async def preflight(
     (2) §19 drift — the graph and vector projections agree with the Postgres
     truth on entity/relation/point counts for THIS build; (3) the §20 eval
     gate, FAIL-CLOSED: failed>0 in the candidate's report → FAILURE (before
-    everything else); unscored candidate/active with an active present →
-    FAILURE; no active build → vacuous (deferred); both scored →
+    everything else); unscored candidate → FAILURE (bootstrap included);
+    unscored active → FAILURE; no active build (candidate scored, clean) →
+    the regression comparison alone is vacuous (deferred); both scored →
     regression blocks. Both the drift check AND the eval gate are
     re-checked under the promotion lock (racing activations can replace the
     active build between preflight and lock — the comparison must bind to

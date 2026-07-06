@@ -725,13 +725,18 @@ async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) 
 
     candidate, active = uuid.uuid4(), uuid.uuid4()
 
-    # unscored candidate + an active exists → FAIL-CLOSED (a deferral would
-    # be ignored by report.ok and the gate's target case would promote)
+    # unscored candidate → FAIL-CLOSED with or without an active build:
+    # measuring the candidate is a standalone requirement — the first-ever
+    # activation must not bypass it (Codex round 12)
     conn = _Conn({candidate: None, active: {"eval": {"score": 0.9}}}, active)
     failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
     assert any("graphrag eval" in f for f in failures) and deferred == []
+    conn = _Conn({candidate: None}, None)  # bootstrap, unscored → still blocked
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("graphrag eval" in f for f in failures) and deferred == []
 
-    # no active build → the only genuinely vacuous cell (bootstrap)
+    # no active build + candidate scored clean → ONLY the regression
+    # comparison is vacuous
     conn = _Conn({candidate: {"eval": {"score": 0.9}}}, None)
     failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
     assert failures == [] and any("no active build" in d for d in deferred)
