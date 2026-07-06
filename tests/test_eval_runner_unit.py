@@ -486,3 +486,17 @@ async def test_expected_edges_synthesizes_cited_typed_relations() -> None:
     assert (
         await _expected_edges(cast(Any, _Repo()), cast(Any, stale), cast(Any, policy), case) is None
     )
+
+    # a store failure during the probe degrades, never crashes (§22 — Codex
+    # round 17): the edge is simply not retrievable now; the (failing)
+    # report must still persist rather than leave the build unscored
+    from neo4j.exceptions import ServiceUnavailable
+
+    class _DownGraph:
+        async def has_edge(self, src: str, dst: str, rel_type: str, *, timeout_ms: int) -> bool:
+            raise ServiceUnavailable("neo4j down")
+
+    assert (
+        await _expected_edges(cast(Any, _Repo()), cast(Any, _DownGraph()), cast(Any, policy), case)
+        is None
+    )

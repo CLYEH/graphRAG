@@ -35,6 +35,7 @@ import sqlalchemy as sa
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.llms import LLM
 from neo4j import AsyncSession
+from neo4j.exceptions import DriverError, Neo4jError
 from qdrant_client import AsyncQdrantClient
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -229,13 +230,20 @@ async def _expected_edges(
             # the PROJECTION must hold the same typed edge — §19 counts
             # alone cannot see a wrong-type/stale edge; the lookup is an
             # EXACT single-triple probe (has_edge, LIMIT 1), so no row
-            # budget can clip the target out of the answer
-            projected = await graph.has_edge(
-                str(triple[0]),
-                str(triple[1]),
-                triple[2],
-                timeout_ms=policy.cypher_policy().timeout_ms,
-            )
+            # budget can clip the target out of the answer. A store failure
+            # here degrades like the mode functions do (§22): the edge is
+            # simply not retrievable right now, the case scores what the
+            # OTHER queries returned, and the (possibly failing) report
+            # still persists — eval must never crash into "unscored".
+            try:
+                projected = await graph.has_edge(
+                    str(triple[0]),
+                    str(triple[1]),
+                    triple[2],
+                    timeout_ms=policy.cypher_policy().timeout_ms,
+                )
+            except (Neo4jError, DriverError):
+                continue
             if not projected:
                 continue  # SoR holds it, the projection does not — not retrievable
             refs = tuple(ref for row in evidence_rows if (ref := evidence_ref(row)) is not None)
