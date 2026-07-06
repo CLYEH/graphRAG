@@ -52,6 +52,10 @@ def test_answer_regex_searches_all_visible_text() -> None:
     response = _response(_result(title="Q3 report", text="revenue rose 12%"))
     assert scoring.answer_regex_score(response, r"revenue.*\d+%") == 1.0
     assert scoring.answer_regex_score(response, r"loss") == 0.0
+    # ORIGINAL casing: a case-sensitive golden pattern must match the text
+    # as returned, not a casefolded copy ("Q3" would never match "q3")
+    assert scoring.answer_regex_score(response, r"Q3 report") == 1.0
+    assert scoring.answer_regex_score(response, r"q3 REPORT") == 0.0
 
 
 def test_relation_hit_needs_all_three_in_one_result() -> None:
@@ -68,6 +72,15 @@ def test_relation_hit_needs_all_three_in_one_result() -> None:
     # §27.3: direction matters — the REVERSED edge must not satisfy src→dst
     reversed_edge = _response(_result(result_type="relation", title="Globex partners_with Acme"))
     assert scoring.relation_hit_rate(reversed_edge, expected) == 0.0
+    # a PATH rendering a backward hop puts src textually before dst with a
+    # "<-" arrow between them (graph.py's renderer) — still not a hit
+    reversed_hop = _response(_result(result_type="path", title="Acme <-[partners_with]- Globex"))
+    assert scoring.relation_hit_rate(reversed_hop, expected) == 0.0
+    # ...but a genuine forward hop in a longer path IS one
+    forward_hop = _response(
+        _result(result_type="path", title="Initech -[owns]-> Acme -[partners_with]-> Globex")
+    )
+    assert scoring.relation_hit_rate(forward_hop, expected) == 1.0
 
 
 def test_relation_hits_only_count_relation_and_path_results() -> None:

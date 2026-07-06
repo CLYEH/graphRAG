@@ -9,10 +9,12 @@ text (titles + texts) and their citations (source_refs):
 - ``must_cite_sources`` → source_recall AND citation_coverage: the share of
   expected source identifiers covered by the response's source_refs
   (matching ``source_uri`` or ``id``).
-- ``answer_regex`` → 1/0: the pattern matches the concatenated result text.
+- ``answer_regex`` → 1/0: the pattern matches the concatenated result text
+  in its ORIGINAL casing (case-sensitive, as regexes are by default).
 - ``must_include_relations`` → relation_hit_rate: a relation expectation
   hits when one relation/path result's visible text carries the type and
-  src BEFORE dst (§27.3: direction matters — reversed edges do not hit).
+  src BEFORE dst with no reversed-arrow hop ("<-") between them (§27.3:
+  direction matters — a reversed edge or backward path hop does not hit).
 - ``must_have_valid_paths`` → path_validity: the share of path results whose
   per-edge relation refs all resolve against the SoR (the runner passes the
   resolution callback); asserting it with NO path results returned scores 0
@@ -43,12 +45,20 @@ from core.eval.spec import SCORE_TOLERANCE
 from core.query.results import McpResponse, RetrievalResult
 
 
+def _raw_text(result: RetrievalResult) -> str:
+    return f"{result.title or ''}\n{result.text or ''}"
+
+
 def _visible_text(result: RetrievalResult) -> str:
-    return f"{result.title or ''}\n{result.text or ''}".casefold()
+    return _raw_text(result).casefold()
 
 
 def _all_text(response: McpResponse) -> str:
     return "\n".join(_visible_text(result) for result in response.results)
+
+
+def _all_raw_text(response: McpResponse) -> str:
+    return "\n".join(_raw_text(result) for result in response.results)
 
 
 def entity_recall(response: McpResponse, expected: list[str]) -> float:
@@ -69,7 +79,10 @@ def source_recall(response: McpResponse, expected: list[str]) -> float:
 
 
 def answer_regex_score(response: McpResponse, pattern: str) -> float:
-    return 1.0 if re.search(pattern, _all_text(response)) else 0.0
+    # ORIGINAL casing: the golden pattern is an ordinary case-sensitive
+    # regex — matching against casefolded text would fail valid answers
+    # (authors can opt into insensitivity with (?i) themselves)
+    return 1.0 if re.search(pattern, _all_raw_text(response)) else 0.0
 
 
 def relation_hit_rate(response: McpResponse, expected: Sequence[Mapping[str, str]]) -> float:
@@ -84,10 +97,19 @@ def relation_hit_rate(response: McpResponse, expected: Sequence[Mapping[str, str
         rel_type = expectation["type"].casefold()
         dst = expectation["dst"].casefold()
         for text in texts:
-            # direction matters (§27.3): src must appear BEFORE dst — plain
-            # co-occurrence would score the reversed edge as a hit
+            # direction matters (§27.3): src must appear BEFORE dst, and the
+            # SEGMENT BETWEEN them must not traverse a reversed edge — path
+            # results render backward hops as "<-[type]-" (graph.py), so
+            # "acme <-[t]- globex" has src before dst textually while the
+            # stored edge points the OTHER way
             src_at = text.find(src)
-            if src_at >= 0 and rel_type in text and text.find(dst, src_at + len(src)) >= 0:
+            if src_at < 0:
+                continue
+            dst_at = text.find(dst, src_at + len(src))
+            if dst_at < 0:
+                continue
+            between = text[src_at + len(src) : dst_at]
+            if rel_type in text and "<-" not in between:
                 hits += 1
                 break
     return hits / len(expected)
