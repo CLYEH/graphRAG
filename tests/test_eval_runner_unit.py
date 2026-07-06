@@ -31,9 +31,10 @@ def test_graph_params_cover_every_expectation() -> None:
     """score_case computes each metric over its WHOLE expectation list — any
     expectation the runner never fetches under-scores valid builds (Codex
     rounds 3+5): every relation gets a path query (connectivity) PLUS a
-    1-hop src neighbors walk (shortest_path is untyped — the neighborhood's
-    rendered direct edges carry every TYPE between the pair), and every
-    expected entity gets its own neighbors walk; duplicates are folded."""
+    1-hop src SUBGRAPH (shortest_path is untyped, and only subgraph emits
+    rendered typed relation results), and every expected entity gets its own
+    subgraph (it INCLUDES the seed — neighbors excludes it, so a singleton
+    expected entity would score 0); duplicates are folded."""
     param_list = _derive_graph_params(
         _case(
             "graph",
@@ -50,17 +51,17 @@ def test_graph_params_cover_every_expectation() -> None:
     )
     assert [(p.template, p.entity, p.other_entity, p.hops) for p in param_list] == [
         ("path", "Acme", "Globex", 3),
-        ("neighbors", "Acme", None, 1),
+        ("subgraph", "Acme", None, 1),
         ("path", "Globex", "Initech", 3),
-        ("neighbors", "Globex", None, 1),
-        # "Acme" neighbors deduped — already derived from the first relation
-        ("neighbors", "Umbrella", None, 1),
+        ("subgraph", "Globex", None, 1),
+        # "Acme" subgraph deduped — already derived from the first relation
+        ("subgraph", "Umbrella", None, 1),
     ]
 
 
-def test_graph_params_fall_back_to_neighbors_then_empty() -> None:
+def test_graph_params_fall_back_to_subgraph_then_empty() -> None:
     param_list = _derive_graph_params(_case("graph", {"must_contain_entities": ["Acme"]}), 3)
-    assert [(p.template, p.entity) for p in param_list] == [("neighbors", "Acme")]
+    assert [(p.template, p.entity) for p in param_list] == [("subgraph", "Acme")]
     assert _derive_graph_params(_case("graph", {"answer_regex": "x"}), 3) == []
 
 

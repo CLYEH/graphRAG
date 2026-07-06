@@ -99,12 +99,14 @@ def _derive_graph_params(case: GoldenCase, max_hops: int) -> list[GraphQueryPara
     runner never fetches under-scores builds that actually satisfy it:
 
     - every expected relation → a path query (connectivity, path_validity)
-      PLUS a 1-hop neighbors walk around its src — shortest_path is untyped
-      (any active edge between the endpoints can come back), while the
-      neighborhood's direct edges carry every TYPE between the pair as
-      rendered relation results;
-    - every expected entity → its own 1-hop neighbors walk (an entity off
-      the relation paths would otherwise never be retrieved).
+      PLUS a 1-hop SUBGRAPH around its src — shortest_path is untyped (any
+      active edge between the endpoints can come back), and of the §27.6
+      templates only subgraph EMITS relation results (rendered
+      "src -[type]-> dst"), exposing every type between the pair;
+    - every expected entity → its own 1-hop subgraph: subgraph INCLUDES the
+      seed (a singleton/disconnected expected entity must be retrievable by
+      its own name — the neighbors template excludes the seed and would
+      score 0 on exactly the entity the case names).
 
     Queries are deduped by parameters; N queries per case is fine for an
     offline eval harness."""
@@ -123,9 +125,9 @@ def _derive_graph_params(case: GoldenCase, max_hops: int) -> list[GraphQueryPara
                 template="path", entity=rel["src"], other_entity=rel["dst"], hops=max_hops
             )
         )
-        _add(GraphQueryParams(template="neighbors", entity=rel["src"], hops=1))
+        _add(GraphQueryParams(template="subgraph", entity=rel["src"], hops=1))
     for name in case.expects.get("must_contain_entities", []):
-        _add(GraphQueryParams(template="neighbors", entity=name, hops=1))
+        _add(GraphQueryParams(template="subgraph", entity=name, hops=1))
     return derived
 
 
