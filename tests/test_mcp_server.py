@@ -282,3 +282,29 @@ async def test_store_outages_degrade_typed_but_code_bugs_stay_loud() -> None:
 
     with pytest.raises(ValueError, match="in-code bug"):
         await _bounded(runtime, "semantic_search", "q", _bug)
+
+
+def test_active_binding_cannot_be_forged() -> None:
+    """Codex round-9: bound_to taking a raw uuid made DR-001 caller
+    discipline — any code could bind an archived build. The ActiveBinding
+    proof restores the CONSTRUCTION fence: only resolve_active_binding()
+    (the §27.1 lookup itself) can mint one; direct construction — with or
+    without a guessed token — raises."""
+    import uuid
+
+    from core.stores.repo import ActiveBinding
+
+    with pytest.raises(RuntimeError, match="resolve_active_binding"):
+        ActiveBinding("p", uuid.uuid4())
+    with pytest.raises(RuntimeError, match="resolve_active_binding"):
+        ActiveBinding("p", uuid.uuid4(), object())  # guessed token
+
+    # dataclasses.replace must not forge a REBOUND proof from a valid one:
+    # the token is an InitVar (dropped by replace → falls back to None)
+    import dataclasses
+
+    import core.stores.repo as repo_module
+
+    valid = ActiveBinding("p", uuid.uuid4(), repo_module._BINDING_TOKEN)
+    with pytest.raises(RuntimeError, match="resolve_active_binding"):
+        dataclasses.replace(valid, build_id=uuid.uuid4())

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Collection, Sequence
+from dataclasses import InitVar, dataclass
 from typing import Any
 
 import sqlalchemy as sa
@@ -162,6 +163,38 @@ class BuildNotWritableError(LookupError):
 #: building build for writes) — an unvalidated direct construction would
 #: reopen the bind-to-anything hole.
 _CONSTRUCTION_TOKEN = object()
+_BINDING_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class ActiveBinding:
+    """Proof of ONE active-build resolution (§27.1/DR-001).
+
+    Mintable only by :func:`resolve_active_binding` (token-fenced like the
+    repos themselves) — the ``bound_to`` factories accept THIS, never a raw
+    uuid, so an arbitrary (archived, foreign) build can never be bound: the
+    DR-001 guarantee stays a construction fence, not caller discipline. The
+    token is an ``InitVar`` (not a stored field) so ``dataclasses.replace``
+    cannot carry it into a rebound forgery — replace drops init-only vars,
+    falls back to None, and the fence raises."""
+
+    project: str
+    build_id: uuid.UUID
+    _token: InitVar[object] = None
+
+    def __post_init__(self, _token: object) -> None:
+        if _token is not _BINDING_TOKEN:
+            raise RuntimeError(
+                "ActiveBinding is minted by resolve_active_binding() only — "
+                "it is the proof that this build was resolved as ACTIVE"
+            )
+
+
+async def resolve_active_binding(conn: AsyncConnection, project: str) -> ActiveBinding:
+    """The ONE §27.1 lookup for a request: resolve the active build and mint
+    the binding proof every store's ``bound_to`` requires."""
+    build = await active_build_id(conn, project)
+    return ActiveBinding(project, build, _token=_BINDING_TOKEN)
 
 
 #: The characters a PostgreSQL operator name may contain (PG manual §4.1.3).
@@ -320,15 +353,16 @@ class BuildScopedRepo:
         return BuildScopedRepo(conn, project, build, _token=_CONSTRUCTION_TOKEN)
 
     @classmethod
-    def bound_to(cls, conn: AsyncConnection, project: str, build_id: uuid.UUID) -> BuildScopedRepo:
-        """Bind to a build the CALLER already resolved via ``active_build_id``.
+    def bound_to(cls, conn: AsyncConnection, binding: ActiveBinding) -> BuildScopedRepo:
+        """Bind to a build the CALLER resolved via ``resolve_active_binding``.
 
         §27.1 reads the active id ONCE per request and binds every store to
         that same id — per-factory lookups could split scopes across a
         mid-request activation (each factory seeing a different 'active').
-        The id must come from ``active_build_id`` on the same request; this
-        factory only carries it, the scope injection below is unchanged."""
-        return BuildScopedRepo(conn, project, build_id, _token=_CONSTRUCTION_TOKEN)
+        The :class:`ActiveBinding` proof is mintable only by that lookup, so
+        this path cannot bind an arbitrary build; scope injection below is
+        unchanged."""
+        return BuildScopedRepo(conn, binding.project, binding.build_id, _token=_CONSTRUCTION_TOKEN)
 
     # -- scope plumbing (single-underscore: shared with the SQL-shape tests) --
 

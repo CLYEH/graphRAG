@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from core.query.hybrid import HybridDeps
 from core.stores.graph import BuildScopedGraphRepo
-from core.stores.repo import BuildScopedRepo, active_build_id
+from core.stores.repo import BuildScopedRepo, resolve_active_binding
 from core.stores.sqlreader import BuildScopedSqlReader
 from core.stores.vectors import BuildScopedVectorRepo
 
@@ -63,12 +63,12 @@ class ProjectContext:
             # split scopes across a mid-call activation (one store on the old
             # build, the next on the new). The lookup's transaction is ended
             # so the sql reader's loaned-clean contract holds (C6b).
-            build_id = await active_build_id(conn, self.project)
+            binding = await resolve_active_binding(conn, self.project)
             await conn.rollback()  # end the lookup's auto-begun read txn
-            sql_reader = BuildScopedSqlReader.bound_to(conn, self.project, build_id)
-            repo = BuildScopedRepo.bound_to(conn, self.project, build_id)
-            vectors = BuildScopedVectorRepo.bound_to(self.qdrant, self.project, build_id)
-            graph = BuildScopedGraphRepo.bound_to(session, self.project, build_id)
+            sql_reader = BuildScopedSqlReader.bound_to(conn, binding)
+            repo = BuildScopedRepo.bound_to(conn, binding)
+            vectors = BuildScopedVectorRepo.bound_to(self.qdrant, binding)
+            graph = BuildScopedGraphRepo.bound_to(session, binding)
             yield HybridDeps(
                 repo=repo,
                 vectors=vectors,
