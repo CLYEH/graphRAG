@@ -196,3 +196,5 @@ async def test_a_registered_tool_calls_through_on_live_stores(
         unwrapped = unwrapped["result"]
     assert unwrapped["project"] == context.project
     assert unwrapped["sql_enabled"] is False and unwrapped["tables"] == {}
+    # the schema snapshot names its build — a later activation is detectable
+    assert uuid.UUID(unwrapped["build_id"])  # real, parseable, never nil

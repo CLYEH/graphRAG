@@ -340,6 +340,10 @@ async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
                     tables = {table: list(cols) for table, cols in columns.items()}
                 return {
                     "project": runtime.context.project,
+                    # the build these columns belong to — an activation
+                    # between this lookup and a later sql_query would
+                    # otherwise be undetectable by the caller (DR-001)
+                    "build_id": bound_build,
                     "sql_enabled": runtime.policy.text_to_sql.enabled,
                     "tables": tables,
                 }
