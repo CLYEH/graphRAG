@@ -339,11 +339,29 @@ async def _eval_gate(
             "eval gate (§20): candidate build has no eval score — run `graphrag eval` "
             "on it first; an unmeasured candidate cannot pass the regression gate"
         ], []
-    active_score = _score_of(await _eval_block(active_row.id))
+    active_block = await _eval_block(active_row.id)
+    active_score = _score_of(active_block)
     if active_score is None:
         return [
             "eval gate (§20): the active build has no eval score — run `graphrag eval` "
             "on the active build first; the gate cannot compare against the unmeasured"
+        ], []
+    # scores are comparable only when both builds were scored against the
+    # SAME golden set + policy (the runner fingerprints what it evaluated —
+    # a candidate scored on an easier suite must not pass on raw numbers)
+    candidate_fp = (candidate_block or {}).get("fingerprint")
+    active_fp = (active_block or {}).get("fingerprint")
+    if not isinstance(candidate_fp, str) or not isinstance(active_fp, str):
+        return [
+            "eval gate (§20): eval report(s) carry no suite fingerprint — re-run "
+            "`graphrag eval` on both builds with the current tooling so the gate "
+            "can verify the scores are comparable"
+        ], []
+    if candidate_fp != active_fp:
+        return [
+            "eval gate (§20): candidate and active were scored against DIFFERENT "
+            "golden sets/policies — re-run `graphrag eval` on both with the same "
+            "suite; raw scores are not comparable"
         ], []
     threshold = get_settings().eval_regression_threshold
     if is_eval_regression(candidate, active_score, threshold):

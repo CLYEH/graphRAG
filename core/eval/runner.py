@@ -54,6 +54,34 @@ from core.stores.sqlreader import BuildScopedSqlReader
 from core.stores.vectors import BuildScopedVectorRepo
 
 
+def eval_fingerprint(golden: GoldenSet, policy: QueryPolicy) -> str:
+    """Identity of WHAT was evaluated (§20): the golden cases + the policy
+    values that shape scoring. Two reports are comparable only when their
+    fingerprints match — a candidate scored against a different (easier)
+    golden set or laxer policy must not pass the regression gate on raw
+    numbers. Canonical JSON (sorted keys) over dataclass dumps → sha256."""
+    import dataclasses
+    import hashlib
+    import json
+
+    def _dump(obj: Any) -> Any:
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            return dataclasses.asdict(obj)
+        # non-dataclass doubles (tests) — deterministic best-effort dump
+        return (
+            {k: str(v) for k, v in sorted(vars(obj).items())}
+            if hasattr(obj, "__dict__")
+            else str(obj)
+        )
+
+    document = {
+        "cases": [dataclasses.asdict(case) for case in golden.cases],
+        "policy": _dump(policy),
+    }
+    canonical = json.dumps(document, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class CaseResult:
     question: str
@@ -72,6 +100,7 @@ class EvalReport:
     failed: int
     cases: tuple[CaseResult, ...]
     metrics: dict[str, float]
+    fingerprint: str
 
     def to_metrics_payload(self) -> dict[str, Any]:
         """The shape stored at builds.metrics['eval'] and read by the §14
@@ -80,6 +109,7 @@ class EvalReport:
             "score": self.score,
             "passed": self.passed,
             "failed": self.failed,
+            "fingerprint": self.fingerprint,
             "metrics": self.metrics,
             "cases": [
                 {
@@ -305,6 +335,7 @@ async def run_eval(
         failed=len(results) - passed,
         cases=tuple(results),
         metrics=metrics,
+        fingerprint=eval_fingerprint(golden, policy),
     )
 
     await conn.rollback()  # end any read txn before OUR write txn

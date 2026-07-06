@@ -120,7 +120,7 @@ async def _new_build(
                 # these tests exercise SWITCH semantics, not the §20 gate:
                 # a stub score keeps the (fail-closed) eval gate green; the
                 # unscored cells are exercised in the eval integration suite
-                metrics={"eval": {"score": score}},
+                metrics={"eval": {"score": score, "failed": 0, "fingerprint": "test-suite"}},
             )
             .returning(tables.builds.c.id)
         )
@@ -741,15 +741,49 @@ async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) 
     failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
     assert any("active build has no eval score" in f for f in failures) and deferred == []
 
-    # regression beyond threshold → blocks
-    conn = _Conn({candidate: {"eval": {"score": 0.5}}, active: {"eval": {"score": 0.9}}}, active)
+    # regression beyond threshold → blocks (same-suite fingerprints)
+    conn = _Conn(
+        {
+            candidate: {"eval": {"score": 0.5, "fingerprint": "fp"}},
+            active: {"eval": {"score": 0.9, "fingerprint": "fp"}},
+        },
+        active,
+    )
     failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
     assert any("eval regression" in f for f in failures)
 
     # within threshold → clean
-    conn = _Conn({candidate: {"eval": {"score": 0.88}}, active: {"eval": {"score": 0.9}}}, active)
+    conn = _Conn(
+        {
+            candidate: {"eval": {"score": 0.88, "fingerprint": "fp"}},
+            active: {"eval": {"score": 0.9, "fingerprint": "fp"}},
+        },
+        active,
+    )
     failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
     assert failures == [] and deferred == []
+
+    # DIFFERENT suites are not comparable — fail-closed naming the reason
+    conn = _Conn(
+        {
+            candidate: {"eval": {"score": 0.95, "fingerprint": "fp-easy"}},
+            active: {"eval": {"score": 0.9, "fingerprint": "fp-hard"}},
+        },
+        active,
+    )
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("DIFFERENT golden sets" in f for f in failures)
+
+    # missing fingerprint (pre-fingerprint report) → fail-closed, actionable
+    conn = _Conn(
+        {
+            candidate: {"eval": {"score": 0.95}},
+            active: {"eval": {"score": 0.9, "fingerprint": "fp"}},
+        },
+        active,
+    )
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("no suite fingerprint" in f for f in failures)
 
     # failed cases block OUTRIGHT — before regression compare AND before the
     # vacuous no-active branch (the CLI exits 1 on the same report; the

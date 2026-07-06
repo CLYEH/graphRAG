@@ -126,9 +126,11 @@ def test_metrics_payload_carries_what_the_gate_reads() -> None:
             CaseResult("q2", "graph", 0.5, False, {}, note="no anchor"),
         ),
         metrics={"entity_recall": 1.0},
+        fingerprint="fp-1",
     )
     payload = report.to_metrics_payload()
     assert payload["score"] == 0.75  # the §14 gate compares exactly this
+    assert payload["fingerprint"] == "fp-1"  # suite identity rides along
     assert payload["passed"] == 1 and payload["failed"] == 1
     assert [c["question"] for c in payload["cases"]] == ["q1", "q2"]
 
@@ -287,3 +289,31 @@ def test_merge_responses_dedupes_and_unions() -> None:
     assert [r.id for r in merged.results] == ["r-1", "r-2"]
     assert merged.results[0].score == 0.9  # the FIRST occurrence is kept
     assert [w.message for w in merged.warnings] == ["shared", "extra"]  # unioned once, in order
+
+
+def test_eval_fingerprint_is_a_pure_function_of_the_suite() -> None:
+    """§20 comparability: two reports may be compared only when scored
+    against the SAME golden set + policy. The fingerprint must be stable
+    for identical inputs and differ when the suite differs — otherwise a
+    candidate scored on an easier suite passes on raw numbers."""
+    import dataclasses
+    from types import SimpleNamespace as _NS
+
+    from core.eval.golden import GoldenSet
+    from core.eval.runner import eval_fingerprint
+
+    @dataclasses.dataclass(frozen=True)
+    class _Policy:
+        max_top_k: int = 20
+        max_latency_ms: int = 10000
+
+    golden_a = GoldenSet(cases=(_case("semantic", {"must_contain_entities": ["Acme"]}),))
+    golden_b = GoldenSet(cases=(_case("semantic", {"must_contain_entities": ["Globex"]}),))
+    fp1 = eval_fingerprint(golden_a, cast(Any, _Policy()))
+    fp2 = eval_fingerprint(golden_a, cast(Any, _Policy()))
+    fp3 = eval_fingerprint(golden_b, cast(Any, _Policy()))
+    fp4 = eval_fingerprint(golden_a, cast(Any, _Policy(max_top_k=5)))
+    assert fp1 == fp2  # deterministic
+    assert fp1 != fp3  # different golden set → different identity
+    assert fp1 != fp4  # different policy → different identity
+    _ = _NS  # keep import local-scope tidy

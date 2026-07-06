@@ -745,6 +745,7 @@ source = { editable = "." }
 dependencies = [
     { name = "alembic" },
     { name = "asyncpg" },
+    { name = "jsonschema" },
     { name = "leidenalg" },
     { name = "llama-index-core" },
     { name = "llama-index-embeddings-openai" },
@@ -754,6 +755,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-igraph" },
+    { name = "pyyaml" },
     { name = "qdrant-client" },
     { name = "sqlalchemy" },
     { name = "sqlglot" },
@@ -780,6 +782,7 @@ dev = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.14" },
     { name = "asyncpg", specifier = ">=0.30" },
+    { name = "jsonschema", specifier = ">=4.21" },
     { name = "leidenalg", specifier = ">=0.12.0" },
     { name = "llama-index-core", specifier = ">=0.14.23" },
     { name = "llama-index-embeddings-openai", specifier = ">=0.5.1" },
@@ -789,6 +792,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.3" },
     { name = "python-igraph", specifier = ">=1.0.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "qdrant-client", specifier = ">=1.12" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "sqlglot", specifier = ">=25.0" },
