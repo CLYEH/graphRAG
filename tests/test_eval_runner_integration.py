@@ -95,6 +95,7 @@ def _golden_file(tmp_path: Path) -> Path:
                         "question": "Path between Acme and Globex?",
                         "mode": "graph",
                         "expects": {
+                            "must_contain_entities": ["Acme", "Globex"],
                             "must_include_relations": [
                                 {"src": "Acme", "type": "partners_with", "dst": "Globex"}
                             ],
@@ -222,6 +223,9 @@ async def test_run_eval_scores_a_projected_build_and_persists(project: str, tmp_
             semantic_case, graph_case = report.cases
             assert semantic_case.subscores["entity_recall"] == 1.0  # both projected + found
             assert graph_case.subscores["relation_hit_rate"] == 1.0
+            # graph entity results carry the SoR canonical name as title
+            # (Codex round 3): recall over visible text sees them
+            assert graph_case.subscores["entity_recall"] == 1.0
             assert graph_case.subscores["path_validity"] == 1.0  # verified real path
             assert report.passed == 2 and report.failed == 0
 

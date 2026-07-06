@@ -27,27 +27,32 @@ def _case(mode: str, expects: dict[str, Any]) -> GoldenCase:
     return GoldenCase(question="q?", mode=mode, expects=expects, min_score=0.5)
 
 
-def test_graph_params_prefer_the_expected_relation_path() -> None:
-    params = _derive_graph_params(
+def test_graph_params_cover_every_expected_relation() -> None:
+    """score_case computes relation_hit_rate over the WHOLE expectation list
+    — deriving only the first would under-score builds holding all expected
+    relations (Codex round 3): every relation gets its own path query."""
+    param_list = _derive_graph_params(
         _case(
             "graph",
-            {"must_include_relations": [{"src": "Acme", "type": "t", "dst": "Globex"}]},
+            {
+                "must_include_relations": [
+                    {"src": "Acme", "type": "t", "dst": "Globex"},
+                    {"src": "Globex", "type": "t2", "dst": "Initech"},
+                ]
+            },
         ),
         max_hops=3,
     )
-    assert params is not None
-    assert (params.template, params.entity, params.other_entity, params.hops) == (
-        "path",
-        "Acme",
-        "Globex",
-        3,
-    )
+    assert [(p.template, p.entity, p.other_entity, p.hops) for p in param_list] == [
+        ("path", "Acme", "Globex", 3),
+        ("path", "Globex", "Initech", 3),
+    ]
 
 
-def test_graph_params_fall_back_to_neighbors_then_none() -> None:
-    params = _derive_graph_params(_case("graph", {"must_contain_entities": ["Acme"]}), 3)
-    assert params is not None and (params.template, params.entity) == ("neighbors", "Acme")
-    assert _derive_graph_params(_case("graph", {"answer_regex": "x"}), 3) is None
+def test_graph_params_fall_back_to_neighbors_then_empty() -> None:
+    param_list = _derive_graph_params(_case("graph", {"must_contain_entities": ["Acme"]}), 3)
+    assert [(p.template, p.entity) for p in param_list] == [("neighbors", "Acme")]
+    assert _derive_graph_params(_case("graph", {"answer_regex": "x"}), 3) == []
 
 
 async def test_an_underivable_graph_case_scores_zero_loudly() -> None:
@@ -239,3 +244,36 @@ def _async(value: Any) -> Any:
         return value
 
     return _coro()
+
+
+def test_merge_responses_dedupes_and_unions() -> None:
+    """Fix-A's downstream: per-relation graph responses merge into ONE §16
+    response for scoring — a result appearing in two responses counts once
+    (dedupe by (result_type, id), first kept), warnings union by value in
+    order (QueryWarning is a frozen dataclass — equality is by fields)."""
+    from core.eval.runner import _merge_responses
+    from core.query.results import QueryWarning
+
+    def _resp(result_id: str, score: float, warning: str) -> McpResponse:
+        return McpResponse(
+            query="q",
+            tool="graph_query",
+            project="p",
+            build_id="b",
+            results=(
+                RetrievalResult(
+                    result_type="relation",
+                    id=result_id,
+                    score=score,
+                    source_refs=(SourceRef(source_type="chunk", id="c-1"),),
+                ),
+            ),
+            warnings=(QueryWarning("TRUNCATED", warning),),
+        )
+
+    merged = _merge_responses(
+        [_resp("r-1", 0.9, "shared"), _resp("r-1", 0.1, "shared"), _resp("r-2", 0.5, "extra")]
+    )
+    assert [r.id for r in merged.results] == ["r-1", "r-2"]
+    assert merged.results[0].score == 0.9  # the FIRST occurrence is kept
+    assert [w.message for w in merged.warnings] == ["shared", "extra"]  # unioned once, in order

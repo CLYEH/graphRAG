@@ -538,6 +538,22 @@ class BuildScopedRepo:
             grouped.setdefault(row.entity_id, []).append((row.source_kind, row.source_ref))
         return grouped
 
+    async def active_entity_names(self, entity_ids: Collection[uuid.UUID]) -> dict[uuid.UUID, str]:
+        """canonical_name per ACTIVE entity id (scoped) — the inverse of
+        entity_ids_by_name; lets graph results carry the human-readable name
+        the SoR holds (C10: eval recall reads visible text; agents too)."""
+        if not entity_ids:
+            return {}
+        entities = tables.entities
+        query = sa.select(entities.c.id, entities.c.canonical_name).where(
+            entities.c.project == self.project,
+            entities.c.build_id == self.build_id,
+            entities.c.status == "active",
+            entities.c.id.in_(list(entity_ids)),
+        )
+        rows = (await self._execute(query)).fetchall()
+        return {row.id: row.canonical_name for row in rows}
+
     async def entity_ids_by_name(self, name: str) -> list[uuid.UUID]:
         """Active entity ids whose canonical_name matches ``name`` (SoR seed
         resolution for C6c's graph templates — the traversal seed is resolved

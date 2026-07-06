@@ -44,7 +44,7 @@ from core.mcp.policy import QueryPolicy, hybrid_policy
 from core.query.global_reports import global_summary
 from core.query.graph import GraphQueryParams, graph_query
 from core.query.hybrid import HybridDeps, hybrid_query
-from core.query.results import McpResponse
+from core.query.results import McpResponse, QueryWarning, RetrievalResult
 from core.query.semantic import semantic_search
 from core.query.sql import sql_query
 from core.stores import tables
@@ -93,17 +93,23 @@ class EvalReport:
         }
 
 
-def _derive_graph_params(case: GoldenCase, max_hops: int) -> GraphQueryParams | None:
+def _derive_graph_params(case: GoldenCase, max_hops: int) -> list[GraphQueryParams]:
+    """EVERY expected relation gets its own path query — score_case computes
+    relation_hit_rate over the whole list, so querying only the first would
+    under-score builds that hold all expected relations (they'd never be
+    fetched). Entities-only cases anchor a neighbors walk on the first name."""
     relations = case.expects.get("must_include_relations")
     if relations:
-        first = relations[0]
-        return GraphQueryParams(
-            template="path", entity=first["src"], other_entity=first["dst"], hops=max_hops
-        )
+        return [
+            GraphQueryParams(
+                template="path", entity=rel["src"], other_entity=rel["dst"], hops=max_hops
+            )
+            for rel in relations
+        ]
     entities = case.expects.get("must_contain_entities")
     if entities:
-        return GraphQueryParams(template="neighbors", entity=entities[0], hops=1)
-    return None
+        return [GraphQueryParams(template="neighbors", entity=entities[0], hops=1)]
+    return []
 
 
 async def _path_validity(repo: BuildScopedRepo, response: McpResponse) -> float | None:
@@ -162,13 +168,13 @@ async def _run_case(
     if case.mode == "global":
         return await global_summary(deps.repo, case.question, policy.top_k(None)), None
     if case.mode == "graph":
-        params = _derive_graph_params(case, policy.max_graph_hops)
-        if params is None:
+        param_list = _derive_graph_params(case, policy.max_graph_hops)
+        if not param_list:
             return None, (
                 "graph case has no derivable anchor — add must_include_relations "
                 "or must_contain_entities to drive the §27.6 template"
             )
-        return (
+        responses = [
             await graph_query(
                 deps.graph,
                 deps.repo,
@@ -176,12 +182,43 @@ async def _run_case(
                 params,
                 case.question,
                 policy.max_graph_hops,
-            ),
-            None,
-        )
-    # hybrid — the default entry; graph params derived when available
-    params = _derive_graph_params(case, policy.max_graph_hops)
+            )
+            for params in param_list
+        ]
+        return _merge_responses(responses), None
+    # hybrid — the default entry; the FIRST derived anchor makes the graph
+    # mode available. Hybrid runs ONE query per mode by design, so a
+    # multi-relation hybrid case scores relation_hit_rate against the tool's
+    # genuine one-path output — deliberate fidelity to what the production
+    # tool returns, NOT the under-fetch bug the graph mode fixed (fetching
+    # all expected relations would OVER-score hybrid instead)
+    param_list = _derive_graph_params(case, policy.max_graph_hops)
+    params = param_list[0] if param_list else None
     return await hybrid_query(deps, hybrid_policy(policy, None), case.question, params), None
+
+
+def _merge_responses(responses: list[McpResponse]) -> McpResponse:
+    """One §16 response for scoring: results concatenated (deduped by
+    (result_type, id) keeping the first), warnings unioned in order."""
+    first = responses[0]
+    seen: set[tuple[str, str]] = set()
+    results: list[RetrievalResult] = []
+    warnings: list[QueryWarning] = []
+    for response in responses:
+        for result in response.results:
+            key = (result.result_type, result.id)
+            if key not in seen:
+                seen.add(key)
+                results.append(result)
+        warnings.extend(w for w in response.warnings if w not in warnings)
+    return McpResponse(
+        query=first.query,
+        tool=first.tool,
+        project=first.project,
+        build_id=first.build_id,
+        results=tuple(results),
+        warnings=tuple(warnings),
+    )
 
 
 async def run_eval(
