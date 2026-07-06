@@ -61,6 +61,10 @@ _BUILD_TABLES: tuple[sa.Table, ...] = (
 #: the §19 drift comparison: Postgres truth vs each projection.
 _DRIFT_TOLERANCE = 0
 
+#: prune sweeps TERMINAL statuses only — active is the serving snapshot,
+#: building is a live pipeline (its cancellation is not GC's job).
+_PRUNABLE = ("ready", "archived", "failed")
+
 
 async def _take_project_lock(conn: AsyncConnection, project: str) -> None:
     """Transaction-scoped advisory lock serializing LIFECYCLE operations per
@@ -541,7 +545,10 @@ async def prune(
         raise ValueError("keep must be >= 1 — pruning everything would drop the active build")
     builds = await list_builds(conn, project)
     keepers = {b.id for b in builds[:keep]} | {b.id for b in builds if b.status == "active"}
-    victims = [b for b in builds if b.id not in keepers]
+    # only TERMINAL statuses are prunable: a 'building' row is a LIVE build —
+    # sweeping it would delete truth and partial outputs from under the
+    # pipeline writer (cancellation is that surface's job, not GC's)
+    victims = [b for b in builds if b.id not in keepers and b.status in _PRUNABLE]
     pruned: list[uuid.UUID] = []
     for victim in victims:
         # the snapshot above is bind-time knowledge, not an invariant: a
@@ -568,8 +575,10 @@ async def prune(
                     .with_for_update()
                 )
             ).one_or_none()
-            if locked is None or locked.status == "active":
-                continue  # gone, or promoted since the snapshot — keep it
+            if locked is None or locked.status not in _PRUNABLE:
+                # gone, promoted, or a build that (re)started since the
+                # snapshot — never sweep a non-terminal status
+                continue
             # the row lock is HELD through everything below: projections
             # first, Postgres truth last, one commit releases it
             try:

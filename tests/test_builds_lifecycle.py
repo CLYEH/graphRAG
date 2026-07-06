@@ -323,6 +323,14 @@ async def test_prune_keeps_the_window_and_always_the_active(project: str) -> Non
             assert set(victims) == {mid}
             remaining = {b.id for b in await list_builds(conn, project)}
             assert remaining == {old_active, newest}
+
+            # a LIVE build outside the window is never GC'd: sweeping a
+            # 'building' row would delete truth and partial outputs from
+            # under the pipeline writer — cancellation is not prune's job
+            live = await _new_build(conn, project, age_days=30, status="building")
+            victims = await prune(conn, qdrant, session, project, keep=1)
+            assert victims == []  # the ancient live build is NOT a victim
+            assert live in {b.id for b in await list_builds(conn, project)}
     finally:
         await qdrant.close()
         await driver.close()
