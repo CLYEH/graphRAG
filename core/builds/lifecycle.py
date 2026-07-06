@@ -34,6 +34,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 import sqlalchemy as sa
 from neo4j import AsyncSession
@@ -285,26 +286,40 @@ async def _eval_gate(
     """§20's activation gate: the candidate regresses when its eval score
     falls below the ACTIVE build's by more than the threshold
     (spec.is_eval_regression — the at-threshold tolerance lives there).
-    Scores come from builds.metrics['eval'] as written by the C10 runner;
-    a missing score is REPORTED as deferred, never silently passed (Rule
-    12): no active build or an unscored active ⇒ nothing to regress against;
-    an unscored candidate ⇒ run `graphrag eval` first."""
+    Scores come from builds.metrics['eval'] as written by the C10 runner.
+    A candidate whose report carries failed>0 (per-case min_score misses) is
+    blocked outright — before and independent of the regression comparison
+    (the CLI exits 1 on the same report; activation must agree). Unscored
+    candidate/active with an active present ⇒ fail-closed; no active build
+    (and no per-case failures) ⇒ the one vacuous, deferred cell."""
     from core.config import get_settings
     from core.eval.spec import is_eval_regression
 
-    async def _score(bid: uuid.UUID) -> float | None:
+    async def _eval_block(bid: uuid.UUID) -> dict[str, Any] | None:
         row = (
             await conn.execute(sa.select(tables.builds.c.metrics).where(tables.builds.c.id == bid))
         ).one_or_none()
         if row is None or not row.metrics:
             return None
         eval_block = row.metrics.get("eval")
-        if not isinstance(eval_block, dict):
-            return None
-        score = eval_block.get("score")
+        return eval_block if isinstance(eval_block, dict) else None
+
+    def _score_of(block: dict[str, Any] | None) -> float | None:
+        score = (block or {}).get("score")
         return float(score) if isinstance(score, (int, float)) else None
 
-    candidate = await _score(build_id)
+    candidate_block = await _eval_block(build_id)
+    candidate = _score_of(candidate_block)
+    # per-case min_score failures block REGARDLESS of the aggregate and
+    # regardless of an active build existing: `graphrag eval` exits 1 on the
+    # same report, and the first-ever activation must not bypass the
+    # per-case bar the golden set sets (checked BEFORE the vacuous branch)
+    failed_cases = (candidate_block or {}).get("failed")
+    if isinstance(failed_cases, int) and failed_cases > 0:
+        return [
+            f"eval gate (§20): {failed_cases} golden case(s) below their min_score "
+            "in the candidate's eval report — activation blocked"
+        ], []
     active_row = (
         await conn.execute(
             sa.select(tables.builds.c.id).where(
@@ -324,7 +339,7 @@ async def _eval_gate(
             "eval gate (§20): candidate build has no eval score — run `graphrag eval` "
             "on it first; an unmeasured candidate cannot pass the regression gate"
         ], []
-    active_score = await _score(active_row.id)
+    active_score = _score_of(await _eval_block(active_row.id))
     if active_score is None:
         return [
             "eval gate (§20): the active build has no eval score — run `graphrag eval` "
@@ -354,7 +369,8 @@ async def preflight(
     activation, additionally ``archived`` for a rollback (``allow_archived``);
     (2) §19 drift — the graph and vector projections agree with the Postgres
     truth on entity/relation/point counts for THIS build; (3) the §20 eval
-    gate, FAIL-CLOSED: unscored candidate/active with an active present →
+    gate, FAIL-CLOSED: failed>0 in the candidate's report → FAILURE (before
+    everything else); unscored candidate/active with an active present →
     FAILURE; no active build → vacuous (deferred); both scored →
     regression blocks. Both the drift check AND the eval gate are
     re-checked under the promotion lock (racing activations can replace the

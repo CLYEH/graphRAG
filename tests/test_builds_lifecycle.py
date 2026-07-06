@@ -751,6 +751,19 @@ async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) 
     failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
     assert failures == [] and deferred == []
 
+    # failed cases block OUTRIGHT — before regression compare AND before the
+    # vacuous no-active branch (the CLI exits 1 on the same report; the
+    # first-ever activation must not bypass the per-case min_score bar)
+    conn = _Conn({candidate: {"eval": {"score": 0.95, "failed": 2}}}, None)
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("2 golden case(s)" in f for f in failures)
+    conn = _Conn(
+        {candidate: {"eval": {"score": 0.95, "failed": 1}}, active: {"eval": {"score": 0.9}}},
+        active,
+    )
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("golden case(s) below their min_score" in f for f in failures)
+
 
 @pytest.mark.integration
 async def test_eval_gate_recheck_binds_to_the_promotion_time_active(project: str) -> None:

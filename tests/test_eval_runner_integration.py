@@ -274,7 +274,10 @@ async def test_run_eval_scores_a_projected_build_and_persists(project: str, tmp_
             )
             check = await preflight(conn, qdrant, session, project, empty)
             assert not check.ok
-            assert any("eval regression" in f for f in check.failures)
+            # the per-case bar fires FIRST (both golden cases fail on the
+            # empty build), before any regression comparison — same verdict
+            # the CLI's exit code gives for this report
+            assert any("golden case(s) below their min_score" in f for f in check.failures)
     finally:
         await qdrant.close()
         await driver.close()
