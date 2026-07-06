@@ -37,6 +37,8 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from neo4j.exceptions import DriverError, Neo4jError
+from qdrant_client.http.exceptions import ApiException
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -59,6 +61,19 @@ from core.stores.vectors import vector_client
 #: binding no build was ever resolved; the nil uuid is the honest,
 #: format-legal sentinel (the warning message says which case happened).
 _NIL_BUILD = "00000000-0000-0000-0000-000000000000"
+
+#: the store CLIENTS' exception families (§22 STORE_UNAVAILABLE): driver-level
+#: trouble from Postgres (DBAPIError — sql.py's own line), Qdrant (ApiException
+#: covers HTTP errors and connection handling), and Neo4j (Neo4jError = server,
+#: DriverError = connectivity). Deliberately NOT Exception: an in-code bug
+#: (ValueError, KeyError, ...) still propagates LOUD — degradation is for
+#: store trouble, never for our own bugs.
+_STORE_ERRORS: tuple[type[BaseException], ...] = (
+    DBAPIError,
+    ApiException,
+    Neo4jError,
+    DriverError,
+)
 
 #: entity_mentions.source_kind → §16 source_type (the C6a mapping).
 _MENTION_SOURCE_TYPE = {"text": "chunk", "structured": "row"}
@@ -114,12 +129,43 @@ async def _bounded(
                 ),
             ),
         ).to_dict()
+    except _STORE_ERRORS as exc:
+        # a store outage during binding or the mode run degrades typed
+        # (§22 STORE_UNAVAILABLE), never an MCP transport error; hybrid maps
+        # per-mode internally — this is the single-mode tools' equivalent
+        return McpResponse(
+            query=query,
+            tool=tool,
+            project=runtime.context.project,
+            build_id=bound_build or _NIL_BUILD,
+            results=(),
+            warnings=(
+                QueryWarning(
+                    "STORE_UNAVAILABLE",
+                    f"store unavailable ({type(exc).__name__}) — degraded to an "
+                    "empty typed response (§22)",
+                ),
+            ),
+        ).to_dict()
 
 
 def _is_statement_timeout(exc: DBAPIError) -> bool:
     """Postgres cancels a statement past ``statement_timeout`` with sqlstate
     57014 (query_canceled) — the DB-side face of the §21 deadline."""
     return getattr(exc.orig, "sqlstate", None) == "57014"
+
+
+def _introspection_store_error(
+    runtime: _Runtime, build_id: str | None, subject: str, exc: BaseException
+) -> dict[str, Any]:
+    """The introspection tools' §22 store-outage shape — the same explicit
+    error field as the timeout shape, naming the store exception class."""
+    return {
+        "project": runtime.context.project,
+        "build_id": build_id or _NIL_BUILD,
+        "subject": subject,
+        "error": f"store unavailable ({type(exc).__name__}) — §22",
+    }
 
 
 def _introspection_timeout(runtime: _Runtime, build_id: str | None, subject: str) -> dict[str, Any]:
@@ -287,6 +333,8 @@ def build_server(project: str, config_path: Path) -> FastMCP:
                     return await _get_entity(deps.repo, rt.context.project, name)
         except TimeoutError:
             return _introspection_timeout(rt, bound_build, name)
+        except _STORE_ERRORS as exc:
+            return _introspection_store_error(rt, bound_build, name, exc)
 
     @server.tool()
     async def list_schema() -> dict[str, Any]:
@@ -364,12 +412,11 @@ async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
     except DBAPIError as exc:
         if _is_statement_timeout(exc):
             return _introspection_timeout(runtime, bound_build, "list_schema")
-        return {
-            "project": runtime.context.project,
-            "build_id": bound_build or _NIL_BUILD,
-            "subject": "list_schema",
-            "error": f"schema discovery failed ({type(exc).__name__}) — §22",
-        }
+        return _introspection_store_error(runtime, bound_build, "list_schema", exc)
+    except _STORE_ERRORS as exc:
+        # binding touches the other stores' clients too (qdrant/neo4j) — the
+        # same §22 line as _bounded
+        return _introspection_store_error(runtime, bound_build, "list_schema", exc)
 
 
 async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
