@@ -178,16 +178,20 @@ def _derive_graph_params(case: GoldenCase, max_hops: int) -> list[GraphQueryPara
     return derived
 
 
-async def _expected_edges(repo: Any, case: GoldenCase) -> McpResponse | None:
-    """Targeted SoR lookup for the case's expected typed edges (§27.2-cited).
+async def _expected_edges(
+    repo: Any, graph: Any, policy: QueryPolicy, case: GoldenCase
+) -> McpResponse | None:
+    """Targeted lookup for the case's expected typed edges (§27.2-cited).
 
     The derived queries can miss the expected type through no fault of the
     build: shortest_path is untyped, and a dense 1-hop subgraph spends its
     row budget entities-first, starving the edge stage. The expectation
-    names an exact (src, dst, type) — ask the SoR directly and synthesize a
-    rendered, evidence-cited relation result for each edge that exists.
-    Nothing is synthesized for edges the SoR does not hold (an absent edge
-    still scores 0 — this widens RETRIEVAL, never the truth)."""
+    names an exact (src, dst, type) — verified against BOTH stores: the SoR
+    must hold the active, evidence-cited relation AND the graph projection
+    must hold the same typed edge (eval scores what the production graph
+    tool could actually retrieve — a count-balanced but wrong-edge
+    projection must not pass on Postgres alone). Nothing is synthesized for
+    edges either store lacks (retrieval widens, truth does not)."""
     from core.query.graph import evidence_ref
 
     expectations = case.expects.get("must_include_relations")
@@ -203,7 +207,22 @@ async def _expected_edges(repo: Any, case: GoldenCase) -> McpResponse | None:
         if not triples:
             continue
         resolved = await repo.relations_with_evidence(triples)
-        for _triple, (relation_id, evidence_rows) in resolved.items():
+        if not resolved:
+            continue
+        # the PROJECTION must hold the same typed edge — §19 counts alone
+        # cannot see a wrong-type/stale edge
+        endpoint_ids = sorted({str(t[0]) for t in resolved} | {str(t[1]) for t in resolved})
+        projected = await graph.edges_among(
+            endpoint_ids,
+            limit=policy.cypher_policy().max_rows,
+            timeout_ms=policy.cypher_policy().timeout_ms,
+        )
+        projected_triples = {
+            (edge.get("src"), edge.get("dst"), edge.get("type")) for edge in projected
+        }
+        for triple, (relation_id, evidence_rows) in resolved.items():
+            if (str(triple[0]), str(triple[1]), triple[2]) not in projected_triples:
+                continue  # SoR holds it, the projection does not — not retrievable
             refs = tuple(ref for row in evidence_rows if (ref := evidence_ref(row)) is not None)
             if not refs:
                 continue  # §27.2: a relation result cites ≥1 evidence
@@ -301,7 +320,7 @@ async def _run_case(
             )
             for params in param_list
         ]
-        targeted = await _expected_edges(deps.repo, case)
+        targeted = await _expected_edges(deps.repo, deps.graph, policy, case)
         if targeted is not None:
             responses.append(targeted)
         return _merge_responses(responses), None

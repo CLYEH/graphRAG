@@ -445,11 +445,22 @@ async def test_expected_edges_synthesizes_cited_typed_relations() -> None:
                 }
             return {}
 
+    class _Graph:
+        def __init__(self, edges: list[dict[str, str]]) -> None:
+            self._edges = edges
+
+        async def edges_among(self, ids: Any, *, limit: int, timeout_ms: int) -> Any:
+            return self._edges
+
+    projected = _Graph([{"src": str(src_id), "dst": str(dst_id), "type": "partners_with"}])
+    policy = SimpleNamespace(cypher_policy=lambda: SimpleNamespace(max_rows=100, timeout_ms=5000))
     case = _case(
         "graph",
         {"must_include_relations": [{"src": "Acme", "type": "partners_with", "dst": "Globex"}]},
     )
-    response = await _expected_edges(cast(Any, _Repo()), case)
+    response = await _expected_edges(
+        cast(Any, _Repo()), cast(Any, projected), cast(Any, policy), case
+    )
     assert response is not None
     assert response.results[0].title == "Acme -[partners_with]-> Globex"
     assert response.results[0].source_refs  # §27.2: evidence-cited
@@ -459,4 +470,14 @@ async def test_expected_edges_synthesizes_cited_typed_relations() -> None:
         "graph",
         {"must_include_relations": [{"src": "Acme", "type": "owns", "dst": "Globex"}]},
     )
-    assert await _expected_edges(cast(Any, _Repo()), missing) is None
+    assert (
+        await _expected_edges(cast(Any, _Repo()), cast(Any, projected), cast(Any, policy), missing)
+        is None
+    )
+
+    # the SoR alone is NOT enough (Codex round 14): a projection holding a
+    # different/stale edge — §19 count-balanced — must not pass on Postgres
+    stale = _Graph([{"src": str(src_id), "dst": str(dst_id), "type": "owns"}])
+    assert (
+        await _expected_edges(cast(Any, _Repo()), cast(Any, stale), cast(Any, policy), case) is None
+    )
