@@ -170,6 +170,25 @@ async def test_activation_flips_atomically_and_rollback_restores(project: str) -
             assert report.ok  # 'direct' displaced with activated_at still NULL
             target, report = await rollback(conn, qdrant, session, project)
             assert target == direct and report.ok  # NULL-activated_at found
+
+            # the ordering must rank by DISPLACEMENT, not a stale started_at:
+            # direct2 (created active, NULL activated_at, ANCIENT started_at)
+            # is displaced AFTER build_b was archived — rollback must pick
+            # direct2, not the older archived build whose activated_at is a
+            # real (earlier) timestamp. The archive path backfills the
+            # displacement moment to keep the chain monotonic.
+            await conn.execute(
+                tables.builds.update()
+                .where(tables.builds.c.project == project)
+                .values(status="archived")
+            )
+            await conn.commit()
+            direct2 = await _new_build(conn, project, status="active", age_days=30)
+            fresh2 = await _new_build(conn, project)
+            report = await activate(conn, qdrant, session, project, fresh2)
+            assert report.ok  # direct2 displaced NOW (backfilled)
+            target, report = await rollback(conn, qdrant, session, project)
+            assert target == direct2 and report.ok  # displacement order wins
     finally:
         await qdrant.close()
         await driver.close()

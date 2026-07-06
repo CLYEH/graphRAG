@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
 import sqlalchemy as sa
 from neo4j import AsyncSession
@@ -393,7 +393,16 @@ async def _promote_in_tx(
     await conn.execute(
         tables.builds.update()
         .where(tables.builds.c.project == project, tables.builds.c.status == "active")
-        .values(status="archived")
+        .values(
+            status="archived",
+            # a build created DIRECTLY as active has activated_at NULL —
+            # backfill the displacement moment so rollback's ordering (most
+            # recently displaced first) stays monotonic: activation order ==
+            # displacement order for the normal chain, and this keeps the
+            # NULL case inside that chain instead of falling back to a
+            # possibly ancient started_at
+            activated_at=sa.func.coalesce(tables.builds.c.activated_at, sa.func.now()),
+        )
     )
     promoted = await conn.execute(
         tables.builds.update()
@@ -402,7 +411,12 @@ async def _promote_in_tx(
             tables.builds.c.project == project,
             tables.builds.c.status.in_(promotable),  # belt: the lock is the mechanism
         )
-        .values(status="active", activated_at=datetime.now(tz=UTC))
+        .values(
+            # PG's clock, same source as the archive backfill — mixing the
+            # application clock in would let skew reorder displacement history
+            status="active",
+            activated_at=sa.func.now(),
+        )
     )
     if promoted.rowcount != 1:
         raise RuntimeError(
