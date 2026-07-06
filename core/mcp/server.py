@@ -28,6 +28,8 @@ the tools). Entry point: ``projects/<name>/mcp_entrypoint.py`` calls
 
 from __future__ import annotations
 
+import asyncio
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -46,6 +48,7 @@ from core.query.global_reports import global_summary as run_global
 from core.query.graph import GraphQueryParams
 from core.query.graph import graph_query as run_graph
 from core.query.hybrid import hybrid_query as run_hybrid
+from core.query.results import McpResponse, QueryWarning
 from core.query.semantic import semantic_search as run_semantic
 from core.query.sql import sql_query as run_sql
 from core.stores.graph import graph_driver
@@ -53,6 +56,56 @@ from core.stores.vectors import vector_client
 
 #: entity_mentions.source_kind → §16 source_type (the C6a mapping).
 _MENTION_SOURCE_TYPE = {"text": "chunk", "structured": "row"}
+
+
+async def _bounded(
+    runtime: _Runtime,
+    tool: str,
+    query: str,
+    runner: Any,
+) -> dict[str, Any]:
+    """Run one single-mode tool under the project's §21 wall-clock deadline.
+
+    The clock starts BEFORE the per-call binding, so scope resolution counts
+    against the budget and the mode runs on the REMAINDER (the hybrid router
+    enforces its own internal deadline — this is the same rule for the
+    standalone tools, which otherwise had no wall-clock bound at all: a slow
+    embedding or store call could outlive max_latency_ms). A timeout is the
+    typed §22 degradation, never a hung call or an unhandled cancellation;
+    the sql reader's phase transactions roll back under the single
+    cancellation (finally runs), and the per-call connection closes with the
+    context manager either way."""
+    deadline = time.monotonic() + runtime.policy.max_latency_ms / 1000.0
+    async with runtime.context.bound() as deps:
+        try:
+            async with asyncio.timeout(max(deadline - time.monotonic(), 0.001)):
+                response: McpResponse = await runner(deps)
+                return response.to_dict()
+        except TimeoutError:
+            return McpResponse(
+                query=query,
+                tool=tool,
+                project=runtime.context.project,
+                build_id=str(deps.repo.build_id),
+                results=(),
+                warnings=(
+                    QueryWarning(
+                        "PARTIAL_RESULTS",
+                        f"query exceeded the {runtime.policy.max_latency_ms}ms deadline (§21)",
+                    ),
+                ),
+            ).to_dict()
+
+
+def _introspection_timeout(runtime: _Runtime, deps: Any, subject: str) -> dict[str, Any]:
+    """The introspection tools' §22 timeout shape (they are not §16 responses,
+    so the degradation is an explicit error field, never a hung call)."""
+    return {
+        "project": runtime.context.project,
+        "build_id": str(deps.repo.build_id),
+        "subject": subject,
+        "error": f"query exceeded the {runtime.policy.max_latency_ms}ms deadline (§21)",
+    }
 
 
 @dataclass
@@ -98,11 +151,13 @@ def build_server(project: str, config_path: Path) -> FastMCP:
     async def semantic_search(query: str, top_k: int | None = None) -> dict[str, Any]:
         """Fuzzy/topical retrieval over document text (§8 semantic)."""
         rt = _rt()
-        async with rt.context.bound() as deps:
-            response = await run_semantic(
+
+        async def _run(deps: Any) -> McpResponse:
+            return await run_semantic(
                 deps.repo, deps.vectors, deps.embedder, query, rt.policy.top_k(top_k)
             )
-            return response.to_dict()
+
+        return await _bounded(rt, "semantic_search", query, _run)
 
     @server.tool()
     async def graph_query(
@@ -118,34 +173,41 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         params = GraphQueryParams(
             template=template, entity=entity, other_entity=other_entity, hops=hops
         )
-        async with rt.context.bound() as deps:
-            response = await run_graph(
+        label = query or f"{template}({entity})"
+
+        async def _run(deps: Any) -> McpResponse:
+            return await run_graph(
                 deps.graph,
                 deps.repo,
                 rt.policy.cypher_policy(),
                 params,
-                query or f"{template}({entity})",
+                label,
                 rt.policy.max_graph_hops,
             )
-            return response.to_dict()
+
+        return await _bounded(rt, "graph_query", label, _run)
 
     @server.tool()
     async def sql_query(query: str) -> dict[str, Any]:
         """Precise filters/lookups over structured rows (§8 sql, guarded NL→SQL)."""
         rt = _rt()
-        async with rt.context.bound() as deps:
-            response = await run_sql(
+
+        async def _run(deps: Any) -> McpResponse:
+            return await run_sql(
                 deps.sql_reader, deps.llm, rt.policy.sql_policy(), query, rt.policy.sql_rows()
             )
-            return response.to_dict()
+
+        return await _bounded(rt, "sql_query", query, _run)
 
     @server.tool()
     async def global_summary(query: str, top_k: int | None = None) -> dict[str, Any]:
         """Corpus-wide community summaries (§8 global)."""
         rt = _rt()
-        async with rt.context.bound() as deps:
-            response = await run_global(deps.repo, query, rt.policy.top_k(top_k))
-            return response.to_dict()
+
+        async def _run(deps: Any) -> McpResponse:
+            return await run_global(deps.repo, query, rt.policy.top_k(top_k))
+
+        return await _bounded(rt, "global_summary", query, _run)
 
     @server.tool()
     async def hybrid_query(
@@ -178,8 +240,13 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         response (the frozen tool enum covers only the five retrieval tools)
         — but each entity still carries its §27.2-spirit mention citations."""
         rt = _rt()
+        deadline = time.monotonic() + rt.policy.max_latency_ms / 1000.0
         async with rt.context.bound() as deps:
-            return await _get_entity(deps.repo, rt.context.project, name)
+            try:
+                async with asyncio.timeout(max(deadline - time.monotonic(), 0.001)):
+                    return await _get_entity(deps.repo, rt.context.project, name)
+            except TimeoutError:
+                return _introspection_timeout(rt, deps, name)
 
     @server.tool()
     async def list_schema() -> dict[str, Any]:
@@ -188,22 +255,29 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         mode is disabled). Deliberately NOT a §16 response — there is no
         retrieval result to cite; this is introspection."""
         rt = _rt()
+        deadline = time.monotonic() + rt.policy.max_latency_ms / 1000.0
         async with rt.context.bound() as deps:
-            tables: dict[str, list[str]] = {}
-            if rt.policy.text_to_sql.enabled:
-                # the same JSON-key discovery sql_query runs — under the same
-                # reconciled deadline (§21): unbounded, a large structured
-                # build could hold this call past the latency cap
-                async with deps.sql_reader.timed_transaction(rt.policy.sql_policy().timeout_ms):
-                    columns = await deps.sql_reader.columns_by_table(
-                        list(rt.policy.text_to_sql.allowed_tables)
-                    )
-                tables = {table: list(cols) for table, cols in columns.items()}
-            return {
-                "project": rt.context.project,
-                "sql_enabled": rt.policy.text_to_sql.enabled,
-                "tables": tables,
-            }
+            try:
+                async with asyncio.timeout(max(deadline - time.monotonic(), 0.001)):
+                    tables: dict[str, list[str]] = {}
+                    if rt.policy.text_to_sql.enabled:
+                        # the same JSON-key discovery sql_query runs — under
+                        # the same reconciled statement deadline (§21), plus
+                        # the wall-clock bound above
+                        async with deps.sql_reader.timed_transaction(
+                            rt.policy.sql_policy().timeout_ms
+                        ):
+                            columns = await deps.sql_reader.columns_by_table(
+                                list(rt.policy.text_to_sql.allowed_tables)
+                            )
+                        tables = {table: list(cols) for table, cols in columns.items()}
+                    return {
+                        "project": rt.context.project,
+                        "sql_enabled": rt.policy.text_to_sql.enabled,
+                        "tables": tables,
+                    }
+            except TimeoutError:
+                return _introspection_timeout(rt, deps, "list_schema")
 
     @server.tool()
     async def explain_retrieval(query: str, top_k: int | None = None) -> dict[str, Any]:

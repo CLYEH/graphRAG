@@ -51,3 +51,79 @@ def test_the_shipped_demo_config_is_contract_valid() -> None:
     documents — a broken example would teach broken configs."""
     server = build_server("demo", REPO_ROOT / "projects" / "demo" / "config.yaml")
     assert server.name == "graphrag-demo"
+
+
+async def test_bounded_tools_degrade_typed_at_the_wall_clock_deadline() -> None:
+    """§21: max_latency_ms bounds STANDALONE tools too, not just hybrid — a
+    slow embedding/store call must come back as the typed §22 PARTIAL_RESULTS
+    deadline degradation, never a hung MCP call. A fast runner passes through
+    untouched (the over-block dual)."""
+    import asyncio
+    import uuid
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+    from typing import Any
+
+    from core.mcp.server import _bounded, _Runtime
+    from core.query.results import McpResponse
+
+    build_id = uuid.uuid4()
+    deps = SimpleNamespace(repo=SimpleNamespace(project="p", build_id=build_id))
+
+    class _Ctx:
+        project = "p"
+
+        @asynccontextmanager
+        async def bound(self):  # type: ignore[no-untyped-def]
+            yield deps
+
+    policy = SimpleNamespace(max_latency_ms=50)
+    runtime = _Runtime(context=_Ctx(), policy=policy)  # type: ignore[arg-type]
+
+    async def slow(_deps: Any) -> McpResponse:
+        await asyncio.sleep(0.3)
+        raise AssertionError("unreachable — the deadline must cancel first")
+
+    payload = await _bounded(runtime, "semantic_search", "q", slow)
+    assert payload["tool"] == "semantic_search"
+    assert payload["build_id"] == str(build_id)
+    assert payload["results"] == []
+    assert payload["warnings"][0]["code"] == "PARTIAL_RESULTS"
+    assert "deadline" in payload["warnings"][0]["message"]
+
+    async def fast(_deps: Any) -> McpResponse:
+        return McpResponse(
+            query="q",
+            tool="semantic_search",
+            project="p",
+            build_id=str(build_id),
+            results=(),
+            warnings=(),
+        )
+
+    ok = await _bounded(runtime, "semantic_search", "q", fast)
+    assert ok["warnings"] == []  # a fast tool is untouched
+
+
+def test_the_introspection_timeout_shape_is_explicit() -> None:
+    """The introspection tools are not §16 responses, so their §22 deadline
+    degradation is an explicit error field — project/build_id/subject/error,
+    never a hung call or a half-§16 hybrid shape."""
+    import uuid
+    from types import SimpleNamespace
+
+    from core.mcp.server import _introspection_timeout, _Runtime
+
+    build_id = uuid.uuid4()
+    runtime = _Runtime(
+        context=SimpleNamespace(project="p"),  # type: ignore[arg-type]
+        policy=SimpleNamespace(max_latency_ms=1000),  # type: ignore[arg-type]
+    )
+    deps = SimpleNamespace(repo=SimpleNamespace(build_id=build_id))
+    payload = _introspection_timeout(runtime, deps, "list_schema")
+    assert payload == {
+        "project": "p",
+        "build_id": str(build_id),
+        "subject": "list_schema",
+        "error": "query exceeded the 1000ms deadline (§21)",
+    }
