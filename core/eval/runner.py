@@ -94,22 +94,39 @@ class EvalReport:
 
 
 def _derive_graph_params(case: GoldenCase, max_hops: int) -> list[GraphQueryParams]:
-    """EVERY expected relation gets its own path query — score_case computes
-    relation_hit_rate over the whole list, so querying only the first would
-    under-score builds that hold all expected relations (they'd never be
-    fetched). Entities-only cases anchor a neighbors walk on the first name."""
-    relations = case.expects.get("must_include_relations")
-    if relations:
-        return [
+    """EVERYTHING the case scores over gets queried — score_case computes
+    each metric over its WHOLE expectation list, so any expectation the
+    runner never fetches under-scores builds that actually satisfy it:
+
+    - every expected relation → a path query (connectivity, path_validity)
+      PLUS a 1-hop neighbors walk around its src — shortest_path is untyped
+      (any active edge between the endpoints can come back), while the
+      neighborhood's direct edges carry every TYPE between the pair as
+      rendered relation results;
+    - every expected entity → its own 1-hop neighbors walk (an entity off
+      the relation paths would otherwise never be retrieved).
+
+    Queries are deduped by parameters; N queries per case is fine for an
+    offline eval harness."""
+    derived: list[GraphQueryParams] = []
+    seen: set[tuple[str, str, str | None, int]] = set()
+
+    def _add(params: GraphQueryParams) -> None:
+        key = (params.template, params.entity, params.other_entity, params.hops)
+        if key not in seen:
+            seen.add(key)
+            derived.append(params)
+
+    for rel in case.expects.get("must_include_relations", []):
+        _add(
             GraphQueryParams(
                 template="path", entity=rel["src"], other_entity=rel["dst"], hops=max_hops
             )
-            for rel in relations
-        ]
-    entities = case.expects.get("must_contain_entities")
-    if entities:
-        return [GraphQueryParams(template="neighbors", entity=entities[0], hops=1)]
-    return []
+        )
+        _add(GraphQueryParams(template="neighbors", entity=rel["src"], hops=1))
+    for name in case.expects.get("must_contain_entities", []):
+        _add(GraphQueryParams(template="neighbors", entity=name, hops=1))
+    return derived
 
 
 async def _path_validity(repo: BuildScopedRepo, response: McpResponse) -> float | None:

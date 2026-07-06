@@ -470,6 +470,8 @@ async def _relation_results(
     clean = [triple for triple in triples if triple is not None]
     dropped = len(triples) - len(clean)
     resolved = await repo.relations_with_evidence(clean)
+    endpoint_ids = {t[0] for t in clean} | {t[1] for t in clean}
+    names = await repo.active_entity_names(endpoint_ids)
     kept: list[tuple[uuid.UUID, str, tuple[SourceRef, ...]]] = []
     for triple in clean:
         if triple not in resolved:
@@ -480,7 +482,12 @@ async def _relation_results(
         if not refs:
             dropped += 1  # §27.2: a relation result cites ≥1 evidence; none survived
             continue
-        kept.append((relation_id, triple[2], refs))
+        # rendered like a one-hop path ("src -[type]-> dst") so consumers —
+        # agents and §20 relation_hit_rate alike — read the edge from the
+        # visible text; bare ids are unreadable to both
+        src_name = names.get(triple[0], str(triple[0]))
+        dst_name = names.get(triple[1], str(triple[1]))
+        kept.append((relation_id, f"{src_name} -[{triple[2]}]-> {dst_name}", refs))
     return kept, dropped
 
 
@@ -567,15 +574,15 @@ def _score(
                 title=name,
             )
         )
-    for offset, (relation_id, rel_type, refs) in enumerate(relations or []):
+    for offset, (relation_id, rendered, refs) in enumerate(relations or []):
         index = len(entities) + offset
         results.append(
             RetrievalResult(
                 result_type="relation",
                 id=str(relation_id),
+                title=rendered,
                 score=(total - index) / total,
                 source_refs=refs,
-                title=rel_type,
             )
         )
     return ordered_results(results)

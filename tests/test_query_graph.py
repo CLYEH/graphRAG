@@ -716,6 +716,10 @@ async def test_subgraph_emits_cited_entities_and_evidence_backed_relations() -> 
     assert kinds == ["chunk", "document", "row"]  # all three evidence shapes emitted
     row_ref = next(ref for ref in relation.source_refs if ref.source_type == "row")
     assert row_ref.metadata == {"table": "orders", "pk": "17"}  # split losslessly
+    # the relation renders as a one-hop path with SoR names — visible text
+    # for agents and §20 relation_hit_rate (a reverted emission fails here;
+    # the fake's active_entity_names returns name-{id})
+    assert relation.title == f"name-{seed} -[works_at]-> name-{other}"
     # the SEED entity is part of the subgraph (unlike plain neighbors)
     assert {r.id for r in response.results if r.result_type == "entity"} == {
         str(seed),

@@ -27,10 +27,13 @@ def _case(mode: str, expects: dict[str, Any]) -> GoldenCase:
     return GoldenCase(question="q?", mode=mode, expects=expects, min_score=0.5)
 
 
-def test_graph_params_cover_every_expected_relation() -> None:
-    """score_case computes relation_hit_rate over the WHOLE expectation list
-    — deriving only the first would under-score builds holding all expected
-    relations (Codex round 3): every relation gets its own path query."""
+def test_graph_params_cover_every_expectation() -> None:
+    """score_case computes each metric over its WHOLE expectation list — any
+    expectation the runner never fetches under-scores valid builds (Codex
+    rounds 3+5): every relation gets a path query (connectivity) PLUS a
+    1-hop src neighbors walk (shortest_path is untyped — the neighborhood's
+    rendered direct edges carry every TYPE between the pair), and every
+    expected entity gets its own neighbors walk; duplicates are folded."""
     param_list = _derive_graph_params(
         _case(
             "graph",
@@ -38,14 +41,20 @@ def test_graph_params_cover_every_expected_relation() -> None:
                 "must_include_relations": [
                     {"src": "Acme", "type": "t", "dst": "Globex"},
                     {"src": "Globex", "type": "t2", "dst": "Initech"},
-                ]
+                ],
+                # Initech rides no relation SRC; Umbrella is off-path entirely
+                "must_contain_entities": ["Acme", "Umbrella"],
             },
         ),
         max_hops=3,
     )
     assert [(p.template, p.entity, p.other_entity, p.hops) for p in param_list] == [
         ("path", "Acme", "Globex", 3),
+        ("neighbors", "Acme", None, 1),
         ("path", "Globex", "Initech", 3),
+        ("neighbors", "Globex", None, 1),
+        # "Acme" neighbors deduped — already derived from the first relation
+        ("neighbors", "Umbrella", None, 1),
     ]
 
 
