@@ -333,15 +333,28 @@ async def rollback(
 ) -> tuple[uuid.UUID | None, PreflightReport]:
     """Activate the most recently PREVIOUSLY-active build (§14: instant,
     atomic — it is just an activation of an archived build)."""
+    # archived ⇒ was displaced from active (activation is the ONLY archiving
+    # path in this lifecycle), so the predicate must not demand activated_at:
+    # a build created directly as active (schema-legal) archives with it
+    # still NULL and would otherwise vanish as a rollback target. Ordering
+    # falls back to started_at for those rows.
     row = (
         await conn.execute(
             sa.select(tables.builds.c.id)
             .where(
                 tables.builds.c.project == project,
                 tables.builds.c.status == "archived",
-                tables.builds.c.activated_at.is_not(None),
             )
-            .order_by(sa.desc(tables.builds.c.activated_at))
+            .order_by(
+                sa.desc(
+                    sa.func.coalesce(
+                        tables.builds.c.activated_at,
+                        tables.builds.c.started_at,
+                        sa.func.now(),
+                    )
+                ),
+                sa.desc(tables.builds.c.id),
+            )
             .limit(1)
         )
     ).one_or_none()

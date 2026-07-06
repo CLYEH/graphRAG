@@ -151,6 +151,25 @@ async def test_activation_flips_atomically_and_rollback_restores(project: str) -
             assert target == build_a and report.ok
             statuses = {b.id: b.status for b in await list_builds(conn, project)}
             assert statuses == {build_a: "active", build_b: "archived"}
+
+            # a build created DIRECTLY as active (schema-legal: activated_at
+            # stays NULL) must still be a rollback target after displacement
+            await conn.execute(
+                tables.builds.update()
+                .where(tables.builds.c.project == project)
+                .values(status="archived")
+            )
+            await conn.commit()  # clear the active slot BEFORE the direct insert
+            # started_at must sort NEWEST among archived rows: earlier
+            # promotions in this test stamped real-clock activated_at, which
+            # is later than the module NOW constant — age_days=-1 keeps the
+            # ordering deterministic for the fallback key
+            direct = await _new_build(conn, project, status="active", age_days=-1)
+            fresh = await _new_build(conn, project)
+            report = await activate(conn, qdrant, session, project, fresh)
+            assert report.ok  # 'direct' displaced with activated_at still NULL
+            target, report = await rollback(conn, qdrant, session, project)
+            assert target == direct and report.ok  # NULL-activated_at found
     finally:
         await qdrant.close()
         await driver.close()
