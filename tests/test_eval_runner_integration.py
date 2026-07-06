@@ -251,7 +251,10 @@ async def test_run_eval_scores_a_projected_build_and_persists(project: str, tmp_
             ).scalar_one()
             await conn.commit()
             check = await preflight(conn, qdrant, session, project, empty)
-            assert check.ok and any("no eval score" in d for d in check.deferred)
+            # fail-closed: an unscored candidate against a scored active is
+            # REFUSED (a deferral would let the gate's target case promote)
+            assert not check.ok
+            assert any("no eval score" in f for f in check.failures)
 
             # score the empty candidate (no data → recall 0) → regression BLOCKS
             await run_eval(

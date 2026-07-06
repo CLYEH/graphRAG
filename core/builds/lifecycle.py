@@ -18,10 +18,11 @@ DR-001 invariants honored here:
 - preflight (§14) runs BEFORE that transaction: the target must be
   promotable (``ready``, or ``archived`` for rollback), and the three
   stores' projections must agree with Postgres on what the build contains
-  (§19 drift check — counts per store). The eval gate (§20: eval score ≥
-  threshold vs the active build) needs the C10 eval harness and is a
-  DOCUMENTED DEFERRAL: preflight reports it as unchecked rather than
-  silently passing it.
+  (§19 drift check — counts per store), and the §20 eval gate is LIVE and
+  fail-closed: an unscored candidate (or unscored active) against an
+  existing active build REFUSES activation — the only vacuous cell is
+  no-active-build (bootstrap); both drift and the eval gate are re-checked
+  under the promotion lock.
 - prune (GC) keeps the newest ``retention.keep_builds`` builds per project
   (the active build is always kept, whatever its age) and deletes everything
   older from ALL three stores by build_id — Postgres last, because its rows
@@ -106,8 +107,8 @@ class BuildInfo:
 @dataclass(frozen=True)
 class PreflightReport:
     """§14 preflight: empty ``failures`` means promotable; ``deferred`` names
-    the checks this codebase cannot run yet (eval gate → C10) — surfaced,
-    never silently passed (Rule 12)."""
+    checks that are genuinely inapplicable (no active build to regress
+    against; rollback's history exemption) — surfaced, never silent."""
 
     failures: tuple[str, ...]
     deferred: tuple[str, ...]
@@ -311,18 +312,24 @@ async def _eval_gate(
             )
         )
     ).one_or_none()
-    if candidate is None:
-        return [], [
-            "eval gate (§20): candidate build has no eval score — run `graphrag eval` "
-            "to score it; the gate cannot compare what was never measured"
-        ]
     if active_row is None:
+        # bootstrap: nothing to regress against — the only genuinely vacuous
+        # cell (still surfaced, never silent)
         return [], ["eval gate (§20): no active build to regress against — gate vacuous"]
+    if candidate is None:
+        # FAIL-CLOSED (P1): deferred would be ignored by report.ok and the
+        # unscored candidate would promote — bypassing the gate for exactly
+        # its target case. The fix the message names is actionable.
+        return [
+            "eval gate (§20): candidate build has no eval score — run `graphrag eval` "
+            "on it first; an unmeasured candidate cannot pass the regression gate"
+        ], []
     active_score = await _score(active_row.id)
     if active_score is None:
-        return [], [
-            "eval gate (§20): the active build has no eval score — nothing to regress against"
-        ]
+        return [
+            "eval gate (§20): the active build has no eval score — run `graphrag eval` "
+            "on the active build first; the gate cannot compare against the unmeasured"
+        ], []
     threshold = get_settings().eval_regression_threshold
     if is_eval_regression(candidate, active_score, threshold):
         return [
@@ -347,13 +354,13 @@ async def preflight(
     activation, additionally ``archived`` for a rollback (``allow_archived``);
     (2) §19 drift — the graph and vector projections agree with the Postgres
     truth on entity/relation/point counts for THIS build; (3) the §20 eval
-    gate, three-state: unscored candidate/active → DEFERRED (surfaced, never
-    silently passed), no active build → vacuous (deferred), both scored →
-    regression blocks. Unlike drift, the eval gate is NOT re-checked under
-    the promotion lock: eval scores are stable JSONB the runner wrote — no
-    concurrent operation invalidates them the way an aborted prune can
-    invalidate projections — and activations serialize on the project
-    lifecycle lock anyway (deliberate asymmetry)."""
+    gate, FAIL-CLOSED: unscored candidate/active with an active present →
+    FAILURE; no active build → vacuous (deferred); both scored →
+    regression blocks. Both the drift check AND the eval gate are
+    re-checked under the promotion lock (racing activations can replace the
+    active build between preflight and lock — the comparison must bind to
+    the active at promotion time); rollback is exempt from the eval gate
+    (it restores an already-vetted build)."""
     failures: list[str] = []
     row = (
         await conn.execute(
@@ -423,9 +430,14 @@ async def _promote_in_tx(
     build_id: uuid.UUID,
     promotable: tuple[str, ...],
     report: PreflightReport,
+    *,
+    apply_eval_gate: bool = True,
 ) -> PreflightReport:
     """The promotion body — runs inside the CALLER's transaction, which must
-    already hold the project lifecycle lock (activate/rollback both do)."""
+    already hold the project lifecycle lock (activate/rollback both do).
+    ``apply_eval_gate=False`` is rollback's path: it restores a previously
+    active, already-vetted build — the regression gate compares candidates,
+    not history."""
     # take the target's row lock FIRST: this serializes against prune
     # (which sweeps under the same lock) — if prune committed, the row
     # is gone; if prune ABORTED after deleting the projections (the
@@ -449,6 +461,15 @@ async def _promote_in_tx(
     drift = await _drift_failures(conn, qdrant, graph_session, project, build_id)
     if drift:
         raise _DriftedUnderLock(drift)
+    if apply_eval_gate:
+        # re-run the §20 gate UNDER the lock too (P2): two racing scored
+        # activations — the pre-lock preflight compared against an active
+        # that another activation may have replaced by the time we hold the
+        # lock; the comparison must bind to the active AT PROMOTION TIME.
+        # PG-only reads — cheap, unlike the drift check's external stores.
+        eval_failures, _eval_deferred = await _eval_gate(conn, project, build_id)
+        if eval_failures:
+            raise _DriftedUnderLock(eval_failures)
     await conn.execute(
         tables.builds.update()
         .where(tables.builds.c.project == project, tables.builds.c.status == "active")
@@ -543,6 +564,7 @@ async def rollback(
                 row.id,
                 ("ready", "archived"),
                 PreflightReport((), deferred),
+                apply_eval_gate=False,
             )
             return row.id, report
     except _DriftedUnderLock as exc:
