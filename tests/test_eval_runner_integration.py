@@ -1,6 +1,6 @@
 """Why: the runner is the §20 gate's producer — it must score a REAL
 projected build through the real query stack, persist to
-builds.metrics['eval'], and the §14 preflight gate must consume exactly
+builds.eval, and the §14 preflight gate must consume exactly
 those numbers: deferred while unscored (never silently passed), blocking on
 regression, open otherwise. The eval binding is the fence's only sanctioned
 relaxation — its refusals are part of the contract."""
@@ -232,10 +232,10 @@ async def test_run_eval_scores_a_projected_build_and_persists(project: str, tmp_
             # persisted where the §14 gate reads (one producer, one location)
             row = (
                 await conn.execute(
-                    sa.select(tables.builds.c.metrics).where(tables.builds.c.id == build_id)
+                    sa.select(tables.builds.c.eval).where(tables.builds.c.id == build_id)
                 )
             ).one()
-            assert row.metrics["eval"]["score"] == pytest.approx(report.score)
+            assert row.eval["score"] == pytest.approx(report.score)
 
             # ---- the §14 gate consumes these numbers ----
             # candidate scored, no active build → gate vacuous (deferred says so)

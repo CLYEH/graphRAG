@@ -120,7 +120,7 @@ async def _new_build(
                 # these tests exercise SWITCH semantics, not the §20 gate:
                 # a stub score keeps the (fail-closed) eval gate green; the
                 # unscored cells are exercised in the eval integration suite
-                metrics={"eval": {"score": score, "failed": 0, "fingerprint": "test-suite"}},
+                eval={"score": score, "failed": 0, "fingerprint": "test-suite"},
             )
             .returning(tables.builds.c.id)
         )
@@ -707,19 +707,19 @@ async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) 
 
     class _Conn:
         def __init__(
-            self, metrics_by_id: dict[uuid.UUID, dict[str, Any] | None], active: uuid.UUID | None
+            self, eval_by_id: dict[uuid.UUID, dict[str, Any] | None], active: uuid.UUID | None
         ):
-            self._metrics = metrics_by_id
+            self._evals = eval_by_id
             self._active = active
 
         async def execute(self, statement: Any) -> Any:
             sql = str(statement)
-            if "metrics" in sql:
+            if "eval" in sql:
                 bid = statement.compile().params["id_1"]
-                if bid not in self._metrics:
+                if bid not in self._evals:
                     return SimpleNamespace(one_or_none=lambda: None)
-                metrics = self._metrics[bid]
-                return SimpleNamespace(one_or_none=lambda: SimpleNamespace(metrics=metrics))
+                block = self._evals[bid]
+                return SimpleNamespace(one_or_none=lambda: SimpleNamespace(eval=block))
             row = None if self._active is None else SimpleNamespace(id=self._active)
             return SimpleNamespace(one_or_none=lambda: row)
 
@@ -728,7 +728,7 @@ async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) 
     # unscored candidate → FAIL-CLOSED with or without an active build:
     # measuring the candidate is a standalone requirement — the first-ever
     # activation must not bypass it (Codex round 12)
-    conn = _Conn({candidate: None, active: {"eval": {"score": 0.9}}}, active)
+    conn = _Conn({candidate: None, active: {"score": 0.9}}, active)
     failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
     assert any("graphrag eval" in f for f in failures) and deferred == []
     conn = _Conn({candidate: None}, None)  # bootstrap, unscored → still blocked
@@ -737,20 +737,20 @@ async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) 
 
     # no active build + candidate scored clean → ONLY the regression
     # comparison is vacuous
-    conn = _Conn({candidate: {"eval": {"score": 0.9}}}, None)
+    conn = _Conn({candidate: {"score": 0.9}}, None)
     failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
     assert failures == [] and any("no active build" in d for d in deferred)
 
     # active unscored → FAIL-CLOSED too (score the active first — actionable)
-    conn = _Conn({candidate: {"eval": {"score": 0.9}}, active: None}, active)
+    conn = _Conn({candidate: {"score": 0.9}, active: None}, active)
     failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
     assert any("active build has no eval score" in f for f in failures) and deferred == []
 
     # regression beyond threshold → blocks (same-suite fingerprints)
     conn = _Conn(
         {
-            candidate: {"eval": {"score": 0.5, "fingerprint": "fp"}},
-            active: {"eval": {"score": 0.9, "fingerprint": "fp"}},
+            candidate: {"score": 0.5, "fingerprint": "fp"},
+            active: {"score": 0.9, "fingerprint": "fp"},
         },
         active,
     )
@@ -760,8 +760,8 @@ async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) 
     # within threshold → clean
     conn = _Conn(
         {
-            candidate: {"eval": {"score": 0.88, "fingerprint": "fp"}},
-            active: {"eval": {"score": 0.9, "fingerprint": "fp"}},
+            candidate: {"score": 0.88, "fingerprint": "fp"},
+            active: {"score": 0.9, "fingerprint": "fp"},
         },
         active,
     )
@@ -771,8 +771,8 @@ async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) 
     # DIFFERENT suites are not comparable — fail-closed naming the reason
     conn = _Conn(
         {
-            candidate: {"eval": {"score": 0.95, "fingerprint": "fp-easy"}},
-            active: {"eval": {"score": 0.9, "fingerprint": "fp-hard"}},
+            candidate: {"score": 0.95, "fingerprint": "fp-easy"},
+            active: {"score": 0.9, "fingerprint": "fp-hard"},
         },
         active,
     )
@@ -782,8 +782,8 @@ async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) 
     # missing fingerprint (pre-fingerprint report) → fail-closed, actionable
     conn = _Conn(
         {
-            candidate: {"eval": {"score": 0.95}},
-            active: {"eval": {"score": 0.9, "fingerprint": "fp"}},
+            candidate: {"score": 0.95},
+            active: {"score": 0.9, "fingerprint": "fp"},
         },
         active,
     )
@@ -793,11 +793,11 @@ async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) 
     # failed cases block OUTRIGHT — before regression compare AND before the
     # vacuous no-active branch (the CLI exits 1 on the same report; the
     # first-ever activation must not bypass the per-case min_score bar)
-    conn = _Conn({candidate: {"eval": {"score": 0.95, "failed": 2}}}, None)
+    conn = _Conn({candidate: {"score": 0.95, "failed": 2}}, None)
     failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
     assert any("2 golden case(s)" in f for f in failures)
     conn = _Conn(
-        {candidate: {"eval": {"score": 0.95, "failed": 1}}, active: {"eval": {"score": 0.9}}},
+        {candidate: {"score": 0.95, "failed": 1}, active: {"score": 0.9}},
         active,
     )
     failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)

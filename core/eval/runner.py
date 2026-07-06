@@ -18,15 +18,16 @@ is computed here (it needs the SoR to resolve per-edge relation refs).
 ``answer_similarity`` is not emitted — the frozen golden schema carries no
 reference answer (documented in scoring.py).
 
-The report is written to ``builds.metrics['eval']`` (SoR-attached, so the
-§14 preflight eval gate and Health §19 read the same numbers the runner
-produced — one producer, one location).
+The report is written to ``builds.eval`` — the schema's dedicated column
+(§4) — so the §14 preflight eval gate and Health §19 read the same numbers
+the runner produced: one producer, one canonical location.
 """
 
 from __future__ import annotations
 
 import contextlib
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -54,6 +55,19 @@ from core.stores.sqlreader import BuildScopedSqlReader
 from core.stores.vectors import BuildScopedVectorRepo
 
 
+def _model_identity() -> dict[str, str]:
+    """The model settings that shape eval answers — part of the suite
+    fingerprint (§20 comparability)."""
+    from core.config import get_settings
+
+    settings = get_settings()
+    return {
+        "llm_provider": settings.llm_provider,
+        "llm_model": settings.llm_model,
+        "embedding_model": settings.embedding_model,
+    }
+
+
 def models_needed(golden: GoldenSet, policy: QueryPolicy) -> tuple[bool, bool]:
     """(needs_embedder, needs_llm) for this golden set UNDER this policy —
     graph/global cases touch neither model client; semantic needs only the
@@ -71,12 +85,13 @@ def models_needed(golden: GoldenSet, policy: QueryPolicy) -> tuple[bool, bool]:
     return needs_embedder, needs_llm
 
 
-def eval_fingerprint(golden: GoldenSet, policy: QueryPolicy) -> str:
+def eval_fingerprint(golden: GoldenSet, policy: QueryPolicy, models: Mapping[str, str]) -> str:
     """Identity of WHAT was evaluated (§20): the golden cases + the policy
-    values that shape scoring. Two reports are comparable only when their
-    fingerprints match — a candidate scored against a different (easier)
-    golden set or laxer policy must not pass the regression gate on raw
-    numbers. Canonical JSON (sorted keys) over dataclass dumps → sha256."""
+    values that shape scoring + the MODEL identities that produced the
+    answers (llm provider/model, embedding model — a different model changes
+    routing, SQL, and embeddings while golden+policy stay identical). Two
+    reports are comparable only when their fingerprints match. Canonical
+    JSON (sorted keys) over dataclass dumps → sha256."""
     import dataclasses
     import hashlib
     import json
@@ -94,6 +109,7 @@ def eval_fingerprint(golden: GoldenSet, policy: QueryPolicy) -> str:
     document = {
         "cases": [dataclasses.asdict(case) for case in golden.cases],
         "policy": _dump(policy),
+        "models": dict(sorted(models.items())),
     }
     canonical = json.dumps(document, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -119,9 +135,9 @@ class EvalReport:
     metrics: dict[str, float]
     fingerprint: str
 
-    def to_metrics_payload(self) -> dict[str, Any]:
-        """The shape stored at builds.metrics['eval'] and read by the §14
-        preflight gate + Health (§19)."""
+    def to_eval_payload(self) -> dict[str, Any]:
+        """The shape stored at builds.eval (the schema's dedicated column —
+        §4) and read by the §14 preflight gate + Health (§19)."""
         return {
             "score": self.score,
             "passed": self.passed,
@@ -370,7 +386,7 @@ async def run_eval(
     policy: QueryPolicy,
 ) -> EvalReport:
     """Score ``build_id`` (ready or active) against the golden set and write
-    the report to ``builds.metrics['eval']``."""
+    the report to ``builds.eval`` (the schema's dedicated column)."""
     binding = await resolve_eval_binding(conn, project, build_id)
     await conn.rollback()  # loaned-clean for the sql reader (C6b)
     # None model clients are legal when no case's mode calls them
@@ -425,7 +441,7 @@ async def run_eval(
         failed=len(results) - passed,
         cases=tuple(results),
         metrics=metrics,
-        fingerprint=eval_fingerprint(golden, policy),
+        fingerprint=eval_fingerprint(golden, policy, _model_identity()),
     )
 
     await conn.rollback()  # end any read txn before OUR write txn
@@ -433,11 +449,10 @@ async def run_eval(
         stored = await conn.execute(
             tables.builds.update()
             .where(tables.builds.c.id == build_id)
-            .values(
-                metrics=sa.func.coalesce(tables.builds.c.metrics, sa.text("'{}'::jsonb")).op("||")(
-                    sa.cast({"eval": report.to_metrics_payload()}, postgresql.JSONB)
-                )
-            )
+            # the schema's DEDICATED eval column (§4) — not an ad-hoc nest
+            # under metrics: every reader that follows the schema (gate,
+            # Health, API) finds the report in one canonical place
+            .values(eval=sa.cast(report.to_eval_payload(), postgresql.JSONB))
         )
         if stored.rowcount != 1:
             # the binding was valid at resolve time, but a concurrent prune

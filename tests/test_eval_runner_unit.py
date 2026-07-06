@@ -128,7 +128,7 @@ def test_metrics_payload_carries_what_the_gate_reads() -> None:
         metrics={"entity_recall": 1.0},
         fingerprint="fp-1",
     )
-    payload = report.to_metrics_payload()
+    payload = report.to_eval_payload()
     assert payload["score"] == 0.75  # the §14 gate compares exactly this
     assert payload["fingerprint"] == "fp-1"  # suite identity rides along
     assert payload["passed"] == 1 and payload["failed"] == 1
@@ -249,7 +249,7 @@ async def test_run_eval_dispatches_scores_and_persists(
     assert report.passed == 4 and report.failed == 1  # the 'missing' case
     assert "answer_regex" not in report.metrics  # case assertion, not a metric
     assert report.metrics["entity_recall"] == pytest.approx(4 / 5)
-    assert len(conn.executed) == 1  # ONE persisting UPDATE to builds.metrics
+    assert len(conn.executed) == 1  # ONE persisting UPDATE to builds.eval
 
 
 def _async(value: Any) -> Any:
@@ -310,13 +310,16 @@ def test_eval_fingerprint_is_a_pure_function_of_the_suite() -> None:
 
     golden_a = GoldenSet(cases=(_case("semantic", {"must_contain_entities": ["Acme"]}),))
     golden_b = GoldenSet(cases=(_case("semantic", {"must_contain_entities": ["Globex"]}),))
-    fp1 = eval_fingerprint(golden_a, cast(Any, _Policy()))
-    fp2 = eval_fingerprint(golden_a, cast(Any, _Policy()))
-    fp3 = eval_fingerprint(golden_b, cast(Any, _Policy()))
-    fp4 = eval_fingerprint(golden_a, cast(Any, _Policy(max_top_k=5)))
+    models = {"llm_provider": "openai", "llm_model": "m1", "embedding_model": "e1"}
+    fp1 = eval_fingerprint(golden_a, cast(Any, _Policy()), models)
+    fp2 = eval_fingerprint(golden_a, cast(Any, _Policy()), models)
+    fp3 = eval_fingerprint(golden_b, cast(Any, _Policy()), models)
+    fp4 = eval_fingerprint(golden_a, cast(Any, _Policy(max_top_k=5)), models)
+    fp5 = eval_fingerprint(golden_a, cast(Any, _Policy()), {**models, "llm_model": "m2"})
     assert fp1 == fp2  # deterministic
     assert fp1 != fp3  # different golden set → different identity
     assert fp1 != fp4  # different policy → different identity
+    assert fp1 != fp5  # different MODEL → different identity (round 16)
     _ = _NS  # keep import local-scope tidy
 
 

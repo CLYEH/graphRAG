@@ -286,7 +286,8 @@ async def _eval_gate(
     """§20's activation gate: the candidate regresses when its eval score
     falls below the ACTIVE build's by more than the threshold
     (spec.is_eval_regression — the at-threshold tolerance lives there).
-    Scores come from builds.metrics['eval'] as written by the C10 runner.
+    Scores come from builds.eval (the schema's dedicated column) as written
+    by the C10 runner.
     A candidate whose report carries failed>0 (per-case min_score misses) is
     blocked outright — before and independent of the regression comparison
     (the CLI exits 1 on the same report; activation must agree). An unscored
@@ -298,12 +299,11 @@ async def _eval_gate(
 
     async def _eval_block(bid: uuid.UUID) -> dict[str, Any] | None:
         row = (
-            await conn.execute(sa.select(tables.builds.c.metrics).where(tables.builds.c.id == bid))
+            await conn.execute(sa.select(tables.builds.c.eval).where(tables.builds.c.id == bid))
         ).one_or_none()
-        if row is None or not row.metrics:
+        if row is None:
             return None
-        eval_block = row.metrics.get("eval")
-        return eval_block if isinstance(eval_block, dict) else None
+        return row.eval if isinstance(row.eval, dict) else None
 
     def _score_of(block: dict[str, Any] | None) -> float | None:
         score = (block or {}).get("score")
