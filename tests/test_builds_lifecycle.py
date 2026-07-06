@@ -13,6 +13,7 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import pytest_asyncio
@@ -682,3 +683,59 @@ async def test_rollback_selects_its_target_under_the_lifecycle_lock(project: str
         await driver.close()
         await engine.dispose()
         await engine2.dispose()
+
+
+async def test_eval_gate_three_states_on_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """§20's gate logic without stores: unscored candidate → DEFERRED naming
+    the command (never silently passed); no active build → vacuous; active
+    unscored → deferred; regression beyond threshold → FAILURE; within
+    threshold → clean. The live path is walked in the eval integration
+    suite; this pins the decision table the fast gate guards."""
+    from types import SimpleNamespace
+
+    from core.builds.lifecycle import _eval_gate
+
+    class _Conn:
+        def __init__(
+            self, metrics_by_id: dict[uuid.UUID, dict[str, Any] | None], active: uuid.UUID | None
+        ):
+            self._metrics = metrics_by_id
+            self._active = active
+
+        async def execute(self, statement: Any) -> Any:
+            sql = str(statement)
+            if "metrics" in sql:
+                bid = statement.compile().params["id_1"]
+                if bid not in self._metrics:
+                    return SimpleNamespace(one_or_none=lambda: None)
+                metrics = self._metrics[bid]
+                return SimpleNamespace(one_or_none=lambda: SimpleNamespace(metrics=metrics))
+            row = None if self._active is None else SimpleNamespace(id=self._active)
+            return SimpleNamespace(one_or_none=lambda: row)
+
+    candidate, active = uuid.uuid4(), uuid.uuid4()
+
+    # unscored candidate → deferred, names the command
+    conn = _Conn({candidate: None, active: {"eval": {"score": 0.9}}}, active)
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert failures == [] and any("graphrag eval" in d for d in deferred)
+
+    # no active build → vacuous
+    conn = _Conn({candidate: {"eval": {"score": 0.9}}}, None)
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert failures == [] and any("no active build" in d for d in deferred)
+
+    # active unscored → deferred
+    conn = _Conn({candidate: {"eval": {"score": 0.9}}, active: None}, active)
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert failures == [] and any("active build has no eval score" in d for d in deferred)
+
+    # regression beyond threshold → blocks
+    conn = _Conn({candidate: {"eval": {"score": 0.5}}, active: {"eval": {"score": 0.9}}}, active)
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert any("eval regression" in f for f in failures)
+
+    # within threshold → clean
+    conn = _Conn({candidate: {"eval": {"score": 0.88}}, active: {"eval": {"score": 0.9}}}, active)
+    failures, deferred = await _eval_gate(cast(Any, conn), "p", candidate)
+    assert failures == [] and deferred == []

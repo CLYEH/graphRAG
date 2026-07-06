@@ -113,3 +113,24 @@ def test_score_case_threads_path_validity_from_the_runner() -> None:
     )
     assert subscores["path_validity"] == 0.5
     assert subscores["entity_recall"] == 0.0
+
+
+def test_score_case_covers_regex_and_relations_branches() -> None:
+    response = _response(
+        _result(result_type="relation", title="Acme partners_with Globex", text="acme deal")
+    )
+    subscores = scoring.score_case(
+        response,
+        {
+            "answer_regex": "deal",
+            "must_cite_sources": ["c-1"],
+            "must_include_relations": [{"src": "Acme", "type": "partners_with", "dst": "Globex"}],
+        },
+        path_validity_score=None,
+    )
+    assert subscores == {
+        "answer_regex": 1.0,
+        "source_recall": 1.0,
+        "citation_coverage": 1.0,  # the same recall, both frozen names emitted
+        "relation_hit_rate": 1.0,
+    }

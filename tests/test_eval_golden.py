@@ -66,3 +66,16 @@ def test_contract_violations_name_where(tmp_path: Path) -> None:
     document["cases"][0]["typo_field"] = True  # human-authored: unknown keys rejected
     with pytest.raises(GoldenError, match="typo_field"):
         load_golden(_write(tmp_path, document))
+
+
+def test_missing_schema_names_every_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wheel-parity (the C8 lesson): with neither the repo-root nor the
+    packaged contracts copy present, the loader fails LOUD naming both
+    candidates — never a bare FileNotFoundError."""
+    import core.eval.golden as module
+
+    monkeypatch.setattr(module, "_SCHEMA_CANDIDATES", (tmp_path / "a.json", tmp_path / "b.json"))
+    with pytest.raises(GoldenError, match="not found — looked in"):
+        load_golden(_write(tmp_path, _valid()))
