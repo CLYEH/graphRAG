@@ -12,11 +12,12 @@ text (titles + texts) and their citations (source_refs):
 - ``answer_regex`` → 1/0: the pattern matches the concatenated result text
   in its ORIGINAL casing (case-sensitive, as regexes are by default).
 - ``must_include_relations`` → relation_hit_rate: a relation expectation
-  hits when one relation/path result's visible text carries src BEFORE
-  dst with the expected type ON the connecting segment: an arrow-rendered
-  segment must be exactly one forward hop of that type (§27.3 — reversed
-  hops, intermediate nodes, and other types on the direct hop do not hit);
-  plain relation titles match the type between the endpoints.
+  hits when the expected hop appears as one DELIMITED unit: in
+  arrow-rendered text the node labels are bounded by the renderer's
+  arrows/string edges, so "src -[type]-> dst" must match with both
+  endpoint labels exact (§27.3 — substring endpoints, reversed hops,
+  intermediate nodes, and other types on the direct hop do not hit);
+  plain titles match src, type, dst in order on word boundaries.
 - ``must_have_valid_paths`` → path_validity: the share of path results whose
   per-edge relation refs all resolve against the SoR (the runner passes the
   resolution callback); asserting it with NO path results returned scores 0
@@ -95,32 +96,26 @@ def relation_hit_rate(response: McpResponse, expected: Sequence[Mapping[str, str
     ]
     hits = 0
     for expectation in expected:
-        src = expectation["src"].casefold()
-        rel_type = expectation["type"].casefold()
-        dst = expectation["dst"].casefold()
+        src = re.escape(expectation["src"].casefold())
+        rel_type = re.escape(expectation["type"].casefold())
+        dst = re.escape(expectation["dst"].casefold())
+        # arrow-rendered text (paths and graph relation results): node labels
+        # are DELIMITED by the renderer's arrows and the string boundaries,
+        # so the whole expected hop must appear as one delimited unit —
+        # "MegaAcme -[t]-> Globex" or "Acme -[t]-> GlobexCorp" must NOT hit
+        # an expected Acme→Globex (endpoint labels are identities, not
+        # substrings); reversed hops and intermediate nodes cannot match by
+        # construction (§27.3).
+        arrow = rf"(?:^|\]->\s|\]-\s){src}\s-\[{rel_type}\]->\s{dst}(?:$|\s-\[|\s<-\[)"
+        # plain titles (no arrows): src, type, dst in order, each on its own
+        # word boundary — an embedded label ("Acmeta") is a different name
+        plain = rf"(?<!\w){src}(?!\w).*?(?<!\w){rel_type}(?!\w).*?(?<!\w){dst}(?!\w)"
         for text in texts:
-            # direction matters (§27.3): src must appear BEFORE dst, and the
-            # expected TYPE must sit ON the segment CONNECTING them — not
-            # merely somewhere in the same result. Two renderings exist:
-            # graph paths write hops as "-[type]->" / "<-[type]-" (graph.py),
-            # so an arrow-bearing segment must be EXACTLY one forward hop of
-            # the expected type (an intermediate node or a different type on
-            # the direct hop is NOT the expected edge, and a reversed hop
-            # points the other way); plain relation titles ("src type dst")
-            # carry no arrows, so the type need only appear between the
-            # endpoints.
-            src_at = text.find(src)
-            if src_at < 0:
-                continue
-            dst_at = text.find(dst, src_at + len(src))
-            if dst_at < 0:
-                continue
-            between = text[src_at + len(src) : dst_at]
-            if "-[" in between or "<-" in between or "->" in between:
-                if re.fullmatch(rf"\s*-\[{re.escape(rel_type)}\]->\s*", between):
+            if "-[" in text:
+                if re.search(arrow, text, re.MULTILINE):
                     hits += 1
                     break
-            elif rel_type in between:
+            elif re.search(plain, text, re.DOTALL):
                 hits += 1
                 break
     return hits / len(expected)

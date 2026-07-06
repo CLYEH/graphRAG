@@ -93,6 +93,18 @@ def test_relation_hit_needs_all_three_in_one_result() -> None:
         _result(result_type="path", title="Acme -[owns]-> Megacorp -[partners_with]-> Globex")
     )
     assert scoring.relation_hit_rate(intermediate, expected) == 0.0
+    # endpoint labels are IDENTITIES, not substrings (Codex round 7): a
+    # longer canonical name containing the expected one is a different node
+    for wrong in (
+        "Acme -[partners_with]-> GlobexCorp",
+        "MegaAcme -[partners_with]-> Globex",
+        "Acme Holdings -[partners_with]-> Globex",
+    ):
+        superstring = _response(_result(result_type="path", title=wrong))
+        assert scoring.relation_hit_rate(superstring, expected) == 0.0, wrong
+    # plain titles anchor on word boundaries too
+    embedded = _response(_result(result_type="relation", title="Acmeta partners_with Globex"))
+    assert scoring.relation_hit_rate(embedded, expected) == 0.0
 
 
 def test_relation_hits_only_count_relation_and_path_results() -> None:
