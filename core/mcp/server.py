@@ -29,6 +29,7 @@ the tools). Entry point: ``projects/<name>/mcp_entrypoint.py`` calls
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -59,12 +60,6 @@ from core.stores.vectors import vector_client
 #: format-legal sentinel (the warning message says which case happened).
 _NIL_BUILD = "00000000-0000-0000-0000-000000000000"
 
-#: extra outer-bound budget for the hybrid tools: their INTERNAL deadline
-#: (same max_latency_ms, started after binding) must win the terminal cut so
-#: its partial-results assembly is what the caller sees; the outer bound then
-#: only fires on what the inner one cannot see — a binding stall.
-_HYBRID_GRACE_MS = 2_000
-
 #: entity_mentions.source_kind → §16 source_type (the C6a mapping).
 _MENTION_SOURCE_TYPE = {"text": "chunk", "structured": "row"}
 
@@ -74,7 +69,6 @@ async def _bounded(
     tool: str,
     query: str,
     runner: Any,
-    grace_ms: int = 0,
 ) -> dict[str, Any]:
     """Run one single-mode tool under the project's §21 wall-clock deadline.
 
@@ -88,11 +82,20 @@ async def _bounded(
     cancellation (finally runs), and the per-call connection closes with the
     context manager either way."""
     bound_build: str | None = None
+    deadline = time.monotonic() + runtime.policy.max_latency_ms / 1000.0
     try:
-        async with asyncio.timeout((runtime.policy.max_latency_ms + grace_ms) / 1000.0):
+        async with asyncio.timeout(runtime.policy.max_latency_ms / 1000.0):
             async with runtime.context.bound() as deps:
                 bound_build = str(deps.repo.build_id)
-                response: McpResponse = await runner(deps)
+                # the runner gets what binding LEFT of the budget — a pacer
+                # inside it (hybrid) starts from the REMAINDER, never a
+                # fresh full budget, so the whole call respects the cap and
+                # the inner deadline beats this outer one in all but a μs
+                # photo finish (either way a typed §22 cut; partial assembly
+                # stays with the pacer, and the outer cut covers what no
+                # inner timer can see — the binding itself)
+                remaining_ms = max(int((deadline - time.monotonic()) * 1000), 1)
+                response: McpResponse = await runner(deps, remaining_ms)
                 return response.to_dict()
     except TimeoutError:
         detail = "" if bound_build else " during scope binding"
@@ -177,7 +180,7 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         """Fuzzy/topical retrieval over document text (§8 semantic)."""
         rt = _rt()
 
-        async def _run(deps: Any) -> McpResponse:
+        async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
             return await run_semantic(
                 deps.repo, deps.vectors, deps.embedder, query, rt.policy.top_k(top_k)
             )
@@ -200,7 +203,7 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         )
         label = query or f"{template}({entity})"
 
-        async def _run(deps: Any) -> McpResponse:
+        async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
             return await run_graph(
                 deps.graph,
                 deps.repo,
@@ -217,7 +220,7 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         """Precise filters/lookups over structured rows (§8 sql, guarded NL→SQL)."""
         rt = _rt()
 
-        async def _run(deps: Any) -> McpResponse:
+        async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
             return await run_sql(
                 deps.sql_reader, deps.llm, rt.policy.sql_policy(), query, rt.policy.sql_rows()
             )
@@ -229,7 +232,7 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         """Corpus-wide community summaries (§8 global)."""
         rt = _rt()
 
-        async def _run(deps: Any) -> McpResponse:
+        async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
             return await run_global(deps.repo, query, rt.policy.top_k(top_k))
 
         return await _bounded(rt, "global_summary", query, _run)
@@ -255,15 +258,19 @@ def build_server(project: str, config_path: Path) -> FastMCP:
                 hops=graph_hops,
             )
 
-        async def _run(deps: Any) -> McpResponse:
-            return await run_hybrid(deps, hybrid_policy(rt.policy, top_k), query, params)
+        async def _run(deps: Any, remaining_ms: int) -> McpResponse:
+            # hybrid's internal pacer runs on what binding LEFT of the §21
+            # budget — never a fresh full one — so its earlier deadline wins
+            # the terminal cut in all but a μs photo finish (partial
+            # assembly) and the whole call stays within max_latency_ms
+            return await run_hybrid(
+                deps,
+                hybrid_policy(rt.policy, top_k, latency_budget_ms=remaining_ms),
+                query,
+                params,
+            )
 
-        # hybrid's INTERNAL deadline paces the mode loop and assembles
-        # partial results; the outer bound exists for what it cannot see (a
-        # stall during scope binding) and gets a GRACE so the inner deadline
-        # always wins the terminal cut — without it the outer timer (started
-        # before binding) would fire first and discard completed modes
-        return await _bounded(rt, "hybrid_query", query, _run, grace_ms=_HYBRID_GRACE_MS)
+        return await _bounded(rt, "hybrid_query", query, _run)
 
     @server.tool()
     async def get_entity(name: str) -> dict[str, Any]:
@@ -297,10 +304,15 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         but the trace stays null and a typed warning says why."""
         rt = _rt()
 
-        async def _run(deps: Any) -> McpResponse:
-            return await run_hybrid(deps, hybrid_policy(rt.policy, top_k), query, None)
+        async def _run(deps: Any, remaining_ms: int) -> McpResponse:
+            return await run_hybrid(
+                deps,
+                hybrid_policy(rt.policy, top_k, latency_budget_ms=remaining_ms),
+                query,
+                None,
+            )
 
-        payload = await _bounded(rt, "hybrid_query", query, _run, grace_ms=_HYBRID_GRACE_MS)
+        payload = await _bounded(rt, "hybrid_query", query, _run)
         if not rt.policy.expose_debug:
             payload["warnings"] = [
                 *payload["warnings"],

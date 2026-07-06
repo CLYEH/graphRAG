@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 import yaml
 
-from core.mcp.policy import PolicyError, QueryPolicy, load_query_policy
+from core.mcp.policy import PolicyError, QueryPolicy, hybrid_policy, load_query_policy
 
 
 def _valid_document() -> dict[str, Any]:
@@ -151,3 +151,15 @@ def test_the_schema_resolves_from_candidates_and_fails_loud(
     )
     with pytest.raises(PolicyError, match="not found"):
         load_query_policy(_write(tmp_path, _valid_document()))
+
+
+def test_hybrid_gets_the_remaining_budget_never_a_fresh_one(tmp_path: Path) -> None:
+    """Codex round-7: the hybrid tool's internal pacer must start from what
+    the outer clock has LEFT after scope binding — restarting a fresh full
+    max_latency_ms would let one MCP call run to ~2× the §21 cap. The budget
+    is also clamped to the cap (a caller cannot hand MORE than the policy
+    allows)."""
+    policy = load_query_policy(_write(tmp_path, _valid_document()))
+    assert hybrid_policy(policy, None).max_latency_ms == 10000  # no outer clock
+    assert hybrid_policy(policy, None, latency_budget_ms=700).max_latency_ms == 700
+    assert hybrid_policy(policy, None, latency_budget_ms=99999).max_latency_ms == 10000

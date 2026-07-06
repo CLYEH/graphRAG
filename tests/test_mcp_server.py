@@ -80,7 +80,7 @@ async def test_bounded_tools_degrade_typed_at_the_wall_clock_deadline() -> None:
     policy = SimpleNamespace(max_latency_ms=50)
     runtime = _Runtime(context=_Ctx(), policy=policy)  # type: ignore[arg-type]
 
-    async def slow(_deps: Any) -> McpResponse:
+    async def slow(_deps: Any, _remaining_ms: int) -> McpResponse:
         await asyncio.sleep(0.3)
         raise AssertionError("unreachable — the deadline must cancel first")
 
@@ -91,7 +91,10 @@ async def test_bounded_tools_degrade_typed_at_the_wall_clock_deadline() -> None:
     assert payload["warnings"][0]["code"] == "PARTIAL_RESULTS"
     assert "deadline" in payload["warnings"][0]["message"]
 
-    async def fast(_deps: Any) -> McpResponse:
+    seen_budgets: list[int] = []
+
+    async def fast(_deps: Any, remaining_ms: int) -> McpResponse:
+        seen_budgets.append(remaining_ms)
         return McpResponse(
             query="q",
             tool="semantic_search",
@@ -103,6 +106,9 @@ async def test_bounded_tools_degrade_typed_at_the_wall_clock_deadline() -> None:
 
     ok = await _bounded(runtime, "semantic_search", "q", fast)
     assert ok["warnings"] == []  # a fast tool is untouched
+    # the runner is handed what binding LEFT of the §21 budget — a pacer
+    # inside it starts from the remainder, never a fresh full budget
+    assert 0 < seen_budgets[0] <= 50
 
     class _StalledCtx:
         project = "p"

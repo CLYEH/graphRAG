@@ -150,13 +150,24 @@ def load_query_policy(config_path: Path) -> QueryPolicy:
     )
 
 
-def hybrid_policy(policy: QueryPolicy, requested_top_k: int | None) -> Any:
+def hybrid_policy(
+    policy: QueryPolicy,
+    requested_top_k: int | None,
+    latency_budget_ms: int | None = None,
+) -> Any:
     """The :class:`~core.query.hybrid.HybridPolicy` slice for one request.
+
+    ``latency_budget_ms`` is what the CALLER's clock has left of the §21
+    budget (e.g. after scope binding) — hybrid's internal pacer starts from
+    it, never from a fresh full ``max_latency_ms``, so the whole request
+    respects the cap (clamped to the cap either way). None means the full
+    budget (no outer clock).
 
     Imported lazily to keep this module free of the heavy query stack for
     callers that only need validation (e.g. a config linter)."""
     from core.query.hybrid import HybridPolicy
 
+    budget = policy.max_latency_ms if latency_budget_ms is None else latency_budget_ms
     return HybridPolicy(
         text_to_sql=policy.sql_policy(),
         text_to_cypher=policy.cypher_policy(),
@@ -164,5 +175,5 @@ def hybrid_policy(policy: QueryPolicy, requested_top_k: int | None) -> Any:
         top_k=policy.top_k(requested_top_k),
         max_sql_rows=policy.sql_rows(),
         expose_debug=policy.expose_debug,
-        max_latency_ms=policy.max_latency_ms,
+        max_latency_ms=min(budget, policy.max_latency_ms),
     )
