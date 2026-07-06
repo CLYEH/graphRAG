@@ -313,6 +313,16 @@ async def test_prune_keeps_the_window_and_always_the_active(project: str) -> Non
             assert remaining == {old_active, mid, newest}
             statuses = {b.id: b.status for b in await list_builds(conn, project)}
             assert statuses[old_active] == "active"  # never pruned
+
+            await conn.execute(
+                tables.builds.update().where(tables.builds.c.id == mid).values(status="archived")
+            )
+            await conn.commit()
+            victims = await prune(conn, qdrant, session, project, keep=1)
+            # keep=1 window = {newest}; active kept by rule; mid archived → swept
+            assert set(victims) == {mid}
+            remaining = {b.id for b in await list_builds(conn, project)}
+            assert remaining == {old_active, newest}
     finally:
         await qdrant.close()
         await driver.close()
@@ -420,3 +430,61 @@ async def test_a_resolved_and_projected_build_passes_preflight(project: str) -> 
         await qdrant.close()
         await driver.close()
         await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_prune_skips_a_victim_promoted_after_the_snapshot(project: str) -> None:
+    """Class 10: the victim set is a bind-time SNAPSHOT — the deleting
+    transaction re-checks status under the victim's ROW LOCK. Interleaving
+    (two connections, deterministic): conn2 locks the victim FIRST, prune
+    blocks on that lock, conn2 promotes the victim to ACTIVE and commits —
+    prune's re-check then sees 'active' and SKIPS: data intact, excluded
+    from the pruned list. Reverting the FOR-UPDATE+re-check makes prune
+    delete the just-activated build → this test fails."""
+    import asyncio
+
+    from sqlalchemy import select
+
+    engine, engine2 = _engine(), _engine()
+    qdrant = vector_client()
+    driver = graph_driver()
+    try:
+        async with (
+            engine.connect() as conn,
+            engine2.connect() as conn2,
+            driver.session() as session,
+        ):
+            victim = await _new_build(conn, project, age_days=9)
+            keeper = await _new_build(conn, project, age_days=1)
+            assert keeper is not None
+
+            # conn2 takes the victim's row lock BEFORE prune runs
+            txn2 = await conn2.begin()
+            await conn2.execute(
+                select(tables.builds.c.status).where(tables.builds.c.id == victim).with_for_update()
+            )
+
+            prune_task = asyncio.ensure_future(prune(conn, qdrant, session, project, keep=1))
+            done, _ = await asyncio.wait([prune_task], timeout=1.0)
+            assert not done  # prune is BLOCKED on the held lock, pre-delete
+
+            # promote the victim while prune waits, then release the lock
+            await conn2.execute(
+                tables.builds.update()
+                .where(tables.builds.c.project == project, tables.builds.c.status == "active")
+                .values(status="archived")
+            )
+            await conn2.execute(
+                tables.builds.update().where(tables.builds.c.id == victim).values(status="active")
+            )
+            await txn2.commit()
+
+            pruned = await asyncio.wait_for(prune_task, timeout=10)
+            assert victim not in pruned  # the re-check under the lock SKIPPED it
+            statuses = {b.id: b.status for b in await list_builds(conn, project)}
+            assert statuses[victim] == "active"  # promoted build survives intact
+    finally:
+        await qdrant.close()
+        await driver.close()
+        await engine.dispose()
+        await engine2.dispose()

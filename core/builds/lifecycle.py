@@ -426,44 +426,73 @@ async def prune(
     kept regardless of age); delete every older build's data from all three
     stores — projections first, Postgres LAST (its rows are the truth for
     what still needs deleting elsewhere; a crash mid-prune leaves re-runnable
-    leftovers, never orphaned truth)."""
+    leftovers, never orphaned truth). Each victim's builds row is locked
+    FOR UPDATE and its status RE-CHECKED inside the one deleting transaction
+    (gone/active → skipped, data kept): a concurrent activation of that build
+    blocks on the lock and then loses LOUD (no promotable row). No status is
+    written; a crash rolls the Postgres truth back — the victim stays
+    archived and the next run re-sweeps it."""
     if keep < 1:
         raise ValueError("keep must be >= 1 — pruning everything would drop the active build")
-    # single-operator admin surface: the keeper set is a snapshot — prune
-    # assumes no CONCURRENT activation (a build activated after the snapshot
-    # could be swept); serialize lifecycle operations per project
     builds = await list_builds(conn, project)
     keepers = {b.id for b in builds[:keep]} | {b.id for b in builds if b.status == "active"}
     victims = [b for b in builds if b.id not in keepers]
+    pruned: list[uuid.UUID] = []
     for victim in victims:
-        # projections first
-        try:
-            await qdrant.delete(
-                collection_name=collection_for(project),
-                points_selector=qm.FilterSelector(
-                    filter=qm.Filter(
-                        must=[
-                            qm.FieldCondition(key="project", match=qm.MatchValue(value=project)),
-                            qm.FieldCondition(
-                                key="build_id", match=qm.MatchValue(value=str(victim.id))
-                            ),
-                        ]
-                    )
-                ),
-            )
-        except UnexpectedResponse as exc:
-            if exc.status_code != 404:  # no collection ⇒ nothing to prune there
-                raise
-        await (
-            await graph_session.run(
-                "MATCH (n:Entity {project: $project, build_id: $build_id}) DETACH DELETE n",
-                {"project": project, "build_id": str(victim.id)},
-            )
-        ).consume()
-        # Postgres last, children before parents, the build row at the end
+        # the snapshot above is bind-time knowledge, not an invariant: a
+        # concurrent activation could promote a victim before we reach it
+        # (class 10). Serialization is the victim's ROW LOCK: one transaction
+        # covers recheck + projection deletes + Postgres deletes, so a
+        # concurrent activation of THIS build blocks on its promote UPDATE
+        # until our commit — and then finds no promotable row (deleted) and
+        # fails loud, never a silent double-state. A crash anywhere inside
+        # rolls the Postgres truth back intact; projections partially
+        # deleted are re-runnable leftovers (idempotent deletes).
         await conn.rollback()  # end any auto-begun read txn before OUR txn
+        # NB the row lock is held across the external-store deletes below; a
+        # hung store pins this transaction (idle-in-transaction) — bounded
+        # blast radius (only activation of THIS archived victim contends),
+        # but a session lock_timeout/statement_timeout is the mitigation if
+        # this ever runs unattended
         async with conn.begin():
-            # entity_mentions has no build_id — resolve through its entity FK
+            locked = (
+                await conn.execute(
+                    sa.select(tables.builds.c.status)
+                    .where(tables.builds.c.id == victim.id)
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if locked is None or locked.status == "active":
+                continue  # gone, or promoted since the snapshot — keep it
+            # the row lock is HELD through everything below: projections
+            # first, Postgres truth last, one commit releases it
+            try:
+                await qdrant.delete(
+                    collection_name=collection_for(project),
+                    points_selector=qm.FilterSelector(
+                        filter=qm.Filter(
+                            must=[
+                                qm.FieldCondition(
+                                    key="project", match=qm.MatchValue(value=project)
+                                ),
+                                qm.FieldCondition(
+                                    key="build_id", match=qm.MatchValue(value=str(victim.id))
+                                ),
+                            ]
+                        )
+                    ),
+                )
+            except UnexpectedResponse as exc:
+                if exc.status_code != 404:  # no collection ⇒ nothing to prune there
+                    raise
+            await (
+                await graph_session.run(
+                    "MATCH (n:Entity {project: $project, build_id: $build_id}) DETACH DELETE n",
+                    {"project": project, "build_id": str(victim.id)},
+                )
+            ).consume()
+            # Postgres last, children before parents, the build row at the end
+            # (entity_mentions has no build_id — resolve through its entity FK)
             await conn.execute(
                 tables.entity_mentions.delete().where(
                     tables.entity_mentions.c.entity_id.in_(
@@ -483,4 +512,5 @@ async def prune(
                 tables.pipeline_runs.delete().where(tables.pipeline_runs.c.build_id == victim.id)
             )
             await conn.execute(tables.builds.delete().where(tables.builds.c.id == victim.id))
-    return [v.id for v in victims]
+            pruned.append(victim.id)
+    return pruned
