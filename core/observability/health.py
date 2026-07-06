@@ -18,8 +18,10 @@ SEMANTICS (spec-first — the judge-surface lesson):
     incomparable or unscored is NOT a regression light; the activation gate
     fails closed there, but a status light must not scream about what was
     never measured).
-  * Needs review — pending merge candidates exist
-    (``merge_candidates.status='pending'``).
+  * Needs review — the review QUEUE is non-empty: pending merge candidates
+    (``merge_candidates.status='pending'``) plus proposed ontology types
+    (``ontology_proposals.status='proposed'``, the §6 待審池) — §19's
+    "pending review" is the whole queue, not one table.
 - **Metrics** are point-in-time counts, active-build-scoped where the metric
   is about content (docs/chunks/entities/relations), project-scoped where it
   is about workflow (builds, pending review). ``low_confidence_relations``
@@ -122,7 +124,7 @@ async def health_report(
         "builds_total": len(builds),
         "active_build": str(active.id) if active else None,
         "last_failed_build": str(last_failed.id) if last_failed else None,
-        "pending_review": await _count(
+        "pending_merge_candidates": await _count(
             conn,
             sa.select(sa.func.count())
             .select_from(tables.merge_candidates)
@@ -131,7 +133,21 @@ async def health_report(
                 tables.merge_candidates.c.status == "pending",
             ),
         ),
+        "pending_ontology_proposals": await _count(
+            conn,
+            sa.select(sa.func.count())
+            .select_from(tables.ontology_proposals)
+            .where(
+                tables.ontology_proposals.c.project == project,
+                tables.ontology_proposals.c.status == "proposed",
+            ),
+        ),
     }
+    # §19's "pending review" is the WHOLE queue — either table alone must
+    # light Needs review (Codex round 4: a proposal-only backlog was hidden)
+    metrics["pending_review"] = (
+        metrics["pending_merge_candidates"] + metrics["pending_ontology_proposals"]
+    )
     if active is not None:
         scope_e = [e.c.project == project, e.c.build_id == active.id, e.c.status == "active"]
         scope_r = [r.c.project == project, r.c.build_id == active.id, r.c.status == "active"]

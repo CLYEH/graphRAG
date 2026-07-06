@@ -48,6 +48,9 @@ async def project(migrated: None) -> AsyncIterator[str]:
     engine = _engine()
     async with engine.connect() as conn:
         await conn.execute(tables.entities.delete().where(tables.entities.c.project == name))
+        await conn.execute(
+            tables.ontology_proposals.delete().where(tables.ontology_proposals.c.project == name)
+        )
         await conn.execute(tables.builds.delete().where(tables.builds.c.project == name))
         await conn.commit()
     await engine.dispose()
@@ -111,6 +114,24 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
             report = await health_report(conn, qdrant, session, project)
             assert report.status == "Needs review"
             assert report.metrics["pending_review"] == 1
+
+            # a PROPOSED ontology type is review work too (§6 待審池) — the
+            # queue is both tables, either alone must light Needs review
+            await conn.execute(
+                tables.ontology_proposals.insert().values(
+                    project=project,
+                    kind="entity",
+                    type_name="vessel",
+                    proposal_key="entity:vessel",
+                    fingerprint_version=1,
+                    status="proposed",
+                )
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Needs review"
+            assert report.metrics["pending_review"] == 2
+            assert report.metrics["pending_ontology_proposals"] == 1
 
             # an ACTIVE entity in PG only → the SAME drift checker preflight
             # uses fires → Index drift outranks Needs review
