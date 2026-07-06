@@ -278,6 +278,60 @@ async def _drift_failures(
     return failures
 
 
+async def _eval_gate(
+    conn: AsyncConnection, project: str, build_id: uuid.UUID
+) -> tuple[list[str], list[str]]:
+    """§20's activation gate: the candidate regresses when its eval score
+    falls below the ACTIVE build's by more than the threshold
+    (spec.is_eval_regression — the at-threshold tolerance lives there).
+    Scores come from builds.metrics['eval'] as written by the C10 runner;
+    a missing score is REPORTED as deferred, never silently passed (Rule
+    12): no active build or an unscored active ⇒ nothing to regress against;
+    an unscored candidate ⇒ run `graphrag eval` first."""
+    from core.config import get_settings
+    from core.eval.spec import is_eval_regression
+
+    async def _score(bid: uuid.UUID) -> float | None:
+        row = (
+            await conn.execute(sa.select(tables.builds.c.metrics).where(tables.builds.c.id == bid))
+        ).one_or_none()
+        if row is None or not row.metrics:
+            return None
+        eval_block = row.metrics.get("eval")
+        if not isinstance(eval_block, dict):
+            return None
+        score = eval_block.get("score")
+        return float(score) if isinstance(score, (int, float)) else None
+
+    candidate = await _score(build_id)
+    active_row = (
+        await conn.execute(
+            sa.select(tables.builds.c.id).where(
+                tables.builds.c.project == project, tables.builds.c.status == "active"
+            )
+        )
+    ).one_or_none()
+    if candidate is None:
+        return [], [
+            "eval gate (§20): candidate build has no eval score — run `graphrag eval` "
+            "to score it; the gate cannot compare what was never measured"
+        ]
+    if active_row is None:
+        return [], ["eval gate (§20): no active build to regress against — gate vacuous"]
+    active_score = await _score(active_row.id)
+    if active_score is None:
+        return [], [
+            "eval gate (§20): the active build has no eval score — nothing to regress against"
+        ]
+    threshold = get_settings().eval_regression_threshold
+    if is_eval_regression(candidate, active_score, threshold):
+        return [
+            f"eval regression (§20): candidate scored {candidate:.4f}, active "
+            f"{active_score:.4f}, threshold {threshold} — activation blocked"
+        ], []
+    return [], []
+
+
 async def preflight(
     conn: AsyncConnection,
     qdrant: AsyncQdrantClient,
@@ -292,8 +346,14 @@ async def preflight(
     Checks: (1) the target exists and is promotable — ``ready`` for a fresh
     activation, additionally ``archived`` for a rollback (``allow_archived``);
     (2) §19 drift — the graph and vector projections agree with the Postgres
-    truth on entity/relation/point counts for THIS build. The §20 eval gate
-    is deferred to C10 and reported as such."""
+    truth on entity/relation/point counts for THIS build; (3) the §20 eval
+    gate, three-state: unscored candidate/active → DEFERRED (surfaced, never
+    silently passed), no active build → vacuous (deferred), both scored →
+    regression blocks. Unlike drift, the eval gate is NOT re-checked under
+    the promotion lock: eval scores are stable JSONB the runner wrote — no
+    concurrent operation invalidates them the way an aborted prune can
+    invalidate projections — and activations serialize on the project
+    lifecycle lock anyway (deliberate asymmetry)."""
     failures: list[str] = []
     row = (
         await conn.execute(
@@ -315,10 +375,9 @@ async def preflight(
 
     failures.extend(await _drift_failures(conn, qdrant, graph_session, project, build_id))
 
-    return PreflightReport(
-        tuple(failures),
-        ("eval gate (§20) not run — the eval harness lands in C10",),
-    )
+    eval_failures, eval_deferred = await _eval_gate(conn, project, build_id)
+    failures.extend(eval_failures)
+    return PreflightReport(tuple(failures), tuple(eval_deferred))
 
 
 async def activate(
@@ -440,7 +499,10 @@ async def rollback(
     concurrent activation could commit in between and the pre-selected
     target would jump history back two versions instead of one (bind-time
     selection ≠ invariant)."""
-    deferred = ("eval gate (§20) not run — the eval harness lands in C10",)
+    deferred = (
+        "eval gate (§20) not applied — rollback restores a previously-active, "
+        "already-vetted build; the regression gate compares candidates, not history",
+    )
     await conn.rollback()  # end any auto-begun read txn before OUR txn
     try:
         async with conn.begin():

@@ -68,7 +68,7 @@ def test_cli_surface_is_the_frozen_14_set() -> None:
     sub = next(
         a for a in _parser()._actions if isinstance(a, __import__("argparse")._SubParsersAction)
     )
-    assert set(sub.choices) == {"builds", "activate", "rollback", "diff", "prune"}
+    assert set(sub.choices) == {"builds", "activate", "rollback", "diff", "eval", "prune"}
 
 
 async def test_prune_refuses_a_zero_window() -> None:

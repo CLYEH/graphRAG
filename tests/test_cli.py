@@ -29,5 +29,5 @@ def test_help_names_the_lifecycle_verbs(
         main()
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
-    for verb in ("builds", "activate", "rollback", "diff", "prune"):
+    for verb in ("builds", "activate", "rollback", "diff", "eval", "prune"):
         assert verb in out

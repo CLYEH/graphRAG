@@ -227,7 +227,7 @@ graphRAG/
 首頁狀態燈：`Healthy | Needs review | Build failed | Index drift | Eval regression`。指標：active/last-success/last-failed build、source/doc/chunk/entity/relation count、pending review、**projection drift**(PG vs Neo4j/Qdrant 依 build_id 計數對帳)、low-confidence relation、missing-evidence、eval 趨勢。`GET /projects/{p}/health`。
 
 ## 20. 評估框架
-每專案 `eval/golden.yaml`（question, mode, expects{must_contain_entities, must_cite_sources, answer_regex}, min_score）。評分：entity/source recall、答案相似度、citation 覆蓋。回歸門檻 🟡 `eval.regression_threshold`：新 build eval 低於 active 超門檻 → 阻擋 auto-activate、Health 顯示 `Eval regression`。`graphrag eval` / `GET /projects/{p}/eval`。
+每專案 `eval/golden.yaml`（question, mode, expects{must_contain_entities, must_cite_sources, answer_regex}, min_score）。評分：entity/source recall、答案相似度、citation 覆蓋。（答案相似度需 golden 增補參考答案欄位——additive schema 演進——之前不發此指標；C10 runner 註記。）回歸門檻 🟡 `eval.regression_threshold`：新 build eval 低於 active 超門檻 → 阻擋 auto-activate、Health 顯示 `Eval regression`。`graphrag eval` / `GET /projects/{p}/eval`。
 
 ## 21. 查詢安全政策
 `config.query_policy`：`default_mode, max_top_k, max_graph_hops, max_sql_rows, max_latency_ms, require_sources, expose_debug`。

@@ -197,6 +197,32 @@ async def resolve_active_binding(conn: AsyncConnection, project: str) -> ActiveB
     return ActiveBinding(project, build, _token=_BINDING_TOKEN)
 
 
+async def resolve_eval_binding(
+    conn: AsyncConnection, project: str, build_id: uuid.UUID
+) -> ActiveBinding:
+    """The §20 eval path: mint a binding for a CANDIDATE build.
+
+    Evaluation gates activation (§14), so it must read builds that are not
+    yet active — the ONLY relaxation: the named build must exist in this
+    project with status ``ready`` or ``active`` (a building build has no
+    stable content to score; archived history is not what the gate is for).
+    Everything else about the fence is unchanged — the proof still cannot be
+    forged or rebound, and query/MCP surfaces never call this."""
+    row = (
+        await conn.execute(
+            sa.select(tables.builds.c.status).where(
+                tables.builds.c.id == build_id, tables.builds.c.project == project
+            )
+        )
+    ).one_or_none()
+    if row is None or row.status not in ("ready", "active"):
+        raise LookupError(
+            f"build {build_id} is not evaluable in project {project} "
+            f"(status={'missing' if row is None else row.status}; needs ready|active)"
+        )
+    return ActiveBinding(project, build_id, _token=_BINDING_TOKEN)
+
+
 #: The characters a PostgreSQL operator name may contain (PG manual §4.1.3).
 #: SQLAlchemy renders dialect operators (JSONB ``->>``/``@>``/``?``, array
 #: ``&&`` …) as ``custom_op`` nodes whose opstring is drawn ENTIRELY from this
