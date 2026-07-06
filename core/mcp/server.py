@@ -191,9 +191,13 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         async with rt.context.bound() as deps:
             tables: dict[str, list[str]] = {}
             if rt.policy.text_to_sql.enabled:
-                columns = await deps.sql_reader.columns_by_table(
-                    list(rt.policy.text_to_sql.allowed_tables)
-                )
+                # the same JSON-key discovery sql_query runs — under the same
+                # reconciled deadline (§21): unbounded, a large structured
+                # build could hold this call past the latency cap
+                async with deps.sql_reader.timed_transaction(rt.policy.sql_policy().timeout_ms):
+                    columns = await deps.sql_reader.columns_by_table(
+                        list(rt.policy.text_to_sql.allowed_tables)
+                    )
                 tables = {table: list(cols) for table, cols in columns.items()}
             return {
                 "project": rt.context.project,

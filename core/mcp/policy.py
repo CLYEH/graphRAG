@@ -28,8 +28,24 @@ import yaml
 
 from core.query.policy import TextToCypher, TextToSql
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_SCHEMA_PATH = _REPO_ROOT / "contracts" / "query_policy.schema.json"
+#: Where the frozen schema can live: a source checkout keeps contracts/ at
+#: the repo root; an installed wheel ships a build-time copy inside the core
+#: package (pyproject force-include) — same bytes, same release, DR-002 holds
+#: either way. Resolved lazily so a missing file names every candidate.
+_SCHEMA_CANDIDATES = (
+    Path(__file__).resolve().parent.parent.parent / "contracts" / "query_policy.schema.json",
+    Path(__file__).resolve().parent.parent / "contracts" / "query_policy.schema.json",
+)
+
+
+def _schema_text() -> str:
+    for candidate in _SCHEMA_CANDIDATES:
+        if candidate.is_file():
+            return candidate.read_text("utf-8")
+    raise PolicyError(
+        "query_policy.schema.json not found — looked in: "
+        + ", ".join(str(c) for c in _SCHEMA_CANDIDATES)
+    )
 
 
 class PolicyError(ValueError):
@@ -105,7 +121,7 @@ def load_query_policy(config_path: Path) -> QueryPolicy:
         raise PolicyError(f"project config {config_path} has no query_policy block")
     document = raw["query_policy"]
 
-    schema = json.loads(_SCHEMA_PATH.read_text("utf-8"))
+    schema = json.loads(_schema_text())
     validator = jsonschema.Draft202012Validator(schema)
     errors = sorted(validator.iter_errors(document), key=lambda e: list(e.absolute_path))
     if errors:

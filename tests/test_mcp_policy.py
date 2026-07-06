@@ -126,3 +126,28 @@ def test_the_top_level_latency_cap_governs_mode_deadlines(tmp_path: Path) -> Non
     policy = load_query_policy(_write(tmp_path, document))
     assert policy.sql_policy().timeout_ms == 5000  # the smaller mode value holds
     assert policy.cypher_policy().timeout_ms == 5000
+
+
+def test_the_schema_resolves_from_candidates_and_fails_loud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source checkout reads contracts/ at the repo root; an installed wheel
+    reads the build-time copy shipped inside core/ (force-include). Neither
+    present → PolicyError naming every candidate, at startup — never a bare
+    FileNotFoundError mid-config-load."""
+    import core.mcp.policy as module
+
+    real_schema = module._SCHEMA_CANDIDATES[0].read_text("utf-8")
+    packaged = tmp_path / "core" / "contracts" / "query_policy.schema.json"
+    packaged.parent.mkdir(parents=True)
+    packaged.write_text(real_schema, "utf-8")
+    # repo-root candidate missing → the packaged copy is used
+    monkeypatch.setattr(module, "_SCHEMA_CANDIDATES", (tmp_path / "nope.json", packaged))
+    policy = load_query_policy(_write(tmp_path, _valid_document()))
+    assert policy.max_top_k == 20  # loaded through the fallback candidate
+
+    monkeypatch.setattr(
+        module, "_SCHEMA_CANDIDATES", (tmp_path / "nope.json", tmp_path / "also-nope.json")
+    )
+    with pytest.raises(PolicyError, match="not found"):
+        load_query_policy(_write(tmp_path, _valid_document()))
