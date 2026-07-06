@@ -315,6 +315,23 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      mintable solely by the active-build lookup, restored the fence; mind
      `dataclasses.replace` forgeries — tokens live in InitVar).
 
+   - **A state-machine surface gets a MATRIX sweep, not point fixes**: when
+     the surface is a lifecycle/state machine with concurrent operations
+     (activate/rollback/prune; job queues; review flows), enumerate the full
+     matrix at design time — every OPERATION × every STATUS (each cell gets
+     a deliberate verdict: act/skip/refuse) × every PAIR of concurrent
+     operations (what serializes them: row lock, advisory lock, atomic
+     claim). C9 spent five review rounds opening class-10 cells one at a
+     time (snapshot TOCTOU, crash-window recheck, selection outside the
+     lock, non-terminal victim, ordering proxy) that one matrix pass would
+     have covered. Selection queries are part of the matrix: a target
+     SELECTED outside the serialization that promotes it can go stale.
+   - **Ordering-bearing timestamps use ONE clock**: never mix the
+     application clock and the database clock in timestamps that feed an
+     ORDER BY that decides behavior (C9: python datetime.now() on promote
+     vs PG now() on backfill — container clock skew reordered rollback
+     history). Pick the DB clock for DB-ordered history.
+
 ## Output (exactly this shape)
 ```
 VERDICT: PASS | FAIL
