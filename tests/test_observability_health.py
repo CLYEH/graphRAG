@@ -1,0 +1,300 @@
+"""Why: Health is §19's operator-facing verdict — the status light must obey
+the documented precedence (most actionable wins), drift must come from the
+SAME checker preflight uses (one checker, no class-5 fork), and the eval
+light must only report MEASURED, COMPARABLE facts. Live stores; empty builds
+make the drift check trivially agree so each light is isolated."""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+import pytest_asyncio
+from alembic import command
+from alembic.config import Config
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
+
+from core.config import get_settings
+from core.observability.health import health_report
+from core.resolve import fingerprints
+from core.stores import tables
+from core.stores.graph import graph_driver
+from core.stores.vectors import vector_client
+
+pytestmark = pytest.mark.integration
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+NOW = datetime.now(tz=UTC)
+
+
+@pytest.fixture()
+def migrated(require_services: None) -> None:
+    command.upgrade(Config(str(REPO_ROOT / "alembic.ini")), "head")
+
+
+def _engine() -> AsyncEngine:
+    dsn = get_settings().postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return create_async_engine(dsn, poolclass=NullPool)
+
+
+@pytest_asyncio.fixture()
+async def project(migrated: None) -> AsyncIterator[str]:
+    name = f"health-{uuid.uuid4().hex[:10]}"
+    yield name
+    engine = _engine()
+    async with engine.connect() as conn:
+        await conn.execute(tables.entities.delete().where(tables.entities.c.project == name))
+        await conn.execute(tables.relations.delete().where(tables.relations.c.project == name))
+        await conn.execute(
+            tables.ontology_proposals.delete().where(tables.ontology_proposals.c.project == name)
+        )
+        await conn.execute(tables.builds.delete().where(tables.builds.c.project == name))
+        await conn.commit()
+    await engine.dispose()
+
+
+async def test_health_lights_follow_the_documented_precedence(project: str) -> None:
+    engine = _engine()
+    qdrant = vector_client()
+    driver = graph_driver()
+    try:
+        async with engine.connect() as conn, driver.session() as session:
+            # no builds at all → Healthy (nothing to report on)
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Healthy"
+            assert report.metrics["builds_total"] == 0
+
+            # an ACTIVE empty build → still Healthy; content metrics appear
+            active_id: uuid.UUID = (
+                await conn.execute(
+                    tables.builds.insert()
+                    .values(project=project, status="active", started_at=NOW)
+                    .returning(tables.builds.c.id)
+                )
+            ).scalar_one()
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Healthy"
+            assert report.metrics["entities"] == 0 and report.drift == ()
+
+            # pending merge candidate → Needs review. Direct SQL fixture —
+            # the writer's building-only fence is correct and not under test
+            left, right = uuid.uuid4(), uuid.uuid4()
+            for eid, name in ((left, "Acme"), (right, "Acme Corp")):
+                await conn.execute(
+                    tables.entities.insert().values(
+                        id=eid,
+                        project=project,
+                        build_id=active_id,
+                        type="org",
+                        canonical_name=name,
+                        entity_key=fingerprints.entity_key("org", name),
+                        status="merged",  # NOT active — drift check stays 0==0
+                        review_status="unreviewed",
+                        created_by="rule",
+                        created_at=NOW,
+                        updated_at=NOW,
+                    )
+                )
+            await conn.execute(
+                tables.merge_candidates.insert().values(
+                    id=uuid.uuid4(),
+                    project=project,
+                    build_id=active_id,
+                    left_entity_id=left,
+                    right_entity_id=right,
+                    score=0.9,
+                    status="pending",
+                )
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Needs review"
+            assert report.metrics["pending_review"] == 1
+
+            # a PROPOSED ontology type is review work too (§6 待審池) — the
+            # queue is both tables, either alone must light Needs review
+            await conn.execute(
+                tables.ontology_proposals.insert().values(
+                    project=project,
+                    kind="entity",
+                    type_name="vessel",
+                    proposal_key="entity:vessel",
+                    fingerprint_version=1,
+                    status="proposed",
+                )
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Needs review"
+            assert report.metrics["pending_review"] == 2
+            assert report.metrics["pending_ontology_proposals"] == 1
+
+            # §17: an entity parked at status='needs_review' is review work
+            # too, and a DEFERRED merge candidate (defer 仍列入待審) — either
+            # alone must light Needs review (Codex round 8)
+            await conn.execute(
+                tables.entities.insert().values(
+                    id=uuid.uuid4(),
+                    project=project,
+                    build_id=active_id,
+                    type="org",
+                    canonical_name="Umbrella",
+                    entity_key=fingerprints.entity_key("org", "Umbrella"),
+                    status="needs_review",
+                    review_status="unreviewed",
+                    created_by="rule",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            await conn.execute(
+                tables.merge_candidates.update()
+                .where(tables.merge_candidates.c.project == project)
+                .values(status="deferred")
+            )
+            # a needs_review RELATION between two same-build entities — the
+            # symmetric term to needs_review_entities (guards the relations
+            # WHERE clause against the status/review_status footgun)
+            await conn.execute(
+                tables.relations.insert().values(
+                    id=uuid.uuid4(),
+                    project=project,
+                    build_id=active_id,
+                    src_entity_id=left,
+                    dst_entity_id=right,
+                    type="rivals",
+                    status="needs_review",
+                    review_status="unreviewed",
+                    created_by="rule",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Needs review"
+            assert report.metrics["needs_review_entities"] == 1
+            assert report.metrics["needs_review_relations"] == 1
+            assert report.metrics["pending_merge_candidates"] == 1  # deferred still counts
+
+            # an ACTIVE entity in PG only → the SAME drift checker preflight
+            # uses fires → Index drift outranks Needs review
+            await conn.execute(
+                tables.entities.insert().values(
+                    id=uuid.uuid4(),
+                    project=project,
+                    build_id=active_id,
+                    type="org",
+                    canonical_name="Globex",
+                    entity_key=fingerprints.entity_key("org", "Globex"),
+                    status="active",
+                    review_status="unreviewed",
+                    created_by="rule",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Index drift"
+            assert any("drift" in d for d in report.drift)
+
+            # a newer FAILED build → Build failed outranks everything
+            await conn.execute(
+                tables.builds.insert().values(
+                    project=project, status="failed", started_at=datetime.now(tz=UTC)
+                )
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Build failed"
+            assert report.metrics["last_failed_build"] is not None
+
+            # NULLS LAST for `newest` too (Codex round 6): a later
+            # never-started 'building' row must NOT outrank the real failed
+            # build via coalesce(now()). With NULLS LAST the failed build
+            # stays newest → the light stays "Build failed".
+            await conn.execute(
+                tables.builds.insert().values(project=project, status="building", started_at=None)
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Build failed"
+    finally:
+        await qdrant.close()
+        await driver.close()
+        await engine.dispose()
+
+
+async def test_eval_regression_light_needs_comparable_reports(project: str) -> None:
+    """§20's light fires only on MEASURED, same-fingerprint reports — an
+    unscored or different-suite ready build never lights it (the gate fails
+    closed elsewhere; the light must not guess)."""
+    engine = _engine()
+    qdrant = vector_client()
+    driver = graph_driver()
+    try:
+        async with engine.connect() as conn, driver.session() as session:
+            await conn.execute(
+                tables.builds.insert().values(
+                    project=project,
+                    status="active",
+                    started_at=NOW,
+                    eval={"score": 0.9, "failed": 0, "fingerprint": "fp"},
+                )
+            )
+            # ready build, regressing score, SAME fingerprint → light on
+            await conn.execute(
+                tables.builds.insert().values(
+                    project=project,
+                    status="ready",
+                    started_at=datetime.now(tz=UTC),
+                    eval={"score": 0.5, "failed": 0, "fingerprint": "fp"},
+                )
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Eval regression"
+
+            # different fingerprint → incomparable → the light goes dark
+            await conn.execute(
+                tables.builds.update()
+                .where(tables.builds.c.project == project, tables.builds.c.status == "ready")
+                .values(eval={"score": 0.5, "failed": 0, "fingerprint": "other"})
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Healthy"
+
+            # NULLS LAST discriminator (Codex round 6): a NEVER-STARTED ready
+            # build must sort OLDEST, not newest. Restore the comparable
+            # fingerprint on the real regressing candidate, then add a
+            # started_at=NULL non-regressing ready build. Under coalesce(now())
+            # the null row would outrank the real one and hide the
+            # regression; NULLS LAST keeps the regressing candidate on top so
+            # the light stays lit.
+            await conn.execute(
+                tables.builds.update()
+                .where(tables.builds.c.project == project, tables.builds.c.status == "ready")
+                .values(eval={"score": 0.5, "failed": 0, "fingerprint": "fp"})
+            )
+            await conn.execute(
+                tables.builds.insert().values(
+                    project=project,
+                    status="ready",
+                    started_at=None,  # never started — must sort OLDEST
+                    eval={"score": 0.95, "failed": 0, "fingerprint": "fp"},
+                )
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Eval regression"  # real regressing row still picked
+    finally:
+        await qdrant.close()
+        await driver.close()
+        await engine.dispose()

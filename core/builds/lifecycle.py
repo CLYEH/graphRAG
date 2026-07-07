@@ -130,7 +130,10 @@ async def list_builds(conn: AsyncConnection, project: str) -> list[BuildInfo]:
             tables.builds.c.activated_at,
         )
         .where(tables.builds.c.project == project)
-        .order_by(sa.desc(sa.func.coalesce(tables.builds.c.started_at, sa.func.now())))
+        # NULLS LAST: a never-started row sorts OLDEST — coalescing to now()
+        # made it outrank every real timestamp (same class as the health
+        # eval-candidate ordering, swept in the same pass)
+        .order_by(sa.desc(tables.builds.c.started_at).nulls_last())
     )
     return [BuildInfo(*row) for row in rows]
 
@@ -250,7 +253,7 @@ async def _vector_count(client: AsyncQdrantClient, project: str, build_id: uuid.
     return int(result.count)
 
 
-async def _drift_failures(
+async def drift_failures(
     conn: AsyncConnection,
     qdrant: AsyncQdrantClient,
     graph_session: AsyncSession,
@@ -418,7 +421,7 @@ async def preflight(
             f"build status is '{status}' — promotable statuses here: {', '.join(promotable)}"
         )
 
-    failures.extend(await _drift_failures(conn, qdrant, graph_session, project, build_id))
+    failures.extend(await drift_failures(conn, qdrant, graph_session, project, build_id))
 
     eval_failures, eval_deferred = await _eval_gate(conn, project, build_id)
     failures.extend(eval_failures)
@@ -496,7 +499,7 @@ async def _promote_in_tx(
     # pre-lock preflight is bind-time knowledge — an aborted prune can
     # have deleted the projections between it and this lock, and
     # promoting then would point active at missing projections
-    drift = await _drift_failures(conn, qdrant, graph_session, project, build_id)
+    drift = await drift_failures(conn, qdrant, graph_session, project, build_id)
     if drift:
         raise _DriftedUnderLock(drift)
     if apply_eval_gate:

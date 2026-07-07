@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     # activation
     eval_regression_threshold: float = 0.05
 
+    # §18 observability (tunable 🔧): which pipeline item ROWS persist —
+    # failures (default; the §27.7 retry boundary's frozen minimum) |
+    # sampled | all. Counters are always complete regardless.
+    observability_item_logging: str = "failures"
+    # §18 retention (🔧): per-item detail older than this is purged; runs
+    # and step counters are kept
+    observability_item_retention_days: int = 30
+
     # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-nano"
