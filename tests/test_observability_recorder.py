@@ -68,15 +68,28 @@ def test_duplicate_item_refs_dedupe_first_kept() -> None:
     outcomes = (
         ItemOutcome("document", "hash-dup", "skipped"),
         ItemOutcome("document", "hash-dup", "skipped"),
-        ItemOutcome("document", "hash-dup", "failed"),  # later status dropped
+        ItemOutcome("document", "hash-dup", "failed"),  # FAILED must dominate
         ItemOutcome("entity", "hash-dup", "failed"),  # different kind — kept
     )
     kept = _persistable(outcomes, "failures")
+    # failed dominates at the FIRST-seen position (Codex round 7): the §27.7
+    # retry boundary reads persisted failed rows, so a failed occurrence must
+    # never be masked by an earlier skipped/success for the same ref
     assert [(o.item_kind, o.item_ref, o.status) for o in kept] == [
-        ("document", "hash-dup", "skipped"),
+        ("document", "hash-dup", "failed"),
         ("entity", "hash-dup", "failed"),
     ]
     assert len(_persistable(outcomes, "all")) == 2  # dedup applies in every mode
+
+
+def test_dedupe_keeps_first_when_no_failure() -> None:
+    """Without a failed occurrence the first-seen row wins (deterministic)."""
+    outcomes = (
+        ItemOutcome("document", "d", "indexed"),
+        ItemOutcome("document", "d", "skipped"),
+    )
+    kept = _persistable(outcomes, "all")
+    assert [(o.status) for o in kept] == ["indexed"]
 
 
 async def test_unknown_verbosity_falls_back_to_the_frozen_minimum() -> None:

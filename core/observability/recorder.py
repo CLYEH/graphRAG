@@ -58,11 +58,13 @@ class StepReport:
 
 
 def _persistable(outcomes: tuple[ItemOutcome, ...], verbosity: str) -> list[ItemOutcome]:
-    """Filter by verbosity, then DEDUPE by (item_kind, item_ref) keeping the
-    FIRST occurrence — §18/§27.7's own dedup rule, and the table's
-    ``pipeline_step_items_dedup`` unique index makes a duplicate row roll
-    the WHOLE run record back (reachable under default verbosity: ingest
-    emits one skipped outcome per duplicate payload)."""
+    """Filter by verbosity, then DEDUPE by (item_kind, item_ref) at the
+    first-seen position — FAILED dominates the kept status — §18/§27.7's own
+    dedup rule, and the table's ``pipeline_step_items_dedup`` unique index
+    makes a duplicate row roll the WHOLE run record back (reachable under
+    default verbosity: ingest emits one skipped outcome per duplicate
+    payload). Failed-dominates protects the §27.7 retry boundary, which
+    replays the persisted FAILED rows across runs."""
     filtered: list[ItemOutcome]
     if verbosity == "all":
         filtered = list(outcomes)
@@ -76,13 +78,20 @@ def _persistable(outcomes: tuple[ItemOutcome, ...], verbosity: str) -> list[Item
                 success_seen += 1
                 if success_seen % _SAMPLE_EVERY == 1:  # 1st, 11th, 21st …
                     filtered.append(outcome)
-    seen: set[tuple[str, str]] = set()
+    # dedupe by (item_kind, item_ref) — the unique index would roll the run
+    # back otherwise — but FAILED dominates: the §27.7 retry-failed-only
+    # boundary replays the persisted FAILED rows across runs, so a failed
+    # occurrence must never be masked by an earlier skipped/success one for
+    # the same ref (Codex round 7). First-seen position is preserved.
+    index_of: dict[tuple[str, str], int] = {}
     deduped: list[ItemOutcome] = []
     for outcome in filtered:
         key = (outcome.item_kind, outcome.item_ref)
-        if key not in seen:
-            seen.add(key)
+        if key not in index_of:
+            index_of[key] = len(deduped)
             deduped.append(outcome)
+        elif outcome.status == "failed" and deduped[index_of[key]].status != "failed":
+            deduped[index_of[key]] = outcome  # failed dominates the kept row
     return deduped
 
 
