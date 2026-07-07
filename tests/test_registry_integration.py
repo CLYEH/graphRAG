@@ -33,7 +33,13 @@ from core.registry import (
     list_sources,
     update_project,
 )
-from core.stores.tables import builds, sources
+from core.stores.tables import (
+    builds,
+    ontology_proposals,
+    pipeline_runs,
+    review_ledger,
+    sources,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -226,6 +232,53 @@ async def test_delete_project_cascades_sources(migrated: None) -> None:
             assert remaining == []  # cascaded, not orphaned
 
             assert await delete_project(conn, name) is False  # already gone
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_delete_project_purges_carryforward_state(migrated: None) -> None:
+    """review_ledger / ontology_proposals / pipeline_runs are project-keyed
+    with no FK to projects and carry forward across rebuilds by design — on a
+    project DELETE they must be purged, or a recreated same-name project would
+    silently inherit old review/proposal decisions (the completeness twin of
+    the build guard)."""
+    engine = _engine()
+    name = _proj()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=name)
+            await conn.execute(
+                review_ledger.insert().values(
+                    project=name,
+                    target_kind="entity",
+                    target_key="k1",
+                    fingerprint_version=1,
+                    decision="reject",
+                    decided_by="test",
+                )
+            )
+            await conn.execute(
+                ontology_proposals.insert().values(
+                    project=name,
+                    kind="entity",
+                    type_name="Foo",
+                    proposal_key="pk1",
+                    fingerprint_version=1,
+                )
+            )
+            await conn.execute(
+                pipeline_runs.insert().values(project=name, kind="source_validation")
+            )
+
+            assert await delete_project(conn, name) is True
+
+            for tbl in (review_ledger, ontology_proposals, pipeline_runs):
+                remaining = (
+                    await conn.execute(sa.select(tbl.c.id).where(tbl.c.project == name))
+                ).all()
+                assert remaining == [], f"{tbl.name} not purged on project delete"
             await trans.rollback()
     finally:
         await engine.dispose()

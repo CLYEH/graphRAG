@@ -221,12 +221,36 @@ async def update_project(
     return Project(*row) if row is not None else None
 
 
+# Non-build-scoped, project-keyed state with NO FK to projects (bare-text
+# `project`), so it survives a plain projects-row delete and would silently
+# carry forward onto a recreated same-name project — review decisions
+# (DR-003), proposal decisions (DR-007), and observability runs (steps/items
+# cascade off pipeline_runs by their own FKs). Purged in the delete txn.
+_PROJECT_SCOPED_CARRYFORWARD = (
+    tables.review_ledger,
+    tables.ontology_proposals,
+    tables.pipeline_runs,
+)
+
+
 async def delete_project(conn: AsyncConnection, name: str) -> bool:
-    """Delete a project (its sources cascade via the FK). Returns True if a
-    row was removed, False if the project did not exist. Raises
-    ProjectHasBuildsError if the project still owns builds — deleting it would
-    strand build-scoped data under a reusable name (stale active build on
-    recreate); prune the builds via the lifecycle first."""
+    """Delete a project and its project-scoped Postgres state. Returns True if
+    the project existed (and was removed), False if it did not. Raises
+    ProjectHasBuildsError if the project still owns builds.
+
+    Two tiers of project-scoped state, by cleanup cost:
+    - builds (+ build-scoped rows + the Neo4j/Qdrant projections) need a
+      multi-store sweep that is the C9 prune / BA8 lifecycle's job, so we
+      REFUSE while any build exists — else a recreated same-name project would
+      resolve a stale active build (active_build_id reads builds by
+      project/status) and serve old data.
+    - review_ledger / ontology_proposals / pipeline_runs are Postgres-only and
+      carry forward by design across REBUILDS (DR-003/DR-007); on project
+      DELETE that carry-forward is wrong (a new corpus under the same name
+      would inherit old rejects/approvals), so we purge them here in the same
+      transaction (bounded, single-store)."""
+    if await get_project(conn, name) is None:
+        return False  # touch nothing for an absent project
     builds_count = int(
         (
             await conn.execute(
@@ -238,6 +262,8 @@ async def delete_project(conn: AsyncConnection, name: str) -> bool:
     )
     if builds_count > 0:
         raise ProjectHasBuildsError(name, builds_count)
+    for tbl in _PROJECT_SCOPED_CARRYFORWARD:
+        await conn.execute(tbl.delete().where(tbl.c.project == name))
     result = await conn.execute(tables.projects.delete().where(tables.projects.c.name == name))
     return result.rowcount > 0
 
