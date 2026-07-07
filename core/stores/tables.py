@@ -781,3 +781,54 @@ ontology_proposals_by_key = sa.Index(
     ontology_proposals.c.proposal_key,
     unique=True,
 )
+
+
+# ---------------------------------------------------------------------------
+# Control-plane registry (BA1) — projects and their data sources. NOT
+# build-scoped: these are the control plane the build lifecycle hangs off,
+# not a projection of any one build (like `builds` and `review_ledger`, they
+# are rejected by the build-scoped repo). `projects.name` is the stable key
+# used in API paths and store scoping; `sources` is its child — a genuine
+# parent/child, so it carries a real FK with ON DELETE CASCADE rather than the
+# bare-text `project` the build-scoped projection tables use (those are
+# managed en masse by build_id, not referentially). Shapes mirror the frozen
+# contract Project/Source schemas (openapi.yaml); contract tests pin lockstep.
+projects = sa.Table(
+    "projects",
+    metadata,
+    sa.Column("name", sa.Text, primary_key=True),
+    sa.Column("display_name", sa.Text),
+    sa.Column("description", sa.Text),
+    sa.Column("config", postgresql.JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
+    sa.Column(
+        "created_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    ),
+    sa.CheckConstraint("name <> ''", name="projects_name_nonempty"),
+)
+
+sources = sa.Table(
+    "sources",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column(
+        "project",
+        sa.Text,
+        sa.ForeignKey("projects.name", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("kind", sa.Text),
+    sa.Column("uri", sa.Text, nullable=False),
+    sa.Column("metadata", postgresql.JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
+    sa.Column(
+        "added_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    ),
+    sa.CheckConstraint("uri <> ''", name="sources_uri_nonempty"),
+)
+
+# List ordering / keyset pagination reads sources by their parent project.
+sources_by_project = sa.Index("sources_by_project", sources.c.project)
