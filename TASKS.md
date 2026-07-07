@@ -64,7 +64,10 @@ Keep items small enough to finish in one loop.
 - [x] BA0 API skeleton + generated OpenAPI matching contract + auth placeholder
 - [x] BA1a projects/sources registry — schema + core CRUD
 - [x] BA1b projects/sources endpoints — routers + idempotency + opaque cursor
-- [ ] BA2 arq worker + jobs + SSE + ingest/build triggers
+- [x] BA2a jobs table + core job repo + delete-project active-jobs guard
+- [ ] BA2b build/ingest pipeline orchestrator + builds→projects FK (registry-aware build creation)
+- [ ] BA2c arq worker + Redis wiring
+- [ ] BA2d ingest/build triggers + job endpoints + SSE
 - [ ] BA3 inspection endpoints (docs/chunks/entities/relations/subgraph/reports)
 - [ ] BA4 cleaning preview/rules
 - [ ] BA5 merge-candidate review endpoints

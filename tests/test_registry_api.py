@@ -55,15 +55,24 @@ def test_request_hash_is_stable_and_canonical() -> None:
 
 def test_translate_registry_error_maps_each_domain_error() -> None:
     from api.registry_errors import translate_registry_error
-    from core.registry import ProjectExistsError, ProjectHasBuildsError, ProjectNotFoundError
+    from core.registry import (
+        ProjectExistsError,
+        ProjectHasActiveJobsError,
+        ProjectHasBuildsError,
+        ProjectNotFoundError,
+    )
 
     nf = translate_registry_error(ProjectNotFoundError("p"))
     assert nf.code is ErrorCode.PROJECT_NOT_FOUND and nf.details == {"project": "p"}
-    # the flagged gap: exists/has-builds have no frozen conflict code → 400
+    # the flagged gap: exists/has-builds/has-active-jobs have no frozen conflict
+    # code → all 400 (a delete against the new active-jobs guard must NOT fall
+    # through to a 500)
     ex = translate_registry_error(ProjectExistsError("p"))
     assert ex.code is ErrorCode.VALIDATION_ERROR and ex.details == {"name": "p"}
     hb = translate_registry_error(ProjectHasBuildsError("p", 3))
     assert hb.code is ErrorCode.VALIDATION_ERROR and hb.details == {"project": "p", "builds": 3}
+    aj = translate_registry_error(ProjectHasActiveJobsError("p", 2))
+    assert aj.code is ErrorCode.VALIDATION_ERROR and aj.details == {"project": "p", "jobs": 2}
     # an unexpected error is re-raised, never silently reshaped into a 4xx
     with pytest.raises(RuntimeError):
         translate_registry_error(RuntimeError("boom"))

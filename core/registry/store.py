@@ -20,6 +20,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from core.registry import jobs
 from core.stores import tables
 
 
@@ -75,6 +76,19 @@ class ProjectHasBuildsError(Exception):
 
     def __init__(self, name: str, count: int) -> None:
         super().__init__(f"project {name!r} still has {count} build(s); prune them first")
+        self.name = name
+        self.count = count
+
+
+class ProjectHasActiveJobsError(Exception):
+    """delete_project while a queued/running job is still in flight. A live job
+    may not have created its build yet (so ProjectHasBuildsError wouldn't catch
+    it), yet deleting the project out from under it would strand the operation
+    (the jobs row would CASCADE away mid-run). Refuse until it finishes or is
+    cancelled."""
+
+    def __init__(self, name: str, count: int) -> None:
+        super().__init__(f"project {name!r} has {count} active job(s); wait or cancel them first")
         self.name = name
         self.count = count
 
@@ -249,8 +263,23 @@ async def delete_project(conn: AsyncConnection, name: str) -> bool:
       DELETE that carry-forward is wrong (a new corpus under the same name
       would inherit old rejects/approvals), so we purge them here in the same
       transaction (bounded, single-store)."""
-    if await get_project(conn, name) is None:
-        return False  # touch nothing for an absent project
+    # Lock the parent row FIRST (FOR UPDATE): a concurrent create_job/add_source
+    # insert takes FOR KEY SHARE on this projects row for its FK check, so it now
+    # blocks until this delete's transaction ends — closing the count-then-delete
+    # TOCTOU where a job created after the count-returns-0 but before the DELETE
+    # would be silently CASCADE-removed. NOTE builds.project has NO FK yet (BA2b
+    # adds it), so a concurrent build insert is not serialized by this lock until
+    # then; the builds-count refusal below is the interim guard for that path.
+    # Absent row → nothing to delete.
+    locked = (
+        await conn.execute(
+            sa.select(tables.projects.c.name)
+            .where(tables.projects.c.name == name)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if locked is None:
+        return False
     builds_count = int(
         (
             await conn.execute(
@@ -262,6 +291,9 @@ async def delete_project(conn: AsyncConnection, name: str) -> bool:
     )
     if builds_count > 0:
         raise ProjectHasBuildsError(name, builds_count)
+    active_jobs = await jobs.count_active_jobs(conn, name)
+    if active_jobs > 0:
+        raise ProjectHasActiveJobsError(name, active_jobs)
     for tbl in _PROJECT_SCOPED_CARRYFORWARD:
         await conn.execute(tbl.delete().where(tbl.c.project == name))
     result = await conn.execute(tables.projects.delete().where(tables.projects.c.name == name))

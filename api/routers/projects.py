@@ -24,6 +24,7 @@ from api.routers._query import reject_unsupported_query
 from api.schemas import ProjectCreate, ProjectUpdate, project_dto
 from core.registry import (
     ProjectExistsError,
+    ProjectHasActiveJobsError,
     ProjectHasBuildsError,
     create_project,
     delete_project,
@@ -121,7 +122,7 @@ async def update_project_endpoint(
 async def delete_project_endpoint(conn: Conn, project: str) -> Response:
     try:
         existed = await delete_project(conn, project)
-    except ProjectHasBuildsError as exc:
+    except (ProjectHasBuildsError, ProjectHasActiveJobsError) as exc:
         raise translate_registry_error(exc) from exc
     if not existed:
         raise _not_found(project)

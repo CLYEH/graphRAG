@@ -17,7 +17,12 @@ only the two lines below change.
 from __future__ import annotations
 
 from api.errors import ApiError, ErrorCode
-from core.registry import ProjectExistsError, ProjectHasBuildsError, ProjectNotFoundError
+from core.registry import (
+    ProjectExistsError,
+    ProjectHasActiveJobsError,
+    ProjectHasBuildsError,
+    ProjectNotFoundError,
+)
 
 
 def translate_registry_error(exc: Exception) -> ApiError:
@@ -36,5 +41,11 @@ def translate_registry_error(exc: Exception) -> ApiError:
             ErrorCode.VALIDATION_ERROR,  # GAP: no frozen "has builds"/conflict code
             str(exc),
             details={"project": exc.name, "builds": exc.count},
+        )
+    if isinstance(exc, ProjectHasActiveJobsError):
+        return ApiError(
+            ErrorCode.VALIDATION_ERROR,  # GAP: no frozen "active jobs"/conflict code
+            str(exc),
+            details={"project": exc.name, "jobs": exc.count},
         )
     raise exc

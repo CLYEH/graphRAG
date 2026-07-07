@@ -874,3 +874,58 @@ idempotency_keys = sa.Table(
 
 # GC of expired keys (a sweeper / the per-request purge both filter on it).
 idempotency_keys_expiry = sa.Index("idempotency_keys_expiry", idempotency_keys.c.expires_at)
+
+
+# §15/§27.7 jobs — the durable, HTTP-facing tracking row for a long operation
+# (ingest/build). This is the SoR the API serves for GET /jobs/{id}; arq+Redis
+# is only the execution queue and its own job status is never trusted. Distinct
+# from pipeline_runs (§18): jobs is the live, mutable progress row (one per
+# triggered op, control-plane, CASCADE-deleted with its project), while
+# pipeline_runs is the immutable record of what a FINISHED run did (written once
+# via record_run, survives job deletion, feeds retry-failed-only + Health).
+jobs = sa.Table(
+    "jobs",
+    metadata,
+    sa.Column(
+        "id",
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    ),
+    sa.Column(
+        "project", sa.Text, sa.ForeignKey("projects.name", ondelete="CASCADE"), nullable=False
+    ),
+    # Open vocabulary like pipeline_runs.kind — the frozen §15 Job.kind is a free
+    # string ("e.g. ingest, build, reproject").
+    sa.Column("kind", sa.Text, nullable=False),
+    # The building build this job writes to; null until the orchestrator resolves
+    # or creates it (§27.7). NOT an FK to builds, for the same reason
+    # pipeline_runs.build_id isn't: build retention/prune isn't frozen and every
+    # ondelete choice would pre-decide it.
+    sa.Column("build_id", postgresql.UUID(as_uuid=True)),
+    sa.Column("status", sa.Text, nullable=False, server_default=sa.text("'queued'")),
+    sa.Column("step", sa.Text),
+    sa.Column("progress", sa.REAL, nullable=False, server_default=sa.text("0")),
+    sa.Column("message", sa.Text),
+    # The §15 Error shape {code, message, details} verbatim, so GET /jobs/{id}
+    # passes it straight through as Job.error. none_as_null: an un-errored job
+    # stores SQL NULL, not a JSONB 'null' literal (a real error is always an
+    # object) — same trap as idempotency_keys.response.
+    sa.Column("error", postgresql.JSONB(none_as_null=True)),
+    # Cooperative-cancel flag the worker checks between steps. Internal only —
+    # not part of the frozen Job contract shape (DR-002 freezes contracts/, not
+    # internal storage).
+    sa.Column("cancel_requested", sa.Boolean, nullable=False, server_default=sa.text("false")),
+    sa.Column(
+        "created_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    ),
+    sa.Column("finished_at", sa.TIMESTAMP(timezone=True)),
+    sa.CheckConstraint(
+        "status IN ('queued','running','done','failed','cancelled')", name="jobs_status_valid"
+    ),
+    sa.CheckConstraint("progress >= 0 AND progress <= 1", name="jobs_progress_bounded"),
+    sa.CheckConstraint("kind <> ''", name="jobs_kind_nonempty"),
+)
+
+# List/dashboard reads a project's jobs newest-first.
+jobs_by_project = sa.Index("jobs_by_project", jobs.c.project, jobs.c.created_at.desc())
