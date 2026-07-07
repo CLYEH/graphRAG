@@ -63,6 +63,16 @@ def client() -> TestClient:
     async def _boom() -> None:
         raise ApiError(ErrorCode.PROJECT_NOT_FOUND, "no such project", details={"project": "x"})
 
+    @app.get("/_t/boom-uuid")
+    async def _boom_uuid() -> None:
+        # details carries a UUID (a build/job id) — non-JSON-native; the
+        # handler must encode it, not crash into the 500 path
+        raise ApiError(
+            ErrorCode.BUILD_NOT_FOUND,
+            "no such build",
+            details={"build_id": uuid.UUID("00000000-0000-0000-0000-0000000000ab")},
+        )
+
     @app.get("/_t/crash")
     async def _crash() -> None:
         raise RuntimeError("unexpected — must not leak")
@@ -227,14 +237,30 @@ def test_unknown_route_wears_the_frozen_envelope_not_detail(client: TestClient) 
     assert resp.headers["X-Request-ID"] == body["error"]["request_id"]
 
 
-def test_raised_5xx_http_exception_maps_to_internal(client: TestClient) -> None:
+def test_raised_5xx_http_exception_maps_to_internal_without_leaking(
+    client: TestClient,
+) -> None:
     """A 5xx HTTPException wears the envelope with INTERNAL, true status
-    preserved (the server-fault branch of the framework handler)."""
+    preserved, and a FIXED message — exc.detail (backend/downstream failure
+    info) must not leak on a server fault (Codex round 2)."""
     resp = client.get("/_t/unavailable")
     assert resp.status_code == 503  # true status kept
     body = resp.json()
     assert "detail" not in body
     assert body["error"]["code"] == "INTERNAL"  # 5xx → server fault
+    assert body["error"]["message"] == "internal error"
+    assert "downstream" not in resp.text  # the raised detail did not leak
+
+
+def test_api_error_details_with_uuid_serializes_not_crashes(client: TestClient) -> None:
+    """ApiError.details can hold UUIDs/datetimes (build/job ids); the handler
+    must encode them and still return the mapped status — not crash into the
+    500 path (Codex round 2, the ApiError twin of the validation fix)."""
+    resp = client.get("/_t/boom-uuid")
+    assert resp.status_code == 404  # BUILD_NOT_FOUND → 404, NOT 500
+    err = resp.json()["error"]
+    assert err["code"] == "BUILD_NOT_FOUND"
+    assert err["details"] == {"build_id": "00000000-0000-0000-0000-0000000000ab"}
 
 
 def test_auth_placeholder_extracts_token_and_admits_anonymous(client: TestClient) -> None:

@@ -89,9 +89,14 @@ def create_app() -> FastAPI:
     def _error_response(status: int, body: dict[str, Any]) -> JSONResponse:
         # exception handlers run INSIDE Starlette's ServerErrorMiddleware, so
         # the request-context middleware never sees these responses — stamp
-        # X-Request-ID here too, or a 4xx/5xx would ship without the header
+        # X-Request-ID here too, or a 4xx/5xx would ship without the header.
+        # jsonable_encoder on the WHOLE body: ApiError.details can hold UUIDs
+        # or datetimes (build/job ids), which JSONResponse can't serialize —
+        # unencoded, the contract-mapped error would crash into the 500 path.
         rid = body["error"]["request_id"]
-        return JSONResponse(status_code=status, content=body, headers={"X-Request-ID": rid})
+        return JSONResponse(
+            status_code=status, content=jsonable_encoder(body), headers={"X-Request-ID": rid}
+        )
 
     @app.exception_handler(ApiError)
     async def _handle_api_error(request: Request, exc: ApiError) -> JSONResponse:
@@ -102,16 +107,16 @@ def create_app() -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def _handle_validation(request: Request, exc: RequestValidationError) -> JSONResponse:
         # the contract maps VALIDATION_ERROR → 400 (not FastAPI's default 422).
-        # jsonable_encoder: a custom validator can put non-serializable objects
-        # (e.g. the original ValueError) in errors()[*].ctx — passing them raw
-        # to JSONResponse would crash serialization into the uncaught-500 path
+        # errors() can hold non-serializable objects (a custom validator's ctx
+        # carries the original ValueError); _error_response encodes the whole
+        # body, so raw errors() is safe here.
         return _error_response(
             http_status_for(ErrorCode.VALIDATION_ERROR),
             error_body(
                 ErrorCode.VALIDATION_ERROR,
                 "request validation failed",
                 request_id=_request_id(request),
-                details={"errors": jsonable_encoder(exc.errors())},
+                details={"errors": exc.errors()},
             ),
         )
 
@@ -123,15 +128,18 @@ def create_app() -> FastAPI:
         # classify coarsely — 4xx = the client's request didn't conform
         # (VALIDATION_ERROR), 5xx = server fault (INTERNAL) — while PRESERVING
         # the true HTTP status. Domain handlers (BA1+) raise precise ApiErrors.
-        code = ErrorCode.INTERNAL if exc.status_code >= 500 else ErrorCode.VALIDATION_ERROR
+        # 5xx: fixed message — exc.detail may carry backend/downstream failure
+        # info that must not leak on a server fault (as the uncaught handler
+        # does). 4xx: echo the framework's detail (client-facing, e.g. "Not
+        # Found"), falling back to the code name.
+        if exc.status_code >= 500:
+            code, message = ErrorCode.INTERNAL, "internal error"
+        else:
+            code = ErrorCode.VALIDATION_ERROR
+            message = str(exc.detail) if exc.detail else code.value
         return _error_response(
             exc.status_code,
-            error_body(
-                code,
-                str(exc.detail) if exc.detail else code.value,
-                request_id=_request_id(request),
-                details=None,
-            ),
+            error_body(code, message, request_id=_request_id(request), details=None),
         )
 
     @app.exception_handler(Exception)
