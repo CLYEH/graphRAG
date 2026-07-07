@@ -105,6 +105,8 @@ async def record_run(
     verbosity: str | None = None,
     created_by: str = "pipeline",
     error: str | None = None,
+    cancelled: bool = False,
+    failed: bool | None = None,
 ) -> uuid.UUID:
     """Persist one run with its steps and (verbosity-filtered) items.
 
@@ -112,17 +114,70 @@ async def record_run(
     ``observability.item_logging`` from settings — the tunable works without
     every caller wiring it; an explicit argument overrides.
 
+    ``cancelled=True`` forces the run status to ``'cancelled'`` (the §27.2
+    JobStatus vocabulary the CHECK already permits), overriding the
+    failed/done inference — a cooperatively-cancelled build (BA2c) stopped
+    between steps is neither a failure nor a clean completion; the steps that
+    DID run are still recorded truthfully.
+
+    ``failed`` overrides the failed/done inference when the caller owns a
+    higher-level notion of success than "any item failed". A BA2c build run
+    passes ``failed=<did the §22 threshold abort>``: under-threshold item
+    failures are TOLERATED, so the build reaches ``ready`` and its run must read
+    ``'done'`` to match — a ``'failed'`` run on a ``ready`` build would mislead
+    §18 Health. The failed items are still recorded (and their steps still read
+    ``'failed'``); only the run-level roll-up follows the build outcome. Left
+    ``None`` (the default), the run is inferred ``'failed'`` iff there is an
+    error or any failed item.
+
     LOANED-CLEAN connection (the C6b idiom): the caller must hand a
     connection with NO open transaction — rolling one back here would
     silently destroy the caller's uncommitted pipeline writes, and
     committing it would publish work the caller may still abort. This
     module opens exactly one transaction for the whole record (a
-    half-written run would misreport §18's Console line)."""
+    half-written run would misreport §18's Console line). A caller that
+    already owns a transaction (BA2c's atomic terminalization) calls
+    :func:`record_run_in_txn` directly instead."""
     if conn.in_transaction():
         raise RuntimeError(
             "record_run requires a connection with no open transaction — commit or "
             "roll back the pipeline's own work first (a rollback here would destroy it)"
         )
+    async with conn.begin():
+        return await record_run_in_txn(
+            conn,
+            project,
+            build_id,
+            kind,
+            steps,
+            verbosity=verbosity,
+            created_by=created_by,
+            error=error,
+            cancelled=cancelled,
+            failed=failed,
+        )
+
+
+async def record_run_in_txn(
+    conn: AsyncConnection,
+    project: str,
+    build_id: uuid.UUID | None,
+    kind: str,
+    steps: list[StepReport],
+    *,
+    verbosity: str | None = None,
+    created_by: str = "pipeline",
+    error: str | None = None,
+    cancelled: bool = False,
+    failed: bool | None = None,
+) -> uuid.UUID:
+    """Record one run inside the CALLER's already-open transaction — the same
+    inserts as :func:`record_run` but without opening (or requiring the absence
+    of) a transaction. BA2c's terminalization records the run, flips the build,
+    and finalizes the job in ONE transaction, so a crash can't split them and
+    the cancel decision read under the job lock stays consistent with the
+    recorded run's status. :func:`record_run` is the loaned-clean wrapper for
+    callers that own no transaction; this is its transactional body."""
     if verbosity is None:
         from core.config import get_settings
 
@@ -130,83 +185,85 @@ async def record_run(
     if verbosity not in ITEM_LOGGING_MODES:
         verbosity = "failures"  # fail-closed to the frozen minimum
     now = datetime.now(tz=UTC)
-    run_failed = error is not None or any(
-        any(o.status == "failed" for o in step.outcomes) for step in steps
+    run_failed = (
+        failed
+        if failed is not None
+        else error is not None
+        or any(any(o.status == "failed" for o in step.outcomes) for step in steps)
     )
-    async with conn.begin():
-        if build_id is not None:
-            # pipeline_runs has NO FK — an unverified (project, build_id)
-            # pair would attribute observability rows to one project under
-            # another's (or a pruned) build. Verify the binding INSIDE the
-            # write txn, FOR SHARE, so a concurrent prune cannot delete the
-            # build row between check and insert (the class-10 lesson:
-            # bind-time checks alone are TOCTOU). Status is deliberately
-            # unconstrained: recording a FAILED build's run is §18's whole
-            # point, and the record may land right after the flip.
-            owner = (
-                await conn.execute(
-                    sa.select(tables.builds.c.project)
-                    .where(tables.builds.c.id == build_id)
-                    .with_for_update(read=True)
-                )
-            ).scalar_one_or_none()
-            if owner is None:
-                raise LookupError(f"build {build_id} does not exist — cannot record a run")
-            if owner != project:
-                raise LookupError(
-                    f"build {build_id} belongs to project {owner!r}, not {project!r} — "
-                    "refusing a misattributed run record"
-                )
-        run_id: uuid.UUID = (
+    run_status = "cancelled" if cancelled else ("failed" if run_failed else "done")
+    if build_id is not None:
+        # pipeline_runs has NO FK — an unverified (project, build_id) pair would
+        # attribute observability rows to one project under another's (or a
+        # pruned) build. Verify the binding FOR SHARE so a concurrent prune
+        # cannot delete the build row between check and insert (the class-10
+        # lesson: bind-time checks alone are TOCTOU). Status is deliberately
+        # unconstrained: recording a FAILED build's run is §18's whole point,
+        # and the record lands in the same txn as the terminal flip.
+        owner = (
             await conn.execute(
-                tables.pipeline_runs.insert()
+                sa.select(tables.builds.c.project)
+                .where(tables.builds.c.id == build_id)
+                .with_for_update(read=True)
+            )
+        ).scalar_one_or_none()
+        if owner is None:
+            raise LookupError(f"build {build_id} does not exist — cannot record a run")
+        if owner != project:
+            raise LookupError(
+                f"build {build_id} belongs to project {owner!r}, not {project!r} — "
+                "refusing a misattributed run record"
+            )
+    run_id: uuid.UUID = (
+        await conn.execute(
+            tables.pipeline_runs.insert()
+            .values(
+                project=project,
+                build_id=build_id,
+                kind=kind,
+                status=run_status,
+                created_by=created_by,
+                started_at=now,
+                finished_at=now,
+                error=error,
+            )
+            .returning(tables.pipeline_runs.c.id)
+        )
+    ).scalar_one()
+    for step in steps:
+        step_failed = sum(1 for o in step.outcomes if o.status == "failed")
+        skipped = sum(1 for o in step.outcomes if o.status == "skipped")
+        output = len(step.outcomes) - step_failed - skipped
+        step_id: uuid.UUID = (
+            await conn.execute(
+                tables.pipeline_steps.insert()
                 .values(
-                    project=project,
-                    build_id=build_id,
-                    kind=kind,
-                    status="failed" if run_failed else "done",
-                    created_by=created_by,
+                    run_id=run_id,
+                    step_name=step.step_name,
+                    status="failed" if step_failed else "done",
                     started_at=now,
                     finished_at=now,
-                    error=error,
+                    input_count=(
+                        step.input_count if step.input_count is not None else len(step.outcomes)
+                    ),
+                    output_count=output,
+                    skipped_count=skipped,
+                    failed_count=step_failed,
                 )
-                .returning(tables.pipeline_runs.c.id)
+                .returning(tables.pipeline_steps.c.id)
             )
         ).scalar_one()
-        for step in steps:
-            failed = sum(1 for o in step.outcomes if o.status == "failed")
-            skipped = sum(1 for o in step.outcomes if o.status == "skipped")
-            output = len(step.outcomes) - failed - skipped
-            step_id: uuid.UUID = (
-                await conn.execute(
-                    tables.pipeline_steps.insert()
-                    .values(
-                        run_id=run_id,
-                        step_name=step.step_name,
-                        status="failed" if failed else "done",
-                        started_at=now,
-                        finished_at=now,
-                        input_count=(
-                            step.input_count if step.input_count is not None else len(step.outcomes)
-                        ),
-                        output_count=output,
-                        skipped_count=skipped,
-                        failed_count=failed,
-                    )
-                    .returning(tables.pipeline_steps.c.id)
-                )
-            ).scalar_one()
-            rows = [
-                {
-                    "step_id": step_id,
-                    "item_kind": o.item_kind,
-                    "item_ref": o.item_ref,
-                    "status": o.status,
-                }
-                for o in _persistable(step.outcomes, verbosity)
-            ]
-            if rows:
-                await conn.execute(tables.pipeline_step_items.insert(), rows)
+        rows = [
+            {
+                "step_id": step_id,
+                "item_kind": o.item_kind,
+                "item_ref": o.item_ref,
+                "status": o.status,
+            }
+            for o in _persistable(step.outcomes, verbosity)
+        ]
+        if rows:
+            await conn.execute(tables.pipeline_step_items.insert(), rows)
     return run_id
 
 

@@ -66,8 +66,9 @@ Keep items small enough to finish in one loop.
 - [x] BA1b projects/sources endpoints — routers + idempotency + opaque cursor
 - [x] BA2a jobs table + core job repo + delete-project active-jobs guard
 - [x] BA2b builds→projects FK RESTRICT + fixture sweep (close the delete TOCTOU structurally)
-- [ ] BA2c build/ingest pipeline orchestrator (chains C1–C11) + registry-aware build creation
-- [ ] BA2d arq worker + Redis wiring
+- [x] BA2c-1 registry-aware build creation + pipeline orchestrator control flow (six §5 stages injected as a seam; step recording, §22 abort, cooperative cancel, resume; fake stages, hermetic Postgres-only tests)
+- [ ] BA2c-2 wire the real §5 stages (build-config loader + sources→connector resolution + `default_stages` over real LLM/embedder/projectors) + two-lane real-LLM test
+- [ ] BA2d arq worker + Redis wiring — incl. **lease-based execution dedup** (Codex BA2c-1 P2): the FOR UPDATE lock serializes build *creation*, but two concurrent dispatches of one job can still both *execute* the same building build. A crash-safe fix needs a lease/heartbeat (distinguish "actively running" from "crashed running" — a running-claim no-op would strand crashed jobs); this is arq's job-timeout/retry territory, not BA2c-1's. run_build already reclaims a still-`building` build on re-dispatch.
 - [ ] BA2e ingest/build triggers + job endpoints + SSE
 - [ ] BA3 inspection endpoints (docs/chunks/entities/relations/subgraph/reports)
 - [ ] BA4 cleaning preview/rules

@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     # request, not a replay
     idempotency_ttl_hours: int = 24
 
+    # §5/§22 pipeline step abort threshold (tunable 🔧): a build step aborts the
+    # run when its FAILED-item ratio exceeds this (0.5 → abort once more than
+    # half of a step's items fail). DESIGN §5/§22 leaves "failed_count > 閾值"
+    # unquantified; this is a concrete, reversible default (BA2c) — flagged for
+    # owner sign-off, changeable without a contract bump (not a frozen deliverable).
+    pipeline_step_failure_ratio: float = 0.5
+
     # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-nano"

@@ -97,6 +97,19 @@ async def get_job(conn: AsyncConnection, job_id: uuid.UUID) -> Job | None:
     return Job(*row) if row is not None else None
 
 
+async def lock_job(conn: AsyncConnection, job_id: uuid.UUID) -> Job | None:
+    """`SELECT … FOR UPDATE` the job row and return it (or None if absent).
+    Serializes concurrent workers dispatched the same job while they resolve
+    its build (the orchestrator): a second worker blocks here until the first
+    commits, then re-reads the now-attached ``build_id`` instead of minting a
+    second build. Caller must hold an open transaction (the lock lives until it
+    commits/rolls back)."""
+    row = (
+        await conn.execute(sa.select(*_COLS).where(tables.jobs.c.id == job_id).with_for_update())
+    ).one_or_none()
+    return Job(*row) if row is not None else None
+
+
 async def set_progress(
     conn: AsyncConnection,
     job_id: uuid.UUID,
@@ -107,7 +120,7 @@ async def set_progress(
     message: str | None | _Unset = _UNSET,
     build_id: uuid.UUID | None | _Unset = _UNSET,
     error: dict[str, Any] | None | _Unset = _UNSET,
-    finished_at: datetime | _Unset = _UNSET,
+    finished_at: datetime | sa.ColumnElement[Any] | _Unset = _UNSET,
 ) -> Job | None:
     """Patch a job's live fields (only the ones passed change). Returns the
     updated job, or None if the id is unknown. The worker calls this on its own
@@ -148,8 +161,16 @@ async def request_cancel(conn: AsyncConnection, job_id: uuid.UUID) -> Job:
     if job is None:
         raise JobNotFoundError(job_id)
     if job.status in _ACTIVE_STATUSES and not job.cancel_requested:
+        # Status-guard the UPDATE, not just the get_job read above: the
+        # orchestrator's terminalization holds FOR UPDATE on this row and reads
+        # cancel_requested under it, so a cancel racing that finalize blocks
+        # here and then finds a terminal job — the guard makes it a clean no-op
+        # instead of flagging an already-finished job (the class-10 lesson: the
+        # unlocked read is TOCTOU; the decisive check belongs in the write).
         await conn.execute(
-            tables.jobs.update().where(tables.jobs.c.id == job_id).values(cancel_requested=True)
+            tables.jobs.update()
+            .where(tables.jobs.c.id == job_id, tables.jobs.c.status.in_(_ACTIVE_STATUSES))
+            .values(cancel_requested=True)
         )
         return await get_job(conn, job_id) or job
     return job

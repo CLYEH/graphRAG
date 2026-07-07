@@ -151,6 +151,51 @@ async def test_cooperative_cancel_only_flips_live_jobs(migrated: None) -> None:
         await engine.dispose()
 
 
+async def test_request_cancel_update_is_status_guarded_against_a_stale_read(
+    migrated: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """request_cancel's decisive check is the UPDATE's ``WHERE status IN active``,
+    not just the get_job read before it. The orchestrator's finalize holds the
+    job lock and reads cancel_requested under it, so a cancel racing that
+    finalize can pass the (unlocked) status read while the job is still 'running'
+    yet have its UPDATE land after the job is already 'done' — the guard must
+    make that a clean no-op, never flagging a finished job (the limbo Codex
+    flagged). We force the exact TOCTOU: feed request_cancel a stale 'running'
+    snapshot while the row is really 'done'."""
+    import dataclasses
+
+    from core.registry import jobs as jobs_mod
+
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            project = _proj()
+            await create_project(conn, name=project)
+            job = await create_job(conn, project, "build")
+            await set_progress(conn, job.id, status="done", progress=1.0)  # truly terminal
+
+            stale_running = dataclasses.replace(job, status="running", cancel_requested=False)
+            real_get = jobs_mod.get_job
+            reads = {"n": 0}
+
+            async def _stale_then_real(c: object, jid: uuid.UUID) -> object:
+                reads["n"] += 1
+                if reads["n"] == 1:  # the pre-update read request_cancel branches on
+                    return stale_running
+                return await real_get(c, jid)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(jobs_mod, "get_job", _stale_then_real)
+            result = await request_cancel(conn, job.id)
+
+            # the guarded UPDATE matched 0 rows (the row is 'done') → no flag set
+            assert result.status == "done"
+            assert result.cancel_requested is False
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
 async def test_delete_project_refuses_while_a_job_is_active(migrated: None) -> None:
     engine = _engine()
     try:
