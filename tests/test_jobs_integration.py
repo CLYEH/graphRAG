@@ -176,6 +176,72 @@ async def test_delete_project_refuses_while_a_job_is_active(migrated: None) -> N
         await engine.dispose()
 
 
+async def test_delete_project_locks_the_row_before_counting_jobs(
+    migrated: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Execution-level proof the count-then-delete TOCTOU is closed. The race is
+    the window BETWEEN the active-jobs count returning 0 and the DELETE: a
+    create_job committing there is silently CASCADE-removed. The fix takes
+    FOR UPDATE on the projects row BEFORE the count, so a competing
+    FOR KEY SHARE (exactly a create_job FK insert's lock) is already blocked
+    during that window. We pause inside count_active_jobs (after the lock, before
+    the delete) and probe with NOWAIT — without the pre-count lock the row is
+    still free there, so this test fails; the DELETE's own lock (which happens
+    later) would mask the bug if we probed after delete_project returned."""
+    import asyncio
+
+    from sqlalchemy.exc import DBAPIError
+
+    from core.registry import jobs as jobs_mod
+    from core.stores.tables import projects
+
+    engine = _engine()
+    project = _proj()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_count = jobs_mod.count_active_jobs
+
+    async def paused_count(conn: object, name: str) -> int:
+        entered.set()
+        await release.wait()
+        return await real_count(conn, name)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(jobs_mod, "count_active_jobs", paused_count)
+    try:
+        async with engine.connect() as setup:
+            await create_project(setup, name=project)
+            await setup.commit()  # visible to a second connection
+
+        async def _delete() -> None:
+            async with engine.connect() as a:
+                await a.begin()
+                await delete_project(a, project)  # lock → paused count → delete
+                await a.rollback()  # restore the project; we only wanted the timing
+
+        deleter = asyncio.create_task(_delete())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5.0)  # A is mid-count, holding the lock
+            async with engine.connect() as b:
+                await b.begin()
+                with pytest.raises(DBAPIError) as ei:
+                    await b.execute(
+                        sa.select(projects.c.name)
+                        .where(projects.c.name == project)
+                        .with_for_update(key_share=True, nowait=True)
+                    )
+                assert getattr(ei.value.orig, "sqlstate", None) == "55P03"  # lock_not_available
+                await b.rollback()
+        finally:
+            release.set()
+            await deleter
+    finally:
+        async with engine.connect() as cleanup:
+            monkeypatch.setattr(jobs_mod, "count_active_jobs", real_count)
+            await delete_project(cleanup, project)
+            await cleanup.commit()
+        await engine.dispose()
+
+
 async def test_job_requires_an_existing_project(migrated: None) -> None:
     """The FK backstops a job for a project that never existed (or vanished)."""
     engine = _engine()

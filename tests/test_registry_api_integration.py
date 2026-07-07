@@ -23,7 +23,7 @@ from sqlalchemy.pool import NullPool
 from api.app import create_app
 from api.deps import db_conn
 from core.config import get_settings
-from core.stores.tables import builds, idempotency_keys
+from core.stores.tables import builds, idempotency_keys, jobs
 
 pytestmark = pytest.mark.integration
 
@@ -255,6 +255,16 @@ async def test_error_mappings(api: tuple[AsyncClient, AsyncConnection]) -> None:
     blocked = await client.delete(f"/projects/{name}")
     assert blocked.status_code == 400
     assert blocked.json()["error"]["details"]["builds"] == 1
+
+    # delete a project with an active job → the new guard must map to 400, not
+    # fall through to a 500
+    jobless = _proj()
+    await client.post("/projects", json={"name": jobless})
+    await conn.execute(jobs.insert().values(project=jobless, kind="build", status="running"))
+    blocked_jobs = await client.delete(f"/projects/{jobless}")
+    assert blocked_jobs.status_code == 400
+    assert blocked_jobs.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert blocked_jobs.json()["error"]["details"]["jobs"] == 1
 
 
 async def test_request_validation(api: tuple[AsyncClient, AsyncConnection]) -> None:

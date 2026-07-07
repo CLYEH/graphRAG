@@ -263,8 +263,23 @@ async def delete_project(conn: AsyncConnection, name: str) -> bool:
       DELETE that carry-forward is wrong (a new corpus under the same name
       would inherit old rejects/approvals), so we purge them here in the same
       transaction (bounded, single-store)."""
-    if await get_project(conn, name) is None:
-        return False  # touch nothing for an absent project
+    # Lock the parent row FIRST (FOR UPDATE): a concurrent create_job/add_source
+    # insert takes FOR KEY SHARE on this projects row for its FK check, so it now
+    # blocks until this delete's transaction ends — closing the count-then-delete
+    # TOCTOU where a job created after the count-returns-0 but before the DELETE
+    # would be silently CASCADE-removed. NOTE builds.project has NO FK yet (BA2b
+    # adds it), so a concurrent build insert is not serialized by this lock until
+    # then; the builds-count refusal below is the interim guard for that path.
+    # Absent row → nothing to delete.
+    locked = (
+        await conn.execute(
+            sa.select(tables.projects.c.name)
+            .where(tables.projects.c.name == name)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if locked is None:
+        return False
     builds_count = int(
         (
             await conn.execute(
