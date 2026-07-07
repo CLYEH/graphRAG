@@ -19,6 +19,8 @@ dependencies = [
     "leidenalg>=0.12.0",
     "python-igraph>=1.0.0",
     "mcp>=1.28.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
     # runtime loaders: golden.py + mcp/policy.py validate frozen contracts and
     # parse YAML configs on the serving/eval paths — a wheel install without
     # dev extras must not ModuleNotFoundError (Codex PR#39 round 9)
@@ -56,6 +58,7 @@ dev = [
     "types-pyyaml>=6.0",
     "openapi-spec-validator>=0.7.1",
     "hypothesis>=6.100",
+    "httpx>=0.27",
 ]
 
 # ---- tooling -------------------------------------------------------------
