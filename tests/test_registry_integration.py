@@ -23,6 +23,7 @@ from sqlalchemy.pool import NullPool
 from core.config import get_settings
 from core.registry import (
     ProjectExistsError,
+    ProjectHasBuildsError,
     ProjectNotFoundError,
     add_source,
     create_project,
@@ -32,7 +33,7 @@ from core.registry import (
     list_sources,
     update_project,
 )
-from core.stores.tables import sources
+from core.stores.tables import builds, sources
 
 pytestmark = pytest.mark.integration
 
@@ -225,6 +226,30 @@ async def test_delete_project_cascades_sources(migrated: None) -> None:
             assert remaining == []  # cascaded, not orphaned
 
             assert await delete_project(conn, name) is False  # already gone
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_delete_project_refuses_while_builds_exist(migrated: None) -> None:
+    """builds.project is bare text (no FK), so deleting a project with builds
+    would strand build-scoped data under a reusable name → stale active build
+    on recreate. delete_project must refuse until the builds are pruned."""
+    engine = _engine()
+    name = _proj()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=name)
+            await conn.execute(builds.insert().values(project=name, status="ready"))
+
+            with pytest.raises(ProjectHasBuildsError):
+                await delete_project(conn, name)
+            assert await get_project(conn, name) is not None  # not deleted
+
+            # once the build is gone, the delete proceeds
+            await conn.execute(builds.delete().where(builds.c.project == name))
+            assert await delete_project(conn, name) is True
             await trans.rollback()
     finally:
         await engine.dispose()

@@ -10,6 +10,7 @@ land in BA1b/BA2.
 from core.registry.store import (
     Project,
     ProjectExistsError,
+    ProjectHasBuildsError,
     ProjectNotFoundError,
     Source,
     add_source,
@@ -24,6 +25,7 @@ from core.registry.store import (
 __all__ = [
     "Project",
     "ProjectExistsError",
+    "ProjectHasBuildsError",
     "ProjectNotFoundError",
     "Source",
     "add_source",

@@ -64,6 +64,21 @@ class ProjectNotFoundError(Exception):
         self.name = name
 
 
+class ProjectHasBuildsError(Exception):
+    """delete_project on a project that still owns builds. ``builds.project``
+    is bare text (no FK — builds predate the registry and their multi-store
+    cleanup is the C9/BA8 build-lifecycle's job), so deleting the project row
+    would leave its builds and build-scoped data keyed by the same name; a
+    later project of the same name would then resolve a STALE active build and
+    serve old data. Refusing here closes that hole structurally — prune the
+    builds first."""
+
+    def __init__(self, name: str, count: int) -> None:
+        super().__init__(f"project {name!r} still has {count} build(s); prune them first")
+        self.name = name
+        self.count = count
+
+
 class _Unset:
     """PATCH sentinel — distinguishes 'field omitted' from 'set to null'."""
 
@@ -208,7 +223,21 @@ async def update_project(
 
 async def delete_project(conn: AsyncConnection, name: str) -> bool:
     """Delete a project (its sources cascade via the FK). Returns True if a
-    row was removed, False if the project did not exist."""
+    row was removed, False if the project did not exist. Raises
+    ProjectHasBuildsError if the project still owns builds — deleting it would
+    strand build-scoped data under a reusable name (stale active build on
+    recreate); prune the builds via the lifecycle first."""
+    builds_count = int(
+        (
+            await conn.execute(
+                sa.select(sa.func.count())
+                .select_from(tables.builds)
+                .where(tables.builds.c.project == name)
+            )
+        ).scalar_one()
+    )
+    if builds_count > 0:
+        raise ProjectHasBuildsError(name, builds_count)
     result = await conn.execute(tables.projects.delete().where(tables.projects.c.name == name))
     return result.rowcount > 0
 
