@@ -7,8 +7,21 @@ import socket
 from urllib.parse import urlparse
 
 import pytest
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.config import get_settings
+from core.stores import tables
+
+
+async def ensure_project(conn: AsyncConnection, name: str) -> None:
+    """Seed a registry `projects` row so a `builds.insert()` (and other
+    project-FK-backed inserts) can reference it. Idempotent — integration tests
+    that mint ad-hoc builds call this first now that `builds.project` FKs
+    `projects.name` (BA2b)."""
+    await conn.execute(
+        pg_insert(tables.projects).values(name=name).on_conflict_do_nothing(index_elements=["name"])
+    )
 
 
 def _reachable(host: str, port: int, timeout: float = 0.5) -> bool:

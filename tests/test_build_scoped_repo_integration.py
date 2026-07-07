@@ -27,6 +27,7 @@ from core.stores.repo import (
     active_build_id,
 )
 from core.stores.tables import builds, documents
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -46,6 +47,7 @@ def _engine() -> AsyncEngine:
 
 
 async def _insert_build(conn: AsyncConnection, project: str, status: str) -> uuid.UUID:
+    await ensure_project(conn, project)
     build_id: uuid.UUID = (
         await conn.execute(
             builds.insert().values(project=project, status=status).returning(builds.c.id)

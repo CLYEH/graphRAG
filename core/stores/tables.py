@@ -55,7 +55,15 @@ builds = sa.Table(
         primary_key=True,
         server_default=sa.text("gen_random_uuid()"),
     ),
-    sa.Column("project", sa.Text, nullable=False),
+    # FK → projects.name RESTRICT (BA2b): a build cannot exist without its
+    # project (registry-aware creation), and a project with builds cannot be
+    # deleted (the DB backstops delete_project's count+FOR UPDATE, closing the
+    # count-then-delete TOCTOU structurally). RESTRICT not CASCADE — a project
+    # delete must go through the C9/BA8 multi-store build sweep, never silently
+    # drop builds + their build-scoped rows + Neo4j/Qdrant projections.
+    sa.Column(
+        "project", sa.Text, sa.ForeignKey("projects.name", ondelete="RESTRICT"), nullable=False
+    ),
     sa.Column("status", sa.Text, nullable=False, server_default=sa.text("'building'")),
     sa.Column("config_hash", sa.Text),
     sa.Column("source_hash", sa.Text),
@@ -78,6 +86,12 @@ one_active_build = sa.Index(
     unique=True,
     postgresql_where=sa.text("status = 'active'"),
 )
+
+# Supporting index for the builds.project FK (BA2b): the partial one_active_build
+# above only covers status='active', so the RESTRICT RI-check on a projects
+# DELETE (which must find builds of ANY status) would otherwise seq-scan. Every
+# child FK gets a full supporting index — Postgres doesn't auto-create them.
+builds_by_project = sa.Index("builds_by_project", builds.c.project)
 
 # §17 / DR-003: review decisions are deliberately NOT build-scoped — they carry
 # forward across rebuilds, keyed by stable fingerprints (core.resolve.fingerprints)

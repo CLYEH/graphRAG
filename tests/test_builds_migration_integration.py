@@ -19,6 +19,7 @@ from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
 from core.stores.tables import builds
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -43,6 +44,7 @@ async def test_second_active_build_is_impossible(migrated: None) -> None:
     try:
         async with engine.connect() as conn:
             trans = await conn.begin()
+            await ensure_project(conn, project)
             await conn.execute(builds.insert().values(project=project, status="active"))
             with pytest.raises(IntegrityError, match="one_active_build"):
                 await conn.execute(builds.insert().values(project=project, status="active"))
@@ -59,8 +61,10 @@ async def test_only_the_active_status_is_constrained(migrated: None) -> None:
         async with engine.connect() as conn:
             trans = await conn.begin()
             # many builds per project, one active; other projects independent
+            await ensure_project(conn, p1)
             for status in ("building", "ready", "failed", "archived", "active"):
                 await conn.execute(builds.insert().values(project=p1, status=status))
+            await ensure_project(conn, p2)
             await conn.execute(builds.insert().values(project=p2, status="active"))
             await trans.rollback()
     finally:
@@ -72,6 +76,7 @@ async def test_status_outside_the_lifecycle_is_rejected(migrated: None) -> None:
     try:
         async with engine.connect() as conn:
             trans = await conn.begin()
+            await ensure_project(conn, "itest-x")
             with pytest.raises(IntegrityError, match="builds_status_valid"):
                 await conn.execute(builds.insert().values(project="itest-x", status="deployed"))
             await trans.rollback()

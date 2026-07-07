@@ -24,6 +24,7 @@ from core.resolve import fingerprints
 from core.stores import tables
 from core.stores.graph import graph_driver
 from core.stores.vectors import vector_client
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -69,6 +70,7 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
             assert report.metrics["builds_total"] == 0
 
             # an ACTIVE empty build → still Healthy; content metrics appear
+            await ensure_project(conn, project)
             active_id: uuid.UUID = (
                 await conn.execute(
                     tables.builds.insert()
@@ -205,6 +207,7 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
             assert any("drift" in d for d in report.drift)
 
             # a newer FAILED build → Build failed outranks everything
+            await ensure_project(conn, project)
             await conn.execute(
                 tables.builds.insert().values(
                     project=project, status="failed", started_at=datetime.now(tz=UTC)
@@ -219,6 +222,7 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
             # never-started 'building' row must NOT outrank the real failed
             # build via coalesce(now()). With NULLS LAST the failed build
             # stays newest → the light stays "Build failed".
+            await ensure_project(conn, project)
             await conn.execute(
                 tables.builds.insert().values(project=project, status="building", started_at=None)
             )
@@ -240,6 +244,7 @@ async def test_eval_regression_light_needs_comparable_reports(project: str) -> N
     driver = graph_driver()
     try:
         async with engine.connect() as conn, driver.session() as session:
+            await ensure_project(conn, project)
             await conn.execute(
                 tables.builds.insert().values(
                     project=project,
@@ -249,6 +254,7 @@ async def test_eval_regression_light_needs_comparable_reports(project: str) -> N
                 )
             )
             # ready build, regressing score, SAME fingerprint → light on
+            await ensure_project(conn, project)
             await conn.execute(
                 tables.builds.insert().values(
                     project=project,
@@ -283,6 +289,7 @@ async def test_eval_regression_light_needs_comparable_reports(project: str) -> N
                 .where(tables.builds.c.project == project, tables.builds.c.status == "ready")
                 .values(eval={"score": 0.5, "failed": 0, "fingerprint": "fp"})
             )
+            await ensure_project(conn, project)
             await conn.execute(
                 tables.builds.insert().values(
                     project=project,

@@ -25,6 +25,7 @@ from core.query.global_reports import global_summary
 from core.resolve import fingerprints
 from core.stores.repo import BuildScopedRepo, BuildScopedWriter
 from core.stores.tables import builds, community_reports, entities
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -55,6 +56,7 @@ async def conn(migrated: None) -> AsyncIterator[AsyncConnection]:
 
 
 async def _new_build(conn: AsyncConnection, project: str) -> BuildScopedWriter:
+    await ensure_project(conn, project)
     build_id: uuid.UUID = (
         await conn.execute(
             builds.insert().values(project=project, status="building").returning(builds.c.id)

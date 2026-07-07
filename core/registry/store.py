@@ -66,13 +66,13 @@ class ProjectNotFoundError(Exception):
 
 
 class ProjectHasBuildsError(Exception):
-    """delete_project on a project that still owns builds. ``builds.project``
-    is bare text (no FK — builds predate the registry and their multi-store
-    cleanup is the C9/BA8 build-lifecycle's job), so deleting the project row
-    would leave its builds and build-scoped data keyed by the same name; a
-    later project of the same name would then resolve a STALE active build and
-    serve old data. Refusing here closes that hole structurally — prune the
-    builds first."""
+    """delete_project on a project that still owns builds. Their multi-store
+    cleanup (build-scoped rows + Neo4j/Qdrant projections) is the C9/BA8
+    build-lifecycle's job, so we refuse rather than orphan them — a later
+    project of the same name would otherwise resolve a STALE active build and
+    serve old data. The ``builds.project`` FK (RESTRICT, BA2b) is the DB-level
+    backstop; this typed error is the clean count-first path that also carries
+    the count. Prune the builds first."""
 
     def __init__(self, name: str, count: int) -> None:
         super().__init__(f"project {name!r} still has {count} build(s); prune them first")

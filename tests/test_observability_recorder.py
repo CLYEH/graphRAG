@@ -28,6 +28,7 @@ from core.observability.recorder import (
 )
 from core.observability.spec import ItemOutcome
 from core.stores import tables
+from tests.conftest import ensure_project
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -243,6 +244,7 @@ async def test_record_run_persists_three_layers_with_verbosity(project: str) -> 
     engine = _engine()
     try:
         async with engine.connect() as conn:
+            await ensure_project(conn, project)
             build_id: uuid.UUID = (
                 await conn.execute(
                     tables.builds.insert()

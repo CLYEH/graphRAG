@@ -36,6 +36,7 @@ from core.stores import tables
 from core.stores.graph import BuildScopedGraphProjector, graph_driver
 from core.stores.repo import BuildScopedWriter, resolve_eval_binding
 from core.stores.vectors import BuildScopedVectorProjector, vector_client
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -117,6 +118,7 @@ async def test_run_eval_scores_a_projected_build_and_persists(project: str, tmp_
     driver = graph_driver()
     try:
         async with engine.connect() as conn, driver.session() as session:
+            await ensure_project(conn, project)
             build_id: uuid.UUID = (
                 await conn.execute(
                     tables.builds.insert()
@@ -246,6 +248,7 @@ async def test_run_eval_scores_a_projected_build_and_persists(project: str, tmp_
             # activate it, then gate a WORSE unscored candidate → deferred
             check = await activate(conn, qdrant, session, project, build_id)
             assert check.ok
+            await ensure_project(conn, project)
             empty = (
                 await conn.execute(
                     tables.builds.insert()
@@ -288,6 +291,7 @@ async def test_eval_binding_refuses_unevaluable_builds(project: str) -> None:
     engine = _engine()
     try:
         async with engine.connect() as conn:
+            await ensure_project(conn, project)
             building: uuid.UUID = (
                 await conn.execute(
                     tables.builds.insert()

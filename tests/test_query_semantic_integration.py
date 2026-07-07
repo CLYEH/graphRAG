@@ -41,6 +41,7 @@ from core.stores.vectors import (
     collection_for,
     vector_client,
 )
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -88,6 +89,7 @@ async def qdrant(migrated: None) -> AsyncIterator[AsyncQdrantClient]:
 
 
 async def _new_build(conn: AsyncConnection, project: str) -> BuildScopedWriter:
+    await ensure_project(conn, project)
     build_id: uuid.UUID = (
         await conn.execute(
             builds.insert().values(project=project, status="building").returning(builds.c.id)

@@ -41,6 +41,7 @@ from core.stores.repo import BuildScopedRepo, BuildScopedWriter
 from core.stores.sqlreader import BuildScopedSqlReader
 from core.stores.tables import builds, community_reports, entities
 from core.stores.vectors import BuildScopedVectorRepo, vector_client
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -106,6 +107,7 @@ async def test_hybrid_routes_fuses_and_traces_on_live_stores(
     conn, session, client = stores
     project = f"hybtest-{uuid.uuid4().hex[:10]}"
     try:
+        await ensure_project(conn, project)
         build_id: uuid.UUID = (
             await conn.execute(
                 builds.insert().values(project=project, status="building").returning(builds.c.id)

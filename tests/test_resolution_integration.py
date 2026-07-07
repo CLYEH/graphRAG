@@ -30,6 +30,7 @@ from core.stores.tables import (
     relations,
     review_ledger,
 )
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -48,6 +49,7 @@ def _engine() -> AsyncEngine:
 
 
 async def _writer(conn: AsyncConnection, project: str) -> BuildScopedWriter:
+    await ensure_project(conn, project)
     build_id: uuid.UUID = (
         await conn.execute(
             builds.insert().values(project=project, status="building").returning(builds.c.id)

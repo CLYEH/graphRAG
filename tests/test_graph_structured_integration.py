@@ -32,6 +32,7 @@ from core.stores.repo import (
     MentionTargetNotInBuildError,
 )
 from core.stores.tables import builds, entities, entity_mentions, relation_evidence, relations
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -60,6 +61,7 @@ def _engine() -> AsyncEngine:
 
 
 async def _new_build(conn: AsyncConnection, project: str, status: str = "building") -> uuid.UUID:
+    await ensure_project(conn, project)
     return (  # type: ignore[no-any-return]
         await conn.execute(
             builds.insert().values(project=project, status=status).returning(builds.c.id)

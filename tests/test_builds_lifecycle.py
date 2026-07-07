@@ -38,6 +38,7 @@ from core.stores import tables
 from core.stores.graph import graph_driver
 from core.stores.repo import BuildScopedWriter
 from core.stores.vectors import vector_client
+from tests.conftest import ensure_project
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NOW = datetime.now(tz=UTC)
@@ -110,6 +111,7 @@ async def _new_build(
     age_days: int = 0,
     score: float = 1.0,
 ) -> uuid.UUID:
+    await ensure_project(conn, project)
     build_id: uuid.UUID = (
         await conn.execute(
             tables.builds.insert()
