@@ -471,6 +471,42 @@ async def test_build_creation_and_job_attach_are_atomic(
         await engine.dispose()
 
 
+async def test_build_and_job_terminalize_atomically(
+    migrated: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The terminal build flip and the job finalize share ONE transaction: if
+    finalizing the job fails, the build flip must roll back too. Otherwise a
+    crash between the two commits strands the job 'running' on a terminal build
+    (a retry then hits BuildNotResumableError → stuck 'running' forever). We fail
+    set_progress on the terminal call and assert the build stayed 'building' — a
+    two-transaction version would have committed the flip, which this catches."""
+    engine = _engine()
+    project = _proj()
+    try:
+        job_id = await _new_job(engine, project)
+        real_set_progress = jobs_module.set_progress
+
+        async def _fail_on_terminal(conn: AsyncConnection, jid: uuid.UUID, **kw: Any) -> Any:
+            if kw.get("status") in ("done", "failed", "cancelled"):  # the terminal finalize
+                raise RuntimeError("finalize exploded")
+            return await real_set_progress(conn, jid, **kw)
+
+        monkeypatch.setattr(jobs_module, "set_progress", _fail_on_terminal)
+
+        with pytest.raises(RuntimeError, match="finalize exploded"):
+            await run_build(engine, project, job_id, _stages([]))
+
+        # the build flip rolled back with the failed job finalize — still 'building'
+        async with engine.connect() as conn:
+            job = await get_job(conn, job_id)
+        assert job is not None and job.build_id is not None
+        build = await _build_row(engine, job.build_id)
+        assert build.status == "building"
+    finally:
+        await _cleanup(engine, project)
+        await engine.dispose()
+
+
 async def test_cancel_during_the_last_stage_is_honored(migrated: None) -> None:
     """Cancellation is checked before each stage, so a cancel accepted DURING
     the final stage has no next checkpoint. The post-loop recheck must still
