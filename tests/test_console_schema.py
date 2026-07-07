@@ -92,3 +92,7 @@ def test_offline_upgrade_sql_renders_registry_ddl(
     assert "CHECK (name <> '')" in ddl
     assert "CHECK (uri <> '')" in ddl
     assert "CREATE INDEX sources_by_project ON sources (project)" in ddl
+    # the registry must be backfilled from pre-registry project-keyed tables,
+    # or existing projects vanish from list/get while their builds still resolve
+    assert "INSERT INTO projects (name)" in ddl
+    assert "FROM builds" in ddl

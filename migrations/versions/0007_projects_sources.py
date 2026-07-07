@@ -73,6 +73,29 @@ def upgrade() -> None:
     )
     op.create_index("sources_by_project", "sources", ["project"])
 
+    # Backfill the registry from project names already present in
+    # project-keyed tables (builds predates the registry and has no FK). Without
+    # this, on an existing DB those projects vanish from list/get while
+    # active_build_id() still resolves their builds — and a same-name "create"
+    # would look new. The four non-build-scoped project-keyed tables cover every
+    # live project (build-scoped rows always accompany a build). name<>'' keeps
+    # the projects_name_nonempty CHECK; ON CONFLICT makes re-runs idempotent.
+    op.execute(
+        sa.text(
+            """
+            INSERT INTO projects (name)
+            SELECT DISTINCT project FROM (
+                SELECT project FROM builds
+                UNION SELECT project FROM review_ledger
+                UNION SELECT project FROM ontology_proposals
+                UNION SELECT project FROM pipeline_runs
+            ) AS existing
+            WHERE project <> ''
+            ON CONFLICT (name) DO NOTHING
+            """
+        )
+    )
+
 
 def downgrade() -> None:
     op.drop_index("sources_by_project", table_name="sources")

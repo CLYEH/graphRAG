@@ -60,6 +60,21 @@ def _proj() -> str:
     return f"itest-{uuid.uuid4().hex[:10]}"
 
 
+# Mirrors the backfill in migration 0007 (the offline-DDL unit test pins that
+# the migration itself contains it; this drives the SQL's behavior live).
+_BACKFILL_SQL = """
+INSERT INTO projects (name)
+SELECT DISTINCT project FROM (
+    SELECT project FROM builds
+    UNION SELECT project FROM review_ledger
+    UNION SELECT project FROM ontology_proposals
+    UNION SELECT project FROM pipeline_runs
+) AS existing
+WHERE project <> ''
+ON CONFLICT (name) DO NOTHING
+"""
+
+
 async def test_create_get_roundtrip_and_duplicate(migrated: None) -> None:
     engine = _engine()
     name = _proj()
@@ -232,6 +247,26 @@ async def test_delete_project_cascades_sources(migrated: None) -> None:
             assert remaining == []  # cascaded, not orphaned
 
             assert await delete_project(conn, name) is False  # already gone
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_backfill_registers_projects_from_existing_tables(migrated: None) -> None:
+    """A project that exists only through a pre-registry build (no projects row)
+    must be registered by the backfill — else it's invisible to list/get while
+    active_build_id() still resolves its build, and a same-name create looks
+    new. Drives the migration's backfill SQL against a build with no projects
+    row."""
+    engine = _engine()
+    name = _proj()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await conn.execute(builds.insert().values(project=name, status="ready"))
+            assert await get_project(conn, name) is None  # not registered yet
+            await conn.execute(sa.text(_BACKFILL_SQL))
+            assert await get_project(conn, name) is not None  # backfill registered it
             await trans.rollback()
     finally:
         await engine.dispose()
