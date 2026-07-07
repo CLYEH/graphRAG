@@ -15,13 +15,16 @@ rules are NOT restated here (that would be two rule sources that could drift —
 the rule-self-consistency lesson); the loader reuses the dataclasses' own
 ``__post_init__`` and :data:`core.graph.proposals.PROPOSAL_POLICIES`.
 
-``projects.config`` is free-form: the API stores and returns it verbatim
-(``POST``/``PATCH /projects``), so it may carry keys beyond build config. The
-loader therefore reads only the keys it knows and IGNORES the rest — it does not
-reject unknown keys (that would break the free-form-config contract). It does
-reject a ``"table"`` field inside a structured mapping: the mapping KEY is the
-table name, and a second value could disagree with it (the composite-identifier
-lesson — made unrepresentable, not just re-checked).
+``projects.config`` is free-form ONLY at the top level: the API stores and
+returns it verbatim (``POST``/``PATCH /projects``), so it may carry keys beyond
+build config — the loader reads the keys it knows and IGNORES unknown top-level
+ones. Every RECOGNIZED nested block, by contrast, has a closed key set and
+rejects unknown keys, so a typo on an optional key (``disambiguator`` for
+``disambiguator_column``) fails loud instead of silently disabling the field
+(which, for a disambiguator, would collapse distinct same-name rows into one
+entity). It also rejects a ``"table"`` field inside a structured mapping: the
+mapping KEY is the table name, and a second value could disagree with it (the
+composite-identifier lesson — made unrepresentable, not just re-checked).
 
 Not a frozen contract: ``projects.config`` is internal (no ``web``/agent surface
 parses it against a shared schema), so it evolves additively via code review —
@@ -133,6 +136,18 @@ def _str_list(value: Any, path: str) -> tuple[str, ...]:
     return tuple(_str(item, f"{path}[{i}]") for i, item in enumerate(value))
 
 
+def _reject_unknown(block: Mapping[str, Any], allowed: set[str], path: str) -> None:
+    """Fail loud on unknown keys in a CLOSED nested block. Only the top-level
+    ``projects.config`` is free-form; every block the loader recognizes has a
+    fixed key set, so a typo on an OPTIONAL key (``disambiguator`` for
+    ``disambiguator_column``) must raise, not silently fall to the default and
+    disable the field (which, for a disambiguator, collapses distinct same-name
+    rows into one entity)."""
+    extra = sorted(set(block) - allowed)
+    if extra:
+        raise BuildConfigError(f"{path} has unknown key(s) {extra}; allowed: {sorted(allowed)}")
+
+
 def _construct[T](path: str, build: Callable[[], T]) -> T:
     """Run a dataclass constructor, re-wrapping its ``__post_init__``
     ``ValueError`` (the business-rule failure) as a path-prefixed
@@ -147,6 +162,7 @@ def _load_ontology(raw: Mapping[str, Any]) -> tuple[TextOntology | None, str]:
     if "ontology" not in raw:  # omitted → no ontology; explicit null → _mapping rejects it
         return None, _DEFAULT_PROPOSAL_POLICY
     block = _mapping(raw["ontology"], "ontology")
+    _reject_unknown(block, {"entity_types", "relation_types", "proposal_policy"}, "ontology")
     policy = _DEFAULT_PROPOSAL_POLICY
     if "proposal_policy" in block:
         policy = _str(block["proposal_policy"], "ontology.proposal_policy")
@@ -165,6 +181,7 @@ def _load_ontology(raw: Mapping[str, Any]) -> tuple[TextOntology | None, str]:
 
 def _load_entity_rule(raw: Any, path: str) -> EntityRule:
     block = _mapping(raw, path)
+    _reject_unknown(block, {"entity_type", "name_column", "disambiguator_column"}, path)
     for key in ("entity_type", "name_column"):
         if key not in block:
             raise BuildConfigError(f"{path}.{key} is required")
@@ -188,6 +205,7 @@ def _load_entity_rule(raw: Any, path: str) -> EntityRule:
 
 def _load_relation_rule(raw: Any, path: str) -> RelationRule:
     block = _mapping(raw, path)
+    _reject_unknown(block, {"relation_type", "src", "dst"}, path)
     for key in ("relation_type", "src", "dst"):
         if key not in block:
             raise BuildConfigError(f"{path}.{key} is required")
@@ -207,6 +225,7 @@ def _load_structured_mapping(table: str, raw: Any, path: str) -> StructuredMappi
             f"{path} must not carry a 'table' field — the mapping key IS the table "
             f"name ({table!r}); a second value could disagree with it"
         )
+    _reject_unknown(block, {"entities", "relations"}, path)
     entities = {
         alias: _load_entity_rule(rule, f"{path}.entities.{alias}")
         for alias, rule in _mapping(block.get("entities", {}), f"{path}.entities").items()
@@ -238,6 +257,11 @@ def _load_resolution(raw: Mapping[str, Any]) -> ResolutionConfig:
     if "resolution" not in raw:  # omitted → defaults; explicit null → rejected
         return ResolutionConfig()
     block = _mapping(raw["resolution"], "resolution")
+    _reject_unknown(
+        block,
+        {"auto_merge_threshold", "review_threshold", "embedding_weight", "carry_review"},
+        "resolution",
+    )
     kwargs: dict[str, Any] = {}
     for key in ("auto_merge_threshold", "review_threshold", "embedding_weight"):
         if key in block:
@@ -251,6 +275,7 @@ def _load_chunking(raw: Mapping[str, Any]) -> tuple[int, int]:
     if "chunking" not in raw:  # omitted → defaults; explicit null → rejected
         return DEFAULT_MAX_CHARS, DEFAULT_OVERLAP
     block = _mapping(raw["chunking"], "chunking")
+    _reject_unknown(block, {"max_chars", "overlap"}, "chunking")
     max_chars = (
         _int(block["max_chars"], "chunking.max_chars")
         if "max_chars" in block

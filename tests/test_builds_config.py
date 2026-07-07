@@ -227,11 +227,66 @@ def test_nested_leaf_type_error_is_reported_once_not_double_prefixed() -> None:
 
 
 def test_unknown_top_level_keys_are_ignored() -> None:
-    # projects.config is free-form (API round-trips it verbatim) — the loader
-    # reads the keys it knows and ignores the rest, rather than rejecting a
-    # config that legitimately carries other project settings.
+    # projects.config is free-form ONLY at the top level (API round-trips it
+    # verbatim) — the loader reads keys it knows and ignores the rest, rather
+    # than rejecting a config that legitimately carries other project settings.
     cfg = load_build_config({"display_name": "x", "chunking": {"max_chars": 500, "overlap": 50}})
     assert (cfg.chunk_max_chars, cfg.chunk_overlap) == (500, 50)
+
+
+def test_typo_on_optional_entity_rule_key_fails_loud_not_silently_defaulted() -> None:
+    # the actual bug Codex caught: 'disambiguator' (a typo of disambiguator_column)
+    # would silently fall to None and collapse distinct same-name rows into one
+    # entity. A recognized nested block has a CLOSED key set — it must reject it.
+    bad = {
+        "structured_mappings": {
+            "companies": {
+                "entities": {
+                    "co": {"entity_type": "Company", "name_column": "name", "disambiguator": "id"}
+                }
+            }
+        }
+    }
+    with pytest.raises(BuildConfigError, match=r"unknown key\(s\) \['disambiguator'\]"):
+        load_build_config(bad)
+
+
+def test_unknown_keys_in_recognized_nested_blocks_are_rejected() -> None:
+    # same-class sweep: every closed nested block rejects unknown keys, so a typo
+    # can't silently disable an optional field anywhere below the free-form top level.
+    with pytest.raises(BuildConfigError, match=r"ontology has unknown key\(s\) \['entity_typos'\]"):
+        load_build_config(
+            {"ontology": {"entity_types": ["E"], "relation_types": ["R"], "entity_typos": 1}}
+        )
+    with pytest.raises(
+        BuildConfigError, match=r"resolution has unknown key\(s\) \['carryreview'\]"
+    ):
+        load_build_config({"resolution": {"carryreview": True}})
+    with pytest.raises(BuildConfigError, match=r"chunking has unknown key\(s\) \['maxchars'\]"):
+        load_build_config({"chunking": {"maxchars": 500}})
+    with pytest.raises(BuildConfigError, match=r"relations\[0\] has unknown key\(s\) \['source'\]"):
+        load_build_config(
+            {
+                "structured_mappings": {
+                    "t": {
+                        "entities": {"a": {"entity_type": "E", "name_column": "n"}},
+                        "relations": [
+                            {"relation_type": "R", "src": "a", "dst": "a", "source": "a"}
+                        ],
+                    }
+                }
+            }
+        )
+    with pytest.raises(
+        BuildConfigError, match=r"structured_mappings.t has unknown key\(s\) \['rows'\]"
+    ):
+        load_build_config(
+            {
+                "structured_mappings": {
+                    "t": {"entities": {"a": {"entity_type": "E", "name_column": "n"}}, "rows": []}
+                }
+            }
+        )
 
 
 @pytest.mark.parametrize("block", ["ontology", "structured_mappings", "resolution", "chunking"])
