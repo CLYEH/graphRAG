@@ -343,6 +343,19 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      cell (direction → connecting segment → endpoint identity; lookup →
      both-stores → exact probe → degrade guard) — reactive cell
      patching is the anti-pattern; each fix invites the next question.
+   - **A "queue"/"count" metric's denominator is the whole spec state
+     machine, not the first table you think of**: when a metric answers "is
+     there X to do" (pending review, backlog, drift), enumerate EVERY spec
+     state that qualifies before implementing — C11's pending_review took
+     two separate rounds (§6 ontology proposals, then §17 needs_review
+     entities/relations + deferred candidates) because each missing state
+     was a false-dark light hiding real work. List the states from the spec
+     (§17 here), not from memory.
+   - **Config a caller must wire by hand is dead config**: a settings field
+     (verbosity, retention, threshold) that defaults to a literal instead of
+     reading `get_settings()` silently ignores the operator — the advertised
+     tunable never takes effect. A new tunable must be READ on the default
+     path, with an explicit-argument override, or the "knob" is decorative.
 
 ## Output (exactly this shape)
 ```
