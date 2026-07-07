@@ -22,7 +22,7 @@ from api import create_app
 from api.app import _frozen_contract
 from api.auth import Principal, current_principal
 from api.envelope import error_body, success
-from api.errors import ApiError, ErrorCode, http_status_for
+from api.errors import ApiError, ErrorCode, code_for_framework_status, http_status_for
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = REPO_ROOT / "contracts" / "openapi.yaml"
@@ -79,8 +79,13 @@ def client() -> TestClient:
 
     @app.get("/_t/unavailable")
     async def _unavailable() -> None:
-        # a raised 5xx HTTPException — the envelope's INTERNAL branch
+        # a raised 503 — the contract reserves 503 for STORE_UNAVAILABLE;
+        # detail must not leak on a 5xx
         raise HTTPException(status_code=503, detail="downstream down")
+
+    @app.get("/_t/timeout")
+    async def _timeout() -> None:
+        raise HTTPException(status_code=504)  # contract 504 → QUERY_TIMEOUT
 
     @app.post("/_t/validate")
     async def _validate(body: _Body) -> dict[str, Any]:
@@ -138,6 +143,23 @@ def test_http_status_map_matches_the_contract_prose() -> None:
     assert {code.value: http_status_for(code) for code in ErrorCode} == expected
     # and the contract documents every code (no code without a mapping)
     assert set(expected) == {code.value for code in ErrorCode}
+
+
+def test_code_for_framework_status_uses_unique_contract_codes() -> None:
+    """A framework status that the contract maps to exactly one code gets
+    that code; ambiguous (400/404/409) or unmapped statuses fall back to the
+    coarse 4xx→VALIDATION_ERROR / 5xx→INTERNAL split."""
+    # unique statuses → their contract code
+    assert code_for_framework_status(503) == ErrorCode.STORE_UNAVAILABLE
+    assert code_for_framework_status(504) == ErrorCode.QUERY_TIMEOUT
+    assert code_for_framework_status(429) == ErrorCode.RATE_LIMITED
+    assert code_for_framework_status(500) == ErrorCode.INTERNAL
+    # ambiguous statuses (multiple codes) → coarse fallback
+    assert code_for_framework_status(404) == ErrorCode.VALIDATION_ERROR  # 3 codes
+    assert code_for_framework_status(409) == ErrorCode.VALIDATION_ERROR  # 4 codes
+    # unmapped statuses → coarse by class
+    assert code_for_framework_status(405) == ErrorCode.VALIDATION_ERROR  # 4xx
+    assert code_for_framework_status(502) == ErrorCode.INTERNAL  # 5xx
 
 
 def test_success_envelope_shape() -> None:
@@ -249,19 +271,28 @@ def test_http_exception_preserves_framework_headers(client: TestClient) -> None:
     assert resp.headers["X-Request-ID"]  # and still ours
 
 
-def test_raised_5xx_http_exception_maps_to_internal_without_leaking(
+def test_raised_5xx_http_exception_maps_to_contract_code_without_leaking(
     client: TestClient,
 ) -> None:
-    """A 5xx HTTPException wears the envelope with INTERNAL, true status
-    preserved, and a FIXED message — exc.detail (backend/downstream failure
-    info) must not leak on a server fault (Codex round 2)."""
+    """A 503 wears the envelope with the CONTRACT code for that status
+    (STORE_UNAVAILABLE — so a client dispatching on error.code sees the class
+    the status promises, Codex round 4), true status preserved, and a fixed
+    message — exc.detail must not leak on a 5xx (Codex round 2)."""
     resp = client.get("/_t/unavailable")
     assert resp.status_code == 503  # true status kept
     body = resp.json()
     assert "detail" not in body
-    assert body["error"]["code"] == "INTERNAL"  # 5xx → server fault
-    assert body["error"]["message"] == "internal error"
+    assert body["error"]["code"] == "STORE_UNAVAILABLE"  # 503's contract code
+    assert body["error"]["message"] == "STORE_UNAVAILABLE"  # fixed, no leak
     assert "downstream" not in resp.text  # the raised detail did not leak
+
+
+def test_preserved_status_maps_to_its_unique_contract_code(client: TestClient) -> None:
+    """504 → QUERY_TIMEOUT: the status uniquely determines the code, so the
+    envelope emits it rather than a coarse INTERNAL (Codex round 4)."""
+    resp = client.get("/_t/timeout")
+    assert resp.status_code == 504
+    assert resp.json()["error"]["code"] == "QUERY_TIMEOUT"
 
 
 def test_api_error_details_with_uuid_serializes_not_crashes(client: TestClient) -> None:

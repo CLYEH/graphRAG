@@ -58,6 +58,29 @@ def http_status_for(code: ErrorCode) -> int:
     return _HTTP_STATUS[code]
 
 
+#: HTTP status → the frozen code, ONLY where the contract maps that status to
+#: exactly one code (429→RATE_LIMITED, 503→STORE_UNAVAILABLE,
+#: 504→QUERY_TIMEOUT, 500→INTERNAL). Ambiguous statuses (400/404/409 carry
+#: several codes) are omitted — a bare framework error at those can't pick one.
+_UNIQUE_STATUS_CODE: dict[int, ErrorCode] = {
+    status: next(c for c in ErrorCode if _HTTP_STATUS[c] == status)
+    for status in {s for s in _HTTP_STATUS.values()}
+    if sum(1 for c in ErrorCode if _HTTP_STATUS[c] == status) == 1
+}
+
+
+def code_for_framework_status(status: int) -> ErrorCode:
+    """The frozen code for a framework-raised HTTPException at ``status``:
+    the contract's code when the status determines exactly one (so a client
+    dispatching on ``error.code`` sees the class the status promises — e.g.
+    503→STORE_UNAVAILABLE), else a coarse classification (4xx = the client's
+    request didn't conform → VALIDATION_ERROR; 5xx = server fault →
+    INTERNAL)."""
+    if status in _UNIQUE_STATUS_CODE:
+        return _UNIQUE_STATUS_CODE[status]
+    return ErrorCode.INTERNAL if status >= 500 else ErrorCode.VALIDATION_ERROR
+
+
 class ApiError(Exception):
     """The single exception the API raises; the app's handler renders it as
     the frozen error envelope. Carrying the CODE (not an HTTP status) keeps

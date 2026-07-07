@@ -12,10 +12,11 @@ What BA0 establishes and later BA-items build on:
 - **Every error is the frozen envelope**: ApiError → its mapped status +
   ``{"error": {...}}``; request-body validation → VALIDATION_ERROR (400, the
   contract's mapping — not FastAPI's default 422); framework HTTPExceptions
-  (unknown route, wrong method) → the envelope with the true status (4xx →
-  VALIDATION_ERROR, 5xx → INTERNAL) instead of Starlette's ``{"detail": …}``;
-  anything uncaught → INTERNAL (500). No FastAPI/Starlette default error
-  shape ever reaches a client.
+  (unknown route, wrong method) → the envelope with the true status and the
+  contract's code where the status determines one (503 → STORE_UNAVAILABLE),
+  else a coarse 4xx→VALIDATION_ERROR / 5xx→INTERNAL — instead of Starlette's
+  ``{"detail": …}``; anything uncaught → INTERNAL (500). No FastAPI/Starlette
+  default error shape ever reaches a client.
 
 BA0 mounts NO domain routes (those are BA1–BA8) — a skeleton with the
 cross-cutting machinery wired and tested.
@@ -39,7 +40,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.envelope import error_body, error_body_from
-from api.errors import ApiError, ErrorCode, http_status_for
+from api.errors import ApiError, ErrorCode, code_for_framework_status, http_status_for
 
 #: source checkout keeps contracts/ at the repo root; an installed wheel
 #: ships the build-time copy inside core/ (pyproject force-include) — same
@@ -127,18 +128,19 @@ def create_app() -> FastAPI:
     async def _handle_http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         # framework HTTPExceptions (unknown route, wrong method, or a raised
         # HTTPException) must wear the frozen envelope too, never Starlette's
-        # {"detail": ...}. The frozen §27.2 enum has no generic HTTP codes, so
-        # classify coarsely — 4xx = the client's request didn't conform
-        # (VALIDATION_ERROR), 5xx = server fault (INTERNAL) — while PRESERVING
-        # the true HTTP status. Domain handlers (BA1+) raise precise ApiErrors.
-        # 5xx: fixed message — exc.detail may carry backend/downstream failure
-        # info that must not leak on a server fault (as the uncaught handler
-        # does). 4xx: echo the framework's detail (client-facing, e.g. "Not
+        # {"detail": ...}. The code is the contract's code when the status
+        # determines one uniquely (503→STORE_UNAVAILABLE, so a client
+        # dispatching on error.code sees the class the status promises), else
+        # a coarse 4xx/5xx classification — while PRESERVING the true status.
+        # Domain handlers (BA1+) raise precise ApiErrors.
+        # 5xx: fixed message (the code name) — exc.detail may carry
+        # backend/downstream failure info that must not leak on a server
+        # fault. 4xx: echo the framework's detail (client-facing, e.g. "Not
         # Found"), falling back to the code name.
+        code = code_for_framework_status(exc.status_code)
         if exc.status_code >= 500:
-            code, message = ErrorCode.INTERNAL, "internal error"
+            message = code.value
         else:
-            code = ErrorCode.VALIDATION_ERROR
             message = str(exc.detail) if exc.detail else code.value
         return _error_response(
             exc.status_code,
