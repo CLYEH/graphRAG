@@ -32,7 +32,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from core.builds.creation import create_build
-from core.observability.recorder import StepReport, record_run
+from core.observability.recorder import StepReport, record_run_in_txn
 from core.observability.spec import ItemOutcome
 from core.registry import jobs
 from core.stores import tables
@@ -225,26 +225,27 @@ async def run_build(
         async with engine.connect() as conn, conn.begin():
             await jobs.set_progress(conn, job_id, step=name, progress=(i + 1) / len(_STAGE_ORDER))
 
-    # 4f. final cancel checkpoint: a cancel accepted DURING the last stage has no
-    #     subsequent between-stages checkpoint, so it would otherwise be lost and
-    #     the build marked ready. Recheck once before terminalizing —
-    #     request_cancel accepts a running job right up to this terminal update.
-    if error is None and not cancelled:
-        async with engine.connect() as conn:
-            cancelled = await jobs.is_cancel_requested(conn, job_id)
-
-    build_status = "ready" if (error is None and not cancelled) else "failed"
-    # cancelled reuses 'failed' — no 'cancelled' value in the frozen
-    # BUILD_STATUSES enum; metrics.cancelled keeps the distinction for Health.
-    job_status = "cancelled" if cancelled else ("failed" if error is not None else "done")
-
-    # 5. record the run once (§18) — loaned-clean, its own txn, so it can't share
-    #    the terminal transaction (step 6). Recorded here, while the build is
-    #    still 'building': the run's status reflects THIS execution, independent
-    #    of the build's status flip. A crash between here and step 6 leaves the
-    #    build 'building' → a retry cleanly resumes (and records a fresh run).
-    async with engine.connect() as conn:
-        run_id = await record_run(
+    # 5. terminalize atomically. Lock the job row, then read cancel_requested
+    #    UNDER the lock: the lock is the cancellation cutoff — a cancel committed
+    #    before it (incl. one accepted during the last stage) is honored; one
+    #    racing in after blocks on the lock and, finding a terminal job, is
+    #    cleanly rejected by request_cancel's status-guarded update (no 'accepted
+    #    but ignored' limbo). Recording the run, flipping the build, and
+    #    finalizing the job share this ONE transaction: a crash can't split them
+    #    (no job 'running' on a terminal build → no stuck job, no orphan run),
+    #    and the recorded run's status matches the build/job outcome. finished_at
+    #    is the DB clock (single source); error is the full §15 Error shape
+    #    jobs.error documents ({code, message, details}); BA2e's GET /jobs
+    #    serializer fills request_id. cancelled reuses builds.status 'failed' (no
+    #    'cancelled' in the frozen BUILD_STATUSES enum); metrics.cancelled keeps
+    #    the distinction for Health.
+    async with engine.connect() as conn, conn.begin():
+        locked = await jobs.lock_job(conn, job_id)  # FOR UPDATE — the cancel cutoff
+        if error is None and locked is not None and await jobs.is_cancel_requested(conn, job_id):
+            cancelled = True
+        build_status = "ready" if (error is None and not cancelled) else "failed"
+        job_status = "cancelled" if cancelled else ("failed" if error is not None else "done")
+        run_id = await record_run_in_txn(
             conn,
             project,
             build_id,
@@ -253,21 +254,6 @@ async def run_build(
             error=error,
             cancelled=cancelled,
         )
-
-    # 6. terminalize the build AND the job in ONE transaction. Two separate
-    #    commits would let a crash in between leave the job 'running' while its
-    #    build_id points at an already-terminal build — a retry then hits
-    #    BuildNotResumableError and the job is stuck 'running' forever, blocking
-    #    project deletion. Atomic → a crash leaves either both mid-flight
-    #    (build 'building' + job 'running' → a retry resumes cleanly) or both
-    #    terminal (consistent). finished_at uses the DB clock (single source —
-    #    jobs.created_at/builds.* are all now()); error is the full §15 Error
-    #    shape jobs.error documents ({code, message, details}); BA2e's GET /jobs
-    #    serializer fills request_id.
-    progress_fields: dict[str, Any] = {"status": job_status, "finished_at": sa.func.now()}
-    if error is not None:
-        progress_fields["error"] = {"code": "INTERNAL", "message": error, "details": None}
-    async with engine.connect() as conn, conn.begin():
         await conn.execute(
             tables.builds.update()
             .where(tables.builds.c.id == build_id)
@@ -277,6 +263,9 @@ async def run_build(
                 metrics=sa.cast({"steps": metrics_steps, "cancelled": cancelled}, postgresql.JSONB),
             )
         )
+        progress_fields: dict[str, Any] = {"status": job_status, "finished_at": sa.func.now()}
+        if error is not None:
+            progress_fields["error"] = {"code": "INTERNAL", "message": error, "details": None}
         await jobs.set_progress(conn, job_id, **progress_fields)
 
     return BuildOutcome(

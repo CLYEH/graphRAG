@@ -2,7 +2,7 @@
 sequence, the cancel-checkpoint placement, the §22 failed-ratio abort, and the
 terminal build/job status rules — are logic that must hold independently of
 Postgres. These component tests drive the REAL functions with the store seams
-(get_project / jobs CRUD / create_build / record_run) stubbed and a fake
+(get_project / jobs CRUD / create_build / record_run_in_txn) stubbed and a fake
 engine, so the orchestration is exercised with zero I/O; the live SQL is the
 integration suite's job (BA1b's component + integration split, which also keeps
 this integration-only module inside the fast-suite coverage gate).
@@ -220,7 +220,7 @@ class _Spy:
     async def build_status(self, conn: Any, project: str, build_id: uuid.UUID) -> str | None:
         return self._status_value
 
-    async def record_run(
+    async def record_run_in_txn(
         self,
         conn: Any,
         project: str,
@@ -241,7 +241,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, spy: _Spy) -> None:
     monkeypatch.setattr(jobs_module, "set_progress", spy.set_progress)
     monkeypatch.setattr(jobs_module, "is_cancel_requested", spy.is_cancel_requested)
     monkeypatch.setattr(orchestrator, "create_build", spy.create_build)
-    monkeypatch.setattr(orchestrator, "record_run", spy.record_run)
+    monkeypatch.setattr(orchestrator, "record_run_in_txn", spy.record_run_in_txn)
     monkeypatch.setattr(orchestrator, "_build_status", spy.build_status)
 
 

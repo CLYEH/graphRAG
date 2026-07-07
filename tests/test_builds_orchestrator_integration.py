@@ -588,3 +588,57 @@ async def test_build_resolution_locks_the_job_row(
     finally:
         await _cleanup(engine, project)
         await engine.dispose()
+
+
+async def test_finalize_holds_the_job_lock_across_recording(
+    migrated: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The terminal transaction takes FOR UPDATE on the job row and holds it
+    while it records the run and finalizes — this lock is the cancellation
+    cutoff (a cancel racing the finalize blocks on it, then finds a terminal
+    job). We pause inside record_run_in_txn and probe the row with NOWAIT from
+    another connection → 55P03. Drop the lock and the row is free there, so this
+    fails; the deterministic rejection of the blocked cancel is proven
+    separately in test_jobs_integration."""
+    import asyncio
+
+    from sqlalchemy.exc import DBAPIError
+
+    from core.observability.recorder import record_run_in_txn
+
+    engine = _engine()
+    project = _proj()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _paused_record(conn: AsyncConnection, *args: Any, **kwargs: Any) -> uuid.UUID:
+        run_id = await record_run_in_txn(conn, *args, **kwargs)
+        entered.set()
+        await release.wait()  # hold the terminal txn (and its job-row lock) open
+        return run_id
+
+    monkeypatch.setattr("core.builds.orchestrator.record_run_in_txn", _paused_record)
+    try:
+        job_id = await _new_job(engine, project)
+        runner = asyncio.create_task(run_build(engine, project, job_id, _stages([])))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5.0)  # terminal txn holds the lock
+            async with engine.connect() as b:
+                await b.begin()
+                with pytest.raises(DBAPIError) as ei:  # the row is locked by the finalize
+                    await b.execute(
+                        sa.select(tables.jobs.c.id)
+                        .where(tables.jobs.c.id == job_id)
+                        .with_for_update(nowait=True)
+                    )
+                assert getattr(ei.value.orig, "sqlstate", None) == "55P03"
+                await b.rollback()
+        finally:
+            release.set()
+            outcome = await runner
+
+        assert outcome.status == "ready" and not outcome.cancelled
+        assert await _run_status(engine, outcome.run_id) == "done"
+    finally:
+        await _cleanup(engine, project)
+        await engine.dispose()
