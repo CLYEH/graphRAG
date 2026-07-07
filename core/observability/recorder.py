@@ -105,12 +105,19 @@ async def record_run(
     verbosity: str | None = None,
     created_by: str = "pipeline",
     error: str | None = None,
+    cancelled: bool = False,
 ) -> uuid.UUID:
     """Persist one run with its steps and (verbosity-filtered) items.
 
     ``verbosity=None`` (the default) reads 🔧
     ``observability.item_logging`` from settings — the tunable works without
     every caller wiring it; an explicit argument overrides.
+
+    ``cancelled=True`` forces the run status to ``'cancelled'`` (the §27.2
+    JobStatus vocabulary the CHECK already permits), overriding the
+    failed/done inference — a cooperatively-cancelled build (BA2c) stopped
+    between steps is neither a failure nor a clean completion; the steps that
+    DID run are still recorded truthfully.
 
     LOANED-CLEAN connection (the C6b idiom): the caller must hand a
     connection with NO open transaction — rolling one back here would
@@ -133,6 +140,7 @@ async def record_run(
     run_failed = error is not None or any(
         any(o.status == "failed" for o in step.outcomes) for step in steps
     )
+    run_status = "cancelled" if cancelled else ("failed" if run_failed else "done")
     async with conn.begin():
         if build_id is not None:
             # pipeline_runs has NO FK — an unverified (project, build_id)
@@ -164,7 +172,7 @@ async def record_run(
                     project=project,
                     build_id=build_id,
                     kind=kind,
-                    status="failed" if run_failed else "done",
+                    status=run_status,
                     created_by=created_by,
                     started_at=now,
                     finished_at=now,

@@ -237,7 +237,7 @@ graphRAG/
 
 ## 22. 失敗 / 降級行為
 - 單一 store 不可用：hybrid 降級為可用模態子集，`warnings` 標示，不整體失敗。
-- LLM 抽取失敗：該項記 `pipeline_step_items` failed，build 續跑；步驟 `failed_count > 閾值` 才中止。
+- LLM 抽取失敗：該項記 `pipeline_step_items` failed，build 續跑；步驟失敗**比例**超過門檻才中止（🔧 `pipeline.step_failure_ratio`，預設 0.5 = 過半即中止；BA2c orchestrator 每步套用）。
 - 投影 drift：Health 標示，`graphrag reproject <project> <build>` 重建投影。
 - build 中途失敗：`failed`，active 不受影響。
 - query 逾時：回部分結果 + warning，不 500。

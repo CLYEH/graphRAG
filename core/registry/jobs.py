@@ -107,7 +107,7 @@ async def set_progress(
     message: str | None | _Unset = _UNSET,
     build_id: uuid.UUID | None | _Unset = _UNSET,
     error: dict[str, Any] | None | _Unset = _UNSET,
-    finished_at: datetime | _Unset = _UNSET,
+    finished_at: datetime | sa.ColumnElement[Any] | _Unset = _UNSET,
 ) -> Job | None:
     """Patch a job's live fields (only the ones passed change). Returns the
     updated job, or None if the id is unknown. The worker calls this on its own
