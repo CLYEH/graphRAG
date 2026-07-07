@@ -39,8 +39,11 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from api.deps import lifespan
 from api.envelope import error_body, error_body_from
 from api.errors import ApiError, ErrorCode, code_for_framework_status, http_status_for
+from api.routers import projects as projects_router
+from api.routers import sources as sources_router
 
 #: source checkout keeps contracts/ at the repo root; an installed wheel
 #: ships the build-time copy inside core/ (pyproject force-include) — same
@@ -84,7 +87,7 @@ class _RequestContextMiddleware(BaseHTTPMiddleware):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="graphRAG Console API", version="1.0")
+    app = FastAPI(title="graphRAG Console API", version="1.0", lifespan=lifespan)
     app.add_middleware(_RequestContextMiddleware)
 
     def _error_response(
@@ -166,4 +169,9 @@ def create_app() -> FastAPI:
         return app.openapi_schema
 
     app.openapi = _openapi  # type: ignore[method-assign]
+
+    # Domain routers (BA1b+). The served /openapi.json stays the frozen
+    # contract regardless of what's mounted (DR-002, _openapi above).
+    app.include_router(projects_router.router)
+    app.include_router(sources_router.router)
     return app

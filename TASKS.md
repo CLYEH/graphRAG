@@ -63,7 +63,7 @@ Keep items small enough to finish in one loop.
 ## Track 2 — Console backend (FastAPI + arq)  *(needs Track 0 P0; C-items as they land)*
 - [x] BA0 API skeleton + generated OpenAPI matching contract + auth placeholder
 - [x] BA1a projects/sources registry — schema + core CRUD
-- [ ] BA1b projects/sources endpoints — routers + idempotency + opaque cursor
+- [x] BA1b projects/sources endpoints — routers + idempotency + opaque cursor
 - [ ] BA2 arq worker + jobs + SSE + ingest/build triggers
 - [ ] BA3 inspection endpoints (docs/chunks/entities/relations/subgraph/reports)
 - [ ] BA4 cleaning preview/rules

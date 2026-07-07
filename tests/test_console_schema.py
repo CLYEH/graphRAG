@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 
-from core.stores.tables import projects, sources
+from core.stores.tables import idempotency_keys, projects, sources
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -74,6 +74,27 @@ def test_nonempty_checks_present() -> None:
     assert "sources_uri_nonempty" in src
 
 
+def test_idempotency_keys_columns() -> None:
+    assert {c.name for c in idempotency_keys.columns} == {
+        "key",
+        "project",
+        "endpoint",
+        "request_hash",
+        "response",
+        "status",
+        "created_at",
+        "expires_at",
+    }
+    assert idempotency_keys.c.key.primary_key  # the PK serializes concurrent same-key reqs
+    assert not idempotency_keys.c.expires_at.nullable  # every key has a TTL window
+    # response/status are filled AFTER the handler (reserve-first) → nullable
+    assert idempotency_keys.c.response.nullable
+    assert idempotency_keys.c.status.nullable
+    # the reserve-or-filled invariant is enforced structurally, not by handler code
+    checks = {c.name for c in idempotency_keys.constraints if isinstance(c, sa.CheckConstraint)}
+    assert "idempotency_keys_reserve_or_filled" in checks
+
+
 def test_offline_upgrade_sql_renders_registry_ddl(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -96,3 +117,9 @@ def test_offline_upgrade_sql_renders_registry_ddl(
     # or existing projects vanish from list/get while their builds still resolve
     assert "INSERT INTO projects (name)" in ddl
     assert "FROM builds" in ddl
+    # the §27 idempotency store (0008) — key PK, non-empty CHECK, and the
+    # reserve-or-filled invariant (never a half-filled row)
+    assert "CREATE TABLE idempotency_keys" in ddl
+    assert "PRIMARY KEY (key)" in ddl
+    assert "CHECK (key <> '')" in ddl
+    assert "CHECK ((status IS NULL) = (response IS NULL))" in ddl

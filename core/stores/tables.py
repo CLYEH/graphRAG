@@ -832,3 +832,45 @@ sources = sa.Table(
 
 # List ordering / keyset pagination reads sources by their parent project.
 sources_by_project = sa.Index("sources_by_project", sources.c.project)
+
+
+# §27 idempotency — the store behind the Idempotency-Key header on write
+# endpoints (BA1b). `key` is the client-supplied key and the PK: it both
+# uniquely stores one response and SERIALIZES concurrent same-key requests
+# (a second insert of a live key blocks on the first's txn, then replays its
+# stored response). `response`/`status` are nullable because a request
+# RESERVES its key (inserts the row) before running the handler, then fills
+# them on success — a handler that fails rolls the reservation back with its
+# txn. `status` is the HTTP status code to replay; `expires_at` is
+# created_at + the tunable TTL (a reuse past it is a fresh request, not a
+# replay). Not build-scoped and no FK on project (the key must survive to
+# replay regardless of project churn), like builds/review_ledger.
+idempotency_keys = sa.Table(
+    "idempotency_keys",
+    metadata,
+    sa.Column("key", sa.Text, primary_key=True),
+    sa.Column("project", sa.Text, nullable=False),
+    sa.Column("endpoint", sa.Text, nullable=False),
+    sa.Column("request_hash", sa.Text, nullable=False),
+    # none_as_null: a reserved (not-yet-filled) row must store SQL NULL, not a
+    # JSONB 'null' literal — otherwise `response IS NULL` is false and the
+    # reserve/fill CHECK below (and a concurrent replay) misfire. A real
+    # response body is always an object, never a bare JSON null.
+    sa.Column("response", postgresql.JSONB(none_as_null=True)),
+    sa.Column("status", sa.Integer),
+    sa.Column(
+        "created_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    ),
+    sa.Column("expires_at", sa.TIMESTAMP(timezone=True), nullable=False),
+    sa.CheckConstraint("key <> ''", name="idempotency_keys_key_nonempty"),
+    sa.CheckConstraint("request_hash <> ''", name="idempotency_keys_request_hash_nonempty"),
+    # the two states (reserved: both null · committed: both set) are the only
+    # legal ones — a half-filled row would replay `int(None)` as a 500. Enforce
+    # "committed ⟹ filled" structurally, not by handler discipline.
+    sa.CheckConstraint(
+        "(status IS NULL) = (response IS NULL)", name="idempotency_keys_reserve_or_filled"
+    ),
+)
+
+# GC of expired keys (a sweeper / the per-request purge both filter on it).
+idempotency_keys_expiry = sa.Index("idempotency_keys_expiry", idempotency_keys.c.expires_at)
