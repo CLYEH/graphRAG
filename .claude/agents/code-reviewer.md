@@ -356,6 +356,19 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      reading `get_settings()` silently ignores the operator — the advertised
      tunable never takes effect. A new tunable must be READ on the default
      path, with an explicit-argument override, or the "knob" is decorative.
+   - **A guarantee on a framework boundary must enumerate EVERY exit**: when
+     code claims an invariant on a framework's error/response path ("no
+     default shape reaches a client", "every response carries X"), list all
+     the ways the framework can bypass it — polymorphic handler precedence
+     (a built-in handler for a more-specific exception type wins over your
+     generic one), hidden serialization failures (non-JSON values in an
+     error body crash into the 500 path), framework side-channels (headers
+     like 405 Allow / WWW-Authenticate / Retry-After), and consistency
+     between your own mapping and the deeper contract (a preserved HTTP
+     status with a mismatched error code). BA0 spent 4 rounds having these
+     exits found one at a time; a "framework exit list" before implementing
+     closes them at once (and centralize the fix — e.g. one encoder over the
+     whole body — rather than patching each handler).
 
 ## Output (exactly this shape)
 ```
