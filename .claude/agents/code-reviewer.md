@@ -369,6 +369,20 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      exits found one at a time; a "framework exit list" before implementing
      closes them at once (and centralize the fix — e.g. one encoder over the
      whole body — rather than patching each handler).
+   - **A new parent table over existing un-FK'd data owes a three-face
+     completeness check**: when a table is introduced as the parent of data
+     that already exists keyed by a bare string (no FK) — e.g. a `projects`
+     registry over `builds.project`/`review_ledger.project`/… — enumerate
+     (1) DELETE: every child/sibling table keyed by that string that a plain
+     parent-row delete would orphan or leave to carry forward onto a
+     recreated same-name parent (build-scoped rows are covered transitively
+     only if the gateway they resolve through — e.g. the active build — is
+     itself guarded); (2) UPGRADE: the migration must backfill the parent
+     from the pre-existing keyed tables, or existing entities vanish from the
+     new registry while old lookups still resolve them; (3) WRITE-RACE: the
+     count-then-act guard is a TOCTOU until a real FK (or shared lock) binds
+     parent and child — name the FK and who must take it. BA1a spent 3 rounds
+     having these three faces found one at a time.
 
 ## Output (exactly this shape)
 ```
