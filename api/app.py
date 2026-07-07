@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -86,17 +86,20 @@ def create_app() -> FastAPI:
     app = FastAPI(title="graphRAG Console API", version="1.0")
     app.add_middleware(_RequestContextMiddleware)
 
-    def _error_response(status: int, body: dict[str, Any]) -> JSONResponse:
+    def _error_response(
+        status: int, body: dict[str, Any], *, extra_headers: Mapping[str, str] | None = None
+    ) -> JSONResponse:
         # exception handlers run INSIDE Starlette's ServerErrorMiddleware, so
         # the request-context middleware never sees these responses — stamp
         # X-Request-ID here too, or a 4xx/5xx would ship without the header.
         # jsonable_encoder on the WHOLE body: ApiError.details can hold UUIDs
         # or datetimes (build/job ids), which JSONResponse can't serialize —
         # unencoded, the contract-mapped error would crash into the 500 path.
+        # extra_headers carries framework protocol hints (405 Allow,
+        # WWW-Authenticate, Retry-After); X-Request-ID is always ours last.
         rid = body["error"]["request_id"]
-        return JSONResponse(
-            status_code=status, content=jsonable_encoder(body), headers={"X-Request-ID": rid}
-        )
+        headers = {**extra_headers, "X-Request-ID": rid} if extra_headers else {"X-Request-ID": rid}
+        return JSONResponse(status_code=status, content=jsonable_encoder(body), headers=headers)
 
     @app.exception_handler(ApiError)
     async def _handle_api_error(request: Request, exc: ApiError) -> JSONResponse:
@@ -140,6 +143,8 @@ def create_app() -> FastAPI:
         return _error_response(
             exc.status_code,
             error_body(code, message, request_id=_request_id(request), details=None),
+            # keep protocol hints the framework attached (405 Allow, etc.)
+            extra_headers=exc.headers,
         )
 
     @app.exception_handler(Exception)

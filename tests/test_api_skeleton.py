@@ -237,6 +237,18 @@ def test_unknown_route_wears_the_frozen_envelope_not_detail(client: TestClient) 
     assert resp.headers["X-Request-ID"] == body["error"]["request_id"]
 
 
+def test_http_exception_preserves_framework_headers(client: TestClient) -> None:
+    """A 405 (wrong method on a registered route) carries Starlette's Allow
+    header — the envelope handler must keep it, not drop it for X-Request-ID
+    only (Codex round 3: 405 Allow, WWW-Authenticate, Retry-After)."""
+    resp = client.post("/_t/ok")  # /_t/ok is GET-only → 405 with Allow
+    assert resp.status_code == 405
+    assert "Allow" in resp.headers  # protocol hint preserved
+    assert "GET" in resp.headers["Allow"]
+    assert resp.json()["error"]["code"] == "VALIDATION_ERROR"  # still enveloped
+    assert resp.headers["X-Request-ID"]  # and still ours
+
+
 def test_raised_5xx_http_exception_maps_to_internal_without_leaking(
     client: TestClient,
 ) -> None:
