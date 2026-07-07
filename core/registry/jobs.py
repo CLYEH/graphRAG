@@ -97,6 +97,19 @@ async def get_job(conn: AsyncConnection, job_id: uuid.UUID) -> Job | None:
     return Job(*row) if row is not None else None
 
 
+async def lock_job(conn: AsyncConnection, job_id: uuid.UUID) -> Job | None:
+    """`SELECT … FOR UPDATE` the job row and return it (or None if absent).
+    Serializes concurrent workers dispatched the same job while they resolve
+    its build (the orchestrator): a second worker blocks here until the first
+    commits, then re-reads the now-attached ``build_id`` instead of minting a
+    second build. Caller must hold an open transaction (the lock lives until it
+    commits/rolls back)."""
+    row = (
+        await conn.execute(sa.select(*_COLS).where(tables.jobs.c.id == job_id).with_for_update())
+    ).one_or_none()
+    return Job(*row) if row is not None else None
+
+
 async def set_progress(
     conn: AsyncConnection,
     job_id: uuid.UUID,

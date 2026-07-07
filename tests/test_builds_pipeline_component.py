@@ -197,6 +197,9 @@ class _Spy:
     async def get_job(self, conn: Any, job_id: uuid.UUID) -> Job | None:
         return self.job
 
+    async def lock_job(self, conn: Any, job_id: uuid.UUID) -> Job | None:
+        return self.job  # the locked row (same shape; carries build_id)
+
     async def set_progress(self, conn: Any, job_id: uuid.UUID, **kw: Any) -> None:
         self.progress_calls.append(kw)
 
@@ -234,6 +237,7 @@ class _Spy:
 
 def _install(monkeypatch: pytest.MonkeyPatch, spy: _Spy) -> None:
     monkeypatch.setattr(jobs_module, "get_job", spy.get_job)
+    monkeypatch.setattr(jobs_module, "lock_job", spy.lock_job)
     monkeypatch.setattr(jobs_module, "set_progress", spy.set_progress)
     monkeypatch.setattr(jobs_module, "is_cancel_requested", spy.is_cancel_requested)
     monkeypatch.setattr(orchestrator, "create_build", spy.create_build)
@@ -360,6 +364,24 @@ async def test_cancel_between_stages_stops_and_records_cancelled(
     assert calls == ["ingest"]
     assert spy.recorded is not None and spy.recorded["cancelled"] is True
     assert spy.progress_calls[-1]["status"] == "cancelled"
+
+
+async def test_cancel_during_last_stage_is_honored_before_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # False for all six between-stages checkpoints, True on the final recheck —
+    # a cancel that lands while summarize runs has no next checkpoint, so the
+    # post-loop recheck is the only thing that can catch it
+    spy = _Spy(_job(), cancel_script=[False] * 6 + [True])
+    _install(monkeypatch, spy)
+    calls: list[str] = []
+
+    outcome = await run_build(_fake_engine(), "p", uuid.uuid4(), _stages(calls))
+
+    assert calls == list(_STAGE_ORDER)  # every stage ran to completion
+    assert outcome.cancelled  # ...but the late cancel is still honored
+    assert outcome.status == "failed"
+    assert spy.recorded is not None and spy.recorded["cancelled"] is True
 
 
 async def test_cancel_before_first_stage_runs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -469,3 +469,86 @@ async def test_build_creation_and_job_attach_are_atomic(
     finally:
         await _cleanup(engine, project)
         await engine.dispose()
+
+
+async def test_cancel_during_the_last_stage_is_honored(migrated: None) -> None:
+    """Cancellation is checked before each stage, so a cancel accepted DURING
+    the final stage has no next checkpoint. The post-loop recheck must still
+    honor it — else a late cancel silently yields a `ready` build."""
+    engine = _engine()
+    project = _proj()
+    try:
+        job_id = await _new_job(engine, project)
+        calls: list[str] = []
+
+        async def _cancel(conn: AsyncConnection, project: str, build_id: uuid.UUID) -> None:
+            await request_cancel(conn, job_id)  # cancel arrives while summarize runs
+
+        summarize = _recording_stage("summarize", calls, hook=_cancel)
+
+        outcome = await run_build(engine, project, job_id, _stages(calls, summarize=summarize))
+
+        assert calls == list(_STAGE_ORDER)  # all six ran to completion
+        assert outcome.cancelled  # ...and the late cancel was still caught
+        assert outcome.status == "failed"
+        build = await _build_row(engine, outcome.build_id)
+        assert build.status == "failed" and build.metrics["cancelled"] is True
+        assert await _run_status(engine, outcome.run_id) == "cancelled"
+        assert await _step_names(engine, outcome.run_id) == set(_STAGE_ORDER)
+    finally:
+        await _cleanup(engine, project)
+        await engine.dispose()
+
+
+async def test_build_resolution_locks_the_job_row(
+    migrated: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Execution-level proof concurrent workers can't both mint a build for one
+    job. run_build takes FOR UPDATE on the job row while resolving the build; we
+    pause inside create_build (lock held, before commit) and probe the row with
+    NOWAIT from another connection → 55P03. Without the lock the row is free
+    there, so this test fails (the lock is load-bearing)."""
+    import asyncio
+
+    from sqlalchemy.exc import DBAPIError
+
+    engine = _engine()
+    project = _proj()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_create = create_build
+
+    async def _paused_create(
+        conn: AsyncConnection,
+        proj: str,
+        *,
+        config_hash: str | None = None,
+        source_hash: str | None = None,
+    ) -> uuid.UUID:
+        bid = await real_create(conn, proj, config_hash=config_hash, source_hash=source_hash)
+        entered.set()
+        await release.wait()  # hold the job-row lock open
+        return bid
+
+    monkeypatch.setattr("core.builds.orchestrator.create_build", _paused_create)
+    try:
+        job_id = await _new_job(engine, project)
+        runner = asyncio.create_task(run_build(engine, project, job_id, _stages([])))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5.0)  # run_build holds the lock
+            async with engine.connect() as b:
+                await b.begin()
+                with pytest.raises(DBAPIError) as ei:
+                    await b.execute(
+                        sa.select(tables.jobs.c.id)
+                        .where(tables.jobs.c.id == job_id)
+                        .with_for_update(nowait=True)
+                    )
+                assert getattr(ei.value.orig, "sqlstate", None) == "55P03"  # lock_not_available
+                await b.rollback()
+        finally:
+            release.set()
+            await runner
+    finally:
+        await _cleanup(engine, project)
+        await engine.dispose()

@@ -159,27 +159,30 @@ async def run_build(
     if job.project != project:
         raise ValueError(f"job {job_id} belongs to project {job.project!r}, not {project!r}")
 
-    # 2. resolve the build: fresh (create + attach) or resume (validate building)
-    resume_id = build_id if build_id is not None else job.build_id
-    if resume_id is None:
-        # create the build AND attach it to the job in ONE transaction — else a
-        # crash between the two commits leaves the job at build_id=NULL pointing
-        # at nothing while an orphaned 'building' build persists (unresumable,
-        # and RESTRICT blocks deleting it with the project). Atomic → a retry
-        # either finds the attached build (resume) or a clean slate (create).
-        async with engine.connect() as conn, conn.begin():
+    # 2. resolve the build under a per-job lock, in ONE transaction. The
+    #    FOR UPDATE lock + re-read of build_id serializes concurrent workers
+    #    dispatched the same job: without it, two workers both read
+    #    build_id=NULL and both create a build, orphaning one (unresumable, and
+    #    RESTRICT blocks deleting it with the project). A second worker blocks
+    #    on the lock, then re-reads the now-attached build and resumes it.
+    #    Create+attach share this transaction, so a crash before commit leaves
+    #    no orphan (atomic).
+    async with engine.connect() as conn, conn.begin():
+        locked = await jobs.lock_job(conn, job_id)
+        if locked is None:  # deleted between the step-1 read and the lock
+            raise jobs.JobNotFoundError(job_id)
+        resume_id = build_id if build_id is not None else locked.build_id
+        if resume_id is None:
             build_id = await create_build(
                 conn, project, config_hash=config_hash, source_hash=source_hash
             )
             await jobs.set_progress(conn, job_id, build_id=build_id)
-    else:
-        build_id = resume_id
-        async with engine.connect() as conn:
-            status = await _build_status(conn, project, build_id)
-        if status != "building":
-            raise BuildNotResumableError(project, build_id, status)
-        if job.build_id != build_id:
-            async with engine.connect() as conn, conn.begin():
+        else:
+            status = await _build_status(conn, project, resume_id)
+            if status != "building":
+                raise BuildNotResumableError(project, resume_id, status)
+            build_id = resume_id
+            if locked.build_id != build_id:
                 await jobs.set_progress(conn, job_id, build_id=build_id)
 
     # 3. mark running
@@ -221,6 +224,14 @@ async def run_build(
         # e. progress
         async with engine.connect() as conn, conn.begin():
             await jobs.set_progress(conn, job_id, step=name, progress=(i + 1) / len(_STAGE_ORDER))
+
+    # 4f. final cancel checkpoint: a cancel accepted DURING the last stage has no
+    #     subsequent between-stages checkpoint, so it would otherwise be lost and
+    #     the build marked ready. Recheck once before terminalizing —
+    #     request_cancel accepts a running job right up to this terminal update.
+    if error is None and not cancelled:
+        async with engine.connect() as conn:
+            cancelled = await jobs.is_cancel_requested(conn, job_id)
 
     # 5. terminal builds.status + a small metrics summary (cancelled reuses
     #    'failed' — no 'cancelled' value in the frozen BUILD_STATUSES enum;
