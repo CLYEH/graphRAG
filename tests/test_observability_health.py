@@ -48,6 +48,7 @@ async def project(migrated: None) -> AsyncIterator[str]:
     engine = _engine()
     async with engine.connect() as conn:
         await conn.execute(tables.entities.delete().where(tables.entities.c.project == name))
+        await conn.execute(tables.relations.delete().where(tables.relations.c.project == name))
         await conn.execute(
             tables.ontology_proposals.delete().where(tables.ontology_proposals.c.project == name)
         )
@@ -132,6 +133,54 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
             assert report.status == "Needs review"
             assert report.metrics["pending_review"] == 2
             assert report.metrics["pending_ontology_proposals"] == 1
+
+            # §17: an entity parked at status='needs_review' is review work
+            # too, and a DEFERRED merge candidate (defer 仍列入待審) — either
+            # alone must light Needs review (Codex round 8)
+            await conn.execute(
+                tables.entities.insert().values(
+                    id=uuid.uuid4(),
+                    project=project,
+                    build_id=active_id,
+                    type="org",
+                    canonical_name="Umbrella",
+                    entity_key=fingerprints.entity_key("org", "Umbrella"),
+                    status="needs_review",
+                    review_status="unreviewed",
+                    created_by="rule",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            await conn.execute(
+                tables.merge_candidates.update()
+                .where(tables.merge_candidates.c.project == project)
+                .values(status="deferred")
+            )
+            # a needs_review RELATION between two same-build entities — the
+            # symmetric term to needs_review_entities (guards the relations
+            # WHERE clause against the status/review_status footgun)
+            await conn.execute(
+                tables.relations.insert().values(
+                    id=uuid.uuid4(),
+                    project=project,
+                    build_id=active_id,
+                    src_entity_id=left,
+                    dst_entity_id=right,
+                    type="rivals",
+                    status="needs_review",
+                    review_status="unreviewed",
+                    created_by="rule",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Needs review"
+            assert report.metrics["needs_review_entities"] == 1
+            assert report.metrics["needs_review_relations"] == 1
+            assert report.metrics["pending_merge_candidates"] == 1  # deferred still counts
 
             # an ACTIVE entity in PG only → the SAME drift checker preflight
             # uses fires → Index drift outranks Needs review

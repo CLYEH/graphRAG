@@ -24,10 +24,13 @@ SEMANTICS (spec-first — the judge-surface lesson):
     incomparable or unscored is NOT a regression light; the activation gate
     fails closed there, but a status light must not scream about what was
     never measured).
-  * Needs review — the review QUEUE is non-empty: pending merge candidates
-    (``merge_candidates.status='pending'``) plus proposed ontology types
-    (``ontology_proposals.status='proposed'``, the §6 待審池) — §19's
-    "pending review" is the whole queue, not one table.
+  * Needs review — the review QUEUE is non-empty. §17 defines the whole
+    queue, and every one of its pending states counts: merge candidates
+    ``status IN ('pending','deferred')`` (defer 仍列入待審), proposed
+    ontology types (``ontology_proposals.status='proposed'``, the §6 待審
+    池), and entity/relation rows parked at ``status='needs_review'``.
+    Any one of them non-empty lights Needs review — "pending review" is the
+    whole §17 queue, not one table.
 - **Metrics** are point-in-time counts, active-build-scoped where the metric
   is about content (docs/chunks/entities/relations), project-scoped where it
   is about workflow (builds, pending review). ``low_confidence_relations``
@@ -155,7 +158,8 @@ async def health_report(
             .select_from(tables.merge_candidates)
             .where(
                 tables.merge_candidates.c.project == project,
-                tables.merge_candidates.c.status == "pending",
+                # defer 仍列入待審 (§17) — deferred is still review work
+                tables.merge_candidates.c.status.in_(("pending", "deferred")),
             ),
         ),
         "pending_ontology_proposals": await _count(
@@ -167,11 +171,33 @@ async def health_report(
                 tables.ontology_proposals.c.status == "proposed",
             ),
         ),
+        "needs_review_entities": await _count(
+            conn,
+            sa.select(sa.func.count())
+            .select_from(tables.entities)
+            .where(
+                tables.entities.c.project == project,
+                tables.entities.c.status == "needs_review",
+            ),
+        ),
+        "needs_review_relations": await _count(
+            conn,
+            sa.select(sa.func.count())
+            .select_from(tables.relations)
+            .where(
+                tables.relations.c.project == project,
+                tables.relations.c.status == "needs_review",
+            ),
+        ),
     }
-    # §19's "pending review" is the WHOLE queue — either table alone must
-    # light Needs review (Codex round 4: a proposal-only backlog was hidden)
+    # §19's "pending review" is the WHOLE §17 queue — ANY of its pending
+    # states alone must light Needs review (Codex rounds 4/8: a
+    # proposal-only or needs_review-only backlog was hidden)
     metrics["pending_review"] = (
-        metrics["pending_merge_candidates"] + metrics["pending_ontology_proposals"]
+        metrics["pending_merge_candidates"]
+        + metrics["pending_ontology_proposals"]
+        + metrics["needs_review_entities"]
+        + metrics["needs_review_relations"]
     )
     if active is not None:
         scope_e = [e.c.project == project, e.c.build_id == active.id, e.c.status == "active"]
