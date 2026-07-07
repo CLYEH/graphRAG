@@ -36,7 +36,12 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
    - LLM/embeddings via `core.config`, never `os.environ` directly.
 3. **Tests** — the change lands with tests for its tier (unit/contract/integration/
    e2e per docs/LOOP.md), and tests encode *why* the behavior matters, not just that
-   it runs. Missing meaningful tests = FAIL.
+   it runs. Missing meaningful tests = FAIL. A live-DB/service test in a file that
+   marks integration PER-TEST (no module-level `pytestmark`) MUST carry its own
+   `@pytest.mark.integration` — else the fast-coverage gate silently runs it (it
+   passes locally because services are up) but the CI backend job (no services)
+   goes red (BA2c-1). Check any new live-infra test is deselected by
+   `-m 'not integration'`.
 4. **Scope** — surgical: every changed line traces to the task; no unrelated refactors,
    no dead code, no debug leftovers.
 5. **Design alignment** — matches the relevant DESIGN.md section; if it diverges,
@@ -122,6 +127,35 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      fix removed (BA2a: a first-version lock test was false-green this way;
      pause inside the window — e.g. monkeypatch the count to block after the
      lock, before the delete — then probe). Always revert-probe a lock test.
+     A race test can ALSO be false-green by never REACHING the guard: if a
+     concurrent writer's own precheck short-circuits before the guarded
+     statement runs, the test passes without exercising the fix (BA2c-1: a
+     racing `request_cancel` read `done` and its Python status-check skipped the
+     UPDATE, so the WHERE-guard was never hit). Force the exact interleaving
+     deterministically (feed the writer a stale snapshot so it reaches the
+     guarded write against the changed row) — timing-based "create_task then
+     release" does not guarantee the window.
+   - **A multi-commit orchestrator is a TOCTOU/crash-window factory**: a
+     control-flow function that spreads one logical operation across N separate
+     transactions/connections (create, attach, mark-running, per-step, recheck,
+     terminalize, record, finalize) has a crash-or-race window at EVERY commit
+     boundary. Reviewing (and writing) one, walk each boundary and ask "a crash
+     here, or a concurrent op here — what breaks?" up front — else the windows
+     get found one per review round (BA2c-1: 4 of the 7 findings, across rounds
+     1–4 of 5, were exactly
+     this — create+attach split → orphan build; build-terminal+job-finalize
+     split → job stuck `running` on a terminal build; cross-connection cancel
+     read → accepted-but-ignored limbo). Fixes: fold related state transitions
+     into ONE transaction; decide under the row lock that also serializes the
+     racing writer; record-in-txn (an in-txn variant of a loaned-clean recorder)
+     so run+build+job commit atomically. A cross-connection signal read (read a
+     flag on conn A, act on conn B) is inherently racy — the decisive read must
+     be under the same lock as the action, and the racing writer's UPDATE must
+     be status-guarded (`WHERE status IN active`) so a lost race no-ops. This is
+     class-10 at the state-machine level (cf. C9's operation×state×interleaving
+     matrix, #38) — the prevention (enumerate the boundaries/matrix before first
+     push) has now recurred three times (#37 request lifecycle, #38 lifecycle
+     state machine, BA2c-1 execution state machine).
    - **A new domain error's completeness face is the function's callers, not
      your diff**: adding an exception to a SHARED function (one an existing HTTP
      entry already calls) pulls in EVERY caller's translation/handling — trace
