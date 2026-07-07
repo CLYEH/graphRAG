@@ -130,7 +130,10 @@ async def list_builds(conn: AsyncConnection, project: str) -> list[BuildInfo]:
             tables.builds.c.activated_at,
         )
         .where(tables.builds.c.project == project)
-        .order_by(sa.desc(sa.func.coalesce(tables.builds.c.started_at, sa.func.now())))
+        # NULLS LAST: a never-started row sorts OLDEST — coalescing to now()
+        # made it outrank every real timestamp (same class as the health
+        # eval-candidate ordering, swept in the same pass)
+        .order_by(sa.desc(tables.builds.c.started_at).nulls_last())
     )
     return [BuildInfo(*row) for row in rows]
 

@@ -165,6 +165,17 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
             report = await health_report(conn, qdrant, session, project)
             assert report.status == "Build failed"
             assert report.metrics["last_failed_build"] is not None
+
+            # NULLS LAST for `newest` too (Codex round 6): a later
+            # never-started 'building' row must NOT outrank the real failed
+            # build via coalesce(now()). With NULLS LAST the failed build
+            # stays newest → the light stays "Build failed".
+            await conn.execute(
+                tables.builds.insert().values(project=project, status="building", started_at=None)
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Build failed"
     finally:
         await qdrant.close()
         await driver.close()
@@ -210,6 +221,30 @@ async def test_eval_regression_light_needs_comparable_reports(project: str) -> N
             await conn.commit()
             report = await health_report(conn, qdrant, session, project)
             assert report.status == "Healthy"
+
+            # NULLS LAST discriminator (Codex round 6): a NEVER-STARTED ready
+            # build must sort OLDEST, not newest. Restore the comparable
+            # fingerprint on the real regressing candidate, then add a
+            # started_at=NULL non-regressing ready build. Under coalesce(now())
+            # the null row would outrank the real one and hide the
+            # regression; NULLS LAST keeps the regressing candidate on top so
+            # the light stays lit.
+            await conn.execute(
+                tables.builds.update()
+                .where(tables.builds.c.project == project, tables.builds.c.status == "ready")
+                .values(eval={"score": 0.5, "failed": 0, "fingerprint": "fp"})
+            )
+            await conn.execute(
+                tables.builds.insert().values(
+                    project=project,
+                    status="ready",
+                    started_at=None,  # never started — must sort OLDEST
+                    eval={"score": 0.95, "failed": 0, "fingerprint": "fp"},
+                )
+            )
+            await conn.commit()
+            report = await health_report(conn, qdrant, session, project)
+            assert report.status == "Eval regression"  # real regressing row still picked
     finally:
         await qdrant.close()
         await driver.close()

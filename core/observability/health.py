@@ -13,6 +13,12 @@ SEMANTICS (spec-first — the judge-surface lesson):
     the check is lifecycle's own ``drift_failures`` (ONE checker for
     preflight and Health — a fork here is the class-5 checker/consumer
     split). No active build → the check is skipped, never counted as drift.
+    The probe touches Neo4j/Qdrant, so it is (1) SKIPPED entirely when the
+    newest build already failed — Build failed outranks drift, and the
+    operator's answer must not depend on a projection store being up — and
+    (2) degraded to a STORE_UNAVAILABLE warning when a store raises: an
+    unreachable store is UNMEASURED drift, not drift (the same
+    only-report-measured-facts rule the eval light follows).
   * Eval regression — §20 verbatim: the newest READY build's eval score
     regresses vs the active's, on COMPARABLE reports (same fingerprint —
     incomparable or unscored is NOT a regression light; the activation gate
@@ -41,13 +47,19 @@ from typing import Any
 
 import sqlalchemy as sa
 from neo4j import AsyncSession
+from neo4j.exceptions import DriverError, Neo4jError
 from qdrant_client import AsyncQdrantClient
+from qdrant_client.http.exceptions import ApiException
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.builds.lifecycle import drift_failures, list_builds
 from core.config import get_settings
 from core.eval.spec import is_eval_regression
 from core.stores import tables
+
+#: what the drift probe can raise per store (mirrors the MCP layer's
+#: _STORE_ERRORS): unreachable = unmeasured, degraded to a warning.
+_PROBE_ERRORS = (Neo4jError, DriverError, ApiException)
 
 STATUS_LIGHTS = (
     "Build failed",
@@ -76,6 +88,7 @@ class HealthReport:
     active_build_id: uuid.UUID | None
     drift: tuple[str, ...]
     metrics: dict[str, Any]
+    warnings: tuple[str, ...] = ()
 
     def to_payload(self) -> dict[str, Any]:
         """The FROZEN HealthReport contract shape (openapi.yaml): status is
@@ -93,6 +106,9 @@ class HealthReport:
                 for key, value in self.metrics.items()
                 if isinstance(value, int) and key != "pending_review"
             },
+            "warnings": [
+                {"code": "STORE_UNAVAILABLE", "message": message} for message in self.warnings
+            ],
             "metrics": self.metrics,
         }
 
@@ -115,9 +131,18 @@ async def health_report(
     newest = builds[0] if builds else None
     last_failed = next((b for b in builds if b.status == "failed"), None)
 
+    newest_failed = newest is not None and newest.status == "failed"
     drift: tuple[str, ...] = ()
-    if active is not None:
-        drift = tuple(await drift_failures(conn, qdrant, graph_session, project, active.id))
+    warnings: tuple[str, ...] = ()
+    if active is not None and not newest_failed:
+        # skipped when Build failed already wins: the operator's answer must
+        # not depend on Neo4j/Qdrant being reachable (Codex round 6)
+        try:
+            drift = tuple(await drift_failures(conn, qdrant, graph_session, project, active.id))
+        except _PROBE_ERRORS as exc:
+            # unreachable store = UNMEASURED drift, not drift — degrade to
+            # the frozen STORE_UNAVAILABLE warning instead of a 500
+            warnings = (f"drift check unavailable: {exc.__class__.__name__}",)
 
     e, r, ev = tables.entities, tables.relations, tables.relation_evidence
     metrics: dict[str, Any] = {
@@ -197,7 +222,7 @@ async def health_report(
             }
 
     status = status_light(
-        newest_failed=newest is not None and newest.status == "failed",
+        newest_failed=newest_failed,
         drift=bool(drift),
         eval_regressed=active is not None and await _eval_regressed(conn, project, active.id),
         pending_review=metrics["pending_review"] > 0,
@@ -209,6 +234,7 @@ async def health_report(
         active_build_id=active.id if active else None,
         drift=drift,
         metrics=metrics,
+        warnings=warnings,
     )
 
 
@@ -237,7 +263,10 @@ async def _eval_regressed(conn: AsyncConnection, project: str, active_id: uuid.U
         await conn.execute(
             sa.select(tables.builds.c.id, tables.builds.c.eval)
             .where(tables.builds.c.project == project, tables.builds.c.status == "ready")
-            .order_by(sa.desc(sa.func.coalesce(tables.builds.c.started_at, sa.func.now())))
+            # NULLS LAST: a never-started row must sort OLDEST — coalesce to
+            # now() made it outrank every real timestamp and hide a newer
+            # regressing candidate (Codex round 6)
+            .order_by(sa.desc(tables.builds.c.started_at).nulls_last())
             .limit(1)
         )
     ).one_or_none()

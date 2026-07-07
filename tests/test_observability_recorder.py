@@ -488,6 +488,78 @@ async def test_eval_regressed_cells_on_fakes() -> None:
     assert healthy["status"] == "healthy" and healthy["drift"] is None
 
 
+async def test_drift_probe_degrades_and_failed_build_short_circuits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round 6: /health must answer from Postgres alone when the
+    newest build failed (no store probe at all), and a raising probe on the
+    healthy path degrades to a STORE_UNAVAILABLE warning, never a 500."""
+    import uuid as _uuid
+    from typing import Any, cast
+
+    from neo4j.exceptions import ServiceUnavailable
+
+    from core.observability import health as health_module
+    from core.observability.health import health_report
+
+    active_id, failed_id = _uuid.uuid4(), _uuid.uuid4()
+
+    def _rows(build_rows: list[Any]) -> Any:
+        class _Result:
+            def __iter__(self) -> Any:
+                return iter(build_rows)
+
+            def scalar_one(self) -> int:
+                return 0
+
+            def scalar_one_or_none(self) -> Any:
+                return None
+
+            def one_or_none(self) -> Any:
+                return None
+
+        return _Result()
+
+    class _Conn:
+        def __init__(self, build_rows: list[Any]) -> None:
+            self._build_rows = build_rows
+            self.calls = 0
+
+        async def execute(self, statement: Any) -> Any:
+            self.calls += 1
+            return _rows(self._build_rows if self.calls == 1 else [])
+
+    def _build(bid: Any, status: str) -> Any:
+        return (bid, status, None, None, None)
+
+    async def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise ServiceUnavailable("neo4j down")
+
+    monkeypatch.setattr(health_module, "drift_failures", _boom)
+    # newest failed + active exists: the probe is SKIPPED entirely — a
+    # raising probe would fail this test if it were called
+    report = await health_report(
+        cast(Any, _Conn([_build(failed_id, "failed"), _build(active_id, "active")])),
+        cast(Any, None),
+        cast(Any, None),
+        "p",
+    )
+    assert report.status == "Build failed"
+    assert report.warnings == ()
+
+    # healthy path with the store down: degraded warning, light honest
+    report = await health_report(
+        cast(Any, _Conn([_build(active_id, "active")])),
+        cast(Any, None),
+        cast(Any, None),
+        "p",
+    )
+    assert report.status == "Healthy"
+    assert report.warnings and "drift check unavailable" in report.warnings[0]
+    payload = report.to_payload()
+    assert payload["warnings"] == [{"code": "STORE_UNAVAILABLE", "message": report.warnings[0]}]
+
+
 async def test_health_report_shape_without_an_active_build_on_fakes() -> None:
     """No builds at all: Healthy, workflow metrics only (content metrics are
     active-scoped and absent), drift skipped — the report never guesses."""
