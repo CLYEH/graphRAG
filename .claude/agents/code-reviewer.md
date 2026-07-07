@@ -103,7 +103,19 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      writer validated as `building` at bind time kept writing after activation;
      fixed with `INSERT..SELECT..WHERE EXISTS(status='building' FOR SHARE)`. A
      plain recheck still races an uncommitted change — MVCC readers don't block
-     writers.)
+     writers.) A lock/TOCTOU test must probe DURING the exact window the fix
+     protects, not after the operation returns — a later incidental lock (e.g.
+     the DELETE's own row lock) masks the bug and the test passes even with the
+     fix removed (BA2a: a first-version lock test was false-green this way;
+     pause inside the window — e.g. monkeypatch the count to block after the
+     lock, before the delete — then probe). Always revert-probe a lock test.
+   - **A new domain error's completeness face is the function's callers, not
+     your diff**: adding an exception to a SHARED function (one an existing HTTP
+     entry already calls) pulls in EVERY caller's translation/handling — trace
+     it to each consumer's error mapping or it falls through to a 500 (BA2a: a
+     new delete guard with no `translate_registry_error` case became a
+     client-triggerable 500). "This slice has no HTTP" is wrong if the function
+     you touched is HTTP-consumed.
    - **Per-surface inventory (transfer ≠ sweep)**: a boundary module's NEW
      surfaces get their own catalog pass — C1c (surfaces 1:1 with C1b) took 0
      Codex rounds while C1d (new surfaces) took 4, every finding a cataloged
