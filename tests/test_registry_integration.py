@@ -40,6 +40,7 @@ from core.stores.tables import (
     review_ledger,
     sources,
 )
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -58,21 +59,6 @@ def _engine() -> AsyncEngine:
 
 def _proj() -> str:
     return f"itest-{uuid.uuid4().hex[:10]}"
-
-
-# Mirrors the backfill in migration 0007 (the offline-DDL unit test pins that
-# the migration itself contains it; this drives the SQL's behavior live).
-_BACKFILL_SQL = """
-INSERT INTO projects (name)
-SELECT DISTINCT project FROM (
-    SELECT project FROM builds
-    UNION SELECT project FROM review_ledger
-    UNION SELECT project FROM ontology_proposals
-    UNION SELECT project FROM pipeline_runs
-) AS existing
-WHERE project <> ''
-ON CONFLICT (name) DO NOTHING
-"""
 
 
 async def test_create_get_roundtrip_and_duplicate(migrated: None) -> None:
@@ -125,32 +111,34 @@ async def test_update_patch_null_vs_omitted(migrated: None) -> None:
 
 
 async def test_list_projects_keyset_pagination(migrated: None) -> None:
+    """Keyset pagination must not skip or duplicate a row across the page
+    boundary. Self-relative: the three projects are pinned to the newest
+    created_at so they lead the (created_at desc) order regardless of any rows
+    other committing integration tests left in the shared dev DB — the test
+    asserts pagination over ITS three, not that the table is otherwise empty."""
     engine = _engine()
     names = sorted(_proj() for _ in range(3))
     try:
         async with engine.connect() as conn:
             trans = await conn.begin()
-            # force a deterministic created_at order (else same-now() rows tie
-            # only on name); insert oldest→newest a second apart
+            # far-future created_at, a second apart, so these three are the newest
+            # rows (created_at desc) whatever else is committed; i=2 is newest
             for i, n in enumerate(names):
                 await create_project(conn, name=n)
                 await conn.execute(
                     sa.text(
-                        "UPDATE projects SET created_at = now() + make_interval(secs => :s) "
-                        "WHERE name = :n"
+                        "UPDATE projects SET created_at = now() + "
+                        "make_interval(days => 3650, secs => :s) WHERE name = :n"
                     ),
                     {"s": i, "n": n},
                 )
             page1, after1 = await list_projects(conn, limit=2)
-            assert len(page1) == 2
-            assert after1 is not None  # a third row remains
-            page2, after2 = await list_projects(conn, limit=2, after=after1)
-            assert len(page2) == 1
-            assert after2 is None  # last page
-
-            seen = [p.name for p in page1 + page2]
-            assert set(seen) >= set(names)  # every inserted project surfaced once
-            assert len(seen) == len(set(seen))  # no row repeated across pages
+            assert after1 is not None  # more rows remain (our 3rd + any leaked)
+            page2, _ = await list_projects(conn, limit=2, after=after1)
+            # our three lead in created_at-desc order (newest i=2 → i=0); the 3rd
+            # must follow contiguously across the limit=2 boundary, no skip/dupe
+            ours = [p.name for p in page1] + [page2[0].name]
+            assert ours == list(reversed(names))
             await trans.rollback()
     finally:
         await engine.dispose()
@@ -252,26 +240,6 @@ async def test_delete_project_cascades_sources(migrated: None) -> None:
         await engine.dispose()
 
 
-async def test_backfill_registers_projects_from_existing_tables(migrated: None) -> None:
-    """A project that exists only through a pre-registry build (no projects row)
-    must be registered by the backfill — else it's invisible to list/get while
-    active_build_id() still resolves its build, and a same-name create looks
-    new. Drives the migration's backfill SQL against a build with no projects
-    row."""
-    engine = _engine()
-    name = _proj()
-    try:
-        async with engine.connect() as conn:
-            trans = await conn.begin()
-            await conn.execute(builds.insert().values(project=name, status="ready"))
-            assert await get_project(conn, name) is None  # not registered yet
-            await conn.execute(sa.text(_BACKFILL_SQL))
-            assert await get_project(conn, name) is not None  # backfill registered it
-            await trans.rollback()
-    finally:
-        await engine.dispose()
-
-
 async def test_delete_project_purges_carryforward_state(migrated: None) -> None:
     """review_ledger / ontology_proposals / pipeline_runs are project-keyed
     with no FK to projects and carry forward across rebuilds by design — on a
@@ -329,6 +297,7 @@ async def test_delete_project_refuses_while_builds_exist(migrated: None) -> None
         async with engine.connect() as conn:
             trans = await conn.begin()
             await create_project(conn, name=name)
+            await ensure_project(conn, name)
             await conn.execute(builds.insert().values(project=name, status="ready"))
 
             with pytest.raises(ProjectHasBuildsError):

@@ -24,6 +24,7 @@ from api.app import create_app
 from api.deps import db_conn
 from core.config import get_settings
 from core.stores.tables import builds, idempotency_keys, jobs
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -251,6 +252,7 @@ async def test_error_mappings(api: tuple[AsyncClient, AsyncConnection]) -> None:
     assert dup.json()["error"]["details"]["name"] == name
 
     # delete a project that has a build → refused, mapped to VALIDATION_ERROR
+    await ensure_project(conn, name)
     await conn.execute(builds.insert().values(project=name, status="ready"))
     blocked = await client.delete(f"/projects/{name}")
     assert blocked.status_code == 400

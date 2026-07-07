@@ -33,6 +33,7 @@ from core.stores.graph import graph_driver
 from core.stores.repo import BuildScopedWriter
 from core.stores.tables import builds, entities
 from core.stores.vectors import vector_client
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -89,6 +90,7 @@ async def context(migrated: None) -> AsyncIterator[ProjectContext]:
 async def _activate_build(project: str, *, entity_name: str) -> uuid.UUID:
     engine = _engine()
     async with engine.connect() as conn:
+        await ensure_project(conn, project)
         build_id: uuid.UUID = (
             await conn.execute(
                 builds.insert().values(project=project, status="building").returning(builds.c.id)

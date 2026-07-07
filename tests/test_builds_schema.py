@@ -26,7 +26,7 @@ def _alembic_config() -> Config:
 
 def test_migration_chain_has_a_single_head() -> None:
     heads = ScriptDirectory.from_config(_alembic_config()).get_heads()
-    assert heads == ["0009_jobs"]
+    assert heads == ["0010_builds_project_fk"]
 
 
 def test_builds_columns_match_design_spec() -> None:
@@ -66,6 +66,17 @@ def test_one_active_build_is_a_partial_unique_index() -> None:
     assert str(where) == "status = 'active'"
 
 
+def test_builds_project_fk_restricts_deletion() -> None:
+    """BA2b: builds.project → projects.name RESTRICT — a build can't exist
+    without its project, and a project with builds can't be deleted (the DB
+    backstop under delete_project). RESTRICT, never CASCADE (a project delete
+    must go through the multi-store build sweep)."""
+    fks = list(builds.c.project.foreign_keys)
+    assert len(fks) == 1
+    assert fks[0].column.table.name == "projects"
+    assert fks[0].ondelete == "RESTRICT"
+
+
 def test_offline_upgrade_sql_creates_the_partial_index(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -78,3 +89,9 @@ def test_offline_upgrade_sql_creates_the_partial_index(
     assert "CREATE UNIQUE INDEX one_active_build ON builds (project)" in ddl
     assert "WHERE status = 'active'" in ddl
     assert "CHECK (status IN ('building','ready','active','failed','archived'))" in ddl
+    # the FK is added by a later migration (0010) via ALTER TABLE, not in the
+    # CREATE — assert the RESTRICT FK + its supporting index render so a
+    # dropped-FK/index migration is caught
+    assert "ADD CONSTRAINT builds_project_fkey FOREIGN KEY(project)" in ddl
+    assert "REFERENCES projects (name) ON DELETE RESTRICT" in ddl
+    assert "CREATE INDEX builds_by_project ON builds (project)" in ddl

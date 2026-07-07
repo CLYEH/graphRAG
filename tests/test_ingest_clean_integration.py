@@ -24,6 +24,7 @@ from core.ingest.connectors import DocumentPayload
 from core.ingest.documents import ingest_documents
 from core.stores.repo import BuildScopedWriter
 from core.stores.tables import builds, chunks, documents
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -41,6 +42,7 @@ def _engine() -> AsyncEngine:
 
 
 async def _building_writer(conn: AsyncConnection, project: str) -> BuildScopedWriter:
+    await ensure_project(conn, project)
     build_id: uuid.UUID = (
         await conn.execute(
             builds.insert().values(project=project, status="building").returning(builds.c.id)

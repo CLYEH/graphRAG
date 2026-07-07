@@ -37,6 +37,7 @@ from core.query.sql_guard import ValidatedSql
 from core.stores.repo import BuildScopedWriter
 from core.stores.sqlreader import BuildScopedSqlReader
 from core.stores.tables import STRUCTURED_MIME, builds, documents
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -89,6 +90,7 @@ async def conn(migrated: None) -> AsyncIterator[AsyncConnection]:
 
 
 async def _new_build(connection: AsyncConnection, project: str) -> BuildScopedWriter:
+    await ensure_project(connection, project)
     build_id: uuid.UUID = (
         await connection.execute(
             builds.insert().values(project=project, status="building").returning(builds.c.id)

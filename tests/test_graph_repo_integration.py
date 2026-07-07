@@ -30,6 +30,7 @@ from core.stores.graph import (
 )
 from core.stores.repo import BuildNotWritableError, NoActiveBuildError
 from core.stores.tables import builds
+from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -62,6 +63,7 @@ async def graph_session(migrated: None) -> AsyncIterator[AsyncSession]:
 
 
 async def _insert_build(conn: AsyncConnection, project: str, status: str) -> uuid.UUID:
+    await ensure_project(conn, project)
     build_id: uuid.UUID = (
         await conn.execute(
             builds.insert().values(project=project, status=status).returning(builds.c.id)

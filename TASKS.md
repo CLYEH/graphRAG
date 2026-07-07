@@ -65,9 +65,10 @@ Keep items small enough to finish in one loop.
 - [x] BA1a projects/sources registry — schema + core CRUD
 - [x] BA1b projects/sources endpoints — routers + idempotency + opaque cursor
 - [x] BA2a jobs table + core job repo + delete-project active-jobs guard
-- [ ] BA2b build/ingest pipeline orchestrator + builds→projects FK (registry-aware build creation)
-- [ ] BA2c arq worker + Redis wiring
-- [ ] BA2d ingest/build triggers + job endpoints + SSE
+- [x] BA2b builds→projects FK RESTRICT + fixture sweep (close the delete TOCTOU structurally)
+- [ ] BA2c build/ingest pipeline orchestrator (chains C1–C11) + registry-aware build creation
+- [ ] BA2d arq worker + Redis wiring
+- [ ] BA2e ingest/build triggers + job endpoints + SSE
 - [ ] BA3 inspection endpoints (docs/chunks/entities/relations/subgraph/reports)
 - [ ] BA4 cleaning preview/rules
 - [ ] BA5 merge-candidate review endpoints
