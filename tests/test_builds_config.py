@@ -234,6 +234,15 @@ def test_unknown_top_level_keys_are_ignored() -> None:
     assert (cfg.chunk_max_chars, cfg.chunk_overlap) == (500, 50)
 
 
+@pytest.mark.parametrize("block", ["ontology", "structured_mappings", "resolution", "chunking"])
+def test_explicit_null_block_is_rejected_not_defaulted(block: str) -> None:
+    # {"ontology": null} is PRESENT-but-malformed, not the same as omitting it —
+    # an explicit null must fail loud, never silently take the absent-default
+    # (the per-field-nullability lesson: omitted and null must not collapse).
+    with pytest.raises(BuildConfigError, match=f"{block} must be an object, got NoneType"):
+        load_build_config({block: None})
+
+
 def test_non_object_config_is_rejected() -> None:
     with pytest.raises(BuildConfigError, match="config must be an object"):
         load_build_config([])  # type: ignore[arg-type]

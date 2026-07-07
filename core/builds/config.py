@@ -45,7 +45,10 @@ Example ``projects.config`` shape (documented here, not schema-frozen)::
 
 An absent block takes its documented default; a PRESENT-but-malformed block
 fails loud — an omitted key and a broken key must never collapse to the same
-behavior (the per-field-nullability lesson). The ``chunking`` numeric relation
+behavior (the per-field-nullability lesson). An explicit ``null`` for a known
+block (``{"ontology": null}``) is malformed, not the default: ``null`` is not a
+valid block, so it raises — omit the key to take the default (or, for
+``ontology``, to declare no ontology). The ``chunking`` numeric relation
 (``0 <= overlap < max_chars``) is deliberately NOT re-validated here — only the
 leaf types are — so the rule stays owned by ``chunk_text`` alone; a violation
 surfaces (loud) when the clean stage runs.
@@ -141,10 +144,9 @@ def _construct[T](path: str, build: Callable[[], T]) -> T:
 
 
 def _load_ontology(raw: Mapping[str, Any]) -> tuple[TextOntology | None, str]:
-    block = raw.get("ontology")
-    if block is None:
+    if "ontology" not in raw:  # omitted → no ontology; explicit null → _mapping rejects it
         return None, _DEFAULT_PROPOSAL_POLICY
-    block = _mapping(block, "ontology")
+    block = _mapping(raw["ontology"], "ontology")
     policy = _DEFAULT_PROPOSAL_POLICY
     if "proposal_policy" in block:
         policy = _str(block["proposal_policy"], "ontology.proposal_policy")
@@ -224,20 +226,18 @@ def _load_structured_mapping(table: str, raw: Any, path: str) -> StructuredMappi
 
 
 def _load_structured_mappings(raw: Mapping[str, Any]) -> dict[str, StructuredMapping]:
-    block = raw.get("structured_mappings")
-    if block is None:
+    if "structured_mappings" not in raw:  # omitted → none; explicit null → rejected
         return {}
     return {
         table: _load_structured_mapping(table, mapping, f"structured_mappings.{table}")
-        for table, mapping in _mapping(block, "structured_mappings").items()
+        for table, mapping in _mapping(raw["structured_mappings"], "structured_mappings").items()
     }
 
 
 def _load_resolution(raw: Mapping[str, Any]) -> ResolutionConfig:
-    block = raw.get("resolution")
-    if block is None:
+    if "resolution" not in raw:  # omitted → defaults; explicit null → rejected
         return ResolutionConfig()
-    block = _mapping(block, "resolution")
+    block = _mapping(raw["resolution"], "resolution")
     kwargs: dict[str, Any] = {}
     for key in ("auto_merge_threshold", "review_threshold", "embedding_weight"):
         if key in block:
@@ -248,10 +248,9 @@ def _load_resolution(raw: Mapping[str, Any]) -> ResolutionConfig:
 
 
 def _load_chunking(raw: Mapping[str, Any]) -> tuple[int, int]:
-    block = raw.get("chunking")
-    if block is None:
+    if "chunking" not in raw:  # omitted → defaults; explicit null → rejected
         return DEFAULT_MAX_CHARS, DEFAULT_OVERLAP
-    block = _mapping(block, "chunking")
+    block = _mapping(raw["chunking"], "chunking")
     max_chars = (
         _int(block["max_chars"], "chunking.max_chars")
         if "max_chars" in block
