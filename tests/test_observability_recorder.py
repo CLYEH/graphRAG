@@ -328,6 +328,70 @@ async def test_record_run_persists_three_layers_with_verbosity(project: str) -> 
         await engine.dispose()
 
 
+@pytest.mark.integration
+async def test_failed_override_rolls_run_status_to_the_caller_outcome(project: str) -> None:
+    """A build run's status rolls up to the caller's BUILD outcome, not raw
+    item-failure: §22 tolerates under-threshold item failures, so a ready
+    build's run must read 'done' though a step recorded a failed item — a
+    'failed' run on a ready build would mislead §18 Health. ``failed=`` overrides
+    the inference both ways; the failed item's STEP still reads 'failed' (detail
+    preserved)."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            await ensure_project(conn, project)
+            build_id: uuid.UUID = (
+                await conn.execute(
+                    tables.builds.insert()
+                    .values(project=project, status="building")
+                    .returning(tables.builds.c.id)
+                )
+            ).scalar_one()
+            await conn.commit()
+
+            # a failed item, but the caller (under §22 threshold) says not failed
+            tolerated = await record_run(
+                conn,
+                project,
+                build_id,
+                "ingest",
+                [StepReport("chunk", (ItemOutcome("document", "bad", "failed"),))],
+                failed=False,
+            )
+            # a clean run the caller forces failed (e.g. a §22 abort with no item rows)
+            forced = await record_run(
+                conn,
+                project,
+                build_id,
+                "ingest",
+                [StepReport("chunk", (ItemOutcome("document", "ok", "indexed"),))],
+                failed=True,
+            )
+            statuses = {
+                row.id: row.status
+                for row in (
+                    await conn.execute(
+                        sa.select(tables.pipeline_runs.c.id, tables.pipeline_runs.c.status).where(
+                            tables.pipeline_runs.c.id.in_([tolerated, forced])
+                        )
+                    )
+                ).all()
+            }
+            assert statuses[tolerated] == "done"  # override suppressed the failed-item inference
+            assert statuses[forced] == "failed"  # override forced failed on a clean run
+            step_status = (
+                await conn.execute(
+                    sa.select(tables.pipeline_steps.c.status).where(
+                        tables.pipeline_steps.c.run_id == tolerated
+                    )
+                )
+            ).scalar_one()
+            assert step_status == "failed"  # the item failure is still recorded at the step
+            await conn.rollback()
+    finally:
+        await engine.dispose()
+
+
 def test_contract_status_map_is_lockstep_with_the_lights() -> None:
     """A sixth light without a contract mapping would KeyError at report
     time — the map must stay total over STATUS_LIGHTS (reviewer nit)."""

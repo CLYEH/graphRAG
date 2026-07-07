@@ -230,8 +230,15 @@ class _Spy:
         *,
         error: str | None = None,
         cancelled: bool = False,
+        failed: bool | None = None,
     ) -> uuid.UUID:
-        self.recorded = {"steps": steps, "error": error, "cancelled": cancelled, "kind": kind}
+        self.recorded = {
+            "steps": steps,
+            "error": error,
+            "cancelled": cancelled,
+            "failed": failed,
+            "kind": kind,
+        }
         return _RUN_ID
 
 

@@ -168,6 +168,19 @@ async def _run_status(engine: AsyncEngine, run_id: uuid.UUID) -> str:
     return str(status)
 
 
+async def _step_status(engine: AsyncEngine, run_id: uuid.UUID, step_name: str) -> str:
+    async with engine.connect() as conn:
+        status = (
+            await conn.execute(
+                sa.select(tables.pipeline_steps.c.status).where(
+                    tables.pipeline_steps.c.run_id == run_id,
+                    tables.pipeline_steps.c.step_name == step_name,
+                )
+            )
+        ).scalar_one()
+    return str(status)
+
+
 def test_stage_order_is_the_frozen_design_5_sequence() -> None:
     """§5: ingest → clean → graph → resolve → index → summarize. Pinned so a
     reordering (which would corrupt every build) fails loudly here."""
@@ -295,6 +308,10 @@ async def test_a_step_under_the_failure_ratio_does_not_abort(migrated: None) -> 
 
         assert outcome.status == "ready"
         assert calls == list(_STAGE_ORDER)
+        # the run rolls up to the BUILD outcome: a ready build's run reads 'done'
+        # even though the graph STEP recorded a failed item (kept for §18 detail)
+        assert await _run_status(engine, outcome.run_id) == "done"
+        assert await _step_status(engine, outcome.run_id, "graph") == "failed"
     finally:
         await _cleanup(engine, project)
         await engine.dispose()

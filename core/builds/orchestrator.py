@@ -253,6 +253,11 @@ async def run_build(
             step_reports,
             error=error,
             cancelled=cancelled,
+            # the run rolls up to the BUILD outcome, not raw item-failure: §22
+            # tolerates under-threshold item failures, so a ready build's run
+            # reads 'done' (a 'failed' run on a ready build would mislead §18
+            # Health). The failed items + their 'failed' steps are still recorded.
+            failed=error is not None,
         )
         await conn.execute(
             tables.builds.update()

@@ -106,6 +106,7 @@ async def record_run(
     created_by: str = "pipeline",
     error: str | None = None,
     cancelled: bool = False,
+    failed: bool | None = None,
 ) -> uuid.UUID:
     """Persist one run with its steps and (verbosity-filtered) items.
 
@@ -118,6 +119,16 @@ async def record_run(
     failed/done inference — a cooperatively-cancelled build (BA2c) stopped
     between steps is neither a failure nor a clean completion; the steps that
     DID run are still recorded truthfully.
+
+    ``failed`` overrides the failed/done inference when the caller owns a
+    higher-level notion of success than "any item failed". A BA2c build run
+    passes ``failed=<did the §22 threshold abort>``: under-threshold item
+    failures are TOLERATED, so the build reaches ``ready`` and its run must read
+    ``'done'`` to match — a ``'failed'`` run on a ``ready`` build would mislead
+    §18 Health. The failed items are still recorded (and their steps still read
+    ``'failed'``); only the run-level roll-up follows the build outcome. Left
+    ``None`` (the default), the run is inferred ``'failed'`` iff there is an
+    error or any failed item.
 
     LOANED-CLEAN connection (the C6b idiom): the caller must hand a
     connection with NO open transaction — rolling one back here would
@@ -143,6 +154,7 @@ async def record_run(
             created_by=created_by,
             error=error,
             cancelled=cancelled,
+            failed=failed,
         )
 
 
@@ -157,6 +169,7 @@ async def record_run_in_txn(
     created_by: str = "pipeline",
     error: str | None = None,
     cancelled: bool = False,
+    failed: bool | None = None,
 ) -> uuid.UUID:
     """Record one run inside the CALLER's already-open transaction — the same
     inserts as :func:`record_run` but without opening (or requiring the absence
@@ -172,8 +185,11 @@ async def record_run_in_txn(
     if verbosity not in ITEM_LOGGING_MODES:
         verbosity = "failures"  # fail-closed to the frozen minimum
     now = datetime.now(tz=UTC)
-    run_failed = error is not None or any(
-        any(o.status == "failed" for o in step.outcomes) for step in steps
+    run_failed = (
+        failed
+        if failed is not None
+        else error is not None
+        or any(any(o.status == "failed" for o in step.outcomes) for step in steps)
     )
     run_status = "cancelled" if cancelled else ("failed" if run_failed else "done")
     if build_id is not None:
@@ -215,16 +231,16 @@ async def record_run_in_txn(
         )
     ).scalar_one()
     for step in steps:
-        failed = sum(1 for o in step.outcomes if o.status == "failed")
+        step_failed = sum(1 for o in step.outcomes if o.status == "failed")
         skipped = sum(1 for o in step.outcomes if o.status == "skipped")
-        output = len(step.outcomes) - failed - skipped
+        output = len(step.outcomes) - step_failed - skipped
         step_id: uuid.UUID = (
             await conn.execute(
                 tables.pipeline_steps.insert()
                 .values(
                     run_id=run_id,
                     step_name=step.step_name,
-                    status="failed" if failed else "done",
+                    status="failed" if step_failed else "done",
                     started_at=now,
                     finished_at=now,
                     input_count=(
@@ -232,7 +248,7 @@ async def record_run_in_txn(
                     ),
                     output_count=output,
                     skipped_count=skipped,
-                    failed_count=failed,
+                    failed_count=step_failed,
                 )
                 .returning(tables.pipeline_steps.c.id)
             )
