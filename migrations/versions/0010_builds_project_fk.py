@@ -22,6 +22,18 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Reconcile before constraining: 0007 backfilled `projects` when IT ran, but
+    # `builds.project` stayed unconstrained until now, so a build inserted
+    # between 0007 and this migration may reference a project with no `projects`
+    # row. Re-run the builds→projects backfill so ADD CONSTRAINT can't fail on an
+    # orphan and block the upgrade on an existing database. (Empty-project builds
+    # are excluded — projects.name has a non-empty CHECK, and no code creates
+    # them; the FK would correctly reject genuinely-invalid data.)
+    op.execute(
+        "INSERT INTO projects (name) "
+        "SELECT DISTINCT project FROM builds WHERE project <> '' "
+        "ON CONFLICT (name) DO NOTHING"
+    )
     op.create_foreign_key(
         "builds_project_fkey",
         "builds",
