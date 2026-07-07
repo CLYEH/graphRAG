@@ -38,6 +38,7 @@ from core.builds.orchestrator import (
 from core.config import get_settings
 from core.observability.spec import ItemOutcome
 from core.registry import create_job, create_project, get_job, request_cancel
+from core.registry import jobs as jobs_module
 from core.registry.jobs import JobNotFoundError
 from core.stores import tables
 
@@ -424,6 +425,47 @@ async def test_run_build_guards_job_existence_and_ownership(migrated: None) -> N
             await run_build(engine, other, job_id, _stages(calls))
 
         assert calls == []
+    finally:
+        await _cleanup(engine, project)
+        await engine.dispose()
+
+
+async def test_build_creation_and_job_attach_are_atomic(
+    migrated: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between minting the build and attaching it to the job must not
+    orphan a 'building' build (unresumable — the job still points at NULL — and
+    RESTRICT blocks deleting it with the project). They share one transaction:
+    if the attach fails, the build creation rolls back and NO build persists. A
+    two-transaction version would leak the orphan, which this test catches."""
+    engine = _engine()
+    project = _proj()
+    try:
+        job_id = await _new_job(engine, project)
+        real_set_progress = jobs_module.set_progress
+
+        async def _fail_on_attach(conn: AsyncConnection, jid: uuid.UUID, **kw: Any) -> Any:
+            if "build_id" in kw:  # the create→attach step
+                raise RuntimeError("attach exploded")
+            return await real_set_progress(conn, jid, **kw)
+
+        monkeypatch.setattr(jobs_module, "set_progress", _fail_on_attach)
+        calls: list[str] = []
+
+        with pytest.raises(RuntimeError, match="attach exploded"):
+            await run_build(engine, project, job_id, _stages(calls))
+
+        # the failed attach rolled the build creation back — no orphan build
+        async with engine.connect() as conn:
+            count = (
+                await conn.execute(
+                    sa.select(sa.func.count())
+                    .select_from(tables.builds)
+                    .where(tables.builds.c.project == project)
+                )
+            ).scalar_one()
+        assert count == 0
+        assert calls == []  # never reached the stage loop
     finally:
         await _cleanup(engine, project)
         await engine.dispose()

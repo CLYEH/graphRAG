@@ -162,11 +162,15 @@ async def run_build(
     # 2. resolve the build: fresh (create + attach) or resume (validate building)
     resume_id = build_id if build_id is not None else job.build_id
     if resume_id is None:
+        # create the build AND attach it to the job in ONE transaction — else a
+        # crash between the two commits leaves the job at build_id=NULL pointing
+        # at nothing while an orphaned 'building' build persists (unresumable,
+        # and RESTRICT blocks deleting it with the project). Atomic → a retry
+        # either finds the attached build (resume) or a clean slate (create).
         async with engine.connect() as conn, conn.begin():
             build_id = await create_build(
                 conn, project, config_hash=config_hash, source_hash=source_hash
             )
-        async with engine.connect() as conn, conn.begin():
             await jobs.set_progress(conn, job_id, build_id=build_id)
     else:
         build_id = resume_id
