@@ -11,9 +11,11 @@ What BA0 establishes and later BA-items build on:
   ``X-Request-ID`` header.
 - **Every error is the frozen envelope**: ApiError → its mapped status +
   ``{"error": {...}}``; request-body validation → VALIDATION_ERROR (400, the
-  contract's mapping — not FastAPI's default 422); anything uncaught →
-  INTERNAL (500). FastAPI's default HTML/JSON error shapes never reach a
-  client.
+  contract's mapping — not FastAPI's default 422); framework HTTPExceptions
+  (unknown route, wrong method) → the envelope with the true status (4xx →
+  VALIDATION_ERROR, 5xx → INTERNAL) instead of Starlette's ``{"detail": …}``;
+  anything uncaught → INTERNAL (500). No FastAPI/Starlette default error
+  shape ever reaches a client.
 
 BA0 mounts NO domain routes (those are BA1–BA8) — a skeleton with the
 cross-cutting machinery wired and tested.
@@ -30,8 +32,10 @@ from typing import Any
 
 import yaml
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.envelope import error_body, error_body_from
@@ -97,14 +101,36 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation(request: Request, exc: RequestValidationError) -> JSONResponse:
-        # the contract maps VALIDATION_ERROR → 400 (not FastAPI's default 422)
+        # the contract maps VALIDATION_ERROR → 400 (not FastAPI's default 422).
+        # jsonable_encoder: a custom validator can put non-serializable objects
+        # (e.g. the original ValueError) in errors()[*].ctx — passing them raw
+        # to JSONResponse would crash serialization into the uncaught-500 path
         return _error_response(
             http_status_for(ErrorCode.VALIDATION_ERROR),
             error_body(
                 ErrorCode.VALIDATION_ERROR,
                 "request validation failed",
                 request_id=_request_id(request),
-                details={"errors": exc.errors()},
+                details={"errors": jsonable_encoder(exc.errors())},
+            ),
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _handle_http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        # framework HTTPExceptions (unknown route, wrong method, or a raised
+        # HTTPException) must wear the frozen envelope too, never Starlette's
+        # {"detail": ...}. The frozen §27.2 enum has no generic HTTP codes, so
+        # classify coarsely — 4xx = the client's request didn't conform
+        # (VALIDATION_ERROR), 5xx = server fault (INTERNAL) — while PRESERVING
+        # the true HTTP status. Domain handlers (BA1+) raise precise ApiErrors.
+        code = ErrorCode.INTERNAL if exc.status_code >= 500 else ErrorCode.VALIDATION_ERROR
+        return _error_response(
+            exc.status_code,
+            error_body(
+                code,
+                str(exc.detail) if exc.detail else code.value,
+                request_id=_request_id(request),
+                details=None,
             ),
         )
 

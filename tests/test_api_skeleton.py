@@ -14,9 +14,9 @@ from typing import Annotated, Any
 
 import pytest
 import yaml
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request
 from fastapi.testclient import TestClient
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from api import create_app
 from api.app import _frozen_contract
@@ -41,6 +41,16 @@ def client() -> TestClient:
     class _Body(BaseModel):
         name: str
 
+    class _StrictBody(BaseModel):
+        # a custom validator that raises — its ctx carries the original
+        # ValueError, a non-JSON-serializable object (the round-1 crash path)
+        name: str
+
+        @field_validator("name")
+        @classmethod
+        def _reject(cls, value: str) -> str:
+            raise ValueError("name is never valid")
+
     @app.get("/_t/ok")
     async def _ok(request: Request) -> dict[str, Any]:
         return success(
@@ -57,8 +67,17 @@ def client() -> TestClient:
     async def _crash() -> None:
         raise RuntimeError("unexpected — must not leak")
 
+    @app.get("/_t/unavailable")
+    async def _unavailable() -> None:
+        # a raised 5xx HTTPException — the envelope's INTERNAL branch
+        raise HTTPException(status_code=503, detail="downstream down")
+
     @app.post("/_t/validate")
     async def _validate(body: _Body) -> dict[str, Any]:
+        return success(body.model_dump(), request_id=uuid.uuid4(), elapsed_ms=0)
+
+    @app.post("/_t/strict")
+    async def _strict(body: _StrictBody) -> dict[str, Any]:
         return success(body.model_dump(), request_id=uuid.uuid4(), elapsed_ms=0)
 
     @app.get("/_t/whoami")
@@ -183,6 +202,39 @@ def test_body_validation_becomes_validation_error(client: TestClient) -> None:
     err = resp.json()["error"]
     assert err["code"] == "VALIDATION_ERROR"
     assert err["details"] and "errors" in err["details"]
+
+
+def test_custom_validator_error_serializes_not_crashes(client: TestClient) -> None:
+    """A custom validator's error carries the original ValueError in ctx (a
+    non-JSON object); the handler must jsonable_encode it and still return
+    400 — not crash serialization into the uncaught-500 path (Codex round 1)."""
+    resp = client.post("/_t/strict", json={"name": "anything"})
+    assert resp.status_code == 400  # NOT 500 — the ctx object was encoded
+    err = resp.json()["error"]
+    assert err["code"] == "VALIDATION_ERROR"
+    assert err["details"] and "errors" in err["details"]
+
+
+def test_unknown_route_wears_the_frozen_envelope_not_detail(client: TestClient) -> None:
+    """A framework 404 (unknown path) must be the frozen envelope, never
+    Starlette's {"detail": ...} (Codex round 1: the BA0 no-default-shape
+    guarantee covers HTTPException too)."""
+    resp = client.get("/_t/does-not-exist")
+    assert resp.status_code == 404  # the true HTTP status is preserved
+    body = resp.json()
+    assert "detail" not in body  # no leaked framework shape
+    assert body["error"]["code"] == "VALIDATION_ERROR"  # 4xx → client didn't conform
+    assert resp.headers["X-Request-ID"] == body["error"]["request_id"]
+
+
+def test_raised_5xx_http_exception_maps_to_internal(client: TestClient) -> None:
+    """A 5xx HTTPException wears the envelope with INTERNAL, true status
+    preserved (the server-fault branch of the framework handler)."""
+    resp = client.get("/_t/unavailable")
+    assert resp.status_code == 503  # true status kept
+    body = resp.json()
+    assert "detail" not in body
+    assert body["error"]["code"] == "INTERNAL"  # 5xx → server fault
 
 
 def test_auth_placeholder_extracts_token_and_admits_anonymous(client: TestClient) -> None:
