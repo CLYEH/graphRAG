@@ -61,7 +61,7 @@ Keep items small enough to finish in one loop.
 - [x] C11 Observability wiring + drift detection
 
 ## Track 2 — Console backend (FastAPI + arq)  *(needs Track 0 P0; C-items as they land)*
-- [ ] BA0 API skeleton + generated OpenAPI matching contract + auth placeholder
+- [x] BA0 API skeleton + generated OpenAPI matching contract + auth placeholder
 - [ ] BA1 projects/sources endpoints + trigger ingest/build
 - [ ] BA2 arq worker + jobs + SSE
 - [ ] BA3 inspection endpoints (docs/chunks/entities/relations/subgraph/reports)
