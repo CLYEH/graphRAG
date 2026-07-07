@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     # and step counters are kept
     observability_item_retention_days: int = 30
 
+    # §27 idempotency (tunable 🔧): how long a stored Idempotency-Key response
+    # is replayed before the key expires; a later reuse past this is a fresh
+    # request, not a replay
+    idempotency_ttl_hours: int = 24
+
     # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-nano"
