@@ -26,7 +26,7 @@ def _alembic_config() -> Config:
 
 def test_migration_chain_has_a_single_head() -> None:
     heads = ScriptDirectory.from_config(_alembic_config()).get_heads()
-    assert heads == ["0008_idempotency_keys"]
+    assert heads == ["0009_jobs"]
 
 
 def test_builds_columns_match_design_spec() -> None:

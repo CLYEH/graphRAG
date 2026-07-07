@@ -7,9 +7,20 @@ Console API routers (BA1b); the ingest/build triggers and idempotency store
 land in BA1b/BA2.
 """
 
+from core.registry.jobs import (
+    Job,
+    JobNotFoundError,
+    count_active_jobs,
+    create_job,
+    get_job,
+    is_cancel_requested,
+    request_cancel,
+    set_progress,
+)
 from core.registry.store import (
     Project,
     ProjectExistsError,
+    ProjectHasActiveJobsError,
     ProjectHasBuildsError,
     ProjectNotFoundError,
     Source,
@@ -23,16 +34,25 @@ from core.registry.store import (
 )
 
 __all__ = [
+    "Job",
+    "JobNotFoundError",
     "Project",
     "ProjectExistsError",
+    "ProjectHasActiveJobsError",
     "ProjectHasBuildsError",
     "ProjectNotFoundError",
     "Source",
     "add_source",
+    "count_active_jobs",
+    "create_job",
     "create_project",
     "delete_project",
+    "get_job",
     "get_project",
+    "is_cancel_requested",
     "list_projects",
     "list_sources",
+    "request_cancel",
+    "set_progress",
     "update_project",
 ]

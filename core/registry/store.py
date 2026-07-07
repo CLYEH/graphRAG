@@ -20,6 +20,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from core.registry import jobs
 from core.stores import tables
 
 
@@ -75,6 +76,19 @@ class ProjectHasBuildsError(Exception):
 
     def __init__(self, name: str, count: int) -> None:
         super().__init__(f"project {name!r} still has {count} build(s); prune them first")
+        self.name = name
+        self.count = count
+
+
+class ProjectHasActiveJobsError(Exception):
+    """delete_project while a queued/running job is still in flight. A live job
+    may not have created its build yet (so ProjectHasBuildsError wouldn't catch
+    it), yet deleting the project out from under it would strand the operation
+    (the jobs row would CASCADE away mid-run). Refuse until it finishes or is
+    cancelled."""
+
+    def __init__(self, name: str, count: int) -> None:
+        super().__init__(f"project {name!r} has {count} active job(s); wait or cancel them first")
         self.name = name
         self.count = count
 
@@ -262,6 +276,9 @@ async def delete_project(conn: AsyncConnection, name: str) -> bool:
     )
     if builds_count > 0:
         raise ProjectHasBuildsError(name, builds_count)
+    active_jobs = await jobs.count_active_jobs(conn, name)
+    if active_jobs > 0:
+        raise ProjectHasActiveJobsError(name, active_jobs)
     for tbl in _PROJECT_SCOPED_CARRYFORWARD:
         await conn.execute(tbl.delete().where(tbl.c.project == name))
     result = await conn.execute(tables.projects.delete().where(tables.projects.c.name == name))
