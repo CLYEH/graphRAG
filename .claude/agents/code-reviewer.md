@@ -63,6 +63,19 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      project where both sides have it — DR-006 makes mixing unrepresentable);
      parents expose matching UNIQUE FK targets; EVERY child FK has a supporting
      index (Postgres doesn't auto-index FKs).
+   - **Migration (constraint-tightening)**: a migration that ADDs a constraint
+     (FK / CHECK / NOT NULL / UNIQUE) to an EXISTING table must reconcile
+     pre-existing violating rows FIRST — backfill or clean them in the same
+     migration, BEFORE the `ALTER`. Rows accumulate while the constraint doesn't
+     exist (especially in the window since a related earlier migration — e.g. a
+     parent backfill in migration M, the FK not added until N>M), and any that
+     violate the new constraint make `ADD CONSTRAINT` fail and block the upgrade
+     on a populated database. CI migrates a **fresh empty DB**, so this failure
+     is invisible to the check (class-5: the check's DB state ≠ a real dev/prod
+     DB) — reason about the populated case explicitly, and test it by applying
+     the migration over a row that would violate it (BA2b: 0010's FK re-ran the
+     builds→projects backfill before `ADD CONSTRAINT`; the test downgrades,
+     inserts an orphan build, and asserts the upgrade still succeeds).
    - **Conditional**: every (type, per-type required fields) pair is CHECKed
      both directions (must-have AND must-not-have) — and write the IFF as an
      EXPLICIT two-branch disjunction: `(cond) = (A AND B)` under-enforces the
@@ -399,10 +412,16 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      only if the gateway they resolve through — e.g. the active build — is
      itself guarded); (2) UPGRADE: the migration must backfill the parent
      from the pre-existing keyed tables, or existing entities vanish from the
-     new registry while old lookups still resolve them; (3) WRITE-RACE: the
+     new registry while old lookups still resolve them, AND — when the FK
+     itself lands in a LATER migration — that migration must RE-RUN the backfill
+     before `ADD CONSTRAINT` (the M→N window is unconstrained; see the
+     constraint-tightening Migration bullet in §6); (3) WRITE-RACE: the
      count-then-act guard is a TOCTOU until a real FK (or shared lock) binds
      parent and child — name the FK and who must take it. BA1a spent 3 rounds
-     having these three faces found one at a time.
+     having these three faces found one at a time; BA2a took the parent-row
+     `FOR UPDATE` lock and BA2b added the `builds.project` → `projects.name`
+     RESTRICT FK (with its supporting index + reconcile-before-ALTER), closing
+     the orphan + TOCTOU faces structurally.
 
 ## Output (exactly this shape)
 ```

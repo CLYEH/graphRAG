@@ -1,9 +1,18 @@
 ---
 name: graphrag-ba2-registry-fk
-description: BA2 待辦——build-creation 走 registry + 加 FK builds.project→projects.name,結構性關掉 delete TOCTOU
-metadata:
+description: "FK builds.project→projects.name 已於 BA2b(#45)加上(RESTRICT);剩 build-creation 走 registry=BA2c"
+metadata: 
+  node_type: memory
   type: project
+  originSessionId: 24544557-4e13-47f3-89e2-819678d8de00
 ---
+
+**狀態(BA2a #44 + BA2b #45 後)**:第 2 項 FK **已完成**——BA2a 先加 `delete_project` 的
+`FOR UPDATE` 鎖(關 count-then-delete 窗),BA2b 加 `builds.project → projects.name`(RESTRICT)
+FK + supporting index + reconcile-before-ALTER(0010 在 ADD CONSTRAINT 前重跑 backfill,見
+[[graphrag-loop-paused-pr5]] #45 的「收緊型 migration 遮蔽」教訓)。**剩第 1 項**:build-creation
+變 registry-aware(建 build 前確保 projects 有該 name)=**BA2c**(orchestrator + registry-aware
+build 建立)。下方為原始 deferral 紀錄(歷史)。
 
 BA1a(#42) delete_project 的 guard 是 count-then-delete **TOCTOU**：並發「為 project X 建 build」
 插入 builds 若落在 count(=0) 與 delete 之間,會把 build 留在已刪除、可重用的 project name 下
