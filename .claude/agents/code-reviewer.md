@@ -48,6 +48,14 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      CHECKs match frozen vocabularies (lockstep-tested both ways); identifiers,
      hash inputs, and contract-`minLength` fields ban `''`; contract minimums
      become range CHECKs; definitional sanity holds (end ≥ start, positions ≥ 0).
+     A **nullable JSON/JSONB column that stores Python `None` to mean "absent"
+     needs `none_as_null=True`** (or insert `sa.null()`) — otherwise `None`
+     binds as the JSONB `'null'` LITERAL, not SQL NULL, so `col IS NULL` is
+     false and any two-state CHECK / replay keying on absence misfires (BA1b:
+     the reserve/fill CHECK caught this — an ORM representation bug all
+     behavioral tests passed). A DTO whose field is nullable must match the
+     column's nullability: an explicit `null` on a NOT NULL column is a 400 at
+     the boundary, never a NOT NULL IntegrityError surfaced as 500.
    - **Per table**: every frozen identity key gets a UNIQUE (entity_key,
      relation_signature once minted → partial, merge_key → LEAST/GREATEST
      expression index, position keys like (document_id, ordinal), dedup hashes).
