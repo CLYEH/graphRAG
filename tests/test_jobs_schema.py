@@ -44,6 +44,10 @@ def test_jobs_columns_cover_the_contract_job_shape() -> None:
         "cancel_requested",
         "created_at",
         "finished_at",
+        # internal, not part of the frozen Job contract (like cancel_requested):
+        # the BA2d execution lease.
+        "lease_owner",
+        "lease_expires_at",
     }
     assert jobs.c.id.primary_key
     # scoping / lifecycle-init columns are never null
@@ -53,9 +57,11 @@ def test_jobs_columns_cover_the_contract_job_shape() -> None:
     assert not jobs.c.progress.nullable
     assert not jobs.c.cancel_requested.nullable
     # build_id is null until the orchestrator resolves it (§27.7); error is null
-    # for an un-errored job
+    # for an un-errored job; the lease columns are null while the job is unleased
     assert jobs.c.build_id.nullable
     assert jobs.c.error.nullable
+    assert jobs.c.lease_owner.nullable
+    assert jobs.c.lease_expires_at.nullable
 
 
 def test_jobs_project_fk_cascades() -> None:
@@ -77,13 +83,20 @@ def test_jobs_status_enum_is_in_lockstep_with_the_frozen_contract() -> None:
 
 def test_jobs_guard_checks_present() -> None:
     names = set(_checks(jobs))
-    assert {"jobs_status_valid", "jobs_progress_bounded", "jobs_kind_nonempty"} <= names
+    assert {
+        "jobs_status_valid",
+        "jobs_progress_bounded",
+        "jobs_kind_nonempty",
+        "jobs_lease_paired",
+        "jobs_lease_owner_nonempty",
+    } <= names
 
 
 def test_offline_upgrade_sql_renders_jobs_ddl(capsys: pytest.CaptureFixture[str]) -> None:
-    """The 0009 migration must render the table, the CASCADE FK, and the bounded
-    -progress / valid-status CHECKs — a hand-edit dropping one would pass the
-    column tests yet let a bad row land."""
+    """The head DDL must render the 0009 table (CASCADE FK, bounded-progress /
+    valid-status CHECKs) AND the 0011 lease columns + guard CHECKs — a hand-edit
+    dropping one would pass the reflection tests (which read the ORM metadata, not
+    the migration) yet let a bad row land on a freshly-migrated database."""
     command.upgrade(Config(str(REPO_ROOT / "alembic.ini")), "head", sql=True)
     ddl = capsys.readouterr().out
     assert "CREATE TABLE jobs" in ddl
@@ -91,3 +104,8 @@ def test_offline_upgrade_sql_renders_jobs_ddl(capsys: pytest.CaptureFixture[str]
     assert "CHECK (progress >= 0 AND progress <= 1)" in ddl
     assert "status IN ('queued','running','done','failed','cancelled')" in ddl
     assert "CREATE INDEX jobs_by_project ON jobs (project, created_at DESC)" in ddl
+    # 0011 execution lease
+    assert "ADD COLUMN lease_owner" in ddl
+    assert "ADD COLUMN lease_expires_at" in ddl
+    assert "jobs_lease_paired" in ddl
+    assert "jobs_lease_owner_nonempty" in ddl
