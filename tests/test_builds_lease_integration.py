@@ -33,7 +33,12 @@ from core.builds.lease import run_build_leased
 from core.builds.orchestrator import _STAGE_ORDER, StageResult, Stages
 from core.config import get_settings
 from core.registry import create_job, create_project, get_job
-from core.registry.jobs import acquire_lease, release_lease, renew_lease
+from core.registry.jobs import (
+    acquire_lease,
+    capture_config_snapshot,
+    release_lease,
+    renew_lease,
+)
 from core.stores import tables
 
 pytestmark = pytest.mark.integration
@@ -204,6 +209,68 @@ async def test_expired_lease_is_reclaimable(migrated: None) -> None:
         async with engine.begin() as conn:
             assert await acquire_lease(conn, job_id, "B", 60.0) is True  # reclaimed
         assert await _lease_owner(engine, job_id) == "B"
+    finally:
+        await _cleanup(engine, project)
+
+
+# ── config pin ──────────────────────────────────────────────────────────────
+
+
+async def test_config_snapshot_pins_the_first_dispatchs_config(migrated: None) -> None:
+    # the config-drift guard (BA2d-2): a build must run from the config it STARTED
+    # with across every re-dispatch. The first capture writes C1; a later capture
+    # with a drifted C2 (a mid-build PATCH /projects) must return C1 and leave the
+    # stored snapshot C1 — the atomic COALESCE keeps the first-written config, so a
+    # resuming build never picks up drifted chunking/ontology params.
+    engine = _engine()
+    project = _proj()
+    try:
+        job_id = await _make_job(engine, project)
+        c1 = {"chunking": {"max_chars": 100}}
+        c2 = {"chunking": {"max_chars": 999}}
+        async with engine.begin() as conn:
+            first = await capture_config_snapshot(conn, job_id, c1)
+        async with engine.begin() as conn:
+            second = await capture_config_snapshot(conn, job_id, c2)  # drifted live config
+        assert first == c1
+        assert second == c1  # re-dispatch reuses the pinned config, ignores c2
+        async with engine.connect() as conn:
+            stored = (
+                await conn.execute(
+                    sa.select(tables.jobs.c.config_snapshot).where(tables.jobs.c.id == job_id)
+                )
+            ).scalar_one()
+        assert stored == c1
+    finally:
+        await _cleanup(engine, project)
+
+
+async def test_concurrent_capture_converges_on_one_config(migrated: None) -> None:
+    # two dispatches racing the FIRST capture (both see a null snapshot) must
+    # converge on a single stored config — the atomic COALESCE + row lock, the same
+    # single-winner property as the lease's acquire. Never a mix, never one
+    # dispatch building from C_a while the row stores C_b.
+    engine = _engine()
+    project = _proj()
+    try:
+        job_id = await _make_job(engine, project)
+        ca = {"chunking": {"max_chars": 1}}
+        cb = {"chunking": {"max_chars": 2}}
+
+        async def _cap(cfg: dict[str, Any]) -> Any:
+            async with engine.begin() as conn:
+                return await capture_config_snapshot(conn, job_id, cfg)
+
+        a, b = await asyncio.gather(_cap(ca), _cap(cb))
+        assert a == b  # both dispatches see the same pinned config…
+        assert a in (ca, cb)  # …one of the two racing configs, atomically chosen
+        async with engine.connect() as conn:
+            stored = (
+                await conn.execute(
+                    sa.select(tables.jobs.c.config_snapshot).where(tables.jobs.c.id == job_id)
+                )
+            ).scalar_one()
+        assert stored == a
     finally:
         await _cleanup(engine, project)
 

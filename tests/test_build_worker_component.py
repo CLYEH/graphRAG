@@ -48,6 +48,11 @@ def _ctx() -> dict[str, Any]:
     }
 
 
+async def _capture_passthrough(conn: Any, job_id: uuid.UUID, live: Any) -> Any:
+    # first-dispatch behaviour: the snapshot == the live config it captures.
+    return live
+
+
 async def test_run_build_task_wires_config_deps_and_lease(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: dict[str, Any] = {}
     proj = SimpleNamespace(config={"chunking": {"max_chars": 100}})
@@ -70,7 +75,12 @@ async def test_run_build_task_wires_config_deps_and_lease(monkeypatch: pytest.Mo
         calls["leased"] = (project, job_id, stages, owner)
         return SimpleNamespace(status="ready")
 
+    async def _capture(conn: Any, job_id: uuid.UUID, live: Any) -> Any:
+        calls["capture"] = (job_id, live)
+        return live
+
     monkeypatch.setattr(bw, "get_project", _get_project)
+    monkeypatch.setattr(bw, "capture_config_snapshot", _capture)
     monkeypatch.setattr(bw, "load_build_config", _load_config)
     monkeypatch.setattr(bw, "default_stages", _default_stages)
     monkeypatch.setattr(bw, "run_build_leased", _leased)
@@ -80,6 +90,8 @@ async def test_run_build_task_wires_config_deps_and_lease(monkeypatch: pytest.Mo
 
     assert result == "ready"
     assert calls["project"] == "proj"
+    # config is pinned to the job (first dispatch) then loaded from that snapshot
+    assert calls["capture"] == (jid, proj.config)
     assert calls["load"] == proj.config
     config, deps = calls["stages"]
     assert config == "CONFIG"
@@ -102,6 +114,7 @@ async def test_run_build_task_returns_none_when_lease_held(monkeypatch: pytest.M
         return None  # a live peer holds the lease
 
     monkeypatch.setattr(bw, "get_project", _get_project)
+    monkeypatch.setattr(bw, "capture_config_snapshot", _capture_passthrough)
     monkeypatch.setattr(bw, "load_build_config", lambda raw: "CONFIG")
     monkeypatch.setattr(bw, "default_stages", lambda config, **k: "STAGES")
     monkeypatch.setattr(bw, "run_build_leased", _leased)
@@ -157,6 +170,7 @@ async def test_run_build_task_marks_job_failed_on_malformed_config(
         marked["fields"] = fields
 
     monkeypatch.setattr(bw, "get_project", _get_project)
+    monkeypatch.setattr(bw, "capture_config_snapshot", _capture_passthrough)
     monkeypatch.setattr(bw, "load_build_config", _load_config)
     monkeypatch.setattr(bw, "set_progress", _set_progress)
 
@@ -165,6 +179,43 @@ async def test_run_build_task_marks_job_failed_on_malformed_config(
     assert result == "failed"
     assert marked["fields"]["status"] == "failed"
     assert "resolution must be a mapping" in marked["fields"]["error"]["message"]
+
+
+async def test_run_build_task_reuses_pinned_config_on_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: a re-dispatch (arq retry / BA2d-3 reaper) must build from the config the
+    # build STARTED with, not the live project config — a mid-build PATCH /projects
+    # must not drift a resuming build's chunking/ontology params. capture_config_
+    # snapshot returns the pinned snapshot (C1) even though proj.config has since
+    # drifted to C2, and the stages must be built from C1.
+    loaded: dict[str, Any] = {}
+    pinned = {"chunking": {"max_chars": 100}}  # C1 — what the build started with
+    drifted = {"chunking": {"max_chars": 999}}  # C2 — the live project config now
+
+    async def _get_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(config=drifted)
+
+    async def _capture(conn: Any, job_id: uuid.UUID, live: Any) -> Any:
+        return pinned  # the job already has a snapshot; the drifted `live` is ignored
+
+    def _load(raw: Any) -> str:
+        loaded["raw"] = raw
+        return "CONFIG"
+
+    async def _leased(*a: Any, **k: Any) -> Any:
+        return SimpleNamespace(status="ready")
+
+    monkeypatch.setattr(bw, "get_project", _get_project)
+    monkeypatch.setattr(bw, "capture_config_snapshot", _capture)
+    monkeypatch.setattr(bw, "load_build_config", _load)
+    monkeypatch.setattr(bw, "default_stages", lambda config, **k: "STAGES")
+    monkeypatch.setattr(bw, "run_build_leased", _leased)
+
+    await bw.run_build_task(_ctx(), "proj", str(uuid.uuid4()))
+
+    assert loaded["raw"] == pinned  # built from the pinned snapshot…
+    assert loaded["raw"] != drifted  # …NOT the drifted live config
 
 
 async def test_enqueue_build_uses_job_id_dedup() -> None:

@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.stores import tables
@@ -255,6 +256,33 @@ async def release_lease(conn: AsyncConnection, job_id: uuid.UUID, owner: str) ->
         .where(tables.jobs.c.id == job_id, tables.jobs.c.lease_owner == owner)
         .values(lease_owner=None, lease_expires_at=None)
     )
+
+
+async def capture_config_snapshot(
+    conn: AsyncConnection, job_id: uuid.UUID, live_config: dict[str, Any]
+) -> dict[str, Any]:
+    """Pin the build's config to this job and return the effective snapshot. The
+    FIRST dispatch stores ``live_config`` (the project config as it stands then);
+    every later dispatch of the same job — an arq retry, or the BA2d-3 reaper
+    re-enqueuing a crashed build — reads that stored value back, so a mid-build
+    ``PATCH /projects`` can't drift a resuming build's chunking/ontology params
+    (which would break convergent idempotency or mix outputs across the change).
+    One atomic COALESCE UPDATE — two dispatches racing the first capture converge
+    on a single stored config. Falls back to ``live_config`` only if the job row is
+    gone (run_build then raises JobNotFoundError)."""
+    row = (
+        await conn.execute(
+            tables.jobs.update()
+            .where(tables.jobs.c.id == job_id)
+            .values(
+                config_snapshot=sa.func.coalesce(
+                    tables.jobs.c.config_snapshot, sa.literal(live_config, postgresql.JSONB)
+                )
+            )
+            .returning(tables.jobs.c.config_snapshot)
+        )
+    ).one_or_none()
+    return row.config_snapshot if row is not None else live_config
 
 
 async def count_active_jobs(conn: AsyncConnection, project: str) -> int:

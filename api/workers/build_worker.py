@@ -6,10 +6,11 @@ executes builds; the API (BA2e) only enqueues. This wires arq + Redis onto core:
 * ``on_startup`` builds ONE long-lived dep bundle (engine + Qdrant/Neo4j/LLM/
   embedder — the ``ProjectContext`` shape, pooled and reused across jobs) plus a
   unique owner id for this worker process.
-* ``run_build_task`` loads a job's project config, builds the six §5 stages off
-  the bundle, and executes under the BA2d-1 execution lease (``run_build_leased``)
-  so a duplicate dispatch of the same job is a no-op rather than a second
-  concurrent execution.
+* ``run_build_task`` pins the build's config (snapshotted on the first dispatch,
+  reused on every re-dispatch so a mid-build config edit can't drift a resume),
+  builds the six §5 stages off the bundle, and executes under the BA2d-1 execution
+  lease (``run_build_leased``) so a duplicate dispatch of the same job is a no-op
+  rather than a second concurrent execution.
 * ``enqueue_build`` (BA2e's trigger calls it after ``create_job``) enqueues with
   ``_job_id=str(job_id)`` for arq's own dispatch dedup.
 
@@ -35,7 +36,7 @@ from core.builds.lease import run_build_leased
 from core.builds.stages import default_stages
 from core.config import get_settings
 from core.llm.factory import chat_model, embedding_model
-from core.registry import get_project, set_progress
+from core.registry import capture_config_snapshot, get_project, set_progress
 from core.stores.graph import graph_driver
 from core.stores.vectors import vector_client
 
@@ -60,27 +61,35 @@ async def enqueue_build(redis: ArqRedis, project: str, job_id: uuid.UUID) -> Non
 async def run_build_task(ctx: dict[str, Any], project: str, job_id: str) -> str | None:
     """arq task: run one build under the execution lease.
 
-    Reads the long-lived deps from ``ctx`` (built in ``on_startup``), loads the
-    project's config, builds the six §5 stages, and executes via
-    ``run_build_leased`` with this worker's owner id. Returns the terminal build
-    status, or ``None`` if a live peer already holds the lease (this dispatch was
-    a deliberate no-op). A neo4j session is opened per job (the driver is shared);
-    ``run_build`` opens its own per-stage Postgres transactions off the engine.
+    Reads the long-lived deps from ``ctx`` (built in ``on_startup``), pins+loads
+    the project's config (see the preflight), builds the six §5 stages, and
+    executes via ``run_build_leased`` with this worker's owner id. Returns the
+    terminal build status, or ``None`` if a live peer already holds the lease (this
+    dispatch was a deliberate no-op). A neo4j session is opened per job (the driver
+    is shared); ``run_build`` opens its own per-stage Postgres transactions off the
+    engine.
     """
     engine = ctx["engine"]
     build_job = uuid.UUID(job_id)
-    # Preflight (project + config) happens BEFORE run_build enters the orchestrator
-    # path that marks jobs.status. A deterministic failure here (vanished project /
-    # malformed config) would otherwise leave the durable jobs row queued forever —
-    # blocking project delete and misleading GET /jobs — so record it on the row and
-    # don't retry (a retry can't fix it). Transient errors (e.g. a DB blip) are NOT
-    # caught, so arq still retries those.
+    # Preflight (project existence + config) happens BEFORE run_build enters the
+    # orchestrator path that marks jobs.status. A deterministic failure here
+    # (vanished project / malformed config) would otherwise leave the durable jobs
+    # row queued forever — blocking project delete and misleading GET /jobs — so
+    # record it on the row and don't retry (a retry can't fix it). Transient errors
+    # (e.g. a DB blip) are NOT caught, so arq still retries those.
+    #
+    # The config is PINNED to the build here (capture_config_snapshot): the first
+    # dispatch snapshots proj.config onto the job and every re-dispatch (an arq
+    # retry, or the BA2d-3 reaper) reuses that snapshot, so a mid-build
+    # PATCH /projects can't drift a resuming build's chunking/ontology params. The
+    # capture writes the jobs row, so this runs in a committing begin().
     try:
-        async with engine.connect() as conn:
+        async with engine.begin() as conn:
             proj = await get_project(conn, project)
-        if proj is None:
-            raise LookupError(f"project {project!r} does not exist")
-        config = load_build_config(proj.config)
+            if proj is None:
+                raise LookupError(f"project {project!r} does not exist")
+            raw_config = await capture_config_snapshot(conn, build_job, proj.config)
+        config = load_build_config(raw_config)
     except (LookupError, BuildConfigError) as exc:
         await _fail_job(engine, build_job, exc)
         return "failed"

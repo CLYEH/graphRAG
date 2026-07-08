@@ -45,9 +45,10 @@ def test_jobs_columns_cover_the_contract_job_shape() -> None:
         "created_at",
         "finished_at",
         # internal, not part of the frozen Job contract (like cancel_requested):
-        # the BA2d execution lease.
+        # the BA2d execution lease + the BA2d-2 config pin.
         "lease_owner",
         "lease_expires_at",
+        "config_snapshot",
     }
     assert jobs.c.id.primary_key
     # scoping / lifecycle-init columns are never null
@@ -62,6 +63,8 @@ def test_jobs_columns_cover_the_contract_job_shape() -> None:
     assert jobs.c.error.nullable
     assert jobs.c.lease_owner.nullable
     assert jobs.c.lease_expires_at.nullable
+    # config_snapshot is null until the first dispatch pins it (BA2d-2)
+    assert jobs.c.config_snapshot.nullable
 
 
 def test_jobs_project_fk_cascades() -> None:
@@ -109,3 +112,5 @@ def test_offline_upgrade_sql_renders_jobs_ddl(capsys: pytest.CaptureFixture[str]
     assert "ADD COLUMN lease_expires_at" in ddl
     assert "jobs_lease_paired" in ddl
     assert "jobs_lease_owner_nonempty" in ddl
+    # 0012 config pin
+    assert "ADD COLUMN config_snapshot" in ddl

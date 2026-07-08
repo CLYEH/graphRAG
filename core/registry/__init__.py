@@ -10,6 +10,7 @@ land in BA1b/BA2.
 from core.registry.jobs import (
     Job,
     JobNotFoundError,
+    capture_config_snapshot,
     count_active_jobs,
     create_job,
     get_job,
@@ -43,6 +44,7 @@ __all__ = [
     "ProjectNotFoundError",
     "Source",
     "add_source",
+    "capture_config_snapshot",
     "count_active_jobs",
     "create_job",
     "create_project",
