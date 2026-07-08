@@ -26,6 +26,7 @@ dependencies = [
     # dev extras must not ModuleNotFoundError (Codex PR#39 round 9)
     "jsonschema>=4.21",
     "pyyaml>=6.0",
+    "arq>=0.28.0",
 ]
 
 [project.scripts]
@@ -103,6 +104,7 @@ test-eval = { cmd = "pytest -m eval", help = "Retrieval-quality eval (needs a bu
 test-all = { cmd = "pytest -m ''", help = "Every test, all markers" }
 test-cov = { cmd = "pytest -m 'not integration and not eval and not e2e and not slow' --cov=core --cov=api --cov=cli --cov-report=term-missing --cov-fail-under=85", help = "Fast tests with coverage gate" }
 migrate = { cmd = "alembic upgrade head", help = "Apply Postgres migrations (needs: docker compose up -d --wait)" }
+worker = { cmd = "arq api.workers.build_worker.WorkerSettings", help = "Run the arq build worker (needs: docker compose up -d)" }
 
 [tool.poe.tasks.check]
 help = "Backend quality gates: fmt-check, lint, typecheck, test"
