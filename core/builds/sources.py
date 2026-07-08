@@ -1,0 +1,90 @@
+"""Sources → connector dispatch (BA2c-2b) — a project's ``sources`` rows become
+the §5-step-1 :class:`DocumentPayload` stream the ingest stage persists.
+
+BA1a's ``sources`` table stores a free-form ``(kind, uri, metadata)`` per source;
+the C2 connectors (:mod:`core.ingest.connectors`) each read one §2 source FAMILY
+(free text vs. structured/tabular). This module is the routing layer between them:
+it maps each :class:`~core.registry.store.Source` by ``kind`` to the right
+connector call. ``kind`` is free-form in the store (``str | None``, no enum), so
+this dispatch DEFINES the vocabulary it recognizes — the two connector families:
+
+* ``"text"`` → :func:`~core.ingest.connectors.read_text_documents` over the
+  directory the ``file://`` ``uri`` names (``.txt``/``.md``).
+* ``"structured"`` → :func:`~core.ingest.connectors.read_csv_rows` over the CSV
+  the ``file://`` ``uri`` names, with ``table`` and ``pk_column`` read from
+  ``metadata`` (§27.2 row refs cite ``table + pk``).
+
+Any other kind (``None``, ``url``, ``database``, a typo) fails loud: there is no
+connector for it yet, and a build over an unroutable source must not silently
+ingest zero documents. Only ``file://`` URIs are wired — a real registration
+carries one (the connectors themselves emit ``Path.as_uri()``), and a bare
+Windows path would mis-parse (a drive letter reads as a URI scheme), so the
+scheme is required rather than guessed.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
+
+from core.ingest.connectors import DocumentPayload, read_csv_rows, read_text_documents
+from core.registry.store import Source
+
+#: Source kinds this task wires to a C2 connector. The ``sources`` table/API
+#: accept any kind string; a build over a kind absent from this tuple fails loud
+#: (no connector) rather than ingesting nothing.
+SUPPORTED_SOURCE_KINDS = ("text", "structured")
+
+
+class SourceResolutionError(ValueError):
+    """A registered source cannot be turned into a payload stream — an
+    unsupported/missing ``kind``, a non-``file://`` uri, or ``structured``
+    metadata missing ``table``/``pk_column``. Loud at ingest time, never a
+    silent empty ingest."""
+
+
+def _local_path(source: Source) -> Path:
+    """The local filesystem path a ``file://`` source uri names."""
+    parsed = urlparse(source.uri)
+    if parsed.scheme != "file":
+        raise SourceResolutionError(
+            f"source {source.id} uri {source.uri!r} is not a file:// URI — only "
+            f"file-backed sources are wired ({', '.join(SUPPORTED_SOURCE_KINDS)})"
+        )
+    # url2pathname handles the leading slash and Windows drive letters.
+    return Path(url2pathname(parsed.path))
+
+
+def _required_meta(source: Source, key: str) -> str:
+    """A required non-empty string from a structured source's metadata."""
+    value = source.metadata.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise SourceResolutionError(
+            f"structured source {source.id} needs a non-empty string {key!r} in "
+            f"metadata (read_csv_rows cites table + pk per §27.2)"
+        )
+    return value
+
+
+def resolve_source(source: Source) -> Iterator[DocumentPayload]:
+    """The §5-step-1 payload stream for one source, dispatched by ``kind``.
+
+    Raises :class:`SourceResolutionError` eagerly for an unsupported/missing kind,
+    a non-``file://`` uri, or missing structured metadata. The connector's own
+    lazy failures (a missing directory, a CSV header without the pk column) still
+    surface loud when the ingest stage iterates the stream.
+    """
+    if source.kind == "text":
+        return read_text_documents(_local_path(source))
+    if source.kind == "structured":
+        return read_csv_rows(
+            _local_path(source),
+            table=_required_meta(source, "table"),
+            pk_column=_required_meta(source, "pk_column"),
+        )
+    raise SourceResolutionError(
+        f"source {source.id} has unsupported kind {source.kind!r} — wired kinds are "
+        f"{', '.join(SUPPORTED_SOURCE_KINDS)} (url/database have no C2 connector yet)"
+    )
