@@ -141,12 +141,11 @@ class WorkerSettings:
     on_startup = on_startup
     on_shutdown = on_shutdown
     redis_settings = _redis_settings()
-    # arq keeps a job's in-progress key for job_timeout+10s and won't re-dispatch
-    # the job while it exists, so job_timeout is ALSO the ceiling on crash recovery:
-    # a worker that dies mid-build blocks re-dispatch for that long. Keep it modest
-    # (config-tunable) so the DB lease's fast crash-reclaim (BA2d-1) isn't stranded
-    # behind an hour-long arq key; a build that outruns the timeout is killed and
-    # resumed at stage granularity on the next try (each committed stage is
-    # skipped), so the bound is the longest single stage — see build_job_timeout_seconds.
+    # job_timeout is a GENEROUS hung-build backstop, not the crash-recovery timer:
+    # arq cancels a job that outruns it (via asyncio.wait_for) and does NOT retry
+    # the TimeoutError, which would strand the SoR jobs row non-terminal, so it must
+    # exceed any legitimately-slow build. Crash recovery is decoupled — the BA2d-3
+    # lease reaper re-enqueues a `building` build whose lease expired within ~a
+    # minute. See core.config.build_job_timeout_seconds.
     job_timeout = get_settings().build_job_timeout_seconds
     max_tries = 3

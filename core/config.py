@@ -53,16 +53,16 @@ class Settings(BaseSettings):
     # owner sign-off, changeable without a contract bump (not a frozen deliverable).
     pipeline_step_failure_ratio: float = 0.5
 
-    # BA2d worker (tunable 🔧): arq's per-job timeout AND — because arq keeps its
-    # in-progress key for job_timeout+10s — the ceiling on how long a crashed
-    # worker's build stays un-redispatchable. Kept modest (not the whole-build
-    # runtime) so a crash reclaims in minutes, not an hour: a build that outruns
-    # it is killed and resumed at STAGE granularity (each committed stage is
-    # skipped on the next arq try, and the DB lease guarantees that retry finds a
-    # free lease). So the bound is the longest single STAGE, not the whole build —
-    # a stage that alone exceeds it is rolled back and re-run every try, never
-    # converging. Raise it for slow corpora (accepting slower crash recovery).
-    build_job_timeout_seconds: int = 600
+    # BA2d worker (tunable 🔧): arq's per-job timeout — a GENEROUS backstop against
+    # a truly hung build, NOT the crash-recovery timer. arq cancels a job that
+    # outruns this via asyncio.wait_for and does NOT retry the resulting
+    # TimeoutError, so a cancel mid-stage would strand the SoR jobs row non-terminal
+    # (stuck 'running'); it must therefore exceed any legitimately-slow build.
+    # Crash recovery is deliberately DECOUPLED from this: the BA2d-3 lease reaper
+    # re-enqueues a `building` build whose heartbeat-lease has expired within ~a
+    # minute, regardless of job_timeout. Lower only if you also want a tighter
+    # hung-build backstop (and accept the SoR-stranding risk for builds that slow).
+    build_job_timeout_seconds: int = 86_400  # 24h
 
     # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
     llm_provider: str = "openai"
