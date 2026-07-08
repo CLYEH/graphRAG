@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 from arq.connections import RedisSettings
+from arq.cron import CronJob
 
 from api.workers import build_worker as bw
 from core.config import get_settings
@@ -232,6 +233,64 @@ async def test_enqueue_build_uses_job_id_dedup() -> None:
     assert calls["enqueue"] == (bw.BUILD_TASK, ("proj", str(jid)), str(jid))
 
 
+async def test_reenqueue_build_uses_no_job_id() -> None:
+    calls: dict[str, Any] = {}
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> None:
+            calls["enqueue"] = (fn, args, _job_id)
+
+    jid = uuid.uuid4()
+    await bw.reenqueue_build(_Redis(), "proj", jid)  # type: ignore[arg-type]
+
+    # NO _job_id: the crashed job's original in-progress key lingers 24h, so a fresh
+    # arq id is what re-dispatches it; the DB lease still enforces one executor.
+    assert calls["enqueue"] == (bw.BUILD_TASK, ("proj", str(jid)), None)
+
+
+async def test_reap_stuck_builds_reenqueues_each_crashed_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    j1, j2 = uuid.uuid4(), uuid.uuid4()
+    enq: list[Any] = []
+
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str]]:
+        return [(j1, "p1"), (j2, "p2")]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> None:
+            enq.append((fn, args, _job_id))
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 2
+    # each crashed job re-dispatched under a fresh arq id (no _job_id)
+    assert enq == [
+        (bw.BUILD_TASK, ("p1", str(j1)), None),
+        (bw.BUILD_TASK, ("p2", str(j2)), None),
+    ]
+
+
+async def test_reap_stuck_builds_is_a_noop_when_nothing_crashed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enq: list[Any] = []
+
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str]]:
+        return []  # no expired leases → an idle tick
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> None:
+            enq.append(1)
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 0
+    assert enq == []  # nothing enqueued on an idle tick
+
+
 async def test_on_startup_builds_the_dep_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bw, "create_async_engine", lambda *a, **k: "ENGINE")
     monkeypatch.setattr(bw, "vector_client", lambda: "QD")
@@ -275,6 +334,14 @@ def test_worker_settings_shape() -> None:
     assert bw.WorkerSettings.on_startup is bw.on_startup
     assert bw.WorkerSettings.on_shutdown is bw.on_shutdown
     assert isinstance(bw.WorkerSettings.redis_settings, RedisSettings)
+    # BA2d-3: the crash-recovery reaper cron is registered (runs the reaper coro,
+    # deduped across workers so one worker reaps per tick)
+    (reaper,) = bw.WorkerSettings.cron_jobs
+    assert isinstance(reaper, CronJob)
+    assert reaper.coroutine is bw.reap_stuck_builds
+    assert reaper.unique is True
+    # twice a minute — pins the ~1-min recovery cadence against the 60s lease TTL
+    assert reaper.second == {0, 30}
     # crash recovery is bounded by job_timeout (arq's in-progress key), so it's a
     # modest config value, not a build-length-sized 3600
     assert bw.WorkerSettings.job_timeout == get_settings().build_job_timeout_seconds

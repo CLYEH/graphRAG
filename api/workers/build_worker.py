@@ -14,6 +14,10 @@ executes builds; the API (BA2e) only enqueues. This wires arq + Redis onto core:
   execution.
 * ``enqueue_build`` (BA2e's trigger calls it after ``create_job``) enqueues with
   ``_job_id=str(job_id)`` for arq's own dispatch dedup.
+* ``reap_stuck_builds`` (a cron, BA2d-3) re-enqueues builds whose worker crashed —
+  found by an expired execution lease — so crash recovery is fast (~1 min) and
+  decoupled from arq's generous job_timeout; the DB lease keeps it a single
+  executor. This makes the BA2d-1 heartbeat-lease the sole build-liveness authority.
 
 Two dedup layers, by design: arq's ``_job_id`` refuses to *enqueue* a duplicate
 while one is queued/running (the cheap first line); the DB heartbeat-lease is the
@@ -24,10 +28,12 @@ job status — the ``jobs`` row is the SoR (§27.7).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
 import sqlalchemy as sa
+from arq import cron
 from arq.connections import ArqRedis, RedisSettings
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -37,9 +43,16 @@ from core.builds.lease import run_build_leased
 from core.builds.stages import default_stages
 from core.config import get_settings
 from core.llm.factory import chat_model, embedding_model
-from core.registry import capture_config_snapshot, get_project, set_progress
+from core.registry import (
+    capture_config_snapshot,
+    find_reapable_jobs,
+    get_project,
+    set_progress,
+)
 from core.stores.graph import graph_driver
 from core.stores.vectors import vector_client
+
+logger = logging.getLogger(__name__)
 
 #: arq task name — enqueue and the WorkerSettings registration must agree, so the
 #: string is defined once (arq registers a plain coroutine under its __name__).
@@ -57,6 +70,37 @@ async def enqueue_build(redis: ArqRedis, project: str, job_id: uuid.UUID) -> Non
     the crash-safe backstop. BA2e's trigger endpoint calls this after create_job.
     """
     await redis.enqueue_job(BUILD_TASK, project, str(job_id), _job_id=str(job_id))
+
+
+async def reenqueue_build(redis: ArqRedis, project: str, job_id: uuid.UUID) -> None:
+    """Re-dispatch a crashed build (BA2d-3 reaper). Unlike ``enqueue_build`` this
+    passes NO ``_job_id``: the crashed job's original arq in-progress key lingers
+    for job_timeout+10s (the generous 24h backstop), so a same-id enqueue would be
+    refused — a fresh arq id re-dispatches it now. The DB execution lease still
+    guarantees a single executor (a redundant re-dispatch acquires nothing and
+    no-ops), so an occasional duplicate enqueue between reaper ticks is harmless."""
+    await redis.enqueue_job(BUILD_TASK, project, str(job_id))
+
+
+async def reap_stuck_builds(ctx: dict[str, Any]) -> int:
+    """BA2d-3 cron: re-enqueue builds whose worker crashed, decoupling crash
+    recovery from arq's (now generous) job_timeout.
+
+    A crashed/starved worker stops heartbeating, so its job's execution lease
+    expires on the DB clock. This finds those (``find_reapable_jobs`` — expired
+    held lease + non-terminal job) and re-enqueues each under a fresh arq id, so a
+    fresh dispatch reclaims the now-free lease and resumes (~1-min recovery vs the
+    24h backstop). An idle tick is a no-op; ``unique=True`` (see WorkerSettings)
+    runs this on one worker per tick. Returns the count reaped."""
+    engine: AsyncEngine = ctx["engine"]
+    redis: ArqRedis = ctx["redis"]
+    async with engine.connect() as conn:
+        reapable = await find_reapable_jobs(conn)
+    for job_id, project in reapable:
+        await reenqueue_build(redis, project, job_id)
+    if reapable:
+        logger.info("reaped %d stuck build(s): %s", len(reapable), [str(j) for j, _ in reapable])
+    return len(reapable)
 
 
 async def run_build_task(ctx: dict[str, Any], project: str, job_id: str) -> str | None:
@@ -150,6 +194,11 @@ class WorkerSettings:
     ``arq api.workers.build_worker.WorkerSettings``."""
 
     functions = [run_build_task]
+    # BA2d-3 crash-recovery reaper: twice a minute (~1-min recovery given the 60s
+    # lease TTL), re-enqueue builds whose worker crashed. unique=True → one worker
+    # runs it per tick; a short timeout keeps it off the generous build job_timeout;
+    # max_tries=1 (the default) — a failed tick just retries on the next one.
+    cron_jobs = [cron(reap_stuck_builds, second={0, 30}, unique=True, timeout=30)]
     on_startup = on_startup
     on_shutdown = on_shutdown
     redis_settings = _redis_settings()
