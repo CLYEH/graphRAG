@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.stores import tables
@@ -81,11 +82,26 @@ async def create_job(
 ) -> Job:
     """Insert a fresh ``queued`` job for a project. The caller (a trigger
     endpoint) has already verified the project exists; the FK backstops a
-    concurrent delete."""
+    concurrent delete.
+
+    ``config_snapshot`` is pinned to the project config AS OF NOW (a scalar
+    subquery), so the build runs the config the user submitted even if a later
+    ``PATCH /projects`` edits it during the queue delay before the first dispatch.
+    The worker reuses this snapshot on every (re-)dispatch (capture_config_snapshot)
+    rather than re-reading live config, which would drift a resuming build."""
     row = (
         await conn.execute(
             tables.jobs.insert()
-            .values(project=project, kind=kind, build_id=build_id)
+            .values(
+                project=project,
+                kind=kind,
+                build_id=build_id,
+                config_snapshot=(
+                    sa.select(tables.projects.c.config)
+                    .where(tables.projects.c.name == project)
+                    .scalar_subquery()
+                ),
+            )
             .returning(*_COLS)
         )
     ).one()
@@ -255,6 +271,34 @@ async def release_lease(conn: AsyncConnection, job_id: uuid.UUID, owner: str) ->
         .where(tables.jobs.c.id == job_id, tables.jobs.c.lease_owner == owner)
         .values(lease_owner=None, lease_expires_at=None)
     )
+
+
+async def capture_config_snapshot(
+    conn: AsyncConnection, job_id: uuid.UUID, live_config: dict[str, Any]
+) -> dict[str, Any]:
+    """Return the config pinned to this job, defensively pinning ``live_config`` if
+    it has none yet. ``create_job`` pins ``config_snapshot`` at job creation, so the
+    normal path here is a READ: every dispatch (an arq retry, or the BA2d-3 reaper
+    re-enqueuing a crashed build) reads that same value back, so a mid-build
+    ``PATCH /projects`` can't drift a resuming build's chunking/ontology params
+    (which would break convergent idempotency or mix outputs). The write is the
+    fallback for a job that somehow lacks a snapshot: one atomic COALESCE UPDATE
+    pins it on the first dispatch, and two dispatches racing that pin converge on a
+    single stored config. Falls back to ``live_config`` only if the job row is gone
+    (run_build then raises JobNotFoundError)."""
+    row = (
+        await conn.execute(
+            tables.jobs.update()
+            .where(tables.jobs.c.id == job_id)
+            .values(
+                config_snapshot=sa.func.coalesce(
+                    tables.jobs.c.config_snapshot, sa.literal(live_config, postgresql.JSONB)
+                )
+            )
+            .returning(tables.jobs.c.config_snapshot)
+        )
+    ).one_or_none()
+    return row.config_snapshot if row is not None else live_config
 
 
 async def count_active_jobs(conn: AsyncConnection, project: str) -> int:

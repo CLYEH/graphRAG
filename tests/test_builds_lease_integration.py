@@ -33,7 +33,12 @@ from core.builds.lease import run_build_leased
 from core.builds.orchestrator import _STAGE_ORDER, StageResult, Stages
 from core.config import get_settings
 from core.registry import create_job, create_project, get_job
-from core.registry.jobs import acquire_lease, release_lease, renew_lease
+from core.registry.jobs import (
+    acquire_lease,
+    capture_config_snapshot,
+    release_lease,
+    renew_lease,
+)
 from core.stores import tables
 
 pytestmark = pytest.mark.integration
@@ -204,6 +209,100 @@ async def test_expired_lease_is_reclaimable(migrated: None) -> None:
         async with engine.begin() as conn:
             assert await acquire_lease(conn, job_id, "B", 60.0) is True  # reclaimed
         assert await _lease_owner(engine, job_id) == "B"
+    finally:
+        await _cleanup(engine, project)
+
+
+# ── config pin ──────────────────────────────────────────────────────────────
+
+
+async def _stored_snapshot(engine: AsyncEngine, job_id: uuid.UUID) -> Any:
+    async with engine.connect() as conn:
+        return (
+            await conn.execute(
+                sa.select(tables.jobs.c.config_snapshot).where(tables.jobs.c.id == job_id)
+            )
+        ).scalar_one()
+
+
+async def _null_snapshot(engine: AsyncEngine, job_id: uuid.UUID) -> None:
+    # simulate a job with no pinned config (a legacy row predating create_job's
+    # capture) to exercise the worker's defensive read-or-set fallback. sa.null()
+    # writes SQL NULL — the real absent state a legacy column reads as — not a JSONB
+    # 'null' literal (which COALESCE would treat as present).
+    async with engine.begin() as conn:
+        await conn.execute(
+            tables.jobs.update().where(tables.jobs.c.id == job_id).values(config_snapshot=sa.null())
+        )
+
+
+async def test_create_job_pins_config_at_creation_and_survives_drift(migrated: None) -> None:
+    # the config-drift guard (BA2d-2): a build must run the config the user
+    # SUBMITTED, not whatever the project holds when the worker first dispatches.
+    # create_job pins the project config at creation; a later PATCH /projects
+    # (drift) doesn't change the pin, and the worker's capture reads the pin back.
+    engine = _engine()
+    project = _proj()
+    submitted = {"chunking": {"max_chars": 100}}
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project, config=submitted)
+            job = await create_job(conn, project, "build")
+        # create_job pinned the config the build was submitted with…
+        assert await _stored_snapshot(engine, job.id) == submitted
+        # …and the worker reuses that pin even though live config has since drifted.
+        drifted = {"chunking": {"max_chars": 999}}
+        async with engine.begin() as conn:
+            effective = await capture_config_snapshot(conn, job.id, drifted)
+        assert effective == submitted
+        assert await _stored_snapshot(engine, job.id) == submitted
+    finally:
+        await _cleanup(engine, project)
+
+
+async def test_capture_defensively_pins_when_snapshot_absent(migrated: None) -> None:
+    # a job that somehow lacks a snapshot must still be pinned: the first capture
+    # writes C1, a later capture with a drifted C2 returns C1 — the atomic COALESCE
+    # keeps the first-written config so a resume never picks up drifted params.
+    engine = _engine()
+    project = _proj()
+    try:
+        job_id = await _make_job(engine, project)
+        await _null_snapshot(engine, job_id)
+        c1 = {"chunking": {"max_chars": 100}}
+        c2 = {"chunking": {"max_chars": 999}}
+        async with engine.begin() as conn:
+            first = await capture_config_snapshot(conn, job_id, c1)
+        async with engine.begin() as conn:
+            second = await capture_config_snapshot(conn, job_id, c2)  # drifted live config
+        assert first == c1
+        assert second == c1  # re-dispatch reuses the pinned config, ignores c2
+        assert await _stored_snapshot(engine, job_id) == c1
+    finally:
+        await _cleanup(engine, project)
+
+
+async def test_concurrent_capture_converges_on_one_config(migrated: None) -> None:
+    # two dispatches racing the pin of a snapshot-less job must converge on a single
+    # stored config — the atomic COALESCE + row lock, the same single-winner property
+    # as the lease's acquire. Never a mix, never one dispatch building from C_a while
+    # the row stores C_b.
+    engine = _engine()
+    project = _proj()
+    try:
+        job_id = await _make_job(engine, project)
+        await _null_snapshot(engine, job_id)
+        ca = {"chunking": {"max_chars": 1}}
+        cb = {"chunking": {"max_chars": 2}}
+
+        async def _cap(cfg: dict[str, Any]) -> Any:
+            async with engine.begin() as conn:
+                return await capture_config_snapshot(conn, job_id, cfg)
+
+        a, b = await asyncio.gather(_cap(ca), _cap(cb))
+        assert a == b  # both dispatches see the same pinned config…
+        assert a in (ca, cb)  # …one of the two racing configs, atomically chosen
+        assert await _stored_snapshot(engine, job_id) == a
     finally:
         await _cleanup(engine, project)
 
