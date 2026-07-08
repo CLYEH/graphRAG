@@ -40,6 +40,7 @@ from sqlalchemy.pool import NullPool
 
 from core.builds.config import BuildConfigError, load_build_config
 from core.builds.lease import run_build_leased
+from core.builds.orchestrator import BuildNotResumableError
 from core.builds.stages import default_stages
 from core.config import get_settings
 from core.llm.factory import chat_model, embedding_model
@@ -148,8 +149,18 @@ async def run_build_task(ctx: dict[str, Any], project: str, job_id: str) -> str 
             vector_client=ctx["qdrant"],
             graph_session=session,
         )
-        outcome = await run_build_leased(engine, project, build_job, stages, owner=ctx["owner"])
-    return outcome.status if outcome is not None else None
+        try:
+            outcome = await run_build_leased(engine, project, build_job, stages, owner=ctx["owner"])
+        except BuildNotResumableError:
+            # Benign recovery race: a re-dispatch (an arq retry, or the BA2d-3 reaper)
+            # acquired the lease AFTER the original — starved, not dead — worker
+            # terminalized the build and released it. run_build's FOR-UPDATE-locked
+            # build-status check is the atomic recheck: it found the build already
+            # terminal, so recovery wasn't needed. This dispatch is a no-op, not a
+            # failure — don't manufacture a failed/retried arq job for a build that
+            # already succeeded (the jobs row is already terminal, set by that worker).
+            return None
+        return outcome.status if outcome is not None else None
 
 
 async def _fail_job(engine: AsyncEngine, job_id: uuid.UUID, exc: Exception) -> None:

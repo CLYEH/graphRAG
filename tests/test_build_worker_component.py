@@ -182,6 +182,34 @@ async def test_run_build_task_marks_job_failed_on_malformed_config(
     assert "resolution must be a mapping" in marked["fields"]["error"]["message"]
 
 
+async def test_run_build_task_noops_when_build_already_terminalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: a benign recovery race — a re-dispatch (arq retry / BA2d-3 reaper)
+    # acquires the lease AFTER the original (starved-not-dead) worker finished the
+    # build and released it, so run_build raises BuildNotResumableError (the build
+    # is already terminal). The task must treat that as a no-op (return None), NOT a
+    # failure — else the reaper manufactures failed/retried arq jobs for a build that
+    # already succeeded.
+    from core.builds.orchestrator import BuildNotResumableError
+
+    async def _get_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(config={})
+
+    async def _leased(*a: Any, **k: Any) -> Any:
+        raise BuildNotResumableError("proj", uuid.uuid4(), "ready")
+
+    monkeypatch.setattr(bw, "get_project", _get_project)
+    monkeypatch.setattr(bw, "capture_config_snapshot", _capture_passthrough)
+    monkeypatch.setattr(bw, "load_build_config", lambda raw: "CONFIG")
+    monkeypatch.setattr(bw, "default_stages", lambda config, **k: "STAGES")
+    monkeypatch.setattr(bw, "run_build_leased", _leased)
+
+    result = await bw.run_build_task(_ctx(), "proj", str(uuid.uuid4()))
+
+    assert result is None  # benign no-op, not "failed"
+
+
 async def test_run_build_task_reuses_pinned_config_on_resume(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
