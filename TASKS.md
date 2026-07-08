@@ -70,7 +70,7 @@ Keep items small enough to finish in one loop.
 - [x] BA2c-1 registry-aware build creation + pipeline orchestrator control flow (six §5 stages injected as a seam; step recording, §22 abort, cooperative cancel, resume; fake stages, hermetic Postgres-only tests)
 - [x] BA2c-2a build-config loader — `projects.config` JSONB → typed `TextOntology`/`StructuredMapping`/`ResolutionConfig`/chunk params (reuse dataclass validation, no frozen contract; lenient top-level, strict leaves; unit-tested)
 - [x] BA2c-2b sources→connector resolution + `default_stages` + the six stage adapters (shared-conn writer/projectors); component (shared-conn spy) + integration (real stores, fake LLM/embedder) tests
-- [ ] BA2c-2c two-lane real-LLM test — hermetic + real `chat_model()`/`embedding_model()` over a tiny corpus, key-gated skip-only (no CI secret)
+- [x] BA2c-2c two-lane real-LLM test — hermetic + real `chat_model()`/`embedding_model()` over a tiny corpus, key-gated skip-only (no CI secret)
 - [ ] BA2d arq worker + Redis wiring — incl. **lease-based execution dedup** (Codex BA2c-1 P2): the FOR UPDATE lock serializes build *creation*, but two concurrent dispatches of one job can still both *execute* the same building build. A crash-safe fix needs a lease/heartbeat (distinguish "actively running" from "crashed running" — a running-claim no-op would strand crashed jobs); this is arq's job-timeout/retry territory, not BA2c-1's. run_build already reclaims a still-`building` build on re-dispatch.
 - [ ] BA2e ingest/build triggers + job endpoints + SSE
 - [ ] BA3 inspection endpoints (docs/chunks/entities/relations/subgraph/reports)
