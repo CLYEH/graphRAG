@@ -934,11 +934,29 @@ jobs = sa.Table(
         "created_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
     ),
     sa.Column("finished_at", sa.TIMESTAMP(timezone=True)),
+    # BA2d execution lease (core.builds.lease): the id of the worker currently
+    # executing this job's build, and its DB-clock expiry. Both null when
+    # unleased; a crashed holder's lease simply expires so the next dispatch
+    # reclaims it. Internal only — not part of the frozen Job contract shape
+    # (DR-002 freezes contracts/, not internal storage).
+    sa.Column("lease_owner", sa.Text),
+    sa.Column("lease_expires_at", sa.TIMESTAMP(timezone=True)),
     sa.CheckConstraint(
         "status IN ('queued','running','done','failed','cancelled')", name="jobs_status_valid"
     ),
     sa.CheckConstraint("progress >= 0 AND progress <= 1", name="jobs_progress_bounded"),
     sa.CheckConstraint("kind <> ''", name="jobs_kind_nonempty"),
+    # lease_owner and lease_expires_at move together — acquire sets both, release
+    # clears both — so a half-set lease can never exist to confuse an expiry check.
+    sa.CheckConstraint(
+        "(lease_owner IS NULL) = (lease_expires_at IS NULL)", name="jobs_lease_paired"
+    ),
+    # a lease owner is a worker id — an empty one would collapse the owner-guard
+    # (any two empty-owner workers could renew/release each other's lease). Same
+    # non-empty-identifier rule as jobs_kind_nonempty.
+    sa.CheckConstraint(
+        "lease_owner IS NULL OR lease_owner <> ''", name="jobs_lease_owner_nonempty"
+    ),
 )
 
 # List/dashboard reads a project's jobs newest-first.

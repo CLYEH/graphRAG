@@ -188,6 +188,75 @@ async def is_cancel_requested(conn: AsyncConnection, job_id: uuid.UUID) -> bool:
     )
 
 
+# ── Execution lease (BA2d) ──────────────────────────────────────────────────
+# run_build's FOR UPDATE lock serializes build CREATION but releases at the
+# resolution commit; these give EXECUTION mutual-exclusion so two dispatches of
+# one job don't both run the pipeline. Two invariants make it crash-safe: expiry
+# is always the DB clock (single source — never the caller's wall time, which
+# would let clock skew between workers steal a live lease), and every decision
+# lives in the WHERE of the write, never a prior unlocked read — so concurrent
+# claims on a free/expired lease resolve to exactly one winner (the class-10
+# TOCTOU lesson, the same shape as request_cancel's status-guarded update).
+
+
+def _lease_expiry(ttl_seconds: float) -> sa.ColumnElement[Any]:
+    """``now() + ttl`` computed in Postgres, so every worker measures the lease
+    against one clock regardless of its own."""
+    return sa.func.now() + sa.func.make_interval(0, 0, 0, 0, 0, 0, ttl_seconds)
+
+
+async def acquire_lease(
+    conn: AsyncConnection, job_id: uuid.UUID, owner: str, ttl_seconds: float
+) -> bool:
+    """Atomically claim the execution lease for ``owner``. Succeeds iff the lease
+    is free (no owner) or expired (a crashed holder's ``lease_expires_at`` is now
+    past) — one conditional UPDATE, so two workers racing a free/expired lease
+    resolve to a single winner. Returns True if this call now holds the lease."""
+    won = (
+        await conn.execute(
+            tables.jobs.update()
+            .where(
+                tables.jobs.c.id == job_id,
+                sa.or_(
+                    tables.jobs.c.lease_owner.is_(None),
+                    tables.jobs.c.lease_expires_at < sa.func.now(),
+                ),
+            )
+            .values(lease_owner=owner, lease_expires_at=_lease_expiry(ttl_seconds))
+            .returning(tables.jobs.c.id)
+        )
+    ).one_or_none()
+    return won is not None
+
+
+async def renew_lease(
+    conn: AsyncConnection, job_id: uuid.UUID, owner: str, ttl_seconds: float
+) -> bool:
+    """Push the lease's expiry out by ``ttl_seconds`` — the heartbeat. Guarded on
+    ``lease_owner == owner``, so a worker that already lost its lease to a reclaim
+    cannot extend the new holder's. Returns True if still ours and renewed."""
+    won = (
+        await conn.execute(
+            tables.jobs.update()
+            .where(tables.jobs.c.id == job_id, tables.jobs.c.lease_owner == owner)
+            .values(lease_expires_at=_lease_expiry(ttl_seconds))
+            .returning(tables.jobs.c.id)
+        )
+    ).one_or_none()
+    return won is not None
+
+
+async def release_lease(conn: AsyncConnection, job_id: uuid.UUID, owner: str) -> None:
+    """Clear the lease iff ``owner`` still holds it — a no-op if a reclaim already
+    reassigned it (never steal another worker's lease). Both fields drop together
+    (the jobs_lease_paired invariant)."""
+    await conn.execute(
+        tables.jobs.update()
+        .where(tables.jobs.c.id == job_id, tables.jobs.c.lease_owner == owner)
+        .values(lease_owner=None, lease_expires_at=None)
+    )
+
+
 async def count_active_jobs(conn: AsyncConnection, project: str) -> int:
     """Number of still-running (queued/running) jobs for a project — the
     delete_project guard reads this to refuse deletion mid-operation."""
