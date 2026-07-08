@@ -27,6 +27,15 @@ loop back to step 3.
    (`.claude/hooks/require-push-gates.sh`) recomputes the hash and blocks the push if
    anything changed after the PASS — and re-runs `poe check` itself. Steps 4–5 are
    therefore CPU-verified at push time, not taken on faith.
+   **The local review is the pre-push adversarial pass — spend the round HERE, not
+   on Codex.** Run the `code-reviewer` §6/§7 matrix that matches the change to
+   COMPLETION before the first push (input-position × level for parsers/validators;
+   commit-boundary × crash/race for multi-commit; operation × state × interleaving
+   for state machines), sweeping each class's siblings in the same pass. A class
+   Codex later finds that the matching sweep would have caught is a missed pre-push
+   pass, not a new discovery — and every extra Codex round is an external
+   round-trip that dominates wall-clock (BA2c-2a: 2 rounds, both one class a
+   position apart — one matrix pass covers both).
 6. **Commit → push → open PR** (one task, one PR):
    ```bash
    git commit -m "<id>: <summary>"
@@ -98,8 +107,11 @@ loop back to step 3.
      genuinely ambiguous, stop and ask the user.
      And whichever way a suggestion
      is triaged, sweep the whole diff for the same class of issue and settle it in one
-     round. This triage changes nothing about the `+1` gate below — resolving threads
-     never substitutes for a fresh `+1` on the head commit.
+     round. When a round sends you back to step 3, fix ALL of that round's findings
+     (plus that same-class sweep) BEFORE returning to step 5 — each fix changes the
+     tree hash and voids the prior receipt, so the re-review/re-stamp is once per
+     Codex round, not once per finding. This triage changes nothing about the `+1`
+     gate below — resolving threads never substitutes for a fresh `+1` on the head commit.
 
    **Merge requires Codex `+1` on the head commit — no exceptions.** `eyes` / "not seen yet"
    are pending states (wait/poke, never a failure); unresolved threads or a fresh

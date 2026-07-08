@@ -456,6 +456,27 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      `FOR UPDATE` lock and BA2b added the `builds.project` → `projects.name`
      RESTRICT FK (with its supporting index + reconcile-before-ALTER), closing
      the orphan + TOCTOU faces structurally.
+   - **A config/parser loader's completeness face is input-position × level**:
+     when the diff parses untrusted structured input (a `projects.config` JSONB,
+     a request body) into typed objects, enumerate {absent, explicit-null,
+     unknown-key, wrong-type (bool-is-int in Python), out-of-vocabulary} × {top
+     level, each nested block, each rule, each leaf} before first push — every
+     cell fails loud OR is documented. Omitted ≠ explicit-null must not collapse:
+     `raw.get(k)` returns None for BOTH, so a null block silently takes the
+     absent-default (BA2c-2a: `{"ontology": null}` disabled ontology instead of
+     failing loud — branch on `k not in raw`, route present values through the
+     object-check that rejects null). Delegate every business rule to the typed
+     target's own validator (single source) and wrap its error as ONE loader
+     error — don't restate the rule. Leniency (ignoring unknown keys) is licensed
+     ONLY at a genuine free-form CONTRACT boundary (an API-round-tripped config
+     that may legitimately carry other keys); every CLOSED nested schema REJECTS
+     unknown keys, else a typo on an OPTIONAL key silently disables it (BA2c-2a:
+     `disambiguator` for `disambiguator_column` → name-only keys collapse
+     distinct same-name entities into one). Draw the boundary by "are this
+     level's keys DATA or SCHEMA" — a map's keys are data (tolerate), a
+     fixed-field block is schema (strict). BA2c-2a took 2 Codex rounds, both this
+     one class, one position apart (null-block, then unknown-key); one matrix pass
+     covers both.
 
 ## Output (exactly this shape)
 ```
