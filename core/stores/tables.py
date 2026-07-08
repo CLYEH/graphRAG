@@ -941,12 +941,12 @@ jobs = sa.Table(
     # (DR-002 freezes contracts/, not internal storage).
     sa.Column("lease_owner", sa.Text),
     sa.Column("lease_expires_at", sa.TIMESTAMP(timezone=True)),
-    # BA2d-2 config pin: the raw project config the build STARTED with, captured on
-    # the first dispatch and reused on every re-dispatch (an arq retry, or the
-    # BA2d-3 reaper re-enqueuing a crashed build), so a mid-build PATCH /projects
-    # can't drift a resuming build's chunking/ontology params (which would break
-    # convergent idempotency or mix outputs). Null until the first dispatch captures
-    # it. Internal only — not part of the frozen Job contract shape.
+    # BA2d-2 config pin: the project config AS OF this job's creation. create_job
+    # captures it (so a PATCH /projects during the queue delay can't change the
+    # submitted build), and every (re-)dispatch reuses it rather than re-reading
+    # live config — so an arq retry or the BA2d-3 reaper can't drift a resuming
+    # build's chunking/ontology params (which would break convergent idempotency or
+    # mix outputs). Internal only — not part of the frozen Job contract shape.
     sa.Column("config_snapshot", postgresql.JSONB),
     sa.CheckConstraint(
         "status IN ('queued','running','done','failed','cancelled')", name="jobs_status_valid"

@@ -6,11 +6,12 @@ executes builds; the API (BA2e) only enqueues. This wires arq + Redis onto core:
 * ``on_startup`` builds ONE long-lived dep bundle (engine + Qdrant/Neo4j/LLM/
   embedder — the ``ProjectContext`` shape, pooled and reused across jobs) plus a
   unique owner id for this worker process.
-* ``run_build_task`` pins the build's config (snapshotted on the first dispatch,
-  reused on every re-dispatch so a mid-build config edit can't drift a resume),
-  builds the six §5 stages off the bundle, and executes under the BA2d-1 execution
-  lease (``run_build_leased``) so a duplicate dispatch of the same job is a no-op
-  rather than a second concurrent execution.
+* ``run_build_task`` reuses the build's pinned config (``create_job`` snapshots it
+  at job creation; reused on every dispatch so neither a queue-delay config edit
+  nor a re-dispatch can drift a resume), builds the six §5 stages off the bundle,
+  and executes under the BA2d-1 execution lease (``run_build_leased``) so a
+  duplicate dispatch of the same job is a no-op rather than a second concurrent
+  execution.
 * ``enqueue_build`` (BA2e's trigger calls it after ``create_job``) enqueues with
   ``_job_id=str(job_id)`` for arq's own dispatch dedup.
 
@@ -78,11 +79,13 @@ async def run_build_task(ctx: dict[str, Any], project: str, job_id: str) -> str 
     # record it on the row and don't retry (a retry can't fix it). Transient errors
     # (e.g. a DB blip) are NOT caught, so arq still retries those.
     #
-    # The config is PINNED to the build here (capture_config_snapshot): the first
-    # dispatch snapshots proj.config onto the job and every re-dispatch (an arq
-    # retry, or the BA2d-3 reaper) reuses that snapshot, so a mid-build
-    # PATCH /projects can't drift a resuming build's chunking/ontology params. The
-    # capture writes the jobs row, so this runs in a committing begin().
+    # The config is PINNED to the build: create_job snapshots proj.config onto the
+    # job at creation, and capture_config_snapshot reads that pinned config back on
+    # every dispatch (defensively pinning live config if a job somehow lacks one),
+    # so neither a PATCH /projects during the queue delay nor a re-dispatch (an arq
+    # retry, or the BA2d-3 reaper) can drift a resuming build's chunking/ontology
+    # params. The defensive pin can write the jobs row, so this runs in a committing
+    # begin().
     try:
         async with engine.begin() as conn:
             proj = await get_project(conn, project)
