@@ -25,16 +25,17 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+import sqlalchemy as sa
 from arq.connections import ArqRedis, RedisSettings
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from core.builds.config import load_build_config
+from core.builds.config import BuildConfigError, load_build_config
 from core.builds.lease import run_build_leased
 from core.builds.stages import default_stages
 from core.config import get_settings
 from core.llm.factory import chat_model, embedding_model
-from core.registry import get_project
+from core.registry import get_project, set_progress
 from core.stores.graph import graph_driver
 from core.stores.vectors import vector_client
 
@@ -67,11 +68,22 @@ async def run_build_task(ctx: dict[str, Any], project: str, job_id: str) -> str 
     ``run_build`` opens its own per-stage Postgres transactions off the engine.
     """
     engine = ctx["engine"]
-    async with engine.connect() as conn:
-        proj = await get_project(conn, project)
-    if proj is None:  # a build for a vanished project must fail loud, not silently no-op
-        raise LookupError(f"project {project!r} does not exist")
-    config = load_build_config(proj.config)
+    build_job = uuid.UUID(job_id)
+    # Preflight (project + config) happens BEFORE run_build enters the orchestrator
+    # path that marks jobs.status. A deterministic failure here (vanished project /
+    # malformed config) would otherwise leave the durable jobs row queued forever —
+    # blocking project delete and misleading GET /jobs — so record it on the row and
+    # don't retry (a retry can't fix it). Transient errors (e.g. a DB blip) are NOT
+    # caught, so arq still retries those.
+    try:
+        async with engine.connect() as conn:
+            proj = await get_project(conn, project)
+        if proj is None:
+            raise LookupError(f"project {project!r} does not exist")
+        config = load_build_config(proj.config)
+    except (LookupError, BuildConfigError) as exc:
+        await _fail_job(engine, build_job, exc)
+        return "failed"
     async with ctx["neo4j"].session() as session:
         stages = default_stages(
             config,
@@ -80,10 +92,22 @@ async def run_build_task(ctx: dict[str, Any], project: str, job_id: str) -> str 
             vector_client=ctx["qdrant"],
             graph_session=session,
         )
-        outcome = await run_build_leased(
-            engine, project, uuid.UUID(job_id), stages, owner=ctx["owner"]
-        )
+        outcome = await run_build_leased(engine, project, build_job, stages, owner=ctx["owner"])
     return outcome.status if outcome is not None else None
+
+
+async def _fail_job(engine: AsyncEngine, job_id: uuid.UUID, exc: Exception) -> None:
+    """Record a preflight failure on the durable jobs row (its own committed
+    transaction), so a build that never reached the orchestrator still terminates
+    the job instead of leaving it queued."""
+    async with engine.begin() as conn:
+        await set_progress(
+            conn,
+            job_id,
+            status="failed",
+            finished_at=sa.func.now(),
+            error={"code": "INTERNAL", "message": str(exc), "details": None},
+        )
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:
@@ -117,9 +141,12 @@ class WorkerSettings:
     on_startup = on_startup
     on_shutdown = on_shutdown
     redis_settings = _redis_settings()
-    # A build can be long (LLM extraction over many docs). The DB heartbeat-lease
-    # (BA2d-1), NOT this timeout, is the liveness mechanism, so give jobs generous
-    # headroom; arq retries a timed-out/crashed job and run_build resumes the
-    # still-building build.
-    job_timeout = 3600
+    # arq keeps a job's in-progress key for job_timeout+10s and won't re-dispatch
+    # the job while it exists, so job_timeout is ALSO the ceiling on crash recovery:
+    # a worker that dies mid-build blocks re-dispatch for that long. Keep it modest
+    # (config-tunable) so the DB lease's fast crash-reclaim (BA2d-1) isn't stranded
+    # behind an hour-long arq key; a build that outruns the timeout is killed and
+    # resumed at stage granularity on the next try (each committed stage is
+    # skipped), so the bound is the longest single stage — see build_job_timeout_seconds.
+    job_timeout = get_settings().build_job_timeout_seconds
     max_tries = 3

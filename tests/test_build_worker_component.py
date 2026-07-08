@@ -18,11 +18,16 @@ import pytest
 from arq.connections import RedisSettings
 
 from api.workers import build_worker as bw
+from core.config import get_settings
 
 
 class _FakeEngine:
     @asynccontextmanager
     async def connect(self) -> AsyncIterator[Any]:
+        yield SimpleNamespace()
+
+    @asynccontextmanager
+    async def begin(self) -> AsyncIterator[Any]:
         yield SimpleNamespace()
 
 
@@ -106,14 +111,60 @@ async def test_run_build_task_returns_none_when_lease_held(monkeypatch: pytest.M
     assert result is None  # the no-op dispatch surfaces as a None result
 
 
-async def test_run_build_task_missing_project_fails_loud(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_build_task_marks_job_failed_on_missing_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # a preflight failure (vanished project) happens before run_build can mark the
+    # job — the durable jobs row must be set failed, not left queued (which would
+    # block project delete and mislead GET /jobs).
+    marked: dict[str, Any] = {}
+
     async def _get_project(conn: Any, name: str) -> Any:
         return None
 
-    monkeypatch.setattr(bw, "get_project", _get_project)
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        marked["job"] = job_id
+        marked["fields"] = fields
 
-    with pytest.raises(LookupError, match="does not exist"):
-        await bw.run_build_task({"engine": _FakeEngine()}, "gone", str(uuid.uuid4()))
+    monkeypatch.setattr(bw, "get_project", _get_project)
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+
+    jid = uuid.uuid4()
+    result = await bw.run_build_task({"engine": _FakeEngine()}, "gone", str(jid))
+
+    assert result == "failed"  # terminal, not a raised exception left un-recorded
+    assert marked["job"] == jid
+    assert marked["fields"]["status"] == "failed"
+    assert "does not exist" in marked["fields"]["error"]["message"]
+
+
+async def test_run_build_task_marks_job_failed_on_malformed_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # a config that fails validation raises in preflight (before the orchestrator);
+    # same durable-row requirement as a missing project.
+    from core.builds.config import BuildConfigError
+
+    marked: dict[str, Any] = {}
+
+    async def _get_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(config={"resolution": "not-a-block"})
+
+    def _load_config(raw: Any) -> Any:
+        raise BuildConfigError("resolution must be a mapping")
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        marked["fields"] = fields
+
+    monkeypatch.setattr(bw, "get_project", _get_project)
+    monkeypatch.setattr(bw, "load_build_config", _load_config)
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+
+    result = await bw.run_build_task(_ctx(), "proj", str(uuid.uuid4()))
+
+    assert result == "failed"
+    assert marked["fields"]["status"] == "failed"
+    assert "resolution must be a mapping" in marked["fields"]["error"]["message"]
 
 
 async def test_enqueue_build_uses_job_id_dedup() -> None:
@@ -173,5 +224,7 @@ def test_worker_settings_shape() -> None:
     assert bw.WorkerSettings.on_startup is bw.on_startup
     assert bw.WorkerSettings.on_shutdown is bw.on_shutdown
     assert isinstance(bw.WorkerSettings.redis_settings, RedisSettings)
-    assert bw.WorkerSettings.job_timeout == 3600
+    # crash recovery is bounded by job_timeout (arq's in-progress key), so it's a
+    # modest config value, not a build-length-sized 3600
+    assert bw.WorkerSettings.job_timeout == get_settings().build_job_timeout_seconds
     assert bw.WorkerSettings.max_tries == 3
