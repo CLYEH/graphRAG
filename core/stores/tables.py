@@ -968,3 +968,13 @@ jobs = sa.Table(
 
 # List/dashboard reads a project's jobs newest-first.
 jobs_by_project = sa.Index("jobs_by_project", jobs.c.project, jobs.c.created_at.desc())
+
+# BA2d-3 reaper scan: the twice-a-minute cron looks for "held lease + expired +
+# job still active" (find_reapable_jobs — the WHERE here mirrors its predicate).
+# Partial on exactly that near-empty set, so each tick is an index probe rather
+# than a seq scan over the whole job history.
+jobs_reapable = sa.Index(
+    "jobs_reapable",
+    jobs.c.lease_expires_at,
+    postgresql_where=sa.text("lease_owner IS NOT NULL AND status IN ('queued','running')"),
+)
