@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -311,43 +312,74 @@ async def test_enqueue_build_uses_job_id_dedup() -> None:
     assert calls["enqueue"] == (bw.BUILD_TASK, ("proj", str(jid)), str(jid))
 
 
-async def test_reenqueue_build_uses_no_job_id() -> None:
-    calls: dict[str, Any] = {}
+async def test_reenqueue_build_uses_a_deterministic_per_stale_lease_id() -> None:
+    calls: list[Any] = []
 
     class _Redis:
-        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> None:
-            calls["enqueue"] = (fn, args, _job_id)
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            calls.append((fn, args, _job_id))
+            return object()  # arq accepted the enqueue
 
     jid = uuid.uuid4()
-    await bw.reenqueue_build(_Redis(), "proj", jid)  # type: ignore[arg-type]
+    expiry = datetime(2026, 7, 9, 1, 2, 3, tzinfo=UTC)
+    first = await bw.reenqueue_build(_Redis(), "proj", jid, stale_expiry=expiry)  # type: ignore[arg-type]
+    second = await bw.reenqueue_build(_Redis(), "proj", jid, stale_expiry=expiry)  # type: ignore[arg-type]
 
-    # NO _job_id: the crashed job's original in-progress key lingers 24h, so a fresh
-    # arq id is what re-dispatches it; the DB lease still enforces one executor.
-    assert calls["enqueue"] == (bw.BUILD_TASK, ("proj", str(jid)), None)
+    assert first is True and second is True
+    # the id is derived from (job, stale lease expiry) — NOT the job's own id (the
+    # crashed dispatch's in-progress key lingers 24h and would refuse it) and NOT a
+    # fresh id per call (ticks would pile up duplicates behind a saturated queue).
+    # Same stale lease → byte-identical id, so arq's own dedup suppresses re-ticks.
+    expected = f"reap:{jid}:{expiry.isoformat()}"
+    assert [c[2] for c in calls] == [expected, expected]
+    assert calls[0][:2] == (bw.BUILD_TASK, ("proj", str(jid)))
 
 
 async def test_reap_stuck_builds_reenqueues_each_crashed_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     j1, j2 = uuid.uuid4(), uuid.uuid4()
+    e1 = datetime(2026, 7, 9, 1, 0, 0, tzinfo=UTC)
+    e2 = datetime(2026, 7, 9, 1, 0, 30, tzinfo=UTC)
     enq: list[Any] = []
 
-    async def _find(conn: Any) -> list[tuple[uuid.UUID, str]]:
-        return [(j1, "p1"), (j2, "p2")]
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
+        return [(j1, "p1", e1), (j2, "p2", e2)]
 
     class _Redis:
-        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> None:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
             enq.append((fn, args, _job_id))
+            return object()
 
     monkeypatch.setattr(bw, "find_reapable_jobs", _find)
     reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
 
     assert reaped == 2
-    # each crashed job re-dispatched under a fresh arq id (no _job_id)
+    # each crashed job re-dispatched under its own per-stale-lease id
     assert enq == [
-        (bw.BUILD_TASK, ("p1", str(j1)), None),
-        (bw.BUILD_TASK, ("p2", str(j2)), None),
+        (bw.BUILD_TASK, ("p1", str(j1)), f"reap:{j1}:{e1.isoformat()}"),
+        (bw.BUILD_TASK, ("p2", str(j2)), f"reap:{j2}:{e2.isoformat()}"),
     ]
+
+
+async def test_reap_stuck_builds_counts_only_new_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: while a replacement dispatch sits queued behind a saturated pool, the
+    # stale row keeps matching every 30s tick. arq refuses the duplicate id
+    # (enqueue_job → None) and the tick must report 0 new dispatches — the reaper
+    # piles up NO duplicates for one crashed job.
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
+        return [(uuid.uuid4(), "p1", datetime(2026, 7, 9, tzinfo=UTC))]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            return None  # arq: a job with this id is already pending → refused
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 0  # matched one stale row, enqueued nothing new
 
 
 async def test_reap_stuck_builds_is_a_noop_when_nothing_crashed(
@@ -355,12 +387,13 @@ async def test_reap_stuck_builds_is_a_noop_when_nothing_crashed(
 ) -> None:
     enq: list[Any] = []
 
-    async def _find(conn: Any) -> list[tuple[uuid.UUID, str]]:
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
         return []  # no expired leases → an idle tick
 
     class _Redis:
-        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> None:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
             enq.append(1)
+            return object()
 
     monkeypatch.setattr(bw, "find_reapable_jobs", _find)
     reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})

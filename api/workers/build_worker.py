@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime
 from typing import Any
 
 import sqlalchemy as sa
@@ -74,14 +75,28 @@ async def enqueue_build(redis: ArqRedis, project: str, job_id: uuid.UUID) -> Non
     await redis.enqueue_job(BUILD_TASK, project, str(job_id), _job_id=str(job_id))
 
 
-async def reenqueue_build(redis: ArqRedis, project: str, job_id: uuid.UUID) -> None:
-    """Re-dispatch a crashed build (BA2d-3 reaper). Unlike ``enqueue_build`` this
-    passes NO ``_job_id``: the crashed job's original arq in-progress key lingers
-    for job_timeout+10s (the generous 24h backstop), so a same-id enqueue would be
-    refused — a fresh arq id re-dispatches it now. The DB execution lease still
-    guarantees a single executor (a redundant re-dispatch acquires nothing and
-    no-ops), so an occasional duplicate enqueue between reaper ticks is harmless."""
-    await redis.enqueue_job(BUILD_TASK, project, str(job_id))
+async def reenqueue_build(
+    redis: ArqRedis, project: str, job_id: uuid.UUID, *, stale_expiry: datetime
+) -> bool:
+    """Re-dispatch a crashed build (BA2d-3 reaper); True if a new dispatch was
+    enqueued, False if one is already pending. The arq id is DETERMINISTIC per
+    stale lease — ``reap:<job>:<expiry>`` — not the job's own id (the crashed
+    dispatch's in-progress key lingers for job_timeout+10s, so a same-id enqueue
+    would be refused for 24h) and not a fresh id per call (the row keeps matching
+    ``find_reapable_jobs`` until the replacement actually STARTS, so a fresh id
+    every 30s tick would pile up unbounded duplicates behind a saturated queue).
+    The stale expiry only moves on acquire/renew, so all ticks while the job sits
+    crashed derive the SAME id and arq refuses the duplicates — one pending
+    recovery per stale lease. If the replacement itself crashes, the lease it
+    acquired expires at a NEW timestamp → a new id → the next recovery generation.
+    The DB execution lease remains the single-executor guarantee either way."""
+    job = await redis.enqueue_job(
+        BUILD_TASK,
+        project,
+        str(job_id),
+        _job_id=f"reap:{job_id}:{stale_expiry.isoformat()}",
+    )
+    return job is not None
 
 
 async def reap_stuck_builds(ctx: dict[str, Any]) -> int:
@@ -90,19 +105,29 @@ async def reap_stuck_builds(ctx: dict[str, Any]) -> int:
 
     A crashed/starved worker stops heartbeating, so its job's execution lease
     expires on the DB clock. This finds those (``find_reapable_jobs`` — expired
-    held lease + non-terminal job) and re-enqueues each under a fresh arq id, so a
-    fresh dispatch reclaims the now-free lease and resumes (~1-min recovery vs the
-    24h backstop). An idle tick is a no-op; ``unique=True`` (see WorkerSettings)
-    runs this on one worker per tick. Returns the count reaped."""
+    held lease + non-terminal job) and re-enqueues each under a deterministic
+    per-stale-lease arq id, so a fresh dispatch reclaims the now-free lease and
+    resumes (~1-min recovery vs the 24h backstop) while re-ticks over the same
+    stale lease dedup instead of piling up duplicates. An idle tick is a no-op;
+    ``unique=True`` (see WorkerSettings) runs this on one worker per tick.
+    Returns the number of NEW dispatches enqueued (dedup-suppressed ones don't
+    count)."""
     engine: AsyncEngine = ctx["engine"]
     redis: ArqRedis = ctx["redis"]
     async with engine.connect() as conn:
         reapable = await find_reapable_jobs(conn)
-    for job_id, project in reapable:
-        await reenqueue_build(redis, project, job_id)
+    enqueued = 0
+    for job_id, project, stale_expiry in reapable:
+        if await reenqueue_build(redis, project, job_id, stale_expiry=stale_expiry):
+            enqueued += 1
     if reapable:
-        logger.info("reaped %d stuck build(s): %s", len(reapable), [str(j) for j, _ in reapable])
-    return len(reapable)
+        logger.info(
+            "reaper: %d stuck build(s), %d newly re-dispatched: %s",
+            len(reapable),
+            enqueued,
+            [str(j) for j, _, _ in reapable],
+        )
+    return enqueued
 
 
 async def run_build_task(ctx: dict[str, Any], project: str, job_id: str) -> str | None:

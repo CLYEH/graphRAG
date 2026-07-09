@@ -355,13 +355,17 @@ async def test_find_reapable_jobs_returns_only_crashed_executions(migrated: None
         async with engine.connect() as conn:
             reapable = await find_reapable_jobs(conn)
 
-        ids = {job_id for job_id, _ in reapable}
+        ids = {job_id for job_id, _, _ in reapable}
         assert crashed in ids  # expired held lease + running → reaped
         assert early_crash in ids  # expired held lease + still queued (pre-running crash) → reaped
         assert live not in ids  # heartbeating (expiry in the future)
         assert released not in ids  # never acquired a lease
         assert terminal not in ids  # terminal status, even with an expired lease
-        assert (crashed, project) in reapable  # returns (id, project) for re-enqueue
+        # returns (id, project, stale expiry) — the expiry is the recovery-generation
+        # marker the reaper derives its dedup id from
+        row = next(r for r in reapable if r[0] == crashed)
+        assert row[1] == project
+        assert row[2] is not None
     finally:
         await _cleanup(engine, project)
 
@@ -385,14 +389,28 @@ async def test_reap_stuck_builds_reenqueues_crashed_over_real_db(migrated: None)
         enq: list[Any] = []
 
         class _Redis:
-            async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> None:
+            async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
                 enq.append((fn, args, _job_id))
+                return object()
 
         reaped = await bw.reap_stuck_builds({"engine": engine, "redis": _Redis()})
 
         assert reaped == 1
-        # only the crashed job, re-dispatched under a fresh arq id (no _job_id)
-        assert enq == [(bw.BUILD_TASK, (project, str(crashed)), None)]
+        # only the crashed job, re-dispatched under the deterministic per-stale-lease
+        # id (reap:<job>:<expiry>) so re-ticks over the same stale lease dedup
+        async with engine.connect() as conn:
+            stale_expiry = (
+                await conn.execute(
+                    sa.select(tables.jobs.c.lease_expires_at).where(tables.jobs.c.id == crashed)
+                )
+            ).scalar_one()
+        assert enq == [
+            (
+                bw.BUILD_TASK,
+                (project, str(crashed)),
+                f"reap:{crashed}:{stale_expiry.isoformat()}",
+            )
+        ]
     finally:
         await _cleanup(engine, project)
 
