@@ -453,6 +453,9 @@ def test_worker_settings_shape() -> None:
     assert reaper.unique is True
     # twice a minute — pins the ~1-min recovery cadence against the 60s lease TTL
     assert reaper.second == {0, 30}
+    # no arq results (jobs row is the SoR): a kept result would reserve a failed
+    # replacement's reap id for an hour and stall recovery to keep_result, not ~1min
+    assert bw.WorkerSettings.keep_result == 0
     # crash recovery is bounded by job_timeout (arq's in-progress key), so it's a
     # modest config value, not a build-length-sized 3600
     assert bw.WorkerSettings.job_timeout == get_settings().build_job_timeout_seconds

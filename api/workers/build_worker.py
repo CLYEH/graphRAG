@@ -88,7 +88,9 @@ async def reenqueue_build(
     The stale expiry only moves on acquire/renew, so all ticks while the job sits
     crashed derive the SAME id and arq refuses the duplicates — one pending
     recovery per stale lease. If the replacement itself crashes, the lease it
-    acquired expires at a NEW timestamp → a new id → the next recovery generation.
+    acquired expires at a NEW timestamp → a new id → the next recovery generation;
+    if it fails BEFORE ever acquiring (same expiry → same id), keep_result=0 (see
+    WorkerSettings) frees the id the moment it finishes, so the next tick retries.
     The DB execution lease remains the single-executor guarantee either way."""
     job = await redis.enqueue_job(
         BUILD_TASK,
@@ -254,3 +256,12 @@ class WorkerSettings:
     # minute. See core.config.build_job_timeout_seconds.
     job_timeout = get_settings().build_job_timeout_seconds
     max_tries = 3
+    # No arq results, ever: the jobs row is the SoR (nothing consumes arq's result
+    # payloads), and a kept result RESERVES its custom job id for keep_result
+    # seconds (default 3600). That reservation would break the reaper: a
+    # replacement dispatch that fails BEFORE acquiring the lease (e.g. a transient
+    # Postgres outage in job_lease entry) leaves the stale expiry — and thus the
+    # derived reap id — unchanged, so its kept result would block that id for an
+    # hour and stall recovery. keep_result=0 frees the id the moment the failed
+    # dispatch finishes, so the next 30s tick retries.
+    keep_result = 0
