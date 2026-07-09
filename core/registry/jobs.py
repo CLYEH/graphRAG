@@ -276,11 +276,13 @@ async def release_lease(conn: AsyncConnection, job_id: uuid.UUID, owner: str) ->
 async def find_reapable_jobs(conn: AsyncConnection) -> list[tuple[uuid.UUID, str]]:
     """Jobs whose execution lease has EXPIRED while the job is still non-terminal —
     a worker acquired the lease then stopped heartbeating (crashed / event-loop
-    starved), so its build is stuck mid-flight. Returns ``(id, project)`` for each;
-    the BA2d-3 reaper re-enqueues them for a fresh dispatch that reclaims the now-
-    free lease and resumes. Nothing else matches: a LIVE worker keeps
+    starved), so its dispatch is stuck mid-flight. Returns ``(id, project)`` for
+    each; the BA2d-3 reaper re-enqueues them for a fresh dispatch that reclaims the
+    now-free lease and resumes. Nothing else matches: a LIVE worker keeps
     ``lease_expires_at`` in the future; a completed run released the lease
-    (``lease_owner`` NULL); a never-dispatched job never acquired one. The job's own
+    (``lease_owner`` NULL); a never-dispatched job never acquired one. Because the
+    worker enters the lease FIRST (before its preflight), any crash mid-dispatch —
+    even before run_build — leaves a held lease this predicate sees. The job's own
     status gates on non-terminal (``queued``/``running``) so a build that finished
     but crashed before the lease release isn't pointlessly re-run."""
     rows = (

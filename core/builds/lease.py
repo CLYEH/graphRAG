@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from contextlib import suppress
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -53,6 +54,48 @@ async def _heartbeat(
             return
 
 
+@asynccontextmanager
+async def job_lease(
+    engine: AsyncEngine,
+    job_id: uuid.UUID,
+    owner: str,
+    *,
+    ttl_seconds: float = _DEFAULT_TTL_SECONDS,
+    heartbeat_seconds: float = _DEFAULT_HEARTBEAT_SECONDS,
+) -> AsyncIterator[bool]:
+    """Hold the job's execution lease for the duration of the block, yielding
+    whether it was acquired (False → a live peer holds it; the caller should
+    no-op). While held, a background heartbeat renews it; on exit (success OR
+    failure) it is released so a retry can re-acquire. A crashed holder never
+    releases, but its lease expires on the DB clock and the next dispatch (or the
+    reaper) reclaims it.
+
+    The worker enters this FIRST — before preflight/stage construction — so the
+    lease brackets the ENTIRE dispatch: a crash anywhere mid-dispatch leaves a
+    held-but-lapsing lease the BA2d-3 reaper can see, rather than an unmarked
+    ``queued`` row stranded until arq's own (24h) timeout.
+    """
+    async with engine.begin() as conn:
+        acquired = await acquire_lease(conn, job_id, owner, ttl_seconds)
+    if not acquired:
+        # a live peer holds the lease → the caller's dispatch is a deliberate
+        # no-op. (An absent job also fails to acquire and yields False rather than
+        # raising, but the delete-project guard refuses deletion under an active
+        # job, so a dispatched job can't vanish — that path is unreachable in
+        # practice.)
+        yield False
+        return
+    beat = asyncio.create_task(_heartbeat(engine, job_id, owner, ttl_seconds, heartbeat_seconds))
+    try:
+        yield True
+    finally:
+        beat.cancel()
+        with suppress(asyncio.CancelledError):
+            await beat
+        async with engine.begin() as conn:
+            await release_lease(conn, job_id, owner)
+
+
 async def run_build_leased(
     engine: AsyncEngine,
     project: str,
@@ -71,22 +114,16 @@ async def run_build_leased(
 
     Returns the ``BuildOutcome`` if this call acquired the lease and ran the
     pipeline, or ``None`` if another live worker already holds it — then this
-    dispatch is a deliberate no-op (the peer is executing the same build). While
-    run_build runs, a background heartbeat renews the lease so a long build keeps
-    it; the lease is always released on exit (success OR failure) so a retry can
-    re-acquire. A crashed worker never releases, but its lease expires on the DB
-    clock and the next dispatch reclaims it.
+    dispatch is a deliberate no-op (the peer is executing the same build).
+    A thin composition of ``job_lease`` + ``run_build`` for callers whose whole
+    dispatch IS the build; the worker instead enters ``job_lease`` itself so the
+    lease also covers its preflight.
     """
-    async with engine.begin() as conn:
-        acquired = await acquire_lease(conn, job_id, owner, ttl_seconds)
-    if not acquired:
-        # a live peer holds the lease → this dispatch is a deliberate no-op. (An
-        # absent job also fails to acquire and returns None rather than raising,
-        # but the delete-project guard refuses deletion under an active job, so a
-        # dispatched job can't vanish — that path is unreachable in practice.)
-        return None
-    beat = asyncio.create_task(_heartbeat(engine, job_id, owner, ttl_seconds, heartbeat_seconds))
-    try:
+    async with job_lease(
+        engine, job_id, owner, ttl_seconds=ttl_seconds, heartbeat_seconds=heartbeat_seconds
+    ) as acquired:
+        if not acquired:
+            return None
         return await run_build(
             engine,
             project,
@@ -97,9 +134,3 @@ async def run_build_leased(
             source_hash=source_hash,
             step_failure_ratio=step_failure_ratio,
         )
-    finally:
-        beat.cancel()
-        with suppress(asyncio.CancelledError):
-            await beat
-        async with engine.begin() as conn:
-            await release_lease(conn, job_id, owner)

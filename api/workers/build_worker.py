@@ -6,12 +6,13 @@ executes builds; the API (BA2e) only enqueues. This wires arq + Redis onto core:
 * ``on_startup`` builds ONE long-lived dep bundle (engine + Qdrant/Neo4j/LLM/
   embedder — the ``ProjectContext`` shape, pooled and reused across jobs) plus a
   unique owner id for this worker process.
-* ``run_build_task`` reuses the build's pinned config (``create_job`` snapshots it
-  at job creation; reused on every dispatch so neither a queue-delay config edit
-  nor a re-dispatch can drift a resume), builds the six §5 stages off the bundle,
-  and executes under the BA2d-1 execution lease (``run_build_leased``) so a
-  duplicate dispatch of the same job is a no-op rather than a second concurrent
-  execution.
+* ``run_build_task`` runs the WHOLE dispatch under the BA2d-1 execution lease
+  (``job_lease`` entered before preflight, so a crash anywhere mid-dispatch is
+  reaper-visible, and a duplicate dispatch is a no-op rather than a second
+  concurrent execution), reuses the build's pinned config (``create_job``
+  snapshots it at job creation; reused on every dispatch so neither a queue-delay
+  config edit nor a re-dispatch can drift a resume), builds the six §5 stages off
+  the bundle, and runs ``run_build``.
 * ``enqueue_build`` (BA2e's trigger calls it after ``create_job``) enqueues with
   ``_job_id=str(job_id)`` for arq's own dispatch dedup.
 * ``reap_stuck_builds`` (a cron, BA2d-3) re-enqueues builds whose worker crashed —
@@ -39,8 +40,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from core.builds.config import BuildConfigError, load_build_config
-from core.builds.lease import run_build_leased
-from core.builds.orchestrator import BuildNotResumableError
+from core.builds.lease import job_lease
+from core.builds.orchestrator import BuildNotResumableError, run_build
 from core.builds.stages import default_stages
 from core.config import get_settings
 from core.llm.factory import chat_model, embedding_model
@@ -107,60 +108,67 @@ async def reap_stuck_builds(ctx: dict[str, Any]) -> int:
 async def run_build_task(ctx: dict[str, Any], project: str, job_id: str) -> str | None:
     """arq task: run one build under the execution lease.
 
-    Reads the long-lived deps from ``ctx`` (built in ``on_startup``), pins+loads
-    the project's config (see the preflight), builds the six §5 stages, and
-    executes via ``run_build_leased`` with this worker's owner id. Returns the
-    terminal build status, or ``None`` if a live peer already holds the lease (this
-    dispatch was a deliberate no-op). A neo4j session is opened per job (the driver
-    is shared); ``run_build`` opens its own per-stage Postgres transactions off the
-    engine.
+    ENTERS THE LEASE FIRST — before preflight/stage construction — so the lease
+    brackets the entire dispatch: a worker that crashes anywhere mid-dispatch
+    (even during preflight) leaves a held-but-lapsing lease the BA2d-3 reaper can
+    see, instead of an unmarked ``queued`` row stranded until arq's 24h timeout.
+    Then pins+loads the project's config (see the preflight comment), builds the
+    six §5 stages off the ``ctx`` dep bundle, and runs ``run_build``. Returns the
+    terminal build status, or ``None`` if a live peer already holds the lease
+    (this dispatch was a deliberate no-op). A neo4j session is opened per job
+    (the driver is shared); ``run_build`` opens its own per-stage Postgres
+    transactions off the engine.
     """
     engine = ctx["engine"]
     build_job = uuid.UUID(job_id)
-    # Preflight (project existence + config) happens BEFORE run_build enters the
-    # orchestrator path that marks jobs.status. A deterministic failure here
-    # (vanished project / malformed config) would otherwise leave the durable jobs
-    # row queued forever — blocking project delete and misleading GET /jobs — so
-    # record it on the row and don't retry (a retry can't fix it). Transient errors
-    # (e.g. a DB blip) are NOT caught, so arq still retries those.
-    #
-    # The config is PINNED to the build: create_job snapshots proj.config onto the
-    # job at creation, and capture_config_snapshot reads that pinned config back on
-    # every dispatch (defensively pinning live config if a job somehow lacks one),
-    # so neither a PATCH /projects during the queue delay nor a re-dispatch (an arq
-    # retry, or the BA2d-3 reaper) can drift a resuming build's chunking/ontology
-    # params. The defensive pin can write the jobs row, so this runs in a committing
-    # begin().
-    try:
-        async with engine.begin() as conn:
-            proj = await get_project(conn, project)
-            if proj is None:
-                raise LookupError(f"project {project!r} does not exist")
-            raw_config = await capture_config_snapshot(conn, build_job, proj.config)
-        config = load_build_config(raw_config)
-    except (LookupError, BuildConfigError) as exc:
-        await _fail_job(engine, build_job, exc)
-        return "failed"
-    async with ctx["neo4j"].session() as session:
-        stages = default_stages(
-            config,
-            chat_model=ctx["llm"],
-            embedder=ctx["embedder"],
-            vector_client=ctx["qdrant"],
-            graph_session=session,
-        )
+    async with job_lease(engine, build_job, ctx["owner"]) as acquired:
+        if not acquired:
+            return None  # a live peer is executing this job — deliberate no-op
+        # Preflight (project existence + config) happens BEFORE run_build enters the
+        # orchestrator path that marks jobs.status. A deterministic failure here
+        # (vanished project / malformed config) would otherwise leave the durable
+        # jobs row queued forever — blocking project delete and misleading GET /jobs
+        # — so record it on the row and don't retry (a retry can't fix it).
+        # Transient errors (e.g. a DB blip) are NOT caught, so arq still retries.
+        #
+        # The config is PINNED to the build: create_job snapshots proj.config onto
+        # the job at creation, and capture_config_snapshot reads that pinned config
+        # back on every dispatch (defensively pinning live config if a job somehow
+        # lacks one), so neither a PATCH /projects during the queue delay nor a
+        # re-dispatch (an arq retry, or the BA2d-3 reaper) can drift a resuming
+        # build's chunking/ontology params. The defensive pin can write the jobs
+        # row, so this runs in a committing begin().
         try:
-            outcome = await run_build_leased(engine, project, build_job, stages, owner=ctx["owner"])
-        except BuildNotResumableError:
-            # Benign recovery race: a re-dispatch (an arq retry, or the BA2d-3 reaper)
-            # acquired the lease AFTER the original — starved, not dead — worker
-            # terminalized the build and released it. run_build's FOR-UPDATE-locked
-            # build-status check is the atomic recheck: it found the build already
-            # terminal, so recovery wasn't needed. This dispatch is a no-op, not a
-            # failure — don't manufacture a failed/retried arq job for a build that
-            # already succeeded (the jobs row is already terminal, set by that worker).
-            return None
-        return outcome.status if outcome is not None else None
+            async with engine.begin() as conn:
+                proj = await get_project(conn, project)
+                if proj is None:
+                    raise LookupError(f"project {project!r} does not exist")
+                raw_config = await capture_config_snapshot(conn, build_job, proj.config)
+            config = load_build_config(raw_config)
+        except (LookupError, BuildConfigError) as exc:
+            await _fail_job(engine, build_job, exc)
+            return "failed"
+        async with ctx["neo4j"].session() as session:
+            stages = default_stages(
+                config,
+                chat_model=ctx["llm"],
+                embedder=ctx["embedder"],
+                vector_client=ctx["qdrant"],
+                graph_session=session,
+            )
+            try:
+                outcome = await run_build(engine, project, build_job, stages)
+            except BuildNotResumableError:
+                # Benign recovery race: a re-dispatch (an arq retry, or the BA2d-3
+                # reaper) acquired the lease AFTER the original — starved, not dead —
+                # worker terminalized the build and released it. run_build's
+                # FOR-UPDATE-locked build-status check is the atomic recheck: it
+                # found the build already terminal, so recovery wasn't needed. This
+                # dispatch is a no-op, not a failure — don't manufacture a
+                # failed/retried arq job for a build that already succeeded (the
+                # jobs row is already terminal, set by that worker).
+                return None
+        return outcome.status
 
 
 async def _fail_job(engine: AsyncEngine, job_id: uuid.UUID, exc: Exception) -> None:
