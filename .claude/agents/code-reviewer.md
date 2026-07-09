@@ -156,6 +156,29 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      matrix, #38) — the prevention (enumerate the boundaries/matrix before first
      push) has now recurred three times (#37 request lifecycle, #38 lifecycle
      state machine, BA2c-1 execution state machine).
+   - **Framework lifecycle mechanism × application-owned SoR/liveness (class 12;
+     formalized after the BA2d saga — #51 candidate, recurred #52)**: when a
+     handler runs on a FRAMEWORK's execution lifecycle (queue dispatch, retry,
+     timeout, dedup keys, result retention, cancellation), read the framework's
+     EXACT semantics from source and write the "framework exit list" BEFORE
+     implementing — its timeout can cancel your handler before the SoR row is
+     terminalized and NOT retry it (arq: `wait_for` TimeoutError is outside the
+     retry branch, #51 P1); its keys outlive your intent (in-progress key =
+     job_timeout+10s blocks re-dispatch; a COMPLETED job's kept result reserves
+     a custom id for keep_result seconds, #52 R4). Defenses, one round each:
+     (a) never couple crash recovery to the framework timeout — own the
+     liveness (DB lease + reaper), keep the framework timeout a generous
+     backstop (#51 P1); (b) the liveness marker must bracket the ENTIRE handler
+     (acquire as the first statement — a crash in unmarked code is invisible to
+     recovery, #52 R2); (c) a recovery/re-dispatch channel is ITSELF a lifecycle
+     to sweep as one matrix: who re-dispatches, how it races the live original,
+     how re-ticks dedup (deterministic per-generation id — stale-lease expiry as
+     the generation marker, #52 R3), whether any framework key can reserve that
+     id across a failed generation (#52 R4), and the scan's cost (index it,
+     #52 R5); (d) recovery racing a slow-but-alive original must degrade to a
+     benign no-op via the SoR's own atomic status check, never a manufactured
+     failure (#52 R1). Ask: "when this framework mechanism fires, what state is
+     my SoR row left in — and can the recovery channel see it AND converge?"
    - **A new domain error's completeness face is the function's callers, not
      your diff**: adding an exception to a SHARED function (one an existing HTTP
      entry already calls) pulls in EVERY caller's translation/handling — trace
