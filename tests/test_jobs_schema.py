@@ -114,3 +114,6 @@ def test_offline_upgrade_sql_renders_jobs_ddl(capsys: pytest.CaptureFixture[str]
     assert "jobs_lease_owner_nonempty" in ddl
     # 0012 config pin
     assert "ADD COLUMN config_snapshot" in ddl
+    # 0013 reaper-scan partial index (WHERE mirrors find_reapable_jobs)
+    assert "CREATE INDEX jobs_reapable" in ddl
+    assert "lease_owner IS NOT NULL AND status IN ('queued','running')" in ddl

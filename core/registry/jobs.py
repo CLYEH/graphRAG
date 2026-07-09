@@ -273,6 +273,36 @@ async def release_lease(conn: AsyncConnection, job_id: uuid.UUID, owner: str) ->
     )
 
 
+async def find_reapable_jobs(conn: AsyncConnection) -> list[tuple[uuid.UUID, str, datetime]]:
+    """Jobs whose execution lease has EXPIRED while the job is still non-terminal —
+    a worker acquired the lease then stopped heartbeating (crashed / event-loop
+    starved), so its dispatch is stuck mid-flight. Returns
+    ``(id, project, lease_expires_at)`` for each; the BA2d-3 reaper re-enqueues
+    them for a fresh dispatch that reclaims the now-free lease and resumes. The
+    stale expiry doubles as the recovery GENERATION marker: it stays byte-stable
+    while the row sits crashed (only an acquire/renew moves it), so the reaper
+    derives its arq dedup id from it — one pending recovery per stale lease, not
+    one per tick. Nothing else matches: a LIVE worker keeps ``lease_expires_at``
+    in the future; a completed run released the lease (``lease_owner`` NULL); a
+    never-dispatched job never acquired one. Because the worker enters the lease
+    FIRST (before its preflight), any crash mid-dispatch — even before run_build —
+    leaves a held lease this predicate sees. The job's own status gates on
+    non-terminal (``queued``/``running``) so a build that finished but crashed
+    before the lease release isn't pointlessly re-run."""
+    rows = (
+        await conn.execute(
+            sa.select(
+                tables.jobs.c.id, tables.jobs.c.project, tables.jobs.c.lease_expires_at
+            ).where(
+                tables.jobs.c.lease_owner.is_not(None),
+                tables.jobs.c.lease_expires_at < sa.func.now(),
+                tables.jobs.c.status.in_(_ACTIVE_STATUSES),
+            )
+        )
+    ).all()
+    return [(row.id, row.project, row.lease_expires_at) for row in rows]
+
+
 async def capture_config_snapshot(
     conn: AsyncConnection, job_id: uuid.UUID, live_config: dict[str, Any]
 ) -> dict[str, Any]:

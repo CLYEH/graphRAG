@@ -3,9 +3,9 @@ round trip proves the arq layer itself — that an enqueued job is dequeued and
 executed by a running worker, its startup builds usable deps, and the build
 lands `done`. This drives a real arq burst worker against live Redis + Postgres
 with the LLM/embedder + stages faked (so no API key and no real pipeline is
-needed — the point under test is the queue→worker→run_build_leased path, not the
-model), asserting the job reaches `done`, exactly one build was created, and the
-execution lease was released.
+needed — the point under test is the queue→worker→job_lease→run_build path, not
+the model), asserting the job reaches `done`, exactly one build was created, and
+the execution lease was released.
 """
 
 from __future__ import annotations

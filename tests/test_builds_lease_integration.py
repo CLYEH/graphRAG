@@ -29,6 +29,7 @@ from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from api.workers import build_worker as bw
 from core.builds.lease import run_build_leased
 from core.builds.orchestrator import _STAGE_ORDER, StageResult, Stages
 from core.config import get_settings
@@ -36,6 +37,7 @@ from core.registry import create_job, create_project, get_job
 from core.registry.jobs import (
     acquire_lease,
     capture_config_snapshot,
+    find_reapable_jobs,
     release_lease,
     renew_lease,
 )
@@ -303,6 +305,112 @@ async def test_concurrent_capture_converges_on_one_config(migrated: None) -> Non
         assert a == b  # both dispatches see the same pinned config…
         assert a in (ca, cb)  # …one of the two racing configs, atomically chosen
         assert await _stored_snapshot(engine, job_id) == a
+    finally:
+        await _cleanup(engine, project)
+
+
+# ── reaper (BA2d-3) ─────────────────────────────────────────────────────────
+
+
+async def _expire_lease(engine: AsyncEngine, job_id: uuid.UUID, status: str) -> None:
+    # simulate a crashed holder: push the lease expiry into the past on the DB clock
+    # and set the job's status (a crash leaves it non-terminal).
+    async with engine.begin() as conn:
+        await conn.execute(
+            tables.jobs.update()
+            .where(tables.jobs.c.id == job_id)
+            .values(lease_expires_at=sa.text("now() - interval '1 minute'"), status=status)
+        )
+
+
+async def test_find_reapable_jobs_returns_only_crashed_executions(migrated: None) -> None:
+    # the reaper's target = expired HELD lease + non-terminal job (a worker that
+    # crashed mid-build). A live (heartbeating) lease, a released/never-acquired
+    # lease, and a job that reached a terminal status must all be EXCLUDED — else
+    # the reaper would re-run healthy or already-finished builds.
+    engine = _engine()
+    project = _proj()
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+            crashed = (await create_job(conn, project, "build")).id
+            early_crash = (await create_job(conn, project, "build")).id
+            live = (await create_job(conn, project, "build")).id
+            released = (await create_job(conn, project, "build")).id
+            terminal = (await create_job(conn, project, "build")).id
+
+        async with engine.begin() as conn:
+            await acquire_lease(conn, crashed, "dead", 60.0)
+            await acquire_lease(conn, early_crash, "dead0", 60.0)
+            await acquire_lease(conn, live, "alive", 60.0)  # live: expiry stays in the future
+            await acquire_lease(conn, terminal, "dead2", 60.0)
+        await _expire_lease(engine, crashed, status="running")
+        # run_build_leased acquires the lease BEFORE run_build marks 'running', so a
+        # crash during build-resolution leaves status still 'queued' + held+expired
+        # lease — that must still be reaped, not stranded for the 24h job_timeout.
+        await _expire_lease(engine, early_crash, status="queued")
+        await _expire_lease(engine, terminal, status="done")  # crashed AFTER terminalizing
+        # `released` keeps its create-time state: unleased (lease_owner NULL).
+
+        async with engine.connect() as conn:
+            reapable = await find_reapable_jobs(conn)
+
+        ids = {job_id for job_id, _, _ in reapable}
+        assert crashed in ids  # expired held lease + running → reaped
+        assert early_crash in ids  # expired held lease + still queued (pre-running crash) → reaped
+        assert live not in ids  # heartbeating (expiry in the future)
+        assert released not in ids  # never acquired a lease
+        assert terminal not in ids  # terminal status, even with an expired lease
+        # returns (id, project, stale expiry) — the expiry is the recovery-generation
+        # marker the reaper derives its dedup id from
+        row = next(r for r in reapable if r[0] == crashed)
+        assert row[1] == project
+        assert row[2] is not None
+    finally:
+        await _cleanup(engine, project)
+
+
+async def test_reap_stuck_builds_reenqueues_crashed_over_real_db(migrated: None) -> None:
+    # the reaper cron task end-to-end over real Postgres (real find_reapable_jobs)
+    # with a spy redis: a crashed job (expired held lease, running) is re-enqueued
+    # under a fresh arq id; a live (heartbeating) one is left alone.
+    engine = _engine()
+    project = _proj()
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+            crashed = (await create_job(conn, project, "build")).id
+            live = (await create_job(conn, project, "build")).id
+        async with engine.begin() as conn:
+            await acquire_lease(conn, crashed, "dead", 60.0)
+            await acquire_lease(conn, live, "alive", 60.0)
+        await _expire_lease(engine, crashed, status="running")
+
+        enq: list[Any] = []
+
+        class _Redis:
+            async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+                enq.append((fn, args, _job_id))
+                return object()
+
+        reaped = await bw.reap_stuck_builds({"engine": engine, "redis": _Redis()})
+
+        assert reaped == 1
+        # only the crashed job, re-dispatched under the deterministic per-stale-lease
+        # id (reap:<job>:<expiry>) so re-ticks over the same stale lease dedup
+        async with engine.connect() as conn:
+            stale_expiry = (
+                await conn.execute(
+                    sa.select(tables.jobs.c.lease_expires_at).where(tables.jobs.c.id == crashed)
+                )
+            ).scalar_one()
+        assert enq == [
+            (
+                bw.BUILD_TASK,
+                (project, str(crashed)),
+                f"reap:{crashed}:{stale_expiry.isoformat()}",
+            )
+        ]
     finally:
         await _cleanup(engine, project)
 

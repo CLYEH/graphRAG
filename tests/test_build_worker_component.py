@@ -1,8 +1,9 @@
-"""Why: the worker is pure wiring — read a job's project config, build the six
-stages off the long-lived dep bundle, and hand them to run_build_leased under a
-per-worker owner id; plus the startup/shutdown lifecycle and the enqueue helper.
-These component tests spy every dependency (no Redis/Postgres/Qdrant/Neo4j/LLM)
-so the config→stages→lease arg flow, the lifecycle, and the _job_id dedup are
+"""Why: the worker is pure wiring — enter the job's execution lease, read its
+pinned config, build the six stages off the long-lived dep bundle, and run the
+build; plus the startup/shutdown lifecycle, the enqueue helpers, and the reaper
+cron. These component tests spy every dependency (no Redis/Postgres/Qdrant/
+Neo4j/LLM) so the lease→preflight→stages→build flow (incl. its ORDER — the lease
+must bracket the whole dispatch), the lifecycle, and the dedup semantics are
 pinned in the fast lane, where the real-worker integration test can't run.
 """
 
@@ -11,11 +12,13 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from arq.connections import RedisSettings
+from arq.cron import CronJob
 
 from api.workers import build_worker as bw
 from core.config import get_settings
@@ -53,6 +56,17 @@ async def _capture_passthrough(conn: Any, job_id: uuid.UUID, live: Any) -> Any:
     return live
 
 
+def _fake_lease(calls: dict[str, Any] | None = None, *, acquired: bool = True) -> Any:
+    # stand-in for job_lease: records (job_id, owner) and yields `acquired`.
+    @asynccontextmanager
+    async def lease(engine: Any, job_id: uuid.UUID, owner: str) -> AsyncIterator[bool]:
+        if calls is not None:
+            calls["lease"] = (job_id, owner)
+        yield acquired
+
+    return lease
+
+
 async def test_run_build_task_wires_config_deps_and_lease(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: dict[str, Any] = {}
     proj = SimpleNamespace(config={"chunking": {"max_chars": 100}})
@@ -69,26 +83,26 @@ async def test_run_build_task_wires_config_deps_and_lease(monkeypatch: pytest.Mo
         calls["stages"] = (config, deps)
         return "STAGES"
 
-    async def _leased(
-        engine: Any, project: str, job_id: uuid.UUID, stages: Any, *, owner: str
-    ) -> Any:
-        calls["leased"] = (project, job_id, stages, owner)
+    async def _run_build(engine: Any, project: str, job_id: uuid.UUID, stages: Any) -> Any:
+        calls["run"] = (project, job_id, stages)
         return SimpleNamespace(status="ready")
 
     async def _capture(conn: Any, job_id: uuid.UUID, live: Any) -> Any:
         calls["capture"] = (job_id, live)
         return live
 
+    monkeypatch.setattr(bw, "job_lease", _fake_lease(calls))
     monkeypatch.setattr(bw, "get_project", _get_project)
     monkeypatch.setattr(bw, "capture_config_snapshot", _capture)
     monkeypatch.setattr(bw, "load_build_config", _load_config)
     monkeypatch.setattr(bw, "default_stages", _default_stages)
-    monkeypatch.setattr(bw, "run_build_leased", _leased)
+    monkeypatch.setattr(bw, "run_build", _run_build)
 
     jid = uuid.uuid4()
     result = await bw.run_build_task(_ctx(), "proj", str(jid))
 
     assert result == "ready"
+    assert calls["lease"] == (jid, "worker-abc")  # the whole dispatch ran leased
     assert calls["project"] == "proj"
     # config is pinned to the job (first dispatch) then loaded from that snapshot
     assert calls["capture"] == (jid, proj.config)
@@ -103,25 +117,57 @@ async def test_run_build_task_wires_config_deps_and_lease(monkeypatch: pytest.Mo
         "vector_client": "QD",
         "graph_session": "SESSION",
     }
-    assert calls["leased"] == ("proj", jid, "STAGES", "worker-abc")
+    assert calls["run"] == ("proj", jid, "STAGES")
 
 
 async def test_run_build_task_returns_none_when_lease_held(monkeypatch: pytest.MonkeyPatch) -> None:
+    preflighted: list[str] = []
+
     async def _get_project(conn: Any, name: str) -> Any:
+        preflighted.append(name)
         return SimpleNamespace(config={})
 
-    async def _leased(*a: Any, **k: Any) -> Any:
-        return None  # a live peer holds the lease
-
+    monkeypatch.setattr(bw, "job_lease", _fake_lease(acquired=False))
     monkeypatch.setattr(bw, "get_project", _get_project)
-    monkeypatch.setattr(bw, "capture_config_snapshot", _capture_passthrough)
-    monkeypatch.setattr(bw, "load_build_config", lambda raw: "CONFIG")
-    monkeypatch.setattr(bw, "default_stages", lambda config, **k: "STAGES")
-    monkeypatch.setattr(bw, "run_build_leased", _leased)
 
     result = await bw.run_build_task(_ctx(), "proj", str(uuid.uuid4()))
 
     assert result is None  # the no-op dispatch surfaces as a None result
+    assert preflighted == []  # a lease-less dispatch does NO work — not even preflight
+
+
+async def test_run_build_task_acquires_the_lease_before_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: the lease is the reaper's crash marker for the ENTIRE dispatch. If
+    # preflight ran before acquisition, a worker dying in preflight would leave a
+    # queued row with no lease — invisible to find_reapable_jobs and stranded for
+    # arq's 24h timeout (the exact gap Codex flagged). Pin the ordering.
+    order: list[str] = []
+
+    @asynccontextmanager
+    async def _lease(engine: Any, job_id: uuid.UUID, owner: str) -> AsyncIterator[bool]:
+        order.append("lease")
+        yield True
+
+    async def _get_project(conn: Any, name: str) -> Any:
+        order.append("preflight")
+        return SimpleNamespace(config={})
+
+    async def _run_build(*a: Any, **k: Any) -> Any:
+        order.append("build")
+        return SimpleNamespace(status="ready")
+
+    monkeypatch.setattr(bw, "job_lease", _lease)
+    monkeypatch.setattr(bw, "get_project", _get_project)
+    monkeypatch.setattr(bw, "capture_config_snapshot", _capture_passthrough)
+    monkeypatch.setattr(bw, "load_build_config", lambda raw: "CONFIG")
+    monkeypatch.setattr(bw, "default_stages", lambda config, **k: "STAGES")
+    monkeypatch.setattr(bw, "run_build", _run_build)
+
+    await bw.run_build_task(_ctx(), "proj", str(uuid.uuid4()))
+
+    assert order == ["lease", "preflight", "build"]
 
 
 async def test_run_build_task_marks_job_failed_on_missing_project(
@@ -139,11 +185,14 @@ async def test_run_build_task_marks_job_failed_on_missing_project(
         marked["job"] = job_id
         marked["fields"] = fields
 
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "get_project", _get_project)
     monkeypatch.setattr(bw, "set_progress", _set_progress)
 
     jid = uuid.uuid4()
-    result = await bw.run_build_task({"engine": _FakeEngine()}, "gone", str(jid))
+    result = await bw.run_build_task(
+        {"engine": _FakeEngine(), "owner": "worker-abc"}, "gone", str(jid)
+    )
 
     assert result == "failed"  # terminal, not a raised exception left un-recorded
     assert marked["job"] == jid
@@ -169,6 +218,7 @@ async def test_run_build_task_marks_job_failed_on_malformed_config(
     async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
         marked["fields"] = fields
 
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "get_project", _get_project)
     monkeypatch.setattr(bw, "capture_config_snapshot", _capture_passthrough)
     monkeypatch.setattr(bw, "load_build_config", _load_config)
@@ -179,6 +229,35 @@ async def test_run_build_task_marks_job_failed_on_malformed_config(
     assert result == "failed"
     assert marked["fields"]["status"] == "failed"
     assert "resolution must be a mapping" in marked["fields"]["error"]["message"]
+
+
+async def test_run_build_task_noops_when_build_already_terminalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: a benign recovery race — a re-dispatch (arq retry / BA2d-3 reaper)
+    # acquires the lease AFTER the original (starved-not-dead) worker finished the
+    # build and released it, so run_build raises BuildNotResumableError (the build
+    # is already terminal). The task must treat that as a no-op (return None), NOT a
+    # failure — else the reaper manufactures failed/retried arq jobs for a build that
+    # already succeeded.
+    from core.builds.orchestrator import BuildNotResumableError
+
+    async def _get_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(config={})
+
+    async def _run_build(*a: Any, **k: Any) -> Any:
+        raise BuildNotResumableError("proj", uuid.uuid4(), "ready")
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "get_project", _get_project)
+    monkeypatch.setattr(bw, "capture_config_snapshot", _capture_passthrough)
+    monkeypatch.setattr(bw, "load_build_config", lambda raw: "CONFIG")
+    monkeypatch.setattr(bw, "default_stages", lambda config, **k: "STAGES")
+    monkeypatch.setattr(bw, "run_build", _run_build)
+
+    result = await bw.run_build_task(_ctx(), "proj", str(uuid.uuid4()))
+
+    assert result is None  # benign no-op, not "failed"
 
 
 async def test_run_build_task_reuses_pinned_config_on_resume(
@@ -203,14 +282,15 @@ async def test_run_build_task_reuses_pinned_config_on_resume(
         loaded["raw"] = raw
         return "CONFIG"
 
-    async def _leased(*a: Any, **k: Any) -> Any:
+    async def _run_build(*a: Any, **k: Any) -> Any:
         return SimpleNamespace(status="ready")
 
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "get_project", _get_project)
     monkeypatch.setattr(bw, "capture_config_snapshot", _capture)
     monkeypatch.setattr(bw, "load_build_config", _load)
     monkeypatch.setattr(bw, "default_stages", lambda config, **k: "STAGES")
-    monkeypatch.setattr(bw, "run_build_leased", _leased)
+    monkeypatch.setattr(bw, "run_build", _run_build)
 
     await bw.run_build_task(_ctx(), "proj", str(uuid.uuid4()))
 
@@ -230,6 +310,96 @@ async def test_enqueue_build_uses_job_id_dedup() -> None:
 
     # arq dedups on _job_id: re-enqueuing a queued/running job is refused.
     assert calls["enqueue"] == (bw.BUILD_TASK, ("proj", str(jid)), str(jid))
+
+
+async def test_reenqueue_build_uses_a_deterministic_per_stale_lease_id() -> None:
+    calls: list[Any] = []
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            calls.append((fn, args, _job_id))
+            return object()  # arq accepted the enqueue
+
+    jid = uuid.uuid4()
+    expiry = datetime(2026, 7, 9, 1, 2, 3, tzinfo=UTC)
+    first = await bw.reenqueue_build(_Redis(), "proj", jid, stale_expiry=expiry)  # type: ignore[arg-type]
+    second = await bw.reenqueue_build(_Redis(), "proj", jid, stale_expiry=expiry)  # type: ignore[arg-type]
+
+    assert first is True and second is True
+    # the id is derived from (job, stale lease expiry) — NOT the job's own id (the
+    # crashed dispatch's in-progress key lingers 24h and would refuse it) and NOT a
+    # fresh id per call (ticks would pile up duplicates behind a saturated queue).
+    # Same stale lease → byte-identical id, so arq's own dedup suppresses re-ticks.
+    expected = f"reap:{jid}:{expiry.isoformat()}"
+    assert [c[2] for c in calls] == [expected, expected]
+    assert calls[0][:2] == (bw.BUILD_TASK, ("proj", str(jid)))
+
+
+async def test_reap_stuck_builds_reenqueues_each_crashed_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    j1, j2 = uuid.uuid4(), uuid.uuid4()
+    e1 = datetime(2026, 7, 9, 1, 0, 0, tzinfo=UTC)
+    e2 = datetime(2026, 7, 9, 1, 0, 30, tzinfo=UTC)
+    enq: list[Any] = []
+
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
+        return [(j1, "p1", e1), (j2, "p2", e2)]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            enq.append((fn, args, _job_id))
+            return object()
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 2
+    # each crashed job re-dispatched under its own per-stale-lease id
+    assert enq == [
+        (bw.BUILD_TASK, ("p1", str(j1)), f"reap:{j1}:{e1.isoformat()}"),
+        (bw.BUILD_TASK, ("p2", str(j2)), f"reap:{j2}:{e2.isoformat()}"),
+    ]
+
+
+async def test_reap_stuck_builds_counts_only_new_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: while a replacement dispatch sits queued behind a saturated pool, the
+    # stale row keeps matching every 30s tick. arq refuses the duplicate id
+    # (enqueue_job → None) and the tick must report 0 new dispatches — the reaper
+    # piles up NO duplicates for one crashed job.
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
+        return [(uuid.uuid4(), "p1", datetime(2026, 7, 9, tzinfo=UTC))]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            return None  # arq: a job with this id is already pending → refused
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 0  # matched one stale row, enqueued nothing new
+
+
+async def test_reap_stuck_builds_is_a_noop_when_nothing_crashed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enq: list[Any] = []
+
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
+        return []  # no expired leases → an idle tick
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            enq.append(1)
+            return object()
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 0
+    assert enq == []  # nothing enqueued on an idle tick
 
 
 async def test_on_startup_builds_the_dep_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -275,6 +445,17 @@ def test_worker_settings_shape() -> None:
     assert bw.WorkerSettings.on_startup is bw.on_startup
     assert bw.WorkerSettings.on_shutdown is bw.on_shutdown
     assert isinstance(bw.WorkerSettings.redis_settings, RedisSettings)
+    # BA2d-3: the crash-recovery reaper cron is registered (runs the reaper coro,
+    # deduped across workers so one worker reaps per tick)
+    (reaper,) = bw.WorkerSettings.cron_jobs
+    assert isinstance(reaper, CronJob)
+    assert reaper.coroutine is bw.reap_stuck_builds
+    assert reaper.unique is True
+    # twice a minute — pins the ~1-min recovery cadence against the 60s lease TTL
+    assert reaper.second == {0, 30}
+    # no arq results (jobs row is the SoR): a kept result would reserve a failed
+    # replacement's reap id for an hour and stall recovery to keep_result, not ~1min
+    assert bw.WorkerSettings.keep_result == 0
     # crash recovery is bounded by job_timeout (arq's in-progress key), so it's a
     # modest config value, not a build-length-sized 3600
     assert bw.WorkerSettings.job_timeout == get_settings().build_job_timeout_seconds
