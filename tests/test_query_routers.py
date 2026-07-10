@@ -154,6 +154,29 @@ def test_top_k_is_accepted_and_reaches_the_mode(
     )
     assert captured_k == [5, 20]  # 5 passes un-clamped; 500 clamps to max_top_k
 
+    # the sql sibling (Codex #60 R1): top_k NARROWS the §21 row ceiling —
+    # min(top_k, sql_rows()) — never ignored, never widening
+    captured_rows: list[int] = []
+
+    async def fake_run_sql(reader: Any, llm: Any, policy: Any, q: Any, rows: int) -> Any:
+        captured_rows.append(rows)
+        return _mcp_dict()
+
+    async def fake_bounded_sql(
+        context: Any, policy: Any, tool: str, query: str, runner: Any
+    ) -> Any:
+        deps = SimpleNamespace(sql_reader=None, llm=None)
+        return await runner(deps, 1000)
+
+    _stub(monkeypatch, "run_sql", fake_run_sql)
+    _stub(monkeypatch, "run_bounded_query", fake_bounded_sql)
+    assert client.post("/projects/p/query/sql", json={"query": "q", "top_k": 1}).status_code == 200
+    assert (
+        client.post("/projects/p/query/sql", json={"query": "q", "top_k": 999}).status_code == 200
+    )
+    assert client.post("/projects/p/query/sql", json={"query": "q"}).status_code == 200
+    assert captured_rows == [1, 100, 100]  # narrows; clamps to sql_rows(); defaults to it
+
 
 def test_nil_build_sentinel_stays_in_data_never_meta(
     client: TestClient, monkeypatch: pytest.MonkeyPatch

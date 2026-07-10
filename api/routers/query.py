@@ -126,9 +126,14 @@ async def query_sql_endpoint(
 ) -> dict[str, Any]:
     def runner(policy: QueryPolicy) -> Any:
         async def _run(deps: Any, _remaining_ms: int) -> Any:
-            return await run_sql(
-                deps.sql_reader, deps.llm, policy.sql_policy(), body.query, policy.sql_rows()
-            )
+            # the caller's top_k NARROWS the §21 sql row ceiling (min, never
+            # widens — the BA3c limit precedent); accepting-and-ignoring it
+            # would silently exceed the requested cap (Codex #60 R1). MCP's
+            # sql tool exposes no per-call cap, so this is REST-additive on
+            # top of the SAME shared envelope, not a facade divergence.
+            ceiling = policy.sql_rows()
+            rows = min(body.top_k, ceiling) if body.top_k is not None else ceiling
+            return await run_sql(deps.sql_reader, deps.llm, policy.sql_policy(), body.query, rows)
 
         return _run
 
