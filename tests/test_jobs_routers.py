@@ -327,6 +327,30 @@ def test_trigger_accepts_empty_or_absent_body(
     assert r.status_code == 202
 
 
+@pytest.mark.parametrize("path", ["/projects/p/ingest", "/projects/p/build"])
+def test_trigger_rejects_an_explicit_null_body(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    queue_touches: list[int],
+) -> None:
+    # WHY (Codex round 5): the contract's requestBody is optional, but when
+    # present it is the NON-NULLABLE request object — FastAPI binds a JSON
+    # `null` body to None, indistinguishable from absent, which would silently
+    # start work for a contract-invalid request. Same strictness as the
+    # field-level null rejections.
+    async def fail_create(conn: Any, project: str, kind: str) -> Job:
+        raise AssertionError("handler must not run for a null body")
+
+    _stub(monkeypatch, "triggers", "create_job_exclusive", fail_create)
+    enqueued = _spy_enqueue(monkeypatch)
+
+    r = client.post(path, content=b" null ", headers={"Content-Type": "application/json"})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert enqueued == [] and queue_touches == []
+
+
 def test_trigger_unknown_body_field_rejected(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
