@@ -116,6 +116,28 @@ class ReviewDecisionRequest(BaseModel):
     reason: str | None = None
 
 
+class QueryRequest(BaseModel):
+    """The contract QueryRequest. ``filters``/``options`` are parsed to shape
+    then LOUDLY rejected while present (the BA2e owner rule, 2026-07-10): the
+    §8 modes take no store-level filters or mode options yet — silently
+    running an UNfiltered query against an explicit restriction would return
+    results the client did not ask for. Lifting is additive."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1)
+    top_k: int | None = Field(default=None, ge=1)
+    filters: dict[str, Any] | None = None
+    options: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _reject_unsupported(self) -> QueryRequest:
+        for field in ("filters", "options"):
+            if field in self.model_fields_set:
+                raise ValueError(f"{field} is not supported yet; omit it")
+        return self
+
+
 def project_dto(p: Project) -> dict[str, Any]:
     """The contract Project shape."""
     return {

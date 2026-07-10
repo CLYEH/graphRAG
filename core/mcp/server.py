@@ -487,3 +487,20 @@ def run_server(server: FastMCP, transport: str = "stdio") -> None:
     if transport not in TRANSPORTS:
         raise ValueError(f"unknown transport {transport!r} (choose from {sorted(TRANSPORTS)})")
     server.run(transport=cast(Any, TRANSPORTS[transport]))
+
+
+async def run_bounded_query(
+    context: ProjectContext,
+    policy: QueryPolicy,
+    tool: str,
+    query: str,
+    runner: Any,
+) -> dict[str, Any]:
+    """Public seam for non-MCP facades (the Console query playground, BA6):
+    the SAME §21 wall-clock deadline + per-call binding + §22 typed
+    degradation envelope every MCP tool runs under — one machinery, two
+    facades, so the REST playground can never drift from the MCP tools
+    (class 5). ``runner(deps, remaining_ms) -> McpResponse`` exactly as the
+    tools pass it; the returned dict is the §16 shape (the REST layer
+    reprojects it onto the frozen QueryResult)."""
+    return await _bounded(_Runtime(context=context, policy=policy), tool, query, runner)
