@@ -148,6 +148,12 @@ async def test_review_flow_list_approve_refuse(api: Api) -> None:
     assert r.status_code == 400
     assert r.json()["error"]["details"] == {"status": "approved", "decision": "reject"}
 
+    # and the decided candidate leaves the queue — the list matches §19's
+    # pending_review definition (pending+deferred only), never re-serving
+    # handled work (Codex #59 R1)
+    r = await client.get(f"/projects/{project}/merge-candidates")
+    assert r.json()["data"] == []
+
 
 async def test_idempotent_replay_never_stacks_ledger_entries(api: Api) -> None:
     # WHY §27: a client retrying its approve with the same key must get the

@@ -78,7 +78,12 @@ async def list_merge_candidates_endpoint(
     binding = await _bind(conn, project)
     repo = BuildScopedRepo.bound_to(conn, binding)
     mc = tables.merge_candidates
-    where = []
+    # the list IS the review queue: only still-reviewable candidates appear —
+    # the same pending+deferred definition §19's pending_review metric counts
+    # (core/observability/health.py), so the queue and its gauge never diverge
+    # (Codex #59 R1). Decided rows stay in the SoR for audit; surfacing them
+    # is the Filter param's future job (additive).
+    where: list[Any] = [mc.c.status.in_(("pending", "deferred"))]
     if cursor:
         (after_id,) = decode_id_cursor(cursor)
         where.append(mc.c.id < after_id)
