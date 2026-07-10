@@ -499,7 +499,36 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      level's keys DATA or SCHEMA" — a map's keys are data (tolerate), a
      fixed-field block is schema (strict). BA2c-2a took 2 Codex rounds, both this
      one class, one position apart (null-block, then unknown-key); one matrix pass
-     covers both.
+     covers both. **The WHOLE BODY is itself a position**: an optional request
+     body typed `Model | None` binds an explicit JSON `null` to None,
+     indistinguishable from absent — {absent, empty-object, JSON-null,
+     wrong-top-type} at the body level belong in the same matrix (BA2e-1 round 5:
+     field-level nulls were rejected while a whole-body null silently started
+     work — the one unswept position cost a round).
+   - **A stored value served verbatim through a frozen schema is an emission
+     surface**: audit every WRITER of that value against the schema's own
+     required set — read the schema, never a comment's paraphrase of it (a
+     paraphrase is a drift source; BA2e-1 round 1: the `jobs.error` column
+     comment said "the §15 Error shape {code, message, details}" while the
+     frozen Error also requires `request_id`, so both writers stored a
+     contract-invalid object that GET /jobs/{id} passed straight through).
+   - **A fix that changes a stored shape owes its own lifecycle sweep, at fix
+     time**: (1) rows ALREADY WRITTEN under the old shape — reconcile-before-
+     constrain migration + a populated-DB upgrade test (§6's Migration bullet
+     applies to mid-PR FIXES, not only planned schema tasks; CI's fresh DB
+     never executes a backfill); (2) if the fix adds a recurring QUERY, its
+     support structures — a partial index mirroring the predicate, with parity
+     against the sibling mechanism's (BA2d-3's `jobs_reapable` had to be
+     relearned one PR later as `jobs_unenqueued`). BA2e-1 rounds 1→4 were a
+     causal chain (shape fix → legacy rows → backfill → index) that one sweep
+     at fix time collapses into the first round.
+   - **The idempotency replay decision precedes ANY scope-row precheck**
+     (class-11 face): a stored response must replay — and a different-hash
+     reuse must 409 — even after the row the endpoint scopes to has legally
+     vanished (a terminal job CASCADE-deletes with its project). An
+     existence-404 raised before the replay lookup breaks the §27 guarantee
+     exactly when the client most needs it (BA2e-1 round 2). Peek
+     replay/conflict first (non-reserving); precheck only fresh requests.
 
 ## Output (exactly this shape)
 ```
