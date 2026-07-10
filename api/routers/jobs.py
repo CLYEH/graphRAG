@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from api.deps import Conn, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
-from api.idempotency import request_hash, run_idempotent
+from api.idempotency import replay_stored, request_hash, run_idempotent
 from api.registry_errors import translate_registry_error
 from api.schemas import job_accepted_dto, job_dto
 from core.registry import JobNotFoundError, get_job, request_cancel
@@ -59,8 +59,17 @@ async def cancel_job_endpoint(
         return 202, success(job_accepted_dto(job), **response_meta(request))
 
     if idempotency_key:
-        # the idempotency row is keyed under a project — resolve the job first
-        # (an unknown job is a 404 that must never reserve the key)
+        req_hash = request_hash("POST", request.url.path, await request.body())
+        # §27 replay/conflict must be decided BEFORE the job precheck: the job
+        # row can legitimately be gone by the retry (a terminal job CASCADE-
+        # deletes with its project), and a live key must still replay its
+        # stored response — or 409 on a different hash — never JOB_NOT_FOUND.
+        replayed = await replay_stored(conn, key=idempotency_key, req_hash=req_hash)
+        if replayed is not None:
+            status, resp = replayed
+            return JSONResponse(status_code=status, content=resp)
+        # fresh request: the idempotency row is keyed under a project, so
+        # resolve the job now (an unknown job is a 404 that never reserves)
         job = await get_job(conn, job_id)
         if job is None:
             raise _job_not_found(job_id)
@@ -69,7 +78,7 @@ async def cancel_job_endpoint(
             key=idempotency_key,
             project=job.project,
             endpoint="cancelJob",
-            req_hash=request_hash("POST", request.url.path, await request.body()),
+            req_hash=req_hash,
             produce=produce,
         )
         return JSONResponse(status_code=status, content=resp)

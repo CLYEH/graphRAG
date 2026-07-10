@@ -210,6 +210,41 @@ async def test_cancel_terminal_job_is_a_noop_not_an_error(api: Api) -> None:
     assert job is not None and job.cancel_requested is False  # a finished job is untouched
 
 
+async def test_cancel_replays_its_stored_response_after_the_job_row_vanishes(api: Api) -> None:
+    # WHY §27 (Codex round 2): the replay guarantee outlives the job row — a
+    # terminal job CASCADE-deletes with its project, and the client's retry
+    # with the same key must get its stored 202 back (or the conflict on a
+    # different request), NEVER a JOB_NOT_FOUND that implies the cancel was
+    # not accepted. The replay peek must therefore run before the 404 precheck.
+    client, conn, _ = api
+    project = await _make_project(client)
+    job_id = uuid.UUID((await client.post(f"/projects/{project}/build")).json()["data"]["job_id"])
+    other_job = uuid.UUID(
+        (await client.post(f"/projects/{await _make_project(client)}/build")).json()["data"][
+            "job_id"
+        ]
+    )
+    async with conn.begin_nested():
+        await set_progress(conn, job_id, status="done")  # terminal → delete no longer blocked
+    key = f"k-{uuid.uuid4().hex[:8]}"
+
+    first = await client.post(f"/jobs/{job_id}/cancel", headers={"Idempotency-Key": key})
+    assert first.status_code == 202 and first.json()["data"]["status"] == "done"
+
+    assert (await client.delete(f"/projects/{project}")).status_code == 204
+    assert (await client.get(f"/jobs/{job_id}")).status_code == 404  # the row is gone
+
+    replayed = await client.post(f"/jobs/{job_id}/cancel", headers={"Idempotency-Key": key})
+    assert replayed.status_code == 202  # replayed verbatim, not JOB_NOT_FOUND
+    assert replayed.json() == first.json()
+
+    # reusing the key for a DIFFERENT request (another job's cancel) is still
+    # the idempotency conflict — not a 404 from the vanished-row precheck
+    r = await client.post(f"/jobs/{other_job}/cancel", headers={"Idempotency-Key": key})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
 async def test_job_endpoints_404_on_unknown_job(api: Api) -> None:
     client, conn, _ = api
     jid = uuid.uuid4()
