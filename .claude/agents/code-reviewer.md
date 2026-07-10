@@ -187,7 +187,15 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      closed session strands survivors on closed store clients (C8b P1; fix =
      the framework's own per-session channel, request_context.lifespan_context).
      Reading the framework for the NEW feature is not the same as re-auditing
-     the OLD assumptions the new mode invalidates.
+     the OLD assumptions the new mode invalidates. And (f) a yield-dep's
+     lifetime COMPOSES with pool capacity: FastAPI yield-deps live until the
+     RESPONSE completes (the #54 streaming face), so a handler holding a
+     yield-dep connection while entering a seam that acquires ANOTHER
+     connection from the SAME pool convoys at capacity — every worker sits on
+     its first connection waiting for a second, and healthy requests burn
+     their deadline in the queue (BA6a R2 P1). Prechecks take a short-lived
+     acquire-use-release connection (or reuse one), never a held dep plus a
+     second acquire.
    - **A new domain error's completeness face is the function's callers, not
      your diff**: adding an exception to a SHARED function (one an existing HTTP
      entry already calls) pulls in EVERY caller's translation/handling — trace
@@ -404,7 +412,22 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      request-level bound (C8: the §21 deadline took FIVE review rounds to
      converge — reconcile, hybrid wall-clock, standalone sweep, binding
      coverage, remaining-budget threading — each a lifecycle phase found
-     one round at a time).
+     one round at a time). The lifecycle INCLUDES the segments that run
+     BEFORE the seam that enforces the invariant: a typed-degradation
+     guarantee (§22 store outage → STORE_UNAVAILABLE) enforced inside the
+     bounded seam does not cover a preflight read that runs first — its
+     failure falls through to the generic 500 unless the preflight maps it
+     itself (BA6a R4: the policy/binding preflight; the inspect Neo4j
+     handler was the in-repo precedent).
+   - **An error precedence is part of the CONCEPT, not the surface**: when a
+     new entry surface serves a concept whose sibling surfaces already fixed
+     an ordering (project 404 → NO_ACTIVE_BUILD 409 → config/validation
+     gates), the ordering transfers at DESIGN time — re-deriving it re-derives
+     the bug (#57 R1's binding-before-policy recurred VERBATIM as BA6a R3 on
+     the query router, one family later, because the fix had been applied to
+     inspect's helper and not to the concept). The durable fix is structural:
+     one shared helper owns the precedence so future siblings inherit it;
+     reviewing a new surface, diff its gate order against the oldest sibling's.
    - **A new entry point to a fenced surface must carry the fence**: adding
      a convenience path (factory overload, bypass constructor, admin hook)
      to a construction-fenced surface demotes the guarantee from structure
@@ -538,7 +561,13 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      against the sibling mechanism's (BA2d-3's `jobs_reapable` had to be
      relearned one PR later as `jobs_unenqueued`). BA2e-1 rounds 1→4 were a
      causal chain (shape fix → legacy rows → backfill → index) that one sweep
-     at fix time collapses into the first round.
+     at fix time collapses into the first round. (3) if the fix introduces a
+     CAP/limit chain, validate it against the frozen schema's FIELD
+     DESCRIPTIONS, not just its structure — BA6a R1's top_k fix minted
+     `min(top_k, sql_rows)` and both author and reviewer judged it sound
+     without reading `max_top_k`'s description ("the upper bound on
+     QueryRequest.top_k"), so the fix itself became R4's finding. A cap is
+     correct only against the contract's words for every field it touches.
    - **The idempotency replay decision precedes ANY scope-row precheck**
      (class-11 face): a stored response must replay — and a different-hash
      reuse must 409 — even after the row the endpoint scopes to has legally
