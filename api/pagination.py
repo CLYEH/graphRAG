@@ -61,12 +61,13 @@ def decode_source_cursor(token: str) -> tuple[datetime, uuid.UUID]:
     return added_at, sid
 
 
-def decode_document_cursor(token: str) -> tuple[uuid.UUID]:
-    """Documents page by (id desc) — the table has no created_at, and id is
-    the stable unique keyset; recency ordering can land additively with the
-    Sort param later (BA3a)."""
-    (document_id,) = _decode(token, (uuid.UUID,))
-    return (document_id,)
+def decode_id_cursor(token: str) -> tuple[uuid.UUID]:
+    """Documents/entities/relations page by (id desc) — documents carry no
+    created_at and entities/relations only a NULLABLE one, so id is the stable
+    unique keyset shared by all three; recency ordering can land additively
+    with the Sort param later (BA3a/BA3b)."""
+    (row_id,) = _decode(token, (uuid.UUID,))
+    return (row_id,)
 
 
 def decode_chunk_cursor(token: str) -> tuple[uuid.UUID, int]:

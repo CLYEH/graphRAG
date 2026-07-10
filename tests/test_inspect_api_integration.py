@@ -25,7 +25,7 @@ from sqlalchemy.pool import NullPool
 from api.app import create_app
 from api.deps import db_conn
 from core.config import get_settings
-from core.stores.tables import builds, chunks, documents
+from core.stores.tables import builds, chunks, documents, entities, relation_evidence, relations
 
 pytestmark = pytest.mark.integration
 
@@ -122,6 +122,51 @@ async def _make_chunk(
                 )
                 .returning(chunks.c.id)
             )
+        ).scalar_one(),
+    )
+
+
+async def _make_entity(
+    conn: AsyncConnection, project: str, build_id: uuid.UUID, name: str, **over: Any
+) -> uuid.UUID:
+    values: dict[str, Any] = {
+        "project": project,
+        "build_id": build_id,
+        "type": "Person",
+        "canonical_name": name,
+        "entity_key": f"fpv1:person|{name.lower()}-{uuid.uuid4().hex[:6]}",
+        "status": "active",
+    }
+    values.update(over)
+    return cast(
+        "uuid.UUID",
+        (
+            await conn.execute(entities.insert().values(**values).returning(entities.c.id))
+        ).scalar_one(),
+    )
+
+
+async def _make_relation(
+    conn: AsyncConnection,
+    project: str,
+    build_id: uuid.UUID,
+    src: uuid.UUID,
+    dst: uuid.UUID,
+    **over: Any,
+) -> uuid.UUID:
+    values: dict[str, Any] = {
+        "project": project,
+        "build_id": build_id,
+        "src_entity_id": src,
+        "dst_entity_id": dst,
+        "type": "WORKS_AT",
+        "status": "active",
+    }
+    values.update(over)
+    return cast(
+        "uuid.UUID",
+        (
+            await conn.execute(relations.insert().values(**values).returning(relations.c.id))
         ).scalar_one(),
     )
 
@@ -231,6 +276,84 @@ async def test_chunk_detail_and_document_raw(api: Api) -> None:
     assert "status" not in got
     r = await client.get(f"/projects/{project}/documents/{doc}")
     assert r.json()["data"]["status"] == "ingested"  # a real status rides along
+
+
+async def test_entities_and_relations_scoped_with_evidence_on_detail(api: Api) -> None:
+    # WHY (DR-006 + §27.4): the entity/relation surface has the same
+    # invisibility guarantee as documents, and relation detail carries the
+    # evidence audit trail — including evidence whose chunk was pruned (the
+    # denormalized quote/source_uri survive; chunk_id may dangle by design).
+    client, conn = api
+    project = await _make_project(client)
+    async with conn.begin_nested():
+        active = await _make_build(conn, project, "active")
+        archived = await _make_build(conn, project, "archived")
+        alice = await _make_entity(conn, project, active, "Alice", created_by="llm")
+        acme = await _make_entity(conn, project, active, "Acme")
+        ghost = await _make_entity(conn, project, archived, "Ghost")
+        rel = await _make_relation(
+            conn,
+            project,
+            active,
+            alice,
+            acme,
+            relation_signature="fpv1:alice|works_at|acme",
+            created_by="llm",
+            confidence=0.9,
+        )
+        await conn.execute(
+            relation_evidence.insert().values(
+                relation_id=rel,
+                build_id=active,
+                evidence_type="chunk",
+                evidence_ref="doc-h:0",
+                evidence_hash=f"eh-{uuid.uuid4().hex}",  # §27.4 dedup key, NOT NULL
+                chunk_id=uuid.uuid4(),  # dangles by design (§27.4 prune survival)
+                start_offset=0,
+                end_offset=12,
+                quote="Alice works.",
+                source_uri="file:///d.txt",
+                confidence=0.8,
+            )
+        )
+
+    r = await client.get(f"/projects/{project}/entities")
+    ids = {e["id"] for e in r.json()["data"]}
+    assert ids == {str(alice), str(acme)}  # archived-build entity invisible
+    assert r.json()["meta"]["build_id"] == str(active)
+    got_alice = next(e for e in r.json()["data"] if e["id"] == str(alice))
+    assert got_alice["created_by"] == "llm"
+    got_acme = next(e for e in r.json()["data"] if e["id"] == str(acme))
+    assert "created_by" not in got_acme  # NULL column → key omitted
+    assert (await client.get(f"/projects/{project}/entities/{ghost}")).status_code == 404
+
+    r = await client.get(f"/projects/{project}/relations")
+    (listed,) = r.json()["data"]
+    assert listed["id"] == str(rel)
+    assert "evidence" not in listed  # detail-only
+
+    r = await client.get(f"/projects/{project}/relations/{rel}")
+    detail = r.json()["data"]
+    assert detail["relation_signature"] == "fpv1:alice|works_at|acme"
+    (ev,) = detail["evidence"]
+    assert ev["quote"] == "Alice works." and ev["source_uri"] == "file:///d.txt"
+    assert ev["evidence_ref"] == "doc-h:0"
+
+
+async def test_entities_paginate_by_id_desc(api: Api) -> None:
+    client, conn = api
+    project = await _make_project(client)
+    async with conn.begin_nested():
+        active = await _make_build(conn, project, "active")
+        ids = [await _make_entity(conn, project, active, f"E{i}") for i in range(3)]
+
+    expected = [str(i) for i in sorted(ids, reverse=True)]
+    r1 = await client.get(f"/projects/{project}/entities", params={"limit": 2})
+    token = r1.json()["meta"]["next_cursor"]
+    assert [e["id"] for e in r1.json()["data"]] == expected[:2] and token
+    r2 = await client.get(f"/projects/{project}/entities", params={"limit": 2, "cursor": token})
+    assert [e["id"] for e in r2.json()["data"]] == expected[2:]
+    assert r2.json()["meta"]["next_cursor"] is None
 
 
 async def test_no_active_build_is_409_and_missing_project_404(api: Api) -> None:

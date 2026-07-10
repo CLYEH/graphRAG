@@ -30,10 +30,10 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from api.deps import Conn, response_meta
 from api.envelope import success
-from api.pagination import decode_chunk_cursor, decode_document_cursor, encode_cursor
+from api.pagination import decode_chunk_cursor, decode_id_cursor, encode_cursor
 from api.registry_errors import translate_registry_error
 from api.routers._query import reject_unsupported_query
-from api.schemas import chunk_dto, document_dto
+from api.schemas import chunk_dto, document_dto, entity_dto, relation_dto, relation_evidence_dto
 from core.registry import ProjectNotFoundError, get_project
 from core.stores import tables
 from core.stores.repo import ActiveBinding, BuildScopedRepo, NoActiveBuildError
@@ -71,7 +71,7 @@ async def list_documents_endpoint(
     docs = tables.documents
     where = []
     if cursor:
-        (after_id,) = decode_document_cursor(cursor)
+        (after_id,) = decode_id_cursor(cursor)
         where.append(docs.c.id < after_id)
     rows = await repo.fetch_page(docs, *where, order_by=[docs.c.id.desc()], limit=limit + 1)
     page = rows[:limit]
@@ -147,3 +147,96 @@ async def get_chunk_endpoint(
     if not rows:
         raise _not_found("chunk", chunk_id)
     return success(chunk_dto(rows[0]), **response_meta(request), build_id=binding.build_id)
+
+
+@router.get("/projects/{project}/entities")
+async def list_entities_endpoint(
+    request: Request,
+    conn: Conn,
+    project: str,
+    limit: int = Query(50, ge=1, le=500),
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    reject_unsupported_query(request, "id")
+    binding = await _bind(conn, project)
+    repo = BuildScopedRepo.bound_to(conn, binding)
+    ents = tables.entities
+    where = []
+    if cursor:
+        (after_id,) = decode_id_cursor(cursor)
+        where.append(ents.c.id < after_id)
+    rows = await repo.fetch_page(ents, *where, order_by=[ents.c.id.desc()], limit=limit + 1)
+    page = rows[:limit]
+    next_cursor = encode_cursor((page[-1].id,)) if len(rows) > limit else None
+    return success(
+        [entity_dto(r) for r in page],
+        **response_meta(request),
+        build_id=binding.build_id,
+        paginated=True,
+        next_cursor=next_cursor,
+    )
+
+
+@router.get("/projects/{project}/entities/{entity_id}")
+async def get_entity_endpoint(
+    request: Request, conn: Conn, project: str, entity_id: uuid.UUID
+) -> dict[str, Any]:
+    binding = await _bind(conn, project)
+    repo = BuildScopedRepo.bound_to(conn, binding)
+    rows = await repo.fetch_all(tables.entities, tables.entities.c.id == entity_id)
+    if not rows:
+        raise _not_found("entity", entity_id)
+    return success(entity_dto(rows[0]), **response_meta(request), build_id=binding.build_id)
+
+
+@router.get("/projects/{project}/relations")
+async def list_relations_endpoint(
+    request: Request,
+    conn: Conn,
+    project: str,
+    limit: int = Query(50, ge=1, le=500),
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    reject_unsupported_query(request, "id")
+    binding = await _bind(conn, project)
+    repo = BuildScopedRepo.bound_to(conn, binding)
+    rels = tables.relations
+    where = []
+    if cursor:
+        (after_id,) = decode_id_cursor(cursor)
+        where.append(rels.c.id < after_id)
+    rows = await repo.fetch_page(rels, *where, order_by=[rels.c.id.desc()], limit=limit + 1)
+    page = rows[:limit]
+    next_cursor = encode_cursor((page[-1].id,)) if len(rows) > limit else None
+    return success(
+        [relation_dto(r) for r in page],
+        **response_meta(request),
+        build_id=binding.build_id,
+        paginated=True,
+        next_cursor=next_cursor,
+    )
+
+
+@router.get("/projects/{project}/relations/{relation_id}")
+async def get_relation_endpoint(
+    request: Request, conn: Conn, project: str, relation_id: uuid.UUID
+) -> dict[str, Any]:
+    binding = await _bind(conn, project)
+    repo = BuildScopedRepo.bound_to(conn, binding)
+    rows = await repo.fetch_all(tables.relations, tables.relations.c.id == relation_id)
+    if not rows:
+        raise _not_found("relation", relation_id)
+    # detail carries evidence (the getRelation summary: "with evidence") —
+    # scoped fetch, then a deterministic in-Python id order (created_at is a
+    # statement timestamp, identical for rows written in one transaction — not
+    # a total order; id is unique). No silent cap: a relation's evidence set
+    # is §27.4-bounded by the per-source dedup, so reading it whole is honest.
+    evidence_rows = await repo.fetch_all(
+        tables.relation_evidence, tables.relation_evidence.c.relation_id == relation_id
+    )
+    evidence = [relation_evidence_dto(e) for e in sorted(evidence_rows, key=lambda e: str(e.id))]
+    return success(
+        relation_dto(rows[0], evidence=evidence),
+        **response_meta(request),
+        build_id=binding.build_id,
+    )
