@@ -202,6 +202,82 @@ def chunk_dto(row: Any) -> dict[str, Any]:
     return dto
 
 
+def entity_dto(row: Any) -> dict[str, Any]:
+    """The contract Entity shape from a scoped ``entities`` row. Per-field
+    nullability audit (the #55 rule): every required field's column is NOT
+    NULL; ``created_by`` is an optional NON-nullable enum over a nullable
+    column → omit-when-null; ``attributes`` coalesces DB NULL to {} (optional
+    non-nullable object); created_at/updated_at are contract-nullable.
+    ``embedding_point_id`` is internal (not a contract property) and never
+    emitted."""
+    dto = {
+        "id": row.id,
+        "project": row.project,
+        "build_id": row.build_id,
+        "type": row.type,
+        "canonical_name": row.canonical_name,
+        "entity_key": row.entity_key,
+        "attributes": row.attributes or {},
+        "status": row.status,
+        "review_status": row.review_status,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+    if row.created_by is not None:
+        dto["created_by"] = row.created_by
+    return dto
+
+
+def relation_evidence_dto(row: Any) -> dict[str, Any]:
+    """The contract RelationEvidence shape — every optional field is
+    contract-nullable (and ``evidence_ref`` is NOT NULL at the column), so the
+    full shape is always present. ``relation_id``/``build_id`` (parent
+    context) and ``evidence_hash`` (the internal §27.4 dedup key) are not
+    contract properties and never emitted."""
+    return {
+        "id": row.id,
+        "evidence_type": row.evidence_type,
+        "evidence_ref": row.evidence_ref,
+        "chunk_id": row.chunk_id,
+        "start_offset": row.start_offset,
+        "end_offset": row.end_offset,
+        "quote": row.quote,
+        "source_uri": row.source_uri,
+        "confidence": row.confidence,
+    }
+
+
+def relation_dto(row: Any, *, evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """The contract Relation shape from a scoped ``relations`` row. Same
+    nullability audit as entity_dto: ``created_by`` AND ``relation_signature``
+    (legitimately NULL pre-resolve) are optional NON-nullable over nullable
+    columns → omit-when-null; ``attributes`` → {}; confidence and the
+    timestamps are contract-nullable. ``evidence`` is detail-only (the
+    getRelation summary is "Get a relation WITH EVIDENCE"; lists omit the
+    optional key rather than fetch N sub-resources per row)."""
+    dto = {
+        "id": row.id,
+        "project": row.project,
+        "build_id": row.build_id,
+        "src_entity_id": row.src_entity_id,
+        "dst_entity_id": row.dst_entity_id,
+        "type": row.type,
+        "attributes": row.attributes or {},
+        "status": row.status,
+        "review_status": row.review_status,
+        "confidence": row.confidence,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+    if row.created_by is not None:
+        dto["created_by"] = row.created_by
+    if row.relation_signature is not None:
+        dto["relation_signature"] = row.relation_signature
+    if evidence is not None:
+        dto["evidence"] = evidence
+    return dto
+
+
 def job_event_dto(j: Job, ts: datetime) -> dict[str, Any]:
     """The contract JobEvent shape — an SSE ``data:`` payload, FULL and always
     present (step/message null, never absent — §27.2's no-branching-on-missing-

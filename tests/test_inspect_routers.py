@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 
 from api.app import create_app
 from api.deps import db_conn
-from api.pagination import decode_chunk_cursor, decode_document_cursor, encode_cursor
+from api.pagination import decode_chunk_cursor, decode_id_cursor, encode_cursor
 from core.stores.repo import NoActiveBuildError
 
 pytestmark = pytest.mark.contract
@@ -151,7 +151,7 @@ def test_list_documents_pagination_cursor_round_trips(
     body = r.json()
     assert [d["id"] for d in body["data"]] == [str(rows[0].id), str(rows[1].id)]
     token = body["meta"]["next_cursor"]
-    assert decode_document_cursor(token) == (rows[1].id,)  # last IN-PAGE row, not the probe
+    assert decode_id_cursor(token) == (rows[1].id,)  # last IN-PAGE row, not the probe
     assert repo.calls[0]["limit"] == 3  # limit+1 probe
 
     client.get("/projects/p/documents", params={"limit": 2, "cursor": token})
@@ -292,6 +292,155 @@ def test_malformed_cursor_is_a_400(
     r = client.get("/projects/p/documents", params={"cursor": "not-base64!!"})
     assert r.status_code == 400
     assert "cursor" in r.json()["error"]["message"]
+
+
+def _entity_row(**over: Any) -> SimpleNamespace:
+    base: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "project": "p",
+        "build_id": _BUILD,
+        "type": "Person",
+        "canonical_name": "Alice",
+        "entity_key": "fpv1:person|alice",
+        "attributes": None,
+        "embedding_point_id": uuid.uuid4(),  # internal — must never be emitted
+        "status": "active",
+        "review_status": "unreviewed",
+        "created_by": None,
+        "created_at": _TS,
+        "updated_at": None,
+    }
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _relation_row(**over: Any) -> SimpleNamespace:
+    base: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "project": "p",
+        "build_id": _BUILD,
+        "src_entity_id": uuid.uuid4(),
+        "dst_entity_id": uuid.uuid4(),
+        "type": "WORKS_AT",
+        "attributes": None,
+        "relation_signature": None,  # legitimate pre-resolve state
+        "status": "active",
+        "review_status": "unreviewed",
+        "created_by": "llm",
+        "confidence": 0.9,
+        "created_at": _TS,
+        "updated_at": None,
+    }
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _evidence_row(relation_id: uuid.UUID, **over: Any) -> SimpleNamespace:
+    base: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "relation_id": relation_id,
+        "build_id": _BUILD,
+        "evidence_type": "chunk",
+        "evidence_ref": "doc-hash:3",
+        "chunk_id": uuid.uuid4(),
+        "start_offset": 0,
+        "end_offset": 12,
+        "quote": "Alice works.",
+        "source_uri": "file:///d.txt",
+        "confidence": 0.8,
+    }
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_entity_dto_nullability_matrix(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # WHY (the #55 emission rule at design time): created_by is an optional
+    # NON-nullable enum over a nullable column → omit-when-null; attributes
+    # coalesces to {}; the internal embedding_point_id must never leak into
+    # the frozen shape.
+    _bindable(monkeypatch)
+    repo.rows = (_entity_row(),)
+    got = client.get(f"/projects/p/entities/{uuid.uuid4()}").json()["data"]
+    assert "created_by" not in got
+    assert "embedding_point_id" not in got
+    assert got["attributes"] == {}
+    assert got["review_status"] == "unreviewed"
+    assert got["updated_at"] is None  # contract-nullable stays present
+
+    repo.rows = (_entity_row(created_by="rule", attributes={"a": 1}),)
+    got = client.get(f"/projects/p/entities/{uuid.uuid4()}").json()["data"]
+    assert got["created_by"] == "rule" and got["attributes"] == {"a": 1}
+
+
+def test_relation_list_omits_evidence_and_null_signature(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # WHY: evidence is detail-only (getRelation is "Get a relation WITH
+    # EVIDENCE"; a list fetching N sub-resources per row would be silent
+    # N+1) — and relation_signature is legitimately NULL pre-resolve, an
+    # optional NON-nullable string → the key is omitted, never null.
+    _bindable(monkeypatch)
+    repo.pages = (_relation_row(),)
+    r = client.get("/projects/p/relations")
+    (rel,) = r.json()["data"]
+    assert "evidence" not in rel
+    assert "relation_signature" not in rel
+    assert rel["created_by"] == "llm"  # non-null rides along
+    assert rel["confidence"] == pytest.approx(0.9)
+
+
+def test_relation_detail_carries_the_full_evidence_shape(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    _bindable(monkeypatch)
+    relation = _relation_row(relation_signature="fpv1:a|works_at|b")
+
+    class _Repo(_FakeRepo):
+        async def fetch_all(self, table: Any, *where: Any) -> Sequence[Any]:
+            if table is not None and getattr(table, "name", "") == "relation_evidence":
+                return (_evidence_row(relation.id),)
+            return (relation,)
+
+    from api.routers import inspect as inspect_module
+
+    monkeypatch.setattr(inspect_module, "BuildScopedRepo", _Repo)
+    got = client.get(f"/projects/p/relations/{relation.id}").json()["data"]
+    assert got["relation_signature"] == "fpv1:a|works_at|b"
+    (ev,) = got["evidence"]
+    # the full frozen RelationEvidence shape — every optional field is
+    # contract-nullable, so all keys present; parent context never leaks
+    assert set(ev) == {
+        "id",
+        "evidence_type",
+        "evidence_ref",
+        "chunk_id",
+        "start_offset",
+        "end_offset",
+        "quote",
+        "source_uri",
+        "confidence",
+    }
+    assert ev["quote"] == "Alice works."
+
+
+def test_entities_and_relations_paginate_like_documents(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    _bindable(monkeypatch)
+    rows = [_entity_row() for _ in range(3)]
+    repo.pages = rows
+    r = client.get("/projects/p/entities", params={"limit": 2})
+    assert decode_id_cursor(r.json()["meta"]["next_cursor"]) == (rows[1].id,)
+
+    rel_rows = [_relation_row() for _ in range(3)]
+    repo.pages = rel_rows
+    r = client.get("/projects/p/relations", params={"limit": 2})
+    assert decode_id_cursor(r.json()["meta"]["next_cursor"]) == (rel_rows[1].id,)
+    # and both honor the sort/filter rejection
+    assert client.get("/projects/p/entities", params={"sort": "name:asc"}).status_code == 400
+    assert client.get("/projects/p/relations", params={"filter[type]": "x"}).status_code == 400
 
 
 def test_cursor_types_are_distinct_per_resource() -> None:
