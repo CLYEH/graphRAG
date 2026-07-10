@@ -23,6 +23,7 @@ the pipeline can honor them (see api.schemas — owner decision 2026-07-10).
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
 from arq.connections import ArqRedis
@@ -47,7 +48,7 @@ _IdempotencyKey = Annotated[str | None, Header(alias="Idempotency-Key", max_leng
 async def _trigger(
     request: Request,
     conn: AsyncConnection,
-    redis: ArqRedis,
+    get_redis: Callable[[], Awaitable[ArqRedis]],
     project: str,
     kind: str,
     endpoint: str,
@@ -58,7 +59,9 @@ async def _trigger(
             job = await create_job_exclusive(conn, project, kind)
         except (ProjectNotFoundError, JobConflictError) as exc:
             raise translate_registry_error(exc) from exc
-        await enqueue_build(redis, project, job.id)
+        # the queue is touched HERE only — a §27 replay, a 409, or a 404 must
+        # be served even with Redis unreachable (the Queue dep is a lazy handle)
+        await enqueue_build(await get_redis(), project, job.id)
         return 202, success(job_accepted_dto(job), **response_meta(request))
 
     if idempotency_key:
@@ -79,21 +82,25 @@ async def _trigger(
 async def trigger_ingest_endpoint(
     request: Request,
     conn: Conn,
-    redis: Queue,
+    get_redis: Queue,
     project: str,
     body: IngestRequest | None = None,  # shape-validates; source_ids rejects loudly
     idempotency_key: _IdempotencyKey = None,
 ) -> JSONResponse:
-    return await _trigger(request, conn, redis, project, "ingest", "triggerIngest", idempotency_key)
+    return await _trigger(
+        request, conn, get_redis, project, "ingest", "triggerIngest", idempotency_key
+    )
 
 
 @router.post("/projects/{project}/build", tags=["builds"])
 async def trigger_build_endpoint(
     request: Request,
     conn: Conn,
-    redis: Queue,
+    get_redis: Queue,
     project: str,
     body: BuildRequest | None = None,  # shape-validates; reason rejects loudly
     idempotency_key: _IdempotencyKey = None,
 ) -> JSONResponse:
-    return await _trigger(request, conn, redis, project, "build", "triggerBuild", idempotency_key)
+    return await _trigger(
+        request, conn, get_redis, project, "build", "triggerBuild", idempotency_key
+    )

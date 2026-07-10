@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from api.app import create_app
-from api.deps import arq_redis, db_conn
+from api.deps import arq_redis_provider, db_conn
 from core.config import get_settings
 from core.registry import get_job, set_progress
 from core.stores.tables import idempotency_keys
@@ -34,7 +34,8 @@ pytestmark = pytest.mark.integration
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-Api = tuple[AsyncClient, AsyncConnection, list[tuple[str, uuid.UUID]]]
+#: (client, conn, enqueued spy, queue touches — one element per lazy pool acquisition)
+Api = tuple[AsyncClient, AsyncConnection, list[tuple[str, uuid.UUID]], list[int]]
 
 
 @pytest.fixture()
@@ -57,18 +58,26 @@ async def api(migrated: None, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[
             yield conn
 
     enqueued: list[tuple[str, uuid.UUID]] = []
+    queue_touches: list[int] = []
 
     async def _spy_enqueue(redis: Any, project: str, job_id: uuid.UUID) -> bool:
         enqueued.append((project, job_id))
         return True
 
+    def _provider() -> Any:
+        async def _get() -> object:
+            queue_touches.append(1)
+            return object()
+
+        return _get
+
     app.dependency_overrides[db_conn] = _override
-    app.dependency_overrides[arq_redis] = lambda: object()
+    app.dependency_overrides[arq_redis_provider] = _provider
     monkeypatch.setattr("api.routers.triggers.enqueue_build", _spy_enqueue)
     transport = ASGITransport(app=app)
     try:
         async with AsyncClient(transport=transport, base_url="http://t") as client:
-            yield client, conn, enqueued
+            yield client, conn, enqueued, queue_touches
     finally:
         await outer.rollback()
         await conn.close()
@@ -86,7 +95,7 @@ async def _make_project(client: AsyncClient) -> str:
 
 
 async def test_trigger_build_creates_job_and_enqueues_once(api: Api) -> None:
-    client, conn, enqueued = api
+    client, conn, enqueued, *_ = api
     project = await _make_project(client)
 
     r = await client.post(f"/projects/{project}/build")
@@ -112,7 +121,7 @@ async def test_trigger_build_creates_job_and_enqueues_once(api: Api) -> None:
 
 
 async def test_trigger_ingest_records_ingest_kind(api: Api) -> None:
-    client, conn, _ = api
+    client, conn, *_ = api
     project = await _make_project(client)
 
     r = await client.post(f"/projects/{project}/ingest", json={})
@@ -125,7 +134,7 @@ async def test_second_trigger_conflicts_until_the_job_terminalizes(api: Api) -> 
     # WHY: the contract's JOB_CONFLICT ("overlapping job") — one active job per
     # project, and the guard must LIFT once the job reaches a terminal state
     # (it guards overlap, not the project forever).
-    client, conn, enqueued = api
+    client, conn, enqueued, *_ = api
     project = await _make_project(client)
 
     first = await client.post(f"/projects/{project}/build")
@@ -149,7 +158,7 @@ async def test_trigger_idempotency_replays_one_job(api: Api) -> None:
     # WHY §27: a client retrying a trigger with its key must get the SAME job
     # back — one row, one dispatch — while reusing the key for a DIFFERENT
     # request is a 409, not a silent replay of something else.
-    client, conn, enqueued = api
+    client, conn, enqueued, queue_touches = api
     project = await _make_project(client)
     key = f"k-{uuid.uuid4().hex[:8]}"
 
@@ -158,6 +167,9 @@ async def test_trigger_idempotency_replays_one_job(api: Api) -> None:
     assert r1.status_code == r2.status_code == 202
     assert r1.json()["data"]["job_id"] == r2.json()["data"]["job_id"]  # replayed, not re-run
     assert len(enqueued) == 1  # the replay did not enqueue a second dispatch
+    # ...and never even opened the queue (Codex round 3): the replay must be
+    # servable with Redis unreachable, so only the fresh request touched it
+    assert len(queue_touches) == 1
 
     r = await client.post(f"/projects/{project}/ingest", json={}, headers={"Idempotency-Key": key})
     assert r.status_code == 409
@@ -167,7 +179,7 @@ async def test_trigger_idempotency_replays_one_job(api: Api) -> None:
 async def test_failed_trigger_never_poisons_its_key(api: Api) -> None:
     # WHY §27: the reservation must roll back with the failed request — else
     # the client's retry (after fixing the cause) replays the ERROR forever.
-    client, conn, _ = api
+    client, conn, *_ = api
     project = _proj()  # not created yet
     key = f"k-{uuid.uuid4().hex[:8]}"
 
@@ -182,7 +194,7 @@ async def test_failed_trigger_never_poisons_its_key(api: Api) -> None:
 
 
 async def test_cancel_sets_the_cooperative_flag_idempotently(api: Api) -> None:
-    client, conn, _ = api
+    client, conn, *_ = api
     project = await _make_project(client)
     job_id = uuid.UUID((await client.post(f"/projects/{project}/build")).json()["data"]["job_id"])
 
@@ -197,7 +209,7 @@ async def test_cancel_sets_the_cooperative_flag_idempotently(api: Api) -> None:
 
 
 async def test_cancel_terminal_job_is_a_noop_not_an_error(api: Api) -> None:
-    client, conn, _ = api
+    client, conn, *_ = api
     project = await _make_project(client)
     job_id = uuid.UUID((await client.post(f"/projects/{project}/build")).json()["data"]["job_id"])
     async with conn.begin_nested():
@@ -216,7 +228,7 @@ async def test_cancel_replays_its_stored_response_after_the_job_row_vanishes(api
     # with the same key must get its stored 202 back (or the conflict on a
     # different request), NEVER a JOB_NOT_FOUND that implies the cancel was
     # not accepted. The replay peek must therefore run before the 404 precheck.
-    client, conn, _ = api
+    client, conn, *_ = api
     project = await _make_project(client)
     job_id = uuid.UUID((await client.post(f"/projects/{project}/build")).json()["data"]["job_id"])
     other_job = uuid.UUID(
@@ -246,7 +258,7 @@ async def test_cancel_replays_its_stored_response_after_the_job_row_vanishes(api
 
 
 async def test_job_endpoints_404_on_unknown_job(api: Api) -> None:
-    client, conn, _ = api
+    client, conn, *_ = api
     jid = uuid.uuid4()
     assert (await client.get(f"/jobs/{jid}")).status_code == 404
     r = await client.post(f"/jobs/{jid}/cancel", headers={"Idempotency-Key": "k-404"})

@@ -20,7 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.app import create_app
-from api.deps import arq_redis, db_conn
+from api.deps import arq_redis_provider, db_conn
 from core.registry import Job, JobConflictError, JobNotFoundError, ProjectNotFoundError
 
 pytestmark = pytest.mark.contract
@@ -48,16 +48,31 @@ def _job(**over: Any) -> Job:
 
 
 @pytest.fixture()
-def client() -> Iterator[TestClient]:
+def queue_touches() -> list[int]:
+    """Each element = one lazy-pool acquisition (a get_redis() call)."""
+    return []
+
+
+@pytest.fixture()
+def client(queue_touches: list[int]) -> Iterator[TestClient]:
     app = create_app()
 
     async def _conn() -> AsyncIterator[object]:
         yield object()  # registry is stubbed; the connection is never used
 
+    def _provider() -> Any:
+        async def _get() -> object:
+            queue_touches.append(1)
+            return object()
+
+        return _get
+
     app.dependency_overrides[db_conn] = _conn
-    # the enqueue helper is stubbed too — but the dependency must be overridden
-    # or the first trigger request would lazily open a REAL Redis pool
-    app.dependency_overrides[arq_redis] = lambda: object()
+    # the enqueue helper is stubbed too — but the provider dependency must be
+    # overridden or an enqueue path would lazily open a REAL Redis pool; the
+    # fake counts acquisitions so tests can pin that non-enqueue responses
+    # never touch the queue (Codex round 3)
+    app.dependency_overrides[arq_redis_provider] = _provider
     with TestClient(app) as c:
         yield c
 
@@ -185,7 +200,7 @@ def test_cancel_unknown_job_404(client: TestClient, monkeypatch: pytest.MonkeyPa
 
 
 def test_trigger_build_202_creates_then_enqueues(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, queue_touches: list[int]
 ) -> None:
     job = _job(kind="build")
     created: list[tuple[str, str]] = []
@@ -202,6 +217,7 @@ def test_trigger_build_202_creates_then_enqueues(
     assert r.json()["data"] == {"job_id": str(job.id), "status": "queued"}
     assert created == [("p", "build")]
     assert enqueued == [("p", job.id)]  # enqueue rides IN the request, not after
+    assert len(queue_touches) == 1  # the pool opens exactly at the enqueue point
 
 
 def test_trigger_ingest_records_the_ingest_kind(
@@ -221,10 +237,12 @@ def test_trigger_ingest_records_the_ingest_kind(
 
 
 def test_trigger_conflict_409_and_never_enqueues(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, queue_touches: list[int]
 ) -> None:
     # WHY: an overlapping job must not enqueue anything — a 409 that still
-    # dispatched would run a build the client was told did not start.
+    # dispatched would run a build the client was told did not start. And the
+    # queue must not even be TOUCHED (Codex round 3): a 409 must be servable
+    # with Redis unreachable.
     active = uuid.uuid4()
 
     async def fake_create(conn: Any, project: str, kind: str) -> Job:
@@ -238,10 +256,11 @@ def test_trigger_conflict_409_and_never_enqueues(
     assert r.json()["error"]["code"] == "JOB_CONFLICT"
     assert r.json()["error"]["details"]["active_job_id"] == str(active)
     assert enqueued == []
+    assert queue_touches == []  # the pool was never opened
 
 
 def test_trigger_unknown_project_404_and_never_enqueues(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, queue_touches: list[int]
 ) -> None:
     async def fake_create(conn: Any, project: str, kind: str) -> Job:
         raise ProjectNotFoundError(project)
@@ -253,6 +272,7 @@ def test_trigger_unknown_project_404_and_never_enqueues(
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "PROJECT_NOT_FOUND"
     assert enqueued == []
+    assert queue_touches == []  # a 404 must be servable with Redis unreachable
 
 
 @pytest.mark.parametrize(
@@ -266,7 +286,11 @@ def test_trigger_unknown_project_404_and_never_enqueues(
     ],
 )
 def test_trigger_rejects_unsupported_fields_loudly(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, path: str, body: dict[str, Any]
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    body: dict[str, Any],
+    queue_touches: list[int],
 ) -> None:
     # WHY (owner decision 2026-07-10): the pipeline cannot honor these fields
     # yet — a 202 that then ran a FULL ingest against an explicit restriction,
@@ -282,6 +306,7 @@ def test_trigger_rejects_unsupported_fields_loudly(
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "VALIDATION_ERROR"
     assert enqueued == []
+    assert queue_touches == []  # a 400 must be servable with Redis unreachable
 
 
 @pytest.mark.parametrize("body", [None, {}])

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
@@ -77,8 +77,22 @@ async def arq_redis(request: Request) -> ArqRedis:
     return redis
 
 
-#: Handler signature sugar: ``redis: Queue``.
-Queue = Annotated[ArqRedis, Depends(arq_redis)]
+def arq_redis_provider(request: Request) -> Callable[[], Awaitable[ArqRedis]]:
+    """A LAZY handle on the shared arq pool — resolving the dependency does no
+    I/O; the pool is opened only when the handler actually enqueues. A trigger
+    must serve its §27 replay and conflict/not-found responses even with Redis
+    unreachable, so the queue connection is a cost of the fresh-enqueue path
+    only, never a precondition of the route."""
+
+    def _get() -> Awaitable[ArqRedis]:
+        return arq_redis(request)
+
+    return _get
+
+
+#: Handler signature sugar: ``get_redis: Queue`` — call ``await get_redis()``
+#: at the enqueue point.
+Queue = Annotated[Callable[[], Awaitable[ArqRedis]], Depends(arq_redis_provider)]
 
 
 def response_meta(request: Request) -> dict[str, Any]:
