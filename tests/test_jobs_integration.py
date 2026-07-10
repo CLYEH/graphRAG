@@ -92,13 +92,18 @@ async def test_create_get_and_progress_roundtrip(migrated: None) -> None:
             assert updated.message == "extracting"
             assert updated.error is None
 
-            # error stores the §15 Error shape and round-trips as a dict (not a
-            # JSONB 'null' — none_as_null keeps an un-errored job's column SQL NULL)
-            errored = await set_progress(
-                conn, job.id, status="failed", error={"code": "INTERNAL", "message": "boom"}
-            )
+            # error stores the FULL §15 Error shape (the 0014 CHECK refuses a
+            # partial object) and round-trips as a dict (not a JSONB 'null' —
+            # none_as_null keeps an un-errored job's column SQL NULL)
+            full_error = {
+                "code": "INTERNAL",
+                "message": "boom",
+                "details": None,
+                "request_id": str(uuid.uuid4()),
+            }
+            errored = await set_progress(conn, job.id, status="failed", error=full_error)
             assert errored is not None
-            assert errored.error == {"code": "INTERNAL", "message": "boom"}
+            assert errored.error == full_error
             assert errored.step == "graph"  # untouched by this patch
             await trans.rollback()
     finally:
@@ -376,6 +381,96 @@ async def test_create_job_exclusive_race_has_one_winner(migrated: None) -> None:
             await cleanup.execute(jobs.delete().where(jobs.c.project == project))
             await cleanup.execute(projects.delete().where(projects.c.name == project))
             await cleanup.commit()
+        await engine.dispose()
+
+
+def test_upgrade_0014_backfills_legacy_partial_errors_before_the_check(
+    require_services: None,
+) -> None:
+    """0014 must apply on a DB that already holds failed jobs written by the
+    pre-BA2e-1 writers (error = {code, message, details} only — legal at 0013,
+    where no CHECK exists): the backfill runs BEFORE ADD CONSTRAINT, so a
+    populated upgrade reconciles instead of failing, and the stored shape
+    becomes the full frozen Error — request_id stamped, original fields
+    preserved. CI migrates a fresh empty DB, so without this test the
+    backfill (the migration's whole reason to exist) would never execute over
+    a violating row. Sync test: alembic's env.py drives its own asyncio.run,
+    which can't run inside an async test's loop (the 0010 orphan-builds test
+    is the precedent)."""
+    cfg = Config(str(REPO_ROOT / "alembic.ini"))
+    project = f"itest-legacy-{uuid.uuid4().hex[:8]}"
+    legacy = {"code": "INTERNAL", "message": "boom", "details": None}  # pre-0014 shape
+    job_ids: list[uuid.UUID] = []
+
+    async def _insert_legacy_row() -> None:
+        engine = _engine()
+        try:
+            async with engine.connect() as conn:
+                await create_project(conn, name=project)
+                job = await create_job(conn, project, "build")
+                await set_progress(conn, job.id, status="failed", error=legacy)
+                job_ids.append(job.id)
+                await conn.commit()
+        finally:
+            await engine.dispose()
+
+    async def _assert_reconciled() -> None:
+        engine = _engine()
+        try:
+            async with engine.connect() as conn:
+                job = await get_job(conn, job_ids[0])
+                assert job is not None and job.error is not None
+                assert set(job.error) == {"code", "message", "details", "request_id"}
+                assert job.error["code"] == "INTERNAL"  # preserved
+                assert job.error["message"] == "boom"  # preserved
+                assert job.error["details"] is None  # preserved
+                uuid.UUID(job.error["request_id"])  # stamped, parseable
+        finally:
+            await engine.dispose()
+
+    async def _cleanup() -> None:
+        engine = _engine()
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(jobs.delete().where(jobs.c.project == project))
+                await conn.execute(projects.delete().where(projects.c.name == project))
+                await conn.commit()
+        finally:
+            await engine.dispose()
+
+    try:
+        command.downgrade(cfg, "0013_jobs_reaper_index")  # drop the CHECK (+ index)
+        asyncio.run(_insert_legacy_row())
+        command.upgrade(cfg, "head")  # MUST NOT fail on the legacy row
+        asyncio.run(_assert_reconciled())
+    finally:
+        # robust to either migration state: remove the rows, then ensure head
+        asyncio.run(_cleanup())
+        command.upgrade(cfg, "head")
+
+
+async def test_partial_job_error_is_refused_by_the_db(migrated: None) -> None:
+    """WHY (0014): GET /jobs/{id} passes jobs.error through verbatim, so the
+    full frozen Error shape must be a STORAGE invariant, not writer
+    discipline — a partial object is refused at the write. And because 0014
+    adds this CHECK only after backfilling, the constraint's existence on a
+    migrated database proves no legacy partial row survived the upgrade."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            project = _proj()
+            await create_project(conn, name=project)
+            job = await create_job(conn, project, "build")
+            with pytest.raises(IntegrityError):
+                await set_progress(
+                    conn,
+                    job.id,
+                    status="failed",
+                    error={"code": "INTERNAL", "message": "no request_id"},
+                )
+            await trans.rollback()
+    finally:
         await engine.dispose()
 
 
