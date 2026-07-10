@@ -57,6 +57,7 @@ Keep items small enough to finish in one loop.
 - [x] C6e Hybrid router + fusion + routing trace (§8, §16 debug)
 - [x] C7 Global summary (Leiden communities + reports)
 - [x] C8 MCP server (per project) exposing the tool set
+- [ ] C8b MCP HTTP transport — expose the per-project FastMCP server over streamable HTTP (owner 2026-07-10: the no-code agent platform consumes external MCP over HTTP — the museum-guide integration seam; see memory graphrag-goal-museum-guide): entrypoint/CLI transport option (stdio stays the default) + host/port via core.config (never os.environ) + tests; tools/policy untouched (server.py:24 promised transport-additivity — verify it holds); flag the §23 auth placeholder implication (an HTTP-exposed MCP will need real auth → future DR-002-adjacent owner decision, NOT this task)
 - [x] C9 builds/activate/rollback/diff/prune (CLI + core)
 - [x] C10 Eval harness runner
 - [x] C11 Observability wiring + drift detection
