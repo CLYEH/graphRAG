@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Request
+from sqlalchemy.exc import SQLAlchemyError
 
 from api.deps import project_query_context, response_meta
 from api.envelope import success
@@ -60,14 +61,24 @@ async def _load_policy(request: Request, project: str) -> QueryPolicy:
     deadline in the convoy. The query endpoints therefore take NO ``Conn``
     yield-dep at all (which lives until the response completes — the BA2e-2
     lesson's pool-shaped sibling)."""
-    async with request.app.state.engine.connect() as conn:
-        proj = await get_project(conn, project)
-        if proj is None:
-            raise translate_registry_error(ProjectNotFoundError(project))
-        try:
-            await resolve_active_binding(conn, project)
-        except NoActiveBuildError as exc:
-            raise translate_registry_error(exc) from exc
+    try:
+        async with request.app.state.engine.connect() as conn:
+            proj = await get_project(conn, project)
+            if proj is None:
+                raise translate_registry_error(ProjectNotFoundError(project))
+            try:
+                await resolve_active_binding(conn, project)
+            except NoActiveBuildError as exc:
+                raise translate_registry_error(exc) from exc
+    except SQLAlchemyError as exc:
+        # the preflight runs BEFORE the seam's §22 store-degradation path, so
+        # a Postgres/pool outage here must map to the typed 503 itself — the
+        # inspect Neo4j precedent: an outage is 503 STORE_UNAVAILABLE, never
+        # the generic INTERNAL 500 server-bug envelope (Codex #60 R4)
+        raise ApiError(
+            ErrorCode.STORE_UNAVAILABLE,
+            "registry store unavailable while resolving the project policy",
+        ) from exc
     block = (proj.config or {}).get("query_policy")
     if block is None:
         raise ApiError(
@@ -144,11 +155,15 @@ async def query_sql_endpoint(request: Request, project: str, body: QueryRequest)
         async def _run(deps: Any, _remaining_ms: int) -> Any:
             # the caller's top_k NARROWS the §21 sql row ceiling (min, never
             # widens — the BA3c limit precedent); accepting-and-ignoring it
-            # would silently exceed the requested cap (Codex #60 R1). MCP's
-            # sql tool exposes no per-call cap, so this is REST-additive on
-            # top of the SAME shared envelope, not a facade divergence.
+            # would silently exceed the requested cap (Codex #60 R1). The
+            # frozen policy schema defines max_top_k as the upper bound on
+            # QueryRequest.top_k, so the request cap clamps through
+            # policy.top_k() FIRST, then meets the row ceiling (Codex #60
+            # R4); with no top_k the mode's own ceiling stands. MCP's sql
+            # tool exposes no per-call cap, so this is REST-additive on top
+            # of the SAME shared envelope, not a facade divergence.
             ceiling = policy.sql_rows()
-            rows = min(body.top_k, ceiling) if body.top_k is not None else ceiling
+            rows = min(policy.top_k(body.top_k), ceiling) if body.top_k is not None else ceiling
             return await run_sql(deps.sql_reader, deps.llm, policy.sql_policy(), body.query, rows)
 
         return _run

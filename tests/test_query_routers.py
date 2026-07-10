@@ -18,6 +18,7 @@ from typing import Any, cast
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
 
 from api.app import create_app
 from core.llm.factory import LLMNotConfiguredError
@@ -188,8 +189,9 @@ def test_top_k_is_accepted_and_reaches_the_mode(
     )
     assert captured_k == [5, 20]  # 5 passes un-clamped; 500 clamps to max_top_k
 
-    # the sql sibling (Codex #60 R1): top_k NARROWS the §21 row ceiling —
-    # min(top_k, sql_rows()) — never ignored, never widening
+    # the sql sibling (Codex #60 R1+R4): top_k clamps through max_top_k
+    # FIRST (the frozen schema's request-level cap), then meets the sql row
+    # ceiling — never ignored, never widening past EITHER bound
     captured_rows: list[int] = []
 
     async def fake_run_sql(reader: Any, llm: Any, policy: Any, q: Any, rows: int) -> Any:
@@ -209,7 +211,8 @@ def test_top_k_is_accepted_and_reaches_the_mode(
         client.post("/projects/p/query/sql", json={"query": "q", "top_k": 999}).status_code == 200
     )
     assert client.post("/projects/p/query/sql", json={"query": "q"}).status_code == 200
-    assert captured_rows == [1, 100, 100]  # narrows; clamps to sql_rows(); defaults to it
+    # 1 passes; 999 → max_top_k (20), NOT just sql_rows (100); absent → ceiling
+    assert captured_rows == [1, 20, 100]
 
 
 def test_nil_build_sentinel_stays_in_data_never_meta(
@@ -309,3 +312,22 @@ def test_no_active_build_precedes_the_config_gates(
     r = client.post("/projects/p/query/semantic", json={"query": "q"})
     assert r.status_code == 409
     assert r.json()["error"]["code"] == "NO_ACTIVE_BUILD"
+
+
+def test_policy_store_outage_is_a_typed_503(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (Codex #60 R4 — the inspect Neo4j precedent): the preflight reads
+    # run BEFORE the seam's §22 degradation path, so a Postgres/pool outage
+    # there must be the typed 503 STORE_UNAVAILABLE itself — never the
+    # generic INTERNAL 500, which tells the client "server bug" when the
+    # store is merely down.
+    _queryable(monkeypatch)
+
+    async def pg_down(conn: Any, name: str) -> Any:
+        raise OperationalError("select 1", None, OSError("connection refused"))
+
+    _stub(monkeypatch, "get_project", pg_down)
+    r = client.post("/projects/p/query/semantic", json={"query": "q"})
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "STORE_UNAVAILABLE"
