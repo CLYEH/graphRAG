@@ -153,6 +153,55 @@ def job_accepted_dto(j: Job) -> dict[str, Any]:
     return {"job_id": j.id, "status": j.status}
 
 
+def document_dto(row: Any, *, include_raw: bool = False) -> dict[str, Any]:
+    """The contract Document shape from a scoped ``documents`` row. Two kinds
+    of conditional key, each the only legal encoding: ``raw`` is
+    contract-licensed detail-only ("returned on detail GET only"); ``status``
+    is an OPTIONAL NON-NULLABLE string in the frozen schema while the column
+    is nullable — a NULL column can only be expressed by OMITTING the key
+    (emitting null would be contract-invalid). Nullable-typed fields
+    (mime/ingested_at) stay always-present; metadata coalesces DB NULL to {}
+    (the contract types it as a non-nullable object, and 'no metadata' IS the
+    empty object)."""
+    dto = {
+        "id": row.id,
+        "project": row.project,
+        "build_id": row.build_id,
+        "source_uri": row.source_uri,
+        "content_hash": row.content_hash,
+        "mime": row.mime,
+        "metadata": row.metadata or {},
+        "ingested_at": row.ingested_at,
+    }
+    if row.status is not None:
+        dto["status"] = row.status
+    if include_raw:
+        dto["raw"] = row.raw
+    return dto
+
+
+def chunk_dto(row: Any) -> dict[str, Any]:
+    """The contract Chunk shape from a scoped ``chunks`` row. ``status`` is
+    optional NON-nullable in the frozen schema and the cleaning path writes
+    chunks without one — a NULL column is expressed by omitting the key
+    (see document_dto)."""
+    dto = {
+        "id": row.id,
+        "document_id": row.document_id,
+        "build_id": row.build_id,
+        "ordinal": row.ordinal,
+        "text": row.text,
+        "token_count": row.token_count,
+        "start_offset": row.start_offset,
+        "end_offset": row.end_offset,
+        "vector_point_id": row.vector_point_id,
+        "metadata": row.metadata or {},
+    }
+    if row.status is not None:
+        dto["status"] = row.status
+    return dto
+
+
 def job_event_dto(j: Job, ts: datetime) -> dict[str, Any]:
     """The contract JobEvent shape — an SSE ``data:`` payload, FULL and always
     present (step/message null, never absent — §27.2's no-branching-on-missing-

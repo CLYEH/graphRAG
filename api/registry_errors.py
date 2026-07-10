@@ -25,6 +25,7 @@ from core.registry import (
     ProjectHasBuildsError,
     ProjectNotFoundError,
 )
+from core.stores.repo import NoActiveBuildError
 
 
 def translate_registry_error(exc: Exception) -> ApiError:
@@ -40,6 +41,10 @@ def translate_registry_error(exc: Exception) -> ApiError:
             str(exc),
             details={"project": exc.project, "active_job_id": exc.active_job_id},
         )
+    # a DR-006 repo error, not a registry one — but this stays the single
+    # domain-error → frozen-code translation point (module docstring)
+    if isinstance(exc, NoActiveBuildError):
+        return ApiError(ErrorCode.NO_ACTIVE_BUILD, str(exc), details={"project": exc.project})
     if isinstance(exc, ProjectExistsError):
         return ApiError(
             ErrorCode.VALIDATION_ERROR,  # GAP: no frozen "exists"/conflict code

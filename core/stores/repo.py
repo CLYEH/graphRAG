@@ -473,6 +473,29 @@ class BuildScopedRepo:
             query = query.where(predicate)
         return (await self._execute(query)).fetchall()
 
+    async def fetch_page(
+        self,
+        table: sa.Table,
+        *where: sa.ColumnExpressionArgument[bool],
+        order_by: Sequence[sa.ColumnExpressionArgument[Any]],
+        limit: int,
+    ) -> Sequence[sa.Row[Any]]:
+        """``fetch_all`` with a deterministic order and a row cap — the BA3
+        inspection lists' keyset-pagination read. Same narrowing-only
+        discipline, extended to the NEW expression channel: an ordering cannot
+        widen the scope filters, but a raw-SQL fragment smuggled into ORDER BY
+        is the same escape hatch :func:`_reject_raw_sql` exists to close, so
+        every order expression is checked like a predicate. ``limit`` is a
+        plain typed int — no expression channel."""
+        query = self._select(table)
+        for predicate in where:
+            _reject_raw_sql(predicate)
+            query = query.where(predicate)
+        for expression in order_by:
+            _reject_raw_sql(expression)
+            query = query.order_by(expression)
+        return (await self._execute(query.limit(limit))).fetchall()
+
     async def mention_refs(self) -> set[tuple[uuid.UUID, str]]:
         """The ``(entity_id, source_ref)`` mention pairs already in this build.
 
