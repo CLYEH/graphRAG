@@ -106,9 +106,11 @@ class QueryPolicy:
 def load_query_policy(config_path: Path) -> QueryPolicy:
     """Load + validate ``query_policy`` from a project's ``config.yaml``.
 
-    Schema validation runs against the FROZEN contract first (DR-002 — the
-    schema file is read fresh so a bumped contract is picked up, never
-    vendored); the typed models then re-check the §21 frozen guarantees.
+    The file loader owns only the file/YAML/presence concerns; validation and
+    typing are :func:`query_policy_from_mapping`'s (shared with the Console
+    API, which reads the block from the ``projects.config`` registry column —
+    owner decision 2026-07-10: registry is the Console-side policy source,
+    strict, no invented defaults; the file stays the MCP/CLI source).
     Every failure is a :class:`PolicyError` naming what broke.
     """
     try:
@@ -119,8 +121,16 @@ def load_query_policy(config_path: Path) -> QueryPolicy:
         raise PolicyError(f"project config is not valid YAML: {exc}") from exc
     if not isinstance(raw, dict) or "query_policy" not in raw:
         raise PolicyError(f"project config {config_path} has no query_policy block")
-    document = raw["query_policy"]
+    return query_policy_from_mapping(raw["query_policy"])
 
+
+def query_policy_from_mapping(document: Any) -> QueryPolicy:
+    """Validate + type a ``query_policy`` block from any source.
+
+    Schema validation runs against the FROZEN contract first (DR-002 — the
+    schema file is read fresh so a bumped contract is picked up, never
+    vendored); the typed models then re-check the §21 frozen guarantees.
+    """
     schema = json.loads(_schema_text())
     validator = jsonschema.Draft202012Validator(schema)
     errors = sorted(validator.iter_errors(document), key=lambda e: list(e.absolute_path))

@@ -25,9 +25,11 @@ from typing import Annotated, Any
 
 from arq.connections import ArqRedis, RedisSettings, create_pool
 from fastapi import Depends, FastAPI, Request
+from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from core.config import get_settings
+from core.stores.graph import graph_driver
 
 
 def _async_dsn() -> str:
@@ -43,9 +45,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.engine = engine
     app.state.arq_redis = None
     app.state.arq_redis_lock = asyncio.Lock()
+    app.state.neo4j = None
     try:
         yield
     finally:
+        if app.state.neo4j is not None:
+            await app.state.neo4j.close()
         if app.state.arq_redis is not None:
             await app.state.arq_redis.aclose()
         await engine.dispose()
@@ -93,6 +98,26 @@ def arq_redis_provider(request: Request) -> Callable[[], Awaitable[ArqRedis]]:
 #: Handler signature sugar: ``get_redis: Queue`` — call ``await get_redis()``
 #: at the enqueue point.
 Queue = Annotated[Callable[[], Awaitable[ArqRedis]], Depends(arq_redis_provider)]
+
+
+async def neo4j_driver(request: Request) -> AsyncDriver:
+    """The shared Neo4j driver, created on first use — driver construction
+    opens no connection (sessions do, per request in the handler), so this is
+    zero-I/O at resolution like the arq provider. ASYNC deliberately: an async
+    dependency runs on the event loop, where this await-free check-then-set is
+    atomic — a sync def would run in FastAPI's threadpool, where two cold
+    starts could double-construct (and leak one driver until process exit).
+    Lifespan closes it if it was ever created. Tests override this dependency
+    to keep the graph endpoints hermetic."""
+    state = request.app.state
+    if state.neo4j is None:
+        state.neo4j = graph_driver()
+    driver: AsyncDriver = state.neo4j
+    return driver
+
+
+#: Handler signature sugar: ``driver: Graph`` — open a session at the use point.
+Graph = Annotated[AsyncDriver, Depends(neo4j_driver)]
 
 
 def response_meta(request: Request) -> dict[str, Any]:
