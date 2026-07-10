@@ -626,3 +626,23 @@ def test_subgraph_client_limit_narrows_never_widens_the_ceiling(
     client.get("/projects/p/graph/subgraph", params={"entity_id": seed, "limit": 500})
     # policy max_rows is 100 (_QUERY_POLICY.text_to_cypher): 5 narrows, 500 clamps
     assert captured == [5, 100]
+
+
+def test_subgraph_no_active_build_beats_policy_errors(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (Codex #57 R1, surface consistency): this endpoint serves the
+    # ACTIVE build like every other inspect op — a project without one is a
+    # 409 NO_ACTIVE_BUILD even when its policy is ALSO missing; a 400 would
+    # send the client off to fix policy when there is no graph to inspect.
+    from core.stores.repo import NoActiveBuildError as _NoActive
+
+    _graphable(monkeypatch, client, config={})  # policy missing too
+
+    async def no_active(conn: Any, project: str) -> Any:
+        raise _NoActive(project)
+
+    _stub(monkeypatch, "_resolve_active_binding", no_active)
+    r = client.get("/projects/p/graph/subgraph", params={"entity_id": str(uuid.uuid4())})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "NO_ACTIVE_BUILD"

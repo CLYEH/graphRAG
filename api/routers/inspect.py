@@ -271,6 +271,14 @@ async def get_subgraph_endpoint(
     proj = await get_project(conn, project)
     if proj is None:
         raise translate_registry_error(ProjectNotFoundError(project))
+    # bind BEFORE the policy checks: this endpoint serves the ACTIVE build,
+    # and a project without one must answer the surface-consistent 409
+    # NO_ACTIVE_BUILD — not a 400 telling the client to fix policy when there
+    # is no graph to inspect (Codex #57 R1; same precedence as _bind)
+    try:
+        binding = await _resolve_active_binding(conn, project)
+    except NoActiveBuildError as exc:
+        raise translate_registry_error(exc) from exc
     block = (proj.config or {}).get("query_policy")
     if block is None:
         # GAP-adjacent (registry_errors precedent): no frozen code says
@@ -295,10 +303,6 @@ async def get_subgraph_endpoint(
             "(§21 max_graph_hops) — rejected, not clamped",
             details={"hops": hops, "max_graph_hops": qp.max_graph_hops},
         )
-    try:
-        binding = await _resolve_active_binding(conn, project)
-    except NoActiveBuildError as exc:
-        raise translate_registry_error(exc) from exc
     repo = BuildScopedRepo.bound_to(conn, binding)
     cypher = qp.cypher_policy()
     effective = replace(cypher, max_rows=min(limit, cypher.max_rows))
