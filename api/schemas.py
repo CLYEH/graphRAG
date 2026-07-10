@@ -18,6 +18,7 @@ Lifting a rejection later is additive (no contract bump).
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Annotated, Any
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
@@ -150,3 +151,19 @@ def job_dto(j: Job) -> dict[str, Any]:
 def job_accepted_dto(j: Job) -> dict[str, Any]:
     """The contract JobAccepted shape — the 202 payload for long operations."""
     return {"job_id": j.id, "status": j.status}
+
+
+def job_event_dto(j: Job, ts: datetime) -> dict[str, Any]:
+    """The contract JobEvent shape — an SSE ``data:`` payload, FULL and always
+    present (step/message null, never absent — §27.2's no-branching-on-missing-
+    fields doctrine). Distinct from ``job_dto`` (no kind/project/error; adds
+    ``ts`` — the DB clock at the moment the state was observed, see
+    ``get_job_at``)."""
+    return {
+        "job_id": j.id,
+        "status": j.status,
+        "step": j.step,
+        "progress": j.progress,
+        "message": j.message,
+        "ts": ts,
+    }
