@@ -27,6 +27,7 @@ from __future__ import annotations
 import itertools
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,6 +46,7 @@ from core.query.results import (
     SourceRef,
     ordered_results,
 )
+from core.stores import tables
 from core.stores.graph import BuildScopedGraphRepo
 from core.stores.repo import BuildScopedRepo
 
@@ -340,6 +342,116 @@ async def _subgraph(
     return _response(graph, query, results, warnings)
 
 
+@dataclass(frozen=True)
+class SubgraphContext:
+    """The frozen REST GraphContext payload (BA3c): nodes/edges as plain dicts
+    in the GraphNode/GraphEdge shapes, every emitted value read from the SoR —
+    the projection contributes topology only, exactly the graph_query
+    discipline (#31/#33). No warnings channel exists on the REST response, so
+    the §21/§22 caps still APPLY (via the policy) but truncation is not
+    signalled — the client's own ``limit`` is the contract's cap channel."""
+
+    nodes: tuple[dict[str, Any], ...]
+    edges: tuple[dict[str, Any], ...]
+
+
+async def subgraph_context(
+    graph: BuildScopedGraphRepo,
+    repo: BuildScopedRepo,
+    policy: TextToCypher,
+    seed: uuid.UUID,
+    hops: int,
+    *,
+    max_graph_hops: int,
+) -> SubgraphContext | None:
+    """Id-seeded §21-governed subgraph for GET /graph/subgraph (BA3c).
+
+    Same scope equality and hop-ceiling rules as :func:`graph_query` (both
+    raise ``ValueError`` — the endpoint pre-validates for a clean 400; the
+    raise here is the belt). Returns None when ``seed`` is not an ACTIVE
+    entity of the bound build (the endpoint's 404). Traversal, SoR
+    reachability recomputation, caps and the single deadline are all
+    :func:`_neighbor_entities`'s — id-seeded via its ``seeds`` parameter — so
+    the REST surface shows exactly the world the MCP graph tools show,
+    including the §16 mention-backed rule (an active entity with no citable
+    mention is dropped, even the seed). Edges are re-read from the SoR
+    (id/src/dst/type/confidence from ``relations`` rows, active only, both
+    endpoints inside the emitted node set) — never from projection values.
+    """
+    if graph.project != repo.project or graph.build_id != repo.build_id:
+        raise ValueError(
+            f"graph repo ({graph.project}, {graph.build_id}) and SoR repo "
+            f"({repo.project}, {repo.build_id}) are bound to different scopes — "
+            "emission would mix builds (DR-006)"
+        )
+    if hops < 1 or hops > max_graph_hops:
+        raise ValueError(
+            f"hops={hops} is outside the policy ceiling 1..{max_graph_hops} "
+            "(§21 max_graph_hops) — rejected, not clamped"
+        )
+    if not await repo.active_entity_ids({seed}):
+        return None
+
+    deadline = time.monotonic() + policy.timeout_ms / 1000.0
+    params = GraphQueryParams(template="subgraph", entity=str(seed), hops=hops)
+    entities, _dropped, _truncated, timed_out = await _neighbor_entities(
+        graph, repo, policy, params, deadline, include_seeds=True, seeds=[seed]
+    )
+    node_ids = [entity_id for entity_id, _, _, _ in entities]
+
+    # node emission from the SoR rows (type + canonical_name as label);
+    # nearest-first order preserved from the traversal
+    node_rows = await repo.fetch_all(tables.entities, tables.entities.c.id.in_(node_ids))
+    by_id = {row.id: row for row in node_rows}
+    nodes = tuple(
+        {
+            "id": entity_id,
+            "type": by_id[entity_id].type if entity_id in by_id else None,
+            "label": by_id[entity_id].canonical_name if entity_id in by_id else None,
+        }
+        for entity_id in node_ids
+    )
+
+    # edge stage: same shared-deadline + row-budget discipline as _subgraph
+    # (§21 max_rows ceils nodes AND edges combined; entities keep priority),
+    # and the SAME §16 citability bar — a projected edge is emitted only when
+    # its SoR relation is active AND carries ≥1 valid evidence (the
+    # _relation_results doctrine; an evidence-less edge is invisible on every
+    # surface, MCP and REST alike)
+    edge_budget = policy.max_rows - len(nodes)
+    edges: tuple[dict[str, Any], ...] = ()
+    remaining_ms = int((deadline - time.monotonic()) * 1000)
+    if not timed_out and remaining_ms >= 1 and edge_budget > 0 and len(node_ids) >= 2:
+        projected = await graph.edges_among(
+            [str(entity_id) for entity_id in node_ids],
+            limit=edge_budget + 1,  # the truncation probe (policy cap only)
+            timeout_ms=remaining_ms,
+        )
+        projected = projected[:edge_budget]
+        triples = [t for edge in projected if (t := _edge_triple(edge)) is not None]
+        resolved = await repo.relations_with_evidence(triples)
+        citable = [
+            relation_id
+            for triple, (relation_id, evidence_rows) in resolved.items()
+            if any(evidence_ref(row) is not None for row in evidence_rows)
+        ]
+        if citable:
+            node_set = set(node_ids)
+            edge_rows = await repo.fetch_all(tables.relations, tables.relations.c.id.in_(citable))
+            edges = tuple(
+                {
+                    "id": row.id,
+                    "src": row.src_entity_id,
+                    "dst": row.dst_entity_id,
+                    "type": row.type,
+                    "confidence": row.confidence,
+                }
+                for row in sorted(edge_rows, key=lambda r: str(r.id))
+                if row.src_entity_id in node_set and row.dst_entity_id in node_set
+            )
+    return SubgraphContext(nodes=nodes, edges=edges)
+
+
 # -- shared emission helpers ---------------------------------------------------
 
 
@@ -351,6 +463,7 @@ async def _neighbor_entities(
     deadline: float,
     *,
     include_seeds: bool = False,
+    seeds: Sequence[uuid.UUID] | None = None,
 ) -> tuple[list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]], int, bool, bool]:
     """Traverse from every seed, merge, re-verify against the SoR.
 
@@ -373,7 +486,9 @@ async def _neighbor_entities(
     dropped as drift. (A candidate clipped from the node set by the fetch cap
     can make a genuinely-reachable node look unreachable — an over-drop, never
     an under-verify, and the clip itself is surfaced as TRUNCATED.)"""
-    seeds = await repo.entity_ids_by_name(params.entity)
+    if seeds is None:
+        # name-seeded (the graph_query templates); BA3c passes SoR-verified ids
+        seeds = await repo.entity_ids_by_name(params.entity)
     if not seeds:
         return [], 0, False, False
 

@@ -14,13 +14,14 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import jsonschema
 import pytest
 from neo4j.exceptions import ClientError, ServiceUnavailable
 
-from core.query.graph import GraphQueryParams, graph_query
+from core.query.graph import GraphQueryParams, graph_query, subgraph_context
 from core.query.policy import CYPHER_ALLOWED_CLAUSES, CYPHER_BLOCKED_MIN, TextToCypher
 from core.query.results import McpResponse
 from core.stores.graph import BuildScopedGraphRepo
@@ -854,3 +855,110 @@ async def test_an_unavailable_store_degrades_to_store_unavailable() -> None:
     sor = _FakeSoR(seeds={"acme": [uuid.uuid4()]})
     response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
     assert response.results == () and _codes(response) == ["STORE_UNAVAILABLE"]
+
+
+# -- subgraph_context (BA3c: the id-seeded REST GraphContext producer) ---------
+
+
+class _SubgraphSoR(_FakeSoR):
+    """_FakeSoR + the emission fetches. Shape-only fakes (rows are canned, the
+    in_ predicates are not re-evaluated here) — the live SQL filtering is the
+    integration suite's job; these pin the ORCHESTRATION: which ids are asked
+    for, what gets emitted, in what shape and order."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.entity_rows: list[Any] = kwargs.pop("entity_rows", [])
+        self.relation_rows: list[Any] = kwargs.pop("relation_rows", [])
+        super().__init__(*args, **kwargs)
+
+    async def fetch_all(self, table: Any, *where: Any) -> list[Any]:
+        if table.name == "entities":
+            return self.entity_rows
+        if table.name == "relations":
+            return self.relation_rows
+        raise AssertionError(f"unexpected emission fetch on {table.name}")
+
+
+def _sor_entity_row(entity_id: uuid.UUID, name: str) -> Any:
+    return SimpleNamespace(id=entity_id, type="Person", canonical_name=name)
+
+
+def _sor_relation_row(rel_id: uuid.UUID, src: uuid.UUID, dst: uuid.UUID) -> Any:
+    return SimpleNamespace(
+        id=rel_id, src_entity_id=src, dst_entity_id=dst, type="WORKS_AT", confidence=0.9
+    )
+
+
+async def _run_subgraph(
+    graph: _FakeGraph, sor: _SubgraphSoR, seed: uuid.UUID, hops: int, max_hops: int = 3
+) -> Any:
+    return await subgraph_context(
+        cast(BuildScopedGraphRepo, graph),
+        cast(BuildScopedRepo, sor),
+        _POLICY,
+        seed,
+        hops,
+        max_graph_hops=max_hops,
+    )
+
+
+async def test_subgraph_context_rejects_scope_mismatch_and_ceiling() -> None:
+    graph = _FakeGraph()
+    sor = _SubgraphSoR()
+    graph.build_id = uuid.uuid4()  # not the SoR's build
+    with pytest.raises(ValueError, match="different scopes"):
+        await _run_subgraph(graph, sor, uuid.uuid4(), 1)
+    graph.build_id = _BUILD
+    with pytest.raises(ValueError, match="rejected, not clamped"):
+        await _run_subgraph(graph, sor, uuid.uuid4(), 4)
+
+
+async def test_subgraph_context_inactive_seed_is_none() -> None:
+    # WHY: the endpoint's 404 — a merged/rejected/unknown entity is invisible
+    # on every surface (C6 doctrine), so an id-seeded subgraph of one must be
+    # a lookup miss, never an empty-but-200 context.
+    seed = uuid.uuid4()
+    sor = _SubgraphSoR(active=set())  # seed not active
+    assert (await _run_subgraph(_FakeGraph(), sor, seed, 1)) is None
+
+
+async def test_subgraph_context_emits_sor_backed_nodes_and_citable_edges() -> None:
+    # WHY (#31/#33): the projection contributes topology only — every emitted
+    # node/edge value comes from the SoR; a mention-less entity and an
+    # evidence-less edge are invisible here exactly as they are on the MCP
+    # surface (one citability bar, no REST side-channel).
+    seed, buddy, silent = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    rel = uuid.uuid4()
+    graph = _FakeGraph(
+        neighbor_rows=[
+            {"entity": _node(buddy), "distance": 1},
+            {"entity": _node(silent), "distance": 1},
+        ],
+        edges=[
+            {"src": str(seed), "dst": str(buddy), "type": "WORKS_AT"},  # citable
+            {"src": str(seed), "dst": str(silent), "type": "KNOWS"},  # dst dropped
+        ],
+    )
+    sor = _SubgraphSoR(
+        mentions={
+            seed: [("structured", "t:1")],
+            buddy: [("structured", "t:2")],
+            # silent: no mentions → dropped from the node set (§16)
+        },
+        relations={(seed, buddy, "WORKS_AT"): (rel, [_chunk_evidence()])},
+        pairs={(seed, buddy), (seed, silent)},
+        entity_rows=[_sor_entity_row(seed, "Alice"), _sor_entity_row(buddy, "Acme")],
+        relation_rows=[_sor_relation_row(rel, seed, buddy)],
+    )
+    context = await _run_subgraph(graph, sor, seed, 1)
+    assert context is not None
+    assert [n["id"] for n in context.nodes] == [seed, buddy]  # nearest-first, seed at 0
+    assert context.nodes[0] == {"id": seed, "type": "Person", "label": "Alice"}
+    (edge,) = context.edges
+    assert edge == {
+        "id": rel,
+        "src": seed,
+        "dst": buddy,
+        "type": "WORKS_AT",
+        "confidence": 0.9,
+    }

@@ -25,7 +25,15 @@ from sqlalchemy.pool import NullPool
 from api.app import create_app
 from api.deps import db_conn
 from core.config import get_settings
-from core.stores.tables import builds, chunks, documents, entities, relation_evidence, relations
+from core.stores.tables import (
+    builds,
+    chunks,
+    documents,
+    entities,
+    entity_mentions,
+    relation_evidence,
+    relations,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -54,7 +62,13 @@ async def api(migrated: None) -> AsyncIterator[Api]:
     app.dependency_overrides[db_conn] = _override
     transport = ASGITransport(app=app)
     try:
-        async with AsyncClient(transport=transport, base_url="http://t") as client:
+        # ASGITransport does not drive lifespan — enter it explicitly so
+        # app.state (the subgraph endpoint's lazy Neo4j driver slot) exists
+        # and the driver is closed on exit (the BA2e-2 SSE lesson)
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(transport=transport, base_url="http://t") as client,
+        ):
             yield client, conn
     finally:
         await outer.rollback()
@@ -369,3 +383,73 @@ async def test_no_active_build_is_409_and_missing_project_404(api: Api) -> None:
     r = await client.get(f"/projects/{_proj()}/chunks")
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "PROJECT_NOT_FOUND"
+
+
+_QUERY_POLICY: dict[str, Any] = {
+    "schema_version": "1.0",
+    "default_mode": "hybrid",
+    "max_top_k": 20,
+    "max_graph_hops": 3,
+    "max_sql_rows": 100,
+    "max_latency_ms": 10000,
+    "require_sources": True,
+    "expose_debug": True,
+    "text_to_sql": {
+        "enabled": False,
+        "readonly": True,
+        "allowed_tables": [],
+        "blocked_keywords": ["insert", "update", "delete", "drop", "alter", "truncate"],
+        "max_rows": 100,
+        "timeout_ms": 5000,
+    },
+    "text_to_cypher": {
+        "enabled": False,
+        "readonly": True,
+        "allowed_clauses": ["MATCH", "WHERE", "RETURN", "LIMIT"],
+        "blocked": ["CREATE", "MERGE", "DELETE", "SET", "REMOVE", "CALL"],
+        "max_rows": 100,
+        "timeout_ms": 5000,
+    },
+}
+
+
+async def test_subgraph_end_to_end_over_registry_policy(api: Api) -> None:
+    # WHY: BA3c's seam is everything AROUND the traversal (the traversal
+    # itself is C6c's, integration-proven in test_query_graph_integration):
+    # policy read from the REGISTRY config and frozen-schema validated (owner
+    # decision 2026-07-10 — strict, no invented §21 defaults), the binding,
+    # a REAL Neo4j session through the lazy driver seam, and the envelope.
+    # The graph projection is empty for this build, so the context is exactly
+    # the mention-backed seed with no edges — SoR-only emission, live.
+    client, conn = api
+    project = await _make_project(client)
+    r = await client.patch(f"/projects/{project}", json={"config": {"query_policy": _QUERY_POLICY}})
+    assert r.status_code == 200
+    async with conn.begin_nested():
+        active = await _make_build(conn, project, "active")
+        seed = await _make_entity(conn, project, active, "Hall-A")
+        await conn.execute(
+            entity_mentions.insert().values(
+                entity_id=seed, source_kind="structured", source_ref="halls:1"
+            )
+        )
+
+    r = await client.get(f"/projects/{project}/graph/subgraph", params={"entity_id": str(seed)})
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert data["edges"] == []
+    (node,) = data["nodes"]
+    assert node["id"] == str(seed) and node["label"] == "Hall-A" and node["type"] == "Person"
+    assert r.json()["meta"]["build_id"] == str(active)
+
+    # policy gates live too: over-ceiling hops rejected, unconfigured project loud
+    r = await client.get(
+        f"/projects/{project}/graph/subgraph",
+        params={"entity_id": str(seed), "hops": 9},
+    )
+    assert r.status_code == 400 and r.json()["error"]["details"]["max_graph_hops"] == 3
+    bare = await _make_project(client)
+    async with conn.begin_nested():
+        await _make_build(conn, bare, "active")
+    r = await client.get(f"/projects/{bare}/graph/subgraph", params={"entity_id": str(seed)})
+    assert r.status_code == 400 and r.json()["error"]["details"] == {"query_policy": "missing"}

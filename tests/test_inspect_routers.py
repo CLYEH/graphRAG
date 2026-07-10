@@ -13,9 +13,10 @@ import uuid
 from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api.app import create_app
@@ -451,3 +452,177 @@ def test_cursor_types_are_distinct_per_resource() -> None:
 
     with pytest.raises(ApiError):
         decode_chunk_cursor(doc_token)
+
+
+# -- GET /projects/{p}/graph/subgraph (BA3c) ---------------------------------
+
+_QUERY_POLICY: dict[str, Any] = {
+    "schema_version": "1.0",
+    "default_mode": "hybrid",
+    "max_top_k": 20,
+    "max_graph_hops": 3,
+    "max_sql_rows": 100,
+    "max_latency_ms": 10000,
+    "require_sources": True,
+    "expose_debug": True,
+    "text_to_sql": {
+        "enabled": False,
+        "readonly": True,
+        "allowed_tables": [],
+        "blocked_keywords": ["insert", "update", "delete", "drop", "alter", "truncate"],
+        "max_rows": 100,
+        "timeout_ms": 5000,
+    },
+    "text_to_cypher": {
+        "enabled": False,
+        "readonly": True,
+        "allowed_clauses": ["MATCH", "WHERE", "RETURN", "LIMIT"],
+        "blocked": ["CREATE", "MERGE", "DELETE", "SET", "REMOVE", "CALL"],
+        "max_rows": 100,
+        "timeout_ms": 5000,
+    },
+}
+
+
+class _FakeSession:
+    async def __aenter__(self) -> object:
+        return object()
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+
+class _FakeDriver:
+    def session(self) -> _FakeSession:
+        return _FakeSession()
+
+
+def _graphable(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    *,
+    config: dict[str, Any] | None = None,
+) -> None:
+    """Project with a (by default valid) query_policy + stubbed binding/repos
+    and an overridden driver dependency — subgraph tests stub subgraph_context
+    itself, so no Neo4j and no Postgres are touched."""
+    from api.deps import neo4j_driver
+
+    project_config = {"query_policy": _QUERY_POLICY} if config is None else config
+
+    async def fake_get_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(name=name, config=project_config)
+
+    async def fake_resolve(conn: Any, project: str) -> Any:
+        return SimpleNamespace(project=project, build_id=_BUILD)
+
+    _stub(monkeypatch, "get_project", fake_get_project)
+    _stub(monkeypatch, "_resolve_active_binding", fake_resolve)
+    _stub(monkeypatch, "BuildScopedRepo", _FakeRepo)
+    _stub(monkeypatch, "BuildScopedGraphRepo", SimpleNamespace(bound_to=lambda s, b: object()))
+    cast("FastAPI", client.app).dependency_overrides[neo4j_driver] = lambda: _FakeDriver()
+
+
+def test_subgraph_happy_path_stamps_binding_and_shapes(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _graphable(monkeypatch, client)
+    seed = uuid.uuid4()
+    node = {"id": str(seed), "type": "Person", "label": "Alice"}
+
+    async def fake_context(*args: Any, **kwargs: Any) -> Any:
+        return SimpleNamespace(nodes=(node,), edges=())
+
+    _stub(monkeypatch, "subgraph_context", fake_context)
+    r = client.get("/projects/p/graph/subgraph", params={"entity_id": str(seed)})
+    assert r.status_code == 200
+    assert r.json()["data"] == {"nodes": [node], "edges": []}
+    assert r.json()["meta"]["build_id"] == str(_BUILD)
+
+
+def test_subgraph_policy_missing_is_a_loud_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (owner decision 2026-07-10, strict): no invented §21 defaults — an
+    # unconfigured project is told exactly what to configure, never silently
+    # capped by values the contract never froze.
+    _graphable(monkeypatch, client, config={})
+    r = client.get("/projects/p/graph/subgraph", params={"entity_id": str(uuid.uuid4())})
+    assert r.status_code == 400
+    assert r.json()["error"]["details"] == {"query_policy": "missing"}
+    assert "query_policy" in r.json()["error"]["message"]
+
+
+def test_subgraph_invalid_policy_is_a_loud_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bad = dict(_QUERY_POLICY, max_graph_hops=0)  # violates the frozen minimum
+    _graphable(monkeypatch, client, config={"query_policy": bad})
+    r = client.get("/projects/p/graph/subgraph", params={"entity_id": str(uuid.uuid4())})
+    assert r.status_code == 400
+    assert r.json()["error"]["details"] == {"query_policy": "invalid"}
+
+
+def test_subgraph_hops_beyond_ceiling_rejected_not_clamped(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _graphable(monkeypatch, client)
+    r = client.get(
+        "/projects/p/graph/subgraph",
+        params={"entity_id": str(uuid.uuid4()), "hops": 4},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["details"]["max_graph_hops"] == 3
+
+
+def test_subgraph_unknown_seed_404_and_store_outage_503(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from neo4j.exceptions import ServiceUnavailable
+
+    _graphable(monkeypatch, client)
+
+    async def none_context(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    _stub(monkeypatch, "subgraph_context", none_context)
+    r = client.get("/projects/p/graph/subgraph", params={"entity_id": str(uuid.uuid4())})
+    assert r.status_code == 404  # inactive/unknown entity = lookup miss, not empty-200
+
+    async def outage(*args: Any, **kwargs: Any) -> Any:
+        raise ServiceUnavailable("boom")
+
+    _stub(monkeypatch, "subgraph_context", outage)
+    r = client.get("/projects/p/graph/subgraph", params={"entity_id": str(uuid.uuid4())})
+    # WHY: the graph projection is a derived STORE — its outage is an honest
+    # 503, never a silent empty subgraph and never a coarse 500
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "STORE_UNAVAILABLE"
+
+
+def test_subgraph_entity_id_is_required(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _graphable(monkeypatch, client)
+    assert client.get("/projects/p/graph/subgraph").status_code == 400  # missing required param
+
+
+def test_subgraph_client_limit_narrows_never_widens_the_ceiling(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (§21): the client's limit can only NARROW the policy row ceiling —
+    # min(limit, policy.max_rows) — a limit above the policy cap must not
+    # widen what §21 froze as the project's ceiling.
+    _graphable(monkeypatch, client)
+    captured: list[Any] = []
+
+    async def capture_context(graph: Any, repo: Any, policy: Any, *args: Any, **kw: Any) -> Any:
+        captured.append(policy.max_rows)
+        return SimpleNamespace(nodes=(), edges=())
+
+    _stub(monkeypatch, "subgraph_context", capture_context)
+    seed = str(uuid.uuid4())
+    client.get("/projects/p/graph/subgraph", params={"entity_id": seed, "limit": 5})
+    client.get("/projects/p/graph/subgraph", params={"entity_id": seed, "limit": 500})
+    # policy max_rows is 100 (_QUERY_POLICY.text_to_cypher): 5 narrows, 500 clamps
+    assert captured == [5, 100]
