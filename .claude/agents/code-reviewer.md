@@ -512,6 +512,14 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      comment said "the §15 Error shape {code, message, details}" while the
      frozen Error also requires `request_id`, so both writers stored a
      contract-invalid object that GET /jobs/{id} passed straight through).
+     The audit covers EVERY field's typing, not just the required set: for
+     each emitted field, is the column nullable while the contract property
+     is optional NON-nullable? Then a NULL column must OMIT the key —
+     emitting null is schema-invalid (BA3a round 1: the cleaning path writes
+     chunks with no status; `"status": null` broke otherwise-valid
+     responses). The nullability matrix runs on BOTH sides — request parsing
+     (#43/#47/#53's omitted≠null positions) AND response emission — × every
+     field.
    - **A fix that changes a stored shape owes its own lifecycle sweep, at fix
      time**: (1) rows ALREADY WRITTEN under the old shape — reconcile-before-
      constrain migration + a populated-DB upgrade test (§6's Migration bullet
