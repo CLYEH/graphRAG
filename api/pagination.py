@@ -59,3 +59,18 @@ def decode_project_cursor(token: str) -> tuple[datetime, str]:
 def decode_source_cursor(token: str) -> tuple[datetime, uuid.UUID]:
     added_at, sid = _decode(token, (datetime, uuid.UUID))
     return added_at, sid
+
+
+def decode_document_cursor(token: str) -> tuple[uuid.UUID]:
+    """Documents page by (id desc) — the table has no created_at, and id is
+    the stable unique keyset; recency ordering can land additively with the
+    Sort param later (BA3a)."""
+    (document_id,) = _decode(token, (uuid.UUID,))
+    return (document_id,)
+
+
+def decode_chunk_cursor(token: str) -> tuple[uuid.UUID, int]:
+    """Chunks page by (document_id asc, ordinal asc) — the reading order, and
+    UNIQUE(document_id, ordinal) makes it a total keyset (BA3a)."""
+    document_id, ordinal = _decode(token, (uuid.UUID, int))
+    return document_id, ordinal

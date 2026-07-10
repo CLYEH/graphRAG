@@ -153,6 +153,45 @@ def job_accepted_dto(j: Job) -> dict[str, Any]:
     return {"job_id": j.id, "status": j.status}
 
 
+def document_dto(row: Any, *, include_raw: bool = False) -> dict[str, Any]:
+    """The contract Document shape from a scoped ``documents`` row. ``raw`` is
+    the ONE contract-licensed conditional key ("returned on detail GET only")
+    — list responses omit it entirely; everything else is always present
+    (metadata coalesces DB NULL to {} — the contract types it as a
+    non-nullable object, and 'no metadata' IS the empty object)."""
+    dto = {
+        "id": row.id,
+        "project": row.project,
+        "build_id": row.build_id,
+        "source_uri": row.source_uri,
+        "content_hash": row.content_hash,
+        "mime": row.mime,
+        "metadata": row.metadata or {},
+        "status": row.status,
+        "ingested_at": row.ingested_at,
+    }
+    if include_raw:
+        dto["raw"] = row.raw
+    return dto
+
+
+def chunk_dto(row: Any) -> dict[str, Any]:
+    """The contract Chunk shape from a scoped ``chunks`` row."""
+    return {
+        "id": row.id,
+        "document_id": row.document_id,
+        "build_id": row.build_id,
+        "ordinal": row.ordinal,
+        "text": row.text,
+        "token_count": row.token_count,
+        "start_offset": row.start_offset,
+        "end_offset": row.end_offset,
+        "vector_point_id": row.vector_point_id,
+        "metadata": row.metadata or {},
+        "status": row.status,
+    }
+
+
 def job_event_dto(j: Job, ts: datetime) -> dict[str, Any]:
     """The contract JobEvent shape — an SSE ``data:`` payload, FULL and always
     present (step/message null, never absent — §27.2's no-branching-on-missing-

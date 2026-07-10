@@ -181,6 +181,46 @@ async def test_fetch_all_refuses_raw_sql_predicates() -> None:
             await _repo().fetch_all(tables.documents, attack)
 
 
+async def test_fetch_page_refuses_raw_sql_in_both_expression_channels() -> None:
+    """WHY (class 9): fetch_page adds a NEW expression channel — ORDER BY —
+    and a raw fragment there is the same unparenthesized splice the predicate
+    guard exists to close (it cannot widen the WHERE, but it is arbitrary SQL
+    text in the statement). Both channels must reject; the guard cannot cover
+    only the surface it was first written for."""
+    attacks: tuple[sa.ColumnExpressionArgument[bool], ...] = (
+        sa.text("1=1 OR true"),
+        sa.literal_column("1=1 OR true"),
+        # nesting must not hide the raw node from the NEW channel either —
+        # the C1b lesson (guards recurse) re-pinned on order_by
+        sa.desc(sa.text("1=1 OR true")),
+        sa.asc(sa.literal_column("1=1 OR true")),
+    )
+    for attack in attacks:
+        with pytest.raises(TypeError, match="raw-SQL"):
+            await _repo().fetch_page(
+                tables.documents, attack, order_by=[tables.documents.c.id.desc()], limit=1
+            )
+        with pytest.raises(TypeError, match="raw-SQL"):
+            await _repo().fetch_page(tables.documents, order_by=[attack], limit=1)
+
+
+def test_fetch_page_builds_scoped_ordered_capped_sql() -> None:
+    """The paged read keeps the injected scope AND carries the caller's order
+    + cap — structural pin at the SQL level (execution is integration-tested).
+    Safe structural expressions (col.desc()/asc()) pass the guard: rejecting
+    them would over-block the only legitimate ordering channel (class 9 dual).
+    """
+    docs = tables.documents
+    query = _repo()._select(docs).where(docs.c.id < _BUILD)
+    for expression in (docs.c.id.desc(),):
+        repo_module._reject_raw_sql(expression)  # accepted, not over-blocked
+        query = query.order_by(expression)
+    sql = str(query.limit(7).compile(compile_kwargs={"literal_binds": False}))
+    assert "documents.build_id = " in sql and "documents.project = " in sql
+    assert "ORDER BY documents.id DESC" in sql
+    assert "LIMIT" in sql
+
+
 async def test_fetch_all_refuses_raw_sql_nested_inside_structural_operators() -> None:
     """A top-level TextClause check is not enough: sa.or_(text(...), col==x)
     buries the raw node one level down, but SQLAlchemy still splices it
