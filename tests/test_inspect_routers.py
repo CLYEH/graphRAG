@@ -170,6 +170,28 @@ def test_get_document_includes_raw(
     assert r.json()["meta"]["build_id"] == str(_BUILD)
 
 
+def test_null_status_is_omitted_never_emitted_as_null(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # WHY (Codex round 1): the frozen Chunk.status/Document.status are
+    # OPTIONAL NON-NULLABLE strings while the columns are nullable (the
+    # cleaning path writes chunks with no status at all) — "status": null
+    # would make an otherwise-successful inspection response schema-invalid;
+    # the only legal encoding of a NULL column is key absence.
+    _bindable(monkeypatch)
+    repo.rows = (_chunk_row(status=None),)
+    got = client.get(f"/projects/p/chunks/{uuid.uuid4()}").json()["data"]
+    assert "status" not in got
+
+    repo.rows = (_doc_row(status=None),)
+    got = client.get(f"/projects/p/documents/{uuid.uuid4()}").json()["data"]
+    assert "status" not in got
+
+    repo.rows = (_chunk_row(status="embedded"),)
+    got = client.get(f"/projects/p/chunks/{uuid.uuid4()}").json()["data"]
+    assert got["status"] == "embedded"  # a real status still rides along
+
+
 def test_missing_resource_is_a_true_404_with_the_coarse_code(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
 ) -> None:

@@ -226,6 +226,11 @@ async def test_chunk_detail_and_document_raw(api: Api) -> None:
     got = r.json()["data"]
     assert got["document_id"] == str(doc) and got["ordinal"] == 0
     assert got["metadata"] == {}  # DB NULL → the empty object, not null
+    # the cleaning path writes chunks with no status (this fixture mirrors it):
+    # the frozen Chunk.status is optional NON-nullable, so the key is absent
+    assert "status" not in got
+    r = await client.get(f"/projects/{project}/documents/{doc}")
+    assert r.json()["data"]["status"] == "ingested"  # a real status rides along
 
 
 async def test_no_active_build_is_409_and_missing_project_404(api: Api) -> None:
