@@ -36,7 +36,7 @@ from core.query.global_reports import global_summary as run_global
 from core.query.semantic import semantic_search as run_semantic
 from core.query.sql import sql_query as run_sql
 from core.registry import ProjectNotFoundError, get_project
-from core.stores.repo import NoActiveBuildError
+from core.stores.repo import NoActiveBuildError, resolve_active_binding
 
 router = APIRouter(tags=["query"])
 
@@ -44,9 +44,15 @@ _NIL_BUILD = "00000000-0000-0000-0000-000000000000"
 
 
 async def _load_policy(request: Request, project: str) -> QueryPolicy:
-    """Project 404 first, then the registry-config policy (the BA3c seam).
+    """Project 404 first, active build 409 second, THEN the registry-config
+    policy (the BA3c seam) — the inspect ``_bind`` precedence (Codex #60 R3):
+    a bootstrap project with no active build must hear the frozen
+    NO_ACTIVE_BUILD, not 400/503 config errors pointing at the wrong lever.
+    The precheck is error-precedence only, not the binding of record — the
+    seam still re-binds per call under the §21 deadline, and a race to
+    deactivation still maps to 409 in ``_run_mode``.
 
-    The read runs on a SHORT-LIVED connection, returned to the pool before
+    The reads run on a SHORT-LIVED connection, returned to the pool before
     the bounded query begins — a request must never hold one pool connection
     while waiting to acquire another from the SAME pool (Codex #60 R2, P1):
     at pool capacity every worker would sit on its policy connection waiting
@@ -56,8 +62,12 @@ async def _load_policy(request: Request, project: str) -> QueryPolicy:
     lesson's pool-shaped sibling)."""
     async with request.app.state.engine.connect() as conn:
         proj = await get_project(conn, project)
-    if proj is None:
-        raise translate_registry_error(ProjectNotFoundError(project))
+        if proj is None:
+            raise translate_registry_error(ProjectNotFoundError(project))
+        try:
+            await resolve_active_binding(conn, project)
+        except NoActiveBuildError as exc:
+            raise translate_registry_error(exc) from exc
     block = (proj.config or {}).get("query_policy")
     if block is None:
         raise ApiError(

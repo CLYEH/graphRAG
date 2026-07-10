@@ -104,7 +104,11 @@ def _queryable(monkeypatch: pytest.MonkeyPatch, *, config: dict[str, Any] | None
     async def fake_get_project(conn: Any, name: str) -> Any:
         return SimpleNamespace(name=name, config=project_config)
 
+    async def fake_binding(conn: Any, name: str) -> Any:
+        return SimpleNamespace(build_id=_BUILD)
+
     _stub(monkeypatch, "get_project", fake_get_project)
+    _stub(monkeypatch, "resolve_active_binding", fake_binding)
     _stub(monkeypatch, "project_query_context", lambda request, project: object())
 
 
@@ -284,5 +288,24 @@ def test_policy_gates_and_typed_errors(client: TestClient, monkeypatch: pytest.M
 
     _stub(monkeypatch, "run_bounded_query", no_active)
     r = client.post("/projects/p/query/global", json={"query": "q"})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "NO_ACTIVE_BUILD"
+
+
+def test_no_active_build_precedes_the_config_gates(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (Codex #60 R3 — the inspect _bind precedence): a bootstrap project
+    # with no active build must hear the frozen 409 NO_ACTIVE_BUILD even when
+    # its config is ALSO missing the policy (and would 400) — config errors
+    # would send the client to fix settings when there is nothing to query.
+    # Discriminating: with the old gate order this request returned 400.
+    _queryable(monkeypatch, config={})  # policy missing too
+
+    async def no_build(conn: Any, name: str) -> Any:
+        raise NoActiveBuildError("p")
+
+    _stub(monkeypatch, "resolve_active_binding", no_build)
+    r = client.post("/projects/p/query/semantic", json={"query": "q"})
     assert r.status_code == 409
     assert r.json()["error"]["code"] == "NO_ACTIVE_BUILD"
