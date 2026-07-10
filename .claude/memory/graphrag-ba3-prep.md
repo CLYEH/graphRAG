@@ -1,13 +1,13 @@
 ---
 name: graphrag-ba3-prep
-description: BA3 進度——BA3a 已 merge(PR #55);剩 BA3b(entities/relations)/BA3c(subgraph):凍結合約摘要、可沿用 seam、開工前掃項
+description: BA3 進度——BA3a/#55、BA3b/#56 已 merge;剩 BA3c(subgraph=Neo4j seam):凍結合約摘要、可沿用件、開工前掃項
 metadata: 
   node_type: memory
   type: project
   originSessionId: 1ca14cc5-3e0a-461e-ae04-ca06338ee1f2
 ---
 
-BA3 進度(2026-07-10 更新):**BA3a 已 merge(PR #55,1 輪 Codex;owner 三定案:三切片/reports 剔除/照 Track 2)**;剩 **BA3b(entities/relations)**、**BA3c(subgraph)**。BA3a 落地的可沿用件:`api/routers/inspect.py` 的 `_bind`(project 404 → 409 NO_ACTIVE_BUILD)+ meta.build_id 佈線、`BuildScopedRepo.fetch_page`、cursor codec/`reject_unsupported_query(None)` 模式、component(_FakeRepo)/integration(savepoint+直插 builds/rows)兩層 harness。**BA3b 開工前掃(#55 教訓)**:Entity/Relation 的 `status` 是 REQUIRED——先查 entities/relations.status 欄位 nullability,nullable 就是 required-set 破口(比 #55 的 optional 版更嚴重);Relation.evidence[] detail-only(仿 raw);keyset (created_at,id) 兩欄皆 nullable 的 NULLS 排序=#40 教訓,或退到 id-only(BA3a 先例)。原始 dossier 細節如下。
+BA3 進度(2026-07-10 更新):**BA3a 已 merge(PR #55,1 輪 Codex;owner 三定案:三切片/reports 剔除/照 Track 2)**;剩 **BA3c(subgraph)**(BA3b 已 merge,PR #56,0 輪)。BA3a 落地的可沿用件:`api/routers/inspect.py` 的 `_bind`(project 404 → 409 NO_ACTIVE_BUILD)+ meta.build_id 佈線、`BuildScopedRepo.fetch_page`、cursor codec/`reject_unsupported_query(None)` 模式、component(_FakeRepo)/integration(savepoint+直插 builds/rows)兩層 harness。**BA3b 開工前掃(#55 教訓)**:Entity/Relation 的 `status` 是 REQUIRED——先查 entities/relations.status 欄位 nullability,nullable 就是 required-set 破口(比 #55 的 optional 版更嚴重);Relation.evidence[] detail-only(仿 raw);keyset (created_at,id) 兩欄皆 nullable 的 NULLS 排序=#40 教訓,或退到 id-only(BA3a 先例)。原始 dossier 細節如下。
 
 **凍結合約(contracts/openapi.yaml)——9 ops,全 GET、tags=[inspect]、綁 active build**:
 - list+get × {documents(411/434), chunks(451/474), entities(491/514), relations(531/554)};list 帶 Limit/Cursor/Sort/Filter,path id 全 uuid。
