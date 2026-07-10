@@ -29,7 +29,10 @@ from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from core.config import get_settings
+from core.llm.factory import chat_model, embedding_model
+from core.mcp.context import ProjectContext
 from core.stores.graph import graph_driver
+from core.stores.vectors import vector_client
 
 
 def _async_dsn() -> str:
@@ -46,9 +49,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.arq_redis = None
     app.state.arq_redis_lock = asyncio.Lock()
     app.state.neo4j = None
+    app.state.qdrant = None
+    app.state.embedder = None
+    app.state.llm = None
     try:
         yield
     finally:
+        if app.state.qdrant is not None:
+            await app.state.qdrant.close()
         if app.state.neo4j is not None:
             await app.state.neo4j.close()
         if app.state.arq_redis is not None:
@@ -118,6 +126,33 @@ async def neo4j_driver(request: Request) -> AsyncDriver:
 
 #: Handler signature sugar: ``driver: Graph`` — open a session at the use point.
 Graph = Annotated[AsyncDriver, Depends(neo4j_driver)]
+
+
+def project_query_context(request: Request, project: str) -> ProjectContext:
+    """A per-request ProjectContext over the API's own lazily-held clients —
+    the SAME bundle shape the MCP server binds per call, so the Console query
+    playground and the MCP tools run one binding path (class 5). Every client
+    is created at its FIRST use, never at route resolution (the #53 R3
+    discipline): the qdrant client and Neo4j driver construct without I/O;
+    the model factories can RAISE (no API key) and the caller maps that to a
+    typed error instead of a startup failure."""
+    state = request.app.state
+    if state.qdrant is None:
+        state.qdrant = vector_client()
+    if state.neo4j is None:
+        state.neo4j = graph_driver()
+    if state.embedder is None:
+        state.embedder = embedding_model()
+    if state.llm is None:
+        state.llm = chat_model()
+    return ProjectContext(
+        project=project,
+        engine=state.engine,
+        qdrant=state.qdrant,
+        neo4j=state.neo4j,
+        embedder=state.embedder,
+        llm=state.llm,
+    )
 
 
 def response_meta(request: Request) -> dict[str, Any]:
