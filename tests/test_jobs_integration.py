@@ -9,6 +9,7 @@ transaction so nothing lands in the dev DB.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 
@@ -22,18 +23,22 @@ from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
 from core.registry import (
+    JobConflictError,
     ProjectHasActiveJobsError,
+    ProjectNotFoundError,
     count_active_jobs,
     create_job,
+    create_job_exclusive,
     create_project,
     delete_project,
+    find_unenqueued_jobs,
     get_job,
     is_cancel_requested,
     request_cancel,
     set_progress,
 )
-from core.registry.jobs import JobNotFoundError
-from core.stores.tables import jobs
+from core.registry.jobs import JobNotFoundError, acquire_lease
+from core.stores.tables import jobs, projects
 
 pytestmark = pytest.mark.integration
 
@@ -295,6 +300,123 @@ async def test_job_requires_an_existing_project(migrated: None) -> None:
             trans = await conn.begin()
             with pytest.raises(IntegrityError):
                 await create_job(conn, _proj(), "build")  # no projects row
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+# ── create_job_exclusive (BA2e-1 trigger guard) ─────────────────────────────
+
+
+async def test_create_job_exclusive_conflicts_while_a_job_is_active(migrated: None) -> None:
+    """WHY: the contract's 409 JOB_CONFLICT — one active job per project. The
+    guard must name the blocking job (so a client can join it) and must LIFT
+    once that job terminalizes (it guards overlap, not the project forever)."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            project = _proj()
+            await create_project(conn, name=project)
+
+            first = await create_job_exclusive(conn, project, "build")
+            with pytest.raises(JobConflictError) as ei:
+                await create_job_exclusive(conn, project, "ingest")  # any kind overlaps
+            assert ei.value.active_job_id == first.id
+
+            await set_progress(conn, first.id, status="failed")
+            second = await create_job_exclusive(conn, project, "ingest")  # terminal → free
+            assert second.kind == "ingest"
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_create_job_exclusive_missing_project(migrated: None) -> None:
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            with pytest.raises(ProjectNotFoundError):
+                await create_job_exclusive(conn, _proj(), "build")
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_create_job_exclusive_race_has_one_winner(migrated: None) -> None:
+    """WHY (class 10): an app-level count-then-insert would let two concurrent
+    triggers both see zero active jobs and both insert. The projects row lock
+    must serialize them: the second BLOCKS until the first commits, then sees
+    its job and conflicts — never two active jobs."""
+    engine = _engine()
+    project = _proj()
+    try:
+        async with engine.connect() as seed:
+            await create_project(seed, name=project)
+            await seed.commit()  # visible to both racing connections
+
+        async with engine.connect() as conn_a, engine.connect() as conn_b:
+            txn_a = await conn_a.begin()
+            winner = await create_job_exclusive(conn_a, project, "build")  # holds the row lock
+
+            async def _contender() -> None:
+                async with conn_b.begin():
+                    await create_job_exclusive(conn_b, project, "build")
+
+            contender = asyncio.create_task(_contender())
+            await asyncio.sleep(0.3)
+            assert not contender.done()  # blocked on the row lock, not failed and not inserted
+            await txn_a.commit()
+            with pytest.raises(JobConflictError) as ei:
+                await contender
+            assert ei.value.active_job_id == winner.id
+    finally:
+        async with engine.connect() as cleanup:
+            await cleanup.execute(jobs.delete().where(jobs.c.project == project))
+            await cleanup.execute(projects.delete().where(projects.c.name == project))
+            await cleanup.commit()
+        await engine.dispose()
+
+
+# ── find_unenqueued_jobs (BA2e queued-sweep) ─────────────────────────────────
+
+
+async def test_find_unenqueued_jobs_matches_only_lost_queued_rows(migrated: None) -> None:
+    """WHY: the sweep re-dispatches, so a false match risks a duplicate build.
+    Only a job that should long since have been dispatched and shows no trace
+    of one (still `queued`, never leased, older than the grace) may match: a
+    young row may still be mid-trigger; a leased row is the expired-lease
+    sweep's; a running row was definitely dispatched (arq owns its retry); a
+    terminal row is done."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            project = _proj()
+            await create_project(conn, name=project)
+
+            fresh = await create_job(conn, project, "build")
+            lost = await create_job(conn, project, "build")
+            leased = await create_job(conn, project, "build")
+            running = await create_job(conn, project, "build")
+            done = await create_job(conn, project, "build")
+            await conn.execute(
+                jobs.update()
+                .where(jobs.c.id.in_([lost.id, leased.id, running.id, done.id]))
+                .values(created_at=sa.func.now() - sa.text("interval '10 minutes'"))
+            )
+            await acquire_lease(conn, leased.id, "w1", 60.0)
+            await set_progress(conn, running.id, status="running")
+            await set_progress(conn, done.id, status="done")
+
+            found = {j for j, _ in await find_unenqueued_jobs(conn, 120.0)}
+            mine = {fresh.id, lost.id, leased.id, running.id, done.id}
+            assert found & mine == {lost.id}
+            # each hit carries its project (the reaper enqueues with it)
+            assert (lost.id, project) in await find_unenqueued_jobs(conn, 120.0)
+            # the grace is respected: nothing 10 minutes old matches an hour-long grace
+            assert {j for j, _ in await find_unenqueued_jobs(conn, 3600.0)} & mine == set()
             await trans.rollback()
     finally:
         await engine.dispose()

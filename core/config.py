@@ -64,6 +64,16 @@ class Settings(BaseSettings):
     # hung-build backstop (and accept the SoR-stranding risk for builds that slow).
     build_job_timeout_seconds: int = 86_400  # 24h
 
+    # BA2e trigger crash-window sweep (tunable 🔧): a `queued` job that has never
+    # acquired an execution lease and is older than this grace is re-enqueued by
+    # the reaper cron — it should long since have been dispatched, so its arq
+    # entry was lost (trigger crashed after commit, Redis lost the enqueue, or a
+    # dispatch raced the trigger's commit and no-opped). Generous on purpose: a
+    # job legitimately waiting in a backlogged queue also matches, where the
+    # re-enqueue under the job's own arq id is dedup-refused (a harmless no-op),
+    # so the only cost of a small value is reaper chatter, not duplicate builds.
+    job_enqueue_grace_seconds: int = 120
+
     # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-nano"
