@@ -11,15 +11,15 @@ it and pin the HTTP orchestration.
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import Iterator
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api.app import create_app
-from api.deps import db_conn
 from core.llm.factory import LLMNotConfiguredError
 from core.stores.repo import NoActiveBuildError
 
@@ -56,15 +56,41 @@ _QUERY_POLICY: dict[str, Any] = {
 }
 
 
+class _FakeEngine:
+    """Counts checkouts so tests can pin the P1 property: the policy
+    connection is RETURNED before the bounded query runs (a request must
+    never hold one pool connection while acquiring another — Codex #60 R2)."""
+
+    def __init__(self) -> None:
+        self.open = 0
+
+    def connect(self) -> Any:
+        engine = self
+
+        class _Conn:
+            async def __aenter__(self) -> object:
+                engine.open += 1
+                return object()
+
+            async def __aexit__(self, *exc: Any) -> None:
+                engine.open -= 1
+
+        return _Conn()
+
+
 @pytest.fixture()
-def client() -> Iterator[TestClient]:
+def fake_engine() -> _FakeEngine:
+    return _FakeEngine()
+
+
+@pytest.fixture()
+def client(fake_engine: _FakeEngine) -> Iterator[TestClient]:
     app = create_app()
-
-    async def _conn() -> AsyncIterator[object]:
-        yield object()
-
-    app.dependency_overrides[db_conn] = _conn
     with TestClient(app) as c:
+        # the query endpoints read policy on short-lived connections off the
+        # app engine — swap in the counting fake AFTER lifespan set the real
+        # (lazy, unconnected) one
+        cast("FastAPI", c.app).state.engine = fake_engine
         yield c
 
 
@@ -99,7 +125,7 @@ def _mcp_dict(**over: Any) -> dict[str, Any]:
 
 
 def test_reprojection_onto_the_frozen_query_result(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, fake_engine: _FakeEngine
 ) -> None:
     # WHY: the REST payload is the §16 dict REPROJECTED — mode from the
     # endpoint, tool/project/query/schema_version dropped, the rest verbatim;
@@ -109,6 +135,7 @@ def test_reprojection_onto_the_frozen_query_result(
 
     async def fake_bounded(context: Any, policy: Any, tool: str, query: str, runner: Any) -> Any:
         captured.update({"tool": tool, "query": query, "max_latency": policy.max_latency_ms})
+        captured["held_connections"] = fake_engine.open
         return _mcp_dict()
 
     _stub(monkeypatch, "run_bounded_query", fake_bounded)
@@ -121,6 +148,9 @@ def test_reprojection_onto_the_frozen_query_result(
     assert r.json()["meta"]["build_id"] == _BUILD
     assert captured["tool"] == "query_semantic" and captured["query"] == "who is alice"
     assert captured["max_latency"] == 10000  # the registry policy reached the seam
+    # the P1 pin (Codex #60 R2): by the time the bounded query runs, the
+    # policy-read connection is BACK in the pool — zero held checkouts
+    assert captured["held_connections"] == 0
 
 
 def test_top_k_is_accepted_and_reaches_the_mode(

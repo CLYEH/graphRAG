@@ -23,9 +23,8 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Request
-from sqlalchemy.ext.asyncio import AsyncConnection
 
-from api.deps import Conn, project_query_context, response_meta
+from api.deps import project_query_context, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.registry_errors import translate_registry_error
@@ -44,9 +43,19 @@ router = APIRouter(tags=["query"])
 _NIL_BUILD = "00000000-0000-0000-0000-000000000000"
 
 
-async def _load_policy(conn: AsyncConnection, project: str) -> QueryPolicy:
-    """Project 404 first, then the registry-config policy (the BA3c seam)."""
-    proj = await get_project(conn, project)
+async def _load_policy(request: Request, project: str) -> QueryPolicy:
+    """Project 404 first, then the registry-config policy (the BA3c seam).
+
+    The read runs on a SHORT-LIVED connection, returned to the pool before
+    the bounded query begins — a request must never hold one pool connection
+    while waiting to acquire another from the SAME pool (Codex #60 R2, P1):
+    at pool capacity every worker would sit on its policy connection waiting
+    for a binding connection, and healthy queries would burn their §21
+    deadline in the convoy. The query endpoints therefore take NO ``Conn``
+    yield-dep at all (which lives until the response completes — the BA2e-2
+    lesson's pool-shaped sibling)."""
+    async with request.app.state.engine.connect() as conn:
+        proj = await get_project(conn, project)
     if proj is None:
         raise translate_registry_error(ProjectNotFoundError(project))
     block = (proj.config or {}).get("query_policy")
@@ -67,13 +76,12 @@ async def _load_policy(conn: AsyncConnection, project: str) -> QueryPolicy:
 
 async def _run_mode(
     request: Request,
-    conn: AsyncConnection,
     project: str,
     mode: str,
     body: QueryRequest,
     runner: Any,
 ) -> dict[str, Any]:
-    policy = await _load_policy(conn, project)
+    policy = await _load_policy(request, project)
     try:
         context = project_query_context(request, project)
     except LLMNotConfiguredError as exc:
@@ -107,7 +115,7 @@ async def _run_mode(
 
 @router.post("/projects/{project}/query/semantic")
 async def query_semantic_endpoint(
-    request: Request, conn: Conn, project: str, body: QueryRequest
+    request: Request, project: str, body: QueryRequest
 ) -> dict[str, Any]:
     def runner(policy: QueryPolicy) -> Any:
         async def _run(deps: Any, _remaining_ms: int) -> Any:
@@ -117,13 +125,11 @@ async def query_semantic_endpoint(
 
         return _run
 
-    return await _run_mode(request, conn, project, "semantic", body, runner)
+    return await _run_mode(request, project, "semantic", body, runner)
 
 
 @router.post("/projects/{project}/query/sql")
-async def query_sql_endpoint(
-    request: Request, conn: Conn, project: str, body: QueryRequest
-) -> dict[str, Any]:
+async def query_sql_endpoint(request: Request, project: str, body: QueryRequest) -> dict[str, Any]:
     def runner(policy: QueryPolicy) -> Any:
         async def _run(deps: Any, _remaining_ms: int) -> Any:
             # the caller's top_k NARROWS the §21 sql row ceiling (min, never
@@ -137,12 +143,12 @@ async def query_sql_endpoint(
 
         return _run
 
-    return await _run_mode(request, conn, project, "sql", body, runner)
+    return await _run_mode(request, project, "sql", body, runner)
 
 
 @router.post("/projects/{project}/query/global")
 async def query_global_endpoint(
-    request: Request, conn: Conn, project: str, body: QueryRequest
+    request: Request, project: str, body: QueryRequest
 ) -> dict[str, Any]:
     def runner(policy: QueryPolicy) -> Any:
         async def _run(deps: Any, _remaining_ms: int) -> Any:
@@ -150,4 +156,4 @@ async def query_global_endpoint(
 
         return _run
 
-    return await _run_mode(request, conn, project, "global", body, runner)
+    return await _run_mode(request, project, "global", body, runner)
