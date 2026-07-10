@@ -12,9 +12,14 @@ One decision = three writes that must land in ONE caller-owned transaction:
   impossible). DEFER writes a ledger entry too: #28 R4a froze that a deferred
   pair must not auto-merge, so resolve has to SEE the defer;
 * the candidate row records the audit trail (status/decision/decided_by/
-  decided_at/reason). Both ``decided_at`` stamps are ``now()`` — Postgres
-  pins it to the transaction start, so ledger and candidate carry the SAME
-  instant by construction (single clock source).
+  decided_at/reason). Both stamps reuse ONE ``clock_timestamp()`` captured
+  per decision — still the single DB clock, and ledger + candidate carry the
+  same instant; deliberately NOT ``now()``, which is transaction-stable, so
+  two decisions batched in one transaction (defer then approve — legal, §17)
+  would TIE on ``decided_at`` and §27.3's latest-wins precedence would
+  resolve the pair arbitrarily (Codex #59 R2). ``clock_timestamp()`` is
+  per-call with microsecond precision; two sequential decision round-trips
+  cannot tie.
 
 ``decided_by`` must never be :data:`~core.resolve.review.AUTO_DECIDER` — that
 value marks pipeline auto-decisions, and §27.3 precedence lets curators
@@ -163,6 +168,9 @@ async def decide_merge_candidate(
         )
     target_key = fingerprints.merge_key(keys[row.left_entity_id], keys[row.right_entity_id])
 
+    # ONE per-decision instant for both writes (module docstring: now() would
+    # tie batched re-decisions and break §27.3's latest-wins tie-break)
+    decided_at = (await conn.execute(sa.select(sa.func.clock_timestamp()))).scalar_one()
     await conn.execute(
         tables.review_ledger.insert().values(
             project=project,
@@ -171,7 +179,7 @@ async def decide_merge_candidate(
             fingerprint_version=fingerprints.FINGERPRINT_VERSION,
             decision=verb,
             decided_by=decided_by,
-            decided_at=sa.func.now(),
+            decided_at=decided_at,
             reason=reason,
         )
     )
@@ -183,7 +191,7 @@ async def decide_merge_candidate(
                 status=target,
                 decision=verb,
                 decided_by=decided_by,
-                decided_at=sa.func.now(),
+                decided_at=decided_at,
                 reason=reason,
             )
             .returning(*_COLS)

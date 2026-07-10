@@ -171,10 +171,27 @@ async def test_defer_writes_a_ledger_entry_and_stays_decidable(migrated: None) -
             assert approved.status == "approved"
             rows = (
                 await conn.execute(
-                    sa.select(review_ledger.c.decision).where(review_ledger.c.project == project)
+                    sa.select(review_ledger.c.decision, review_ledger.c.decided_at).where(
+                        review_ledger.c.project == project
+                    )
                 )
-            ).scalars()
-            assert sorted(rows) == ["approve", "defer"]  # both on the record
+            ).all()
+            assert sorted(r.decision for r in rows) == ["approve", "defer"]
+            # WHY (Codex #59 R2): both decisions ran in THIS one transaction —
+            # txn-stable now() would tie them and §27.3's latest-wins
+            # precedence would pick arbitrarily; per-decision clock_timestamp
+            # keeps them ordered so effective_decision resolves to the approve
+            by_verb = {r.decision: r.decided_at for r in rows}
+            assert by_verb["approve"] > by_verb["defer"]
+            from core.resolve.review import LedgerEntry, effective_decision
+
+            winner = effective_decision(
+                [
+                    LedgerEntry(decision=r.decision, decided_by="console", decided_at=r.decided_at)
+                    for r in rows
+                ]
+            )
+            assert winner is not None and winner.decision == "approve"
             await trans.rollback()
     finally:
         await engine.dispose()
