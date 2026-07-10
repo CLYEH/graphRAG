@@ -34,9 +34,9 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from api.deps import Conn, Queue, response_meta
 from api.envelope import success
-from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
 from api.registry_errors import translate_registry_error
+from api.routers._query import reject_null_body
 from api.schemas import BuildRequest, IngestRequest, job_accepted_dto
 from api.workers.build_worker import enqueue_build
 from core.registry import JobConflictError, ProjectNotFoundError, create_job_exclusive
@@ -55,17 +55,8 @@ async def _trigger(
     endpoint: str,
     idempotency_key: str | None,
 ) -> JSONResponse:
-    # the contract's requestBody is OPTIONAL — absent is fine — but when
-    # present it must be the non-nullable IngestRequest/BuildRequest object.
-    # FastAPI binds an explicit JSON `null` body to None, indistinguishable
-    # from absent, so catch it on the raw bytes (the same strictness as the
-    # field-level null rejections) instead of silently starting work for a
-    # contract-invalid request.
-    if (await request.body()).strip(b" \t\r\n") == b"null":
-        raise ApiError(
-            ErrorCode.VALIDATION_ERROR,
-            "request body may not be JSON null; omit the body instead",
-        )
+    # optional body, non-nullable when present (#53 R5 class — shared guard)
+    await reject_null_body(request)
 
     async def produce() -> tuple[int, dict[str, Any]]:
         try:

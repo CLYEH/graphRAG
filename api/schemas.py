@@ -106,6 +106,16 @@ class BuildRequest(BaseModel):
         return self
 
 
+class ReviewDecisionRequest(BaseModel):
+    """The contract ReviewDecisionRequest — an optional free-form reason,
+    contract-nullable (unlike the BA2e trigger fields, ``reason`` here IS
+    honored: it lands on both the ledger entry and the candidate row)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = None
+
+
 def project_dto(p: Project) -> dict[str, Any]:
     """The contract Project shape."""
     return {
@@ -200,6 +210,33 @@ def chunk_dto(row: Any) -> dict[str, Any]:
     if row.status is not None:
         dto["status"] = row.status
     return dto
+
+
+def merge_candidate_dto(row: Any) -> dict[str, Any]:
+    """The contract MergeCandidate shape from a scoped row (works for both a
+    ``merge_candidates`` Row and core's MergeCandidate dataclass — same
+    attribute names). Per-field audit (#55 rule): required columns NOT NULL;
+    ``features`` is an optional NON-nullable object over a nullable column →
+    {} for NULL; ``decision``/``decided_by``/``decided_at``/``reason`` and
+    ``impact``/``left_snapshot``/``right_snapshot`` are contract-NULLABLE →
+    emitted as-is (null is legal for them, unlike features)."""
+    return {
+        "id": row.id,
+        "project": row.project,
+        "build_id": row.build_id,
+        "left_entity_id": row.left_entity_id,
+        "right_entity_id": row.right_entity_id,
+        "score": row.score,
+        "features": row.features or {},
+        "status": row.status,
+        "decision": row.decision,
+        "decided_by": row.decided_by,
+        "decided_at": row.decided_at,
+        "reason": row.reason,
+        "impact": row.impact,
+        "left_snapshot": row.left_snapshot,
+        "right_snapshot": row.right_snapshot,
+    }
 
 
 def entity_dto(row: Any) -> dict[str, Any]:

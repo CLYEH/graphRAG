@@ -37,3 +37,17 @@ def reject_unsupported_query(request: Request, sort_field: str | None) -> None:
             else ("explicit sort is not supported on this list")
         )
         raise ApiError(ErrorCode.VALIDATION_ERROR, supported, details={"sort": sort})
+
+
+async def reject_null_body(request: Request) -> None:
+    """Reject an explicit JSON ``null`` request body (400) on endpoints whose
+    body is OPTIONAL but non-nullable when present — FastAPI binds `null` to
+    None, indistinguishable from absent, which would silently run the
+    operation for a contract-invalid request (the #53 R5 class; extracted
+    from the trigger router when the review decide endpoints grew the same
+    optional-body shape)."""
+    if (await request.body()).strip(b" \t\r\n") == b"null":
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            "request body may not be JSON null; omit the body instead",
+        )
