@@ -11,6 +11,7 @@ protocol round-trip: initialize + list_tools returns the full §9 tool set.
 
 from __future__ import annotations
 
+from contextlib import AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -126,3 +127,74 @@ async def test_streamable_http_serves_the_full_tool_set_in_process(
         assert result.serverInfo.name == "graphrag-demo"
         tools = await session.list_tools()
         assert {tool.name for tool in tools.tools} == _TOOLS
+
+
+async def test_http_sessions_get_isolated_runtimes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (Codex #58 P1): streamable HTTP multiplexes MANY protocol sessions
+    # on one FastMCP instance, and the SDK enters the lifespan once PER
+    # session — a module-level runtime slot would be overwritten by every
+    # later session and, once any session closed, hand the survivors closed
+    # store clients. Each session must see ITS OWN lifespan runtime, and one
+    # session's shutdown must close only its own stores.
+    disposed: list[int] = []
+
+    class _Engine:
+        async def dispose(self) -> None:
+            disposed.append(id(self))
+
+    class _Store:
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(server_module, "create_async_engine", lambda *a, **k: _Engine())
+    monkeypatch.setattr(server_module, "vector_client", lambda: _Store())
+    monkeypatch.setattr(server_module, "graph_driver", lambda: _Store())
+    monkeypatch.setattr(server_module, "embedding_model", lambda: object())
+    monkeypatch.setattr(server_module, "chat_model", lambda: object())
+
+    server = build_server("demo", _DEMO_CONFIG)
+
+    @server.tool()
+    async def runtime_probe() -> str:  # test-only: which runtime does this session see?
+        return str(id(server.get_context().request_context.lifespan_context))
+
+    app = server.streamable_http_app()
+    base = f"http://{server.settings.host}:{server.settings.port}"
+
+    def _client() -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url=base,
+            timeout=httpx.Timeout(30, read=300),
+        )
+
+    async def _probe(session: ClientSession) -> str:
+        result = await session.call_tool("runtime_probe", {})
+        return result.content[0].text  # type: ignore[union-attr]
+
+    async with app.router.lifespan_context(app):
+        async with AsyncExitStack() as stack:
+            read_a, write_a, _ = await stack.enter_async_context(
+                streamable_http_client(f"{base}/mcp", http_client=_client())
+            )
+            session_a = await stack.enter_async_context(ClientSession(read_a, write_a))
+            await session_a.initialize()
+            a_runtime = await _probe(session_a)
+
+            # a SECOND session initializes: its lifespan must not displace A's
+            async with AsyncExitStack() as b_stack:
+                read_b, write_b, _ = await b_stack.enter_async_context(
+                    streamable_http_client(f"{base}/mcp", http_client=_client())
+                )
+                session_b = await b_stack.enter_async_context(ClientSession(read_b, write_b))
+                await session_b.initialize()
+                b_runtime = await _probe(session_b)
+                assert b_runtime != a_runtime  # each session sees its OWN runtime
+
+            # B closed: only B's stores may be disposed, and A still resolves
+            # to the SAME runtime it started with
+            assert await _probe(session_a) == a_runtime
+        assert len(disposed) >= 1  # B's engine went down with B
+    assert len(disposed) == 2  # ...and A's only when A closed

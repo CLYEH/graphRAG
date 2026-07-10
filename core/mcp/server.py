@@ -199,10 +199,8 @@ def build_server(project: str, config_path: Path) -> FastMCP:
     """One project's MCP server, policy-validated at build time (fail loud)."""
     policy = load_query_policy(config_path)
 
-    runtime: dict[str, _Runtime] = {}
-
     @asynccontextmanager
-    async def lifespan(_server: FastMCP) -> AsyncIterator[None]:
+    async def lifespan(_server: FastMCP) -> AsyncIterator[_Runtime]:
         settings = get_settings()
         context = ProjectContext(
             project=project,
@@ -215,9 +213,8 @@ def build_server(project: str, config_path: Path) -> FastMCP:
             embedder=embedding_model(),
             llm=chat_model(),
         )
-        runtime["current"] = _Runtime(context=context, policy=policy)
         try:
-            yield
+            yield _Runtime(context=context, policy=policy)
         finally:
             await context.aclose()
 
@@ -233,7 +230,16 @@ def build_server(project: str, config_path: Path) -> FastMCP:
     )
 
     def _rt() -> _Runtime:
-        return runtime["current"]
+        # SESSION-scoped, via the SDK's own channel: Server.run enters the
+        # lifespan once per protocol session and parks the yielded value on
+        # that session's request context — and streamable HTTP multiplexes
+        # MANY sessions on one process (Codex #58 P1). A module-level slot
+        # here would be overwritten by every later session's startup and
+        # would hand tools already-closed store clients once any session
+        # ends; the request context always resolves to the CALLING session's
+        # own runtime. (stdio = exactly one session; behavior unchanged.)
+        rt: _Runtime = server.get_context().request_context.lifespan_context
+        return rt
 
     @server.tool()
     async def semantic_search(query: str, top_k: int | None = None) -> dict[str, Any]:
