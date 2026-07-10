@@ -45,6 +45,7 @@ from api.errors import ApiError, ErrorCode, code_for_framework_status, http_stat
 from api.routers import inspect as inspect_router
 from api.routers import jobs as jobs_router
 from api.routers import projects as projects_router
+from api.routers import review as review_router
 from api.routers import sources as sources_router
 from api.routers import triggers as triggers_router
 
@@ -180,4 +181,5 @@ def create_app() -> FastAPI:
     app.include_router(triggers_router.router)
     app.include_router(jobs_router.router)
     app.include_router(inspect_router.router)
+    app.include_router(review_router.router)
     return app
