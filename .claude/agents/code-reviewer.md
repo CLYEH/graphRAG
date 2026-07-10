@@ -179,6 +179,15 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      benign no-op via the SoR's own atomic status check, never a manufactured
      failure (#52 R1). Ask: "when this framework mechanism fires, what state is
      my SoR row left in — and can the recovery channel see it AND converge?"
+     And (e) ENABLING a new framework mode/transport re-opens this audit for
+     the EXISTING code whose invariants were mode-dependent: the SDK enters
+     the MCP lifespan once per protocol session, so a module-level runtime
+     slot that was sound under stdio's single session is corrupted the moment
+     streamable HTTP multiplexes sessions — later sessions overwrite it and a
+     closed session strands survivors on closed store clients (C8b P1; fix =
+     the framework's own per-session channel, request_context.lifespan_context).
+     Reading the framework for the NEW feature is not the same as re-auditing
+     the OLD assumptions the new mode invalidates.
    - **A new domain error's completeness face is the function's callers, not
      your diff**: adding an exception to a SHARED function (one an existing HTTP
      entry already calls) pulls in EVERY caller's translation/handling — trace
