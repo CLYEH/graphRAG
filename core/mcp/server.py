@@ -21,9 +21,14 @@ from an UNTRUSTED agent: the transport layer type-checks them
 (FastMCP/pydantic), and the mode functions re-validate at their own doors
 (the C6c/C6d lesson) — belt and braces, typed degradation either way.
 
-Transport is stdio (§9 marks transport 🔧; http can be added without touching
-the tools). Entry point: ``projects/<name>/mcp_entrypoint.py`` calls
-:func:`build_server` and ``server.run()``.
+Transports (§9 🔧): stdio (default) and streamable HTTP (C8b — the external
+no-code agent platform consumes MCP over HTTP), selected at RUN time via
+:func:`run_server`; the tools and policy are transport-agnostic, exactly the
+additivity the original stdio-only note promised. HTTP binds
+``core.config``'s ``mcp_http_host``/``mcp_http_port`` (localhost by default —
+wider exposure is an operator opt-in while §23 auth remains a placeholder).
+Entry point: ``projects/<name>/mcp_entrypoint.py`` calls :func:`build_server`
+and :func:`run_server`.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Final, cast
 
 from mcp.server.fastmcp import FastMCP
 from neo4j.exceptions import DriverError, Neo4jError
@@ -194,10 +199,8 @@ def build_server(project: str, config_path: Path) -> FastMCP:
     """One project's MCP server, policy-validated at build time (fail loud)."""
     policy = load_query_policy(config_path)
 
-    runtime: dict[str, _Runtime] = {}
-
     @asynccontextmanager
-    async def lifespan(_server: FastMCP) -> AsyncIterator[None]:
+    async def lifespan(_server: FastMCP) -> AsyncIterator[_Runtime]:
         settings = get_settings()
         context = ProjectContext(
             project=project,
@@ -210,16 +213,33 @@ def build_server(project: str, config_path: Path) -> FastMCP:
             embedder=embedding_model(),
             llm=chat_model(),
         )
-        runtime["current"] = _Runtime(context=context, policy=policy)
         try:
-            yield
+            yield _Runtime(context=context, policy=policy)
         finally:
             await context.aclose()
 
-    server = FastMCP(f"graphrag-{project}", lifespan=lifespan)
+    # host/port are read at BUILD time like the policy (a later env change
+    # applies on the next build); they only matter for the http transport —
+    # stdio ignores them
+    http_settings = get_settings()
+    server = FastMCP(
+        f"graphrag-{project}",
+        lifespan=lifespan,
+        host=http_settings.mcp_http_host,
+        port=http_settings.mcp_http_port,
+    )
 
     def _rt() -> _Runtime:
-        return runtime["current"]
+        # SESSION-scoped, via the SDK's own channel: Server.run enters the
+        # lifespan once per protocol session and parks the yielded value on
+        # that session's request context — and streamable HTTP multiplexes
+        # MANY sessions on one process (Codex #58 P1). A module-level slot
+        # here would be overwritten by every later session's startup and
+        # would hand tools already-closed store clients once any session
+        # ends; the request context always resolves to the CALLING session's
+        # own runtime. (stdio = exactly one session; behavior unchanged.)
+        rt: _Runtime = server.get_context().request_context.lifespan_context
+        return rt
 
     @server.tool()
     async def semantic_search(query: str, top_k: int | None = None) -> dict[str, Any]:
@@ -450,3 +470,20 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
             for entity_id in entity_ids
         ],
     }
+
+
+#: §9's user-facing transport vocabulary → the SDK's transport names. "http"
+#: is streamable HTTP (the MCP spec's current HTTP transport); SSE is the
+#: SDK's legacy HTTP flavor and deliberately NOT offered — one HTTP transport,
+#: no ambiguity for the consuming platform.
+TRANSPORTS: Final[dict[str, str]] = {"stdio": "stdio", "http": "streamable-http"}
+
+
+def run_server(server: FastMCP, transport: str = "stdio") -> None:
+    """Run a built server on a §9 transport — the one place the vocabulary is
+    mapped, so every project entrypoint offers the same choices. Unknown
+    names fail loud (a typo'd transport must never silently fall back to
+    stdio and strand the HTTP consumer)."""
+    if transport not in TRANSPORTS:
+        raise ValueError(f"unknown transport {transport!r} (choose from {sorted(TRANSPORTS)})")
+    server.run(transport=cast(Any, TRANSPORTS[transport]))

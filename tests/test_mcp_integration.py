@@ -188,12 +188,17 @@ async def test_a_registered_tool_calls_through_on_live_stores(
     )
     await _activate_build(context.project, entity_name="Acme")
     server = build_server(context.project, REPO_ROOT / "projects" / "demo" / "config.yaml")
-    lifespan = server.settings.lifespan
-    assert lifespan is not None
-    async with lifespan(server):
-        result = await server.call_tool("list_schema", {})
-    # FastMCP wraps returns; unwrap the structured payload
-    unwrapped: Any = result[1] if isinstance(result, tuple) else result
+    # dispatch through a REAL in-memory protocol session: Server.run enters
+    # the lifespan per session and parks the runtime on the session's request
+    # context (Codex #58 P1 made the runtime session-scoped, so tools are only
+    # callable inside a session — which is also the more protocol-true seam)
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    async with create_connected_server_and_client_session(server, raise_exceptions=True) as session:
+        result = await session.call_tool("list_schema", {})
+    unwrapped: Any = result.structuredContent
+    if unwrapped is None:
+        unwrapped = json.loads(result.content[0].text)  # type: ignore[union-attr]
     if isinstance(unwrapped, dict) and "result" in unwrapped:
         unwrapped = unwrapped["result"]
     assert unwrapped["project"] == context.project

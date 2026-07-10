@@ -80,6 +80,17 @@ class Settings(BaseSettings):
     # indexed SELECT on its own connection.
     sse_poll_interval_seconds: float = 0.5
 
+    # C8b MCP HTTP transport (tunable 🔧, DESIGN §9: transport stdio/http):
+    # where the per-project MCP server binds when run with --transport http
+    # (streamable HTTP). 127.0.0.1 by default — exposing beyond localhost is a
+    # deliberate operator opt-in (§23 auth is still a placeholder; see
+    # graphrag-goal-museum-guide for the external-platform use case driving
+    # HTTP support). NOTE: a non-localhost host also drops the SDK's
+    # DNS-rebinding protection (auto-enabled only for localhost bindings), so
+    # wider exposure has NO transport-layer guard until §23 auth lands.
+    mcp_http_host: str = "127.0.0.1"
+    mcp_http_port: int = 8300
+
     # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-nano"
