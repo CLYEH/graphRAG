@@ -921,10 +921,12 @@ jobs = sa.Table(
     sa.Column("step", sa.Text),
     sa.Column("progress", sa.REAL, nullable=False, server_default=sa.text("0")),
     sa.Column("message", sa.Text),
-    # The §15 Error shape {code, message, details} verbatim, so GET /jobs/{id}
-    # passes it straight through as Job.error. none_as_null: an un-errored job
-    # stores SQL NULL, not a JSONB 'null' literal (a real error is always an
-    # object) — same trap as idempotency_keys.response.
+    # The FULL §15 Error shape {code, message, details, request_id} verbatim
+    # (the frozen Error requires all four — writers mint a request_id naming
+    # the failure record, since no HTTP request exists worker-side), so
+    # GET /jobs/{id} passes it straight through as Job.error. none_as_null: an
+    # un-errored job stores SQL NULL, not a JSONB 'null' literal (a real error
+    # is always an object) — same trap as idempotency_keys.response.
     sa.Column("error", postgresql.JSONB(none_as_null=True)),
     # Cooperative-cancel flag the worker checks between steps. Internal only —
     # not part of the frozen Job contract shape (DR-002 freezes contracts/, not

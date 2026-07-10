@@ -317,10 +317,18 @@ def test_trigger_unknown_body_field_rejected(
 def test_job_dtos_project_the_contract_shapes() -> None:
     from api.schemas import job_accepted_dto, job_dto
 
-    job = _job(status="failed", error={"code": "INTERNAL", "message": "m", "details": None})
+    # the stored error is the FULL frozen Error (writers mint request_id) and
+    # the dto passes it through UNTOUCHED — no re-stamping, no field loss
+    stored_error = {
+        "code": "INTERNAL",
+        "message": "m",
+        "details": None,
+        "request_id": str(uuid.uuid4()),
+    }
+    job = _job(status="failed", error=stored_error)
     dto = job_dto(job)
     assert dto["job_id"] == job.id  # id → the contract's job_id
-    assert dto["error"] == {"code": "INTERNAL", "message": "m", "details": None}
+    assert dto["error"] == stored_error
     # internal columns never leak into the frozen shape
     assert "cancel_requested" not in dto and "id" not in dto
     assert job_accepted_dto(job) == {"job_id": job.id, "status": "failed"}

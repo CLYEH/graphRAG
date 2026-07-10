@@ -229,7 +229,14 @@ async def _fail_job(engine: AsyncEngine, job_id: uuid.UUID, exc: Exception) -> N
             job_id,
             status="failed",
             finished_at=sa.func.now(),
-            error={"code": "INTERNAL", "message": str(exc), "details": None},
+            # the FULL frozen Error shape (§27.2 requires request_id; no HTTP
+            # request exists here, so the id names this failure record)
+            error={
+                "code": "INTERNAL",
+                "message": str(exc),
+                "details": None,
+                "request_id": str(uuid.uuid4()),
+            },
         )
 
 
