@@ -270,7 +270,16 @@ async def run_build(
         )
         progress_fields: dict[str, Any] = {"status": job_status, "finished_at": sa.func.now()}
         if error is not None:
-            progress_fields["error"] = {"code": "INTERNAL", "message": error, "details": None}
+            # the FULL frozen Error shape (§27.2 requires request_id too — a
+            # 3-field object would make GET /jobs/{id} contract-invalid). No
+            # HTTP request exists at terminalization, so mint an id that
+            # uniquely identifies this failure record.
+            progress_fields["error"] = {
+                "code": "INTERNAL",
+                "message": error,
+                "details": None,
+                "request_id": str(uuid.uuid4()),
+            }
         await jobs.set_progress(conn, job_id, **progress_fields)
 
     return BuildOutcome(

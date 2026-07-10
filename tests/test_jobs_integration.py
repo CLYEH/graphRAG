@@ -9,6 +9,7 @@ transaction so nothing lands in the dev DB.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 
@@ -22,18 +23,22 @@ from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
 from core.registry import (
+    JobConflictError,
     ProjectHasActiveJobsError,
+    ProjectNotFoundError,
     count_active_jobs,
     create_job,
+    create_job_exclusive,
     create_project,
     delete_project,
+    find_unenqueued_jobs,
     get_job,
     is_cancel_requested,
     request_cancel,
     set_progress,
 )
-from core.registry.jobs import JobNotFoundError
-from core.stores.tables import jobs
+from core.registry.jobs import JobNotFoundError, acquire_lease
+from core.stores.tables import jobs, projects
 
 pytestmark = pytest.mark.integration
 
@@ -87,13 +92,18 @@ async def test_create_get_and_progress_roundtrip(migrated: None) -> None:
             assert updated.message == "extracting"
             assert updated.error is None
 
-            # error stores the §15 Error shape and round-trips as a dict (not a
-            # JSONB 'null' — none_as_null keeps an un-errored job's column SQL NULL)
-            errored = await set_progress(
-                conn, job.id, status="failed", error={"code": "INTERNAL", "message": "boom"}
-            )
+            # error stores the FULL §15 Error shape (the 0014 CHECK refuses a
+            # partial object) and round-trips as a dict (not a JSONB 'null' —
+            # none_as_null keeps an un-errored job's column SQL NULL)
+            full_error = {
+                "code": "INTERNAL",
+                "message": "boom",
+                "details": None,
+                "request_id": str(uuid.uuid4()),
+            }
+            errored = await set_progress(conn, job.id, status="failed", error=full_error)
             assert errored is not None
-            assert errored.error == {"code": "INTERNAL", "message": "boom"}
+            assert errored.error == full_error
             assert errored.step == "graph"  # untouched by this patch
             await trans.rollback()
     finally:
@@ -295,6 +305,213 @@ async def test_job_requires_an_existing_project(migrated: None) -> None:
             trans = await conn.begin()
             with pytest.raises(IntegrityError):
                 await create_job(conn, _proj(), "build")  # no projects row
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+# ── create_job_exclusive (BA2e-1 trigger guard) ─────────────────────────────
+
+
+async def test_create_job_exclusive_conflicts_while_a_job_is_active(migrated: None) -> None:
+    """WHY: the contract's 409 JOB_CONFLICT — one active job per project. The
+    guard must name the blocking job (so a client can join it) and must LIFT
+    once that job terminalizes (it guards overlap, not the project forever)."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            project = _proj()
+            await create_project(conn, name=project)
+
+            first = await create_job_exclusive(conn, project, "build")
+            with pytest.raises(JobConflictError) as ei:
+                await create_job_exclusive(conn, project, "ingest")  # any kind overlaps
+            assert ei.value.active_job_id == first.id
+
+            await set_progress(conn, first.id, status="failed")
+            second = await create_job_exclusive(conn, project, "ingest")  # terminal → free
+            assert second.kind == "ingest"
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_create_job_exclusive_missing_project(migrated: None) -> None:
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            with pytest.raises(ProjectNotFoundError):
+                await create_job_exclusive(conn, _proj(), "build")
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_create_job_exclusive_race_has_one_winner(migrated: None) -> None:
+    """WHY (class 10): an app-level count-then-insert would let two concurrent
+    triggers both see zero active jobs and both insert. The projects row lock
+    must serialize them: the second BLOCKS until the first commits, then sees
+    its job and conflicts — never two active jobs."""
+    engine = _engine()
+    project = _proj()
+    try:
+        async with engine.connect() as seed:
+            await create_project(seed, name=project)
+            await seed.commit()  # visible to both racing connections
+
+        async with engine.connect() as conn_a, engine.connect() as conn_b:
+            txn_a = await conn_a.begin()
+            winner = await create_job_exclusive(conn_a, project, "build")  # holds the row lock
+
+            async def _contender() -> None:
+                async with conn_b.begin():
+                    await create_job_exclusive(conn_b, project, "build")
+
+            contender = asyncio.create_task(_contender())
+            await asyncio.sleep(0.3)
+            assert not contender.done()  # blocked on the row lock, not failed and not inserted
+            await txn_a.commit()
+            with pytest.raises(JobConflictError) as ei:
+                await contender
+            assert ei.value.active_job_id == winner.id
+    finally:
+        async with engine.connect() as cleanup:
+            await cleanup.execute(jobs.delete().where(jobs.c.project == project))
+            await cleanup.execute(projects.delete().where(projects.c.name == project))
+            await cleanup.commit()
+        await engine.dispose()
+
+
+def test_upgrade_0014_backfills_legacy_partial_errors_before_the_check(
+    require_services: None,
+) -> None:
+    """0014 must apply on a DB that already holds failed jobs written by the
+    pre-BA2e-1 writers (error = {code, message, details} only — legal at 0013,
+    where no CHECK exists): the backfill runs BEFORE ADD CONSTRAINT, so a
+    populated upgrade reconciles instead of failing, and the stored shape
+    becomes the full frozen Error — request_id stamped, original fields
+    preserved. CI migrates a fresh empty DB, so without this test the
+    backfill (the migration's whole reason to exist) would never execute over
+    a violating row. Sync test: alembic's env.py drives its own asyncio.run,
+    which can't run inside an async test's loop (the 0010 orphan-builds test
+    is the precedent)."""
+    cfg = Config(str(REPO_ROOT / "alembic.ini"))
+    project = f"itest-legacy-{uuid.uuid4().hex[:8]}"
+    legacy = {"code": "INTERNAL", "message": "boom", "details": None}  # pre-0014 shape
+    job_ids: list[uuid.UUID] = []
+
+    async def _insert_legacy_row() -> None:
+        engine = _engine()
+        try:
+            async with engine.connect() as conn:
+                await create_project(conn, name=project)
+                job = await create_job(conn, project, "build")
+                await set_progress(conn, job.id, status="failed", error=legacy)
+                job_ids.append(job.id)
+                await conn.commit()
+        finally:
+            await engine.dispose()
+
+    async def _assert_reconciled() -> None:
+        engine = _engine()
+        try:
+            async with engine.connect() as conn:
+                job = await get_job(conn, job_ids[0])
+                assert job is not None and job.error is not None
+                assert set(job.error) == {"code", "message", "details", "request_id"}
+                assert job.error["code"] == "INTERNAL"  # preserved
+                assert job.error["message"] == "boom"  # preserved
+                assert job.error["details"] is None  # preserved
+                uuid.UUID(job.error["request_id"])  # stamped, parseable
+        finally:
+            await engine.dispose()
+
+    async def _cleanup() -> None:
+        engine = _engine()
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(jobs.delete().where(jobs.c.project == project))
+                await conn.execute(projects.delete().where(projects.c.name == project))
+                await conn.commit()
+        finally:
+            await engine.dispose()
+
+    try:
+        command.downgrade(cfg, "0013_jobs_reaper_index")  # drop the CHECK (+ index)
+        asyncio.run(_insert_legacy_row())
+        command.upgrade(cfg, "head")  # MUST NOT fail on the legacy row
+        asyncio.run(_assert_reconciled())
+    finally:
+        # robust to either migration state: remove the rows, then ensure head
+        asyncio.run(_cleanup())
+        command.upgrade(cfg, "head")
+
+
+async def test_partial_job_error_is_refused_by_the_db(migrated: None) -> None:
+    """WHY (0014): GET /jobs/{id} passes jobs.error through verbatim, so the
+    full frozen Error shape must be a STORAGE invariant, not writer
+    discipline — a partial object is refused at the write. And because 0014
+    adds this CHECK only after backfilling, the constraint's existence on a
+    migrated database proves no legacy partial row survived the upgrade."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            project = _proj()
+            await create_project(conn, name=project)
+            job = await create_job(conn, project, "build")
+            with pytest.raises(IntegrityError):
+                await set_progress(
+                    conn,
+                    job.id,
+                    status="failed",
+                    error={"code": "INTERNAL", "message": "no request_id"},
+                )
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+# ── find_unenqueued_jobs (BA2e queued-sweep) ─────────────────────────────────
+
+
+async def test_find_unenqueued_jobs_matches_only_lost_queued_rows(migrated: None) -> None:
+    """WHY: the sweep re-dispatches, so a false match risks a duplicate build.
+    Only a job that should long since have been dispatched and shows no trace
+    of one (still `queued`, never leased, older than the grace) may match: a
+    young row may still be mid-trigger; a leased row is the expired-lease
+    sweep's; a running row was definitely dispatched (arq owns its retry); a
+    terminal row is done."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            project = _proj()
+            await create_project(conn, name=project)
+
+            fresh = await create_job(conn, project, "build")
+            lost = await create_job(conn, project, "build")
+            leased = await create_job(conn, project, "build")
+            running = await create_job(conn, project, "build")
+            done = await create_job(conn, project, "build")
+            await conn.execute(
+                jobs.update()
+                .where(jobs.c.id.in_([lost.id, leased.id, running.id, done.id]))
+                .values(created_at=sa.func.now() - sa.text("interval '10 minutes'"))
+            )
+            await acquire_lease(conn, leased.id, "w1", 60.0)
+            await set_progress(conn, running.id, status="running")
+            await set_progress(conn, done.id, status="done")
+
+            found = {j for j, _ in await find_unenqueued_jobs(conn, 120.0)}
+            mine = {fresh.id, lost.id, leased.id, running.id, done.id}
+            assert found & mine == {lost.id}
+            # each hit carries its project (the reaper enqueues with it)
+            assert (lost.id, project) in await find_unenqueued_jobs(conn, 120.0)
+            # the grace is respected: nothing 10 minutes old matches an hour-long grace
+            assert {j for j, _ in await find_unenqueued_jobs(conn, 3600.0)} & mine == set()
             await trans.rollback()
     finally:
         await engine.dispose()

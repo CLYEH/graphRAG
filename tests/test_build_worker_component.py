@@ -302,14 +302,26 @@ async def test_enqueue_build_uses_job_id_dedup() -> None:
     calls: dict[str, Any] = {}
 
     class _Redis:
-        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> None:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
             calls["enqueue"] = (fn, args, _job_id)
+            return object()  # arq accepted the enqueue
 
     jid = uuid.uuid4()
-    await bw.enqueue_build(_Redis(), "proj", jid)  # type: ignore[arg-type]
+    accepted = await bw.enqueue_build(_Redis(), "proj", jid)  # type: ignore[arg-type]
 
     # arq dedups on _job_id: re-enqueuing a queued/running job is refused.
     assert calls["enqueue"] == (bw.BUILD_TASK, ("proj", str(jid)), str(jid))
+    assert accepted is True
+
+
+async def test_enqueue_build_reports_a_dedup_refusal() -> None:
+    # WHY: the reaper's queued-sweep replays this exact call and must count only
+    # NEW dispatches — arq's refusal (a dispatch already pending) returns False.
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            return None  # a job with this id is already pending → refused
+
+    assert await bw.enqueue_build(_Redis(), "proj", uuid.uuid4()) is False  # type: ignore[arg-type]
 
 
 async def test_reenqueue_build_uses_a_deterministic_per_stale_lease_id() -> None:
@@ -335,6 +347,10 @@ async def test_reenqueue_build_uses_a_deterministic_per_stale_lease_id() -> None
     assert calls[0][:2] == (bw.BUILD_TASK, ("proj", str(jid)))
 
 
+async def _no_unenqueued(conn: Any, grace: float) -> list[tuple[uuid.UUID, str]]:
+    return []
+
+
 async def test_reap_stuck_builds_reenqueues_each_crashed_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -352,6 +368,7 @@ async def test_reap_stuck_builds_reenqueues_each_crashed_job(
             return object()
 
     monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    monkeypatch.setattr(bw, "find_unenqueued_jobs", _no_unenqueued)
     reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
 
     assert reaped == 2
@@ -377,6 +394,7 @@ async def test_reap_stuck_builds_counts_only_new_dispatches(
             return None  # arq: a job with this id is already pending → refused
 
     monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    monkeypatch.setattr(bw, "find_unenqueued_jobs", _no_unenqueued)
     reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
 
     assert reaped == 0  # matched one stale row, enqueued nothing new
@@ -396,10 +414,72 @@ async def test_reap_stuck_builds_is_a_noop_when_nothing_crashed(
             return object()
 
     monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    monkeypatch.setattr(bw, "find_unenqueued_jobs", _no_unenqueued)
     reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
 
     assert reaped == 0
     assert enq == []  # nothing enqueued on an idle tick
+
+
+async def test_reap_stuck_builds_replays_lost_enqueues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (BA2e queued-sweep): a job committed `queued` whose arq enqueue was
+    # lost (trigger crash window / Redis loss / a dispatch that raced the
+    # trigger's commit and no-opped) has NO lease — invisible to the expired-
+    # lease sweep — so the reaper must replay the trigger's own enqueue: the
+    # job's OWN arq id (freed by keep_result=0 after any no-op dispatch), not
+    # a reap:<...> generation id.
+    j1, j2 = uuid.uuid4(), uuid.uuid4()
+    enq: list[Any] = []
+    seen_grace: list[float] = []
+
+    async def _none_reapable(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
+        return []
+
+    async def _find_lost(conn: Any, grace: float) -> list[tuple[uuid.UUID, str]]:
+        seen_grace.append(grace)
+        return [(j1, "p1"), (j2, "p2")]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            enq.append((fn, args, _job_id))
+            return object() if args[1] == str(j1) else None  # j2: already pending → refused
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _none_reapable)
+    monkeypatch.setattr(bw, "find_unenqueued_jobs", _find_lost)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 1  # j1 newly dispatched; j2's refusal (mere backlog) not counted
+    assert enq == [
+        (bw.BUILD_TASK, ("p1", str(j1)), str(j1)),
+        (bw.BUILD_TASK, ("p2", str(j2)), str(j2)),
+    ]
+    # the sweep's grace comes from settings, not a hardcoded literal
+    assert seen_grace == [get_settings().job_enqueue_grace_seconds]
+
+
+async def test_reap_stuck_builds_counts_both_sweeps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crashed, lost = uuid.uuid4(), uuid.uuid4()
+    expiry = datetime(2026, 7, 10, 1, 0, 0, tzinfo=UTC)
+
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
+        return [(crashed, "p1", expiry)]
+
+    async def _find_lost(conn: Any, grace: float) -> list[tuple[uuid.UUID, str]]:
+        return [(lost, "p2")]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            return object()
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    monkeypatch.setattr(bw, "find_unenqueued_jobs", _find_lost)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 2  # one crashed re-dispatch + one replayed lost enqueue
 
 
 async def test_on_startup_builds_the_dep_bundle(monkeypatch: pytest.MonkeyPatch) -> None:

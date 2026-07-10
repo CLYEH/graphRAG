@@ -55,6 +55,17 @@ class JobNotFoundError(Exception):
         self.job_id = job_id
 
 
+class JobConflictError(Exception):
+    """The project already has an active (queued/running) job — the frozen
+    contract's ``JOB_CONFLICT`` ("overlapping job") on the trigger endpoints.
+    Carries the active job's id so a client can join it instead."""
+
+    def __init__(self, project: str, active_job_id: uuid.UUID) -> None:
+        super().__init__(f"project {project!r} already has an active job {active_job_id}")
+        self.project = project
+        self.active_job_id = active_job_id
+
+
 class _Unset:
     """Partial-update sentinel — 'field omitted' vs 'set to this value'."""
 
@@ -106,6 +117,47 @@ async def create_job(
         )
     ).one()
     return Job(*row)
+
+
+async def create_job_exclusive(conn: AsyncConnection, project: str, kind: str) -> Job:
+    """``create_job`` guarded by the single-active-job-per-project rule the
+    trigger endpoints enforce (the contract's 409 ``JOB_CONFLICT`` "overlapping
+    job") — storage itself allows overlapping jobs (the BA2d lease/reaper design
+    depends on that), so the guard lives HERE, not in a constraint.
+
+    Race-safe the way ``delete_project`` is: lock the parent projects row FIRST
+    (FOR UPDATE — an app-level count-then-insert would be TOCTOU, and a
+    single-statement INSERT..WHERE NOT EXISTS still races under READ COMMITTED
+    with no unique index to backstop it). Two concurrent triggers serialize on
+    the row lock, so the loser re-counts after the winner's commit and sees its
+    job; a concurrent ``delete_project`` takes the same lock, so trigger-vs-
+    delete serializes too. Raises ``ProjectNotFoundError`` (absent project) or
+    ``JobConflictError`` (an active job exists, its id attached).
+    """
+    from core.registry.store import ProjectNotFoundError  # deferred: store imports this module
+
+    locked = (
+        await conn.execute(
+            sa.select(tables.projects.c.name)
+            .where(tables.projects.c.name == project)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if locked is None:
+        raise ProjectNotFoundError(project)
+    active = (
+        await conn.execute(
+            sa.select(tables.jobs.c.id)
+            .where(
+                tables.jobs.c.project == project,
+                tables.jobs.c.status.in_(_ACTIVE_STATUSES),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if active is not None:
+        raise JobConflictError(project, active)
+    return await create_job(conn, project, kind)
 
 
 async def get_job(conn: AsyncConnection, job_id: uuid.UUID) -> Job | None:
@@ -301,6 +353,37 @@ async def find_reapable_jobs(conn: AsyncConnection) -> list[tuple[uuid.UUID, str
         )
     ).all()
     return [(row.id, row.project, row.lease_expires_at) for row in rows]
+
+
+async def find_unenqueued_jobs(
+    conn: AsyncConnection, grace_seconds: float
+) -> list[tuple[uuid.UUID, str]]:
+    """Jobs whose arq dispatch appears LOST — still ``queued``, never acquired an
+    execution lease, and older than ``grace_seconds`` (DB clock) — the sibling of
+    ``find_reapable_jobs`` for the class-12 window BEFORE the lease exists. The
+    trigger enqueues in-band before its commit, so a committed-but-never-enqueued
+    job can only arise from Redis losing an acked enqueue or from a dispatch that
+    raced the trigger's commit and no-opped (the row wasn't visible yet); either
+    way nothing in arq or the lease sweep will ever touch the row again. Returns
+    ``(id, project)`` for each; the reaper re-runs the trigger's lost step —
+    ``enqueue_build`` under the job's own arq id — which arq dedup-refuses while
+    a genuine dispatch is merely backlogged past the grace (harmless no-op), so a
+    false positive costs nothing. A job that crashed AFTER arq pickup but BEFORE
+    lease acquire also matches; its own-id enqueue is refused while the crashed
+    dispatch's in-progress key lingers, and recovery falls back to arq's own
+    retry — accepted residual (a milliseconds-wide window), same double-crash
+    class BA2d-3 accepts."""
+    rows = (
+        await conn.execute(
+            sa.select(tables.jobs.c.id, tables.jobs.c.project).where(
+                tables.jobs.c.status == "queued",
+                tables.jobs.c.lease_owner.is_(None),
+                tables.jobs.c.created_at
+                < sa.func.now() - sa.func.make_interval(0, 0, 0, 0, 0, 0, grace_seconds),
+            )
+        )
+    ).all()
+    return [(row.id, row.project) for row in rows]
 
 
 async def capture_config_snapshot(

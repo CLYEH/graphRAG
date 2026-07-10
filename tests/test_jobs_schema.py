@@ -92,6 +92,9 @@ def test_jobs_guard_checks_present() -> None:
         "jobs_kind_nonempty",
         "jobs_lease_paired",
         "jobs_lease_owner_nonempty",
+        # 0014: a stored error is the FULL frozen Error or nothing — a partial
+        # object would make GET /jobs/{id}'s pass-through contract-invalid
+        "jobs_error_frozen_shape",
     } <= names
 
 
@@ -117,3 +120,9 @@ def test_offline_upgrade_sql_renders_jobs_ddl(capsys: pytest.CaptureFixture[str]
     # 0013 reaper-scan partial index (WHERE mirrors find_reapable_jobs)
     assert "CREATE INDEX jobs_reapable" in ddl
     assert "lease_owner IS NOT NULL AND status IN ('queued','running')" in ddl
+    # 0014 frozen-Error backfill + guard + queued-sweep partial index (WHERE
+    # mirrors find_unenqueued_jobs)
+    assert "UPDATE jobs" in ddl and "gen_random_uuid" in ddl  # legacy-error backfill
+    assert "jobs_error_frozen_shape" in ddl
+    assert "CREATE INDEX jobs_unenqueued" in ddl
+    assert "lease_owner IS NULL AND status = 'queued'" in ddl

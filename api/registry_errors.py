@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from api.errors import ApiError, ErrorCode
 from core.registry import (
+    JobConflictError,
+    JobNotFoundError,
     ProjectExistsError,
     ProjectHasActiveJobsError,
     ProjectHasBuildsError,
@@ -30,6 +32,14 @@ def translate_registry_error(exc: Exception) -> ApiError:
     else (an unexpected error must not be silently reshaped into a 4xx)."""
     if isinstance(exc, ProjectNotFoundError):
         return ApiError(ErrorCode.PROJECT_NOT_FOUND, str(exc), details={"project": exc.name})
+    if isinstance(exc, JobNotFoundError):
+        return ApiError(ErrorCode.JOB_NOT_FOUND, str(exc), details={"job_id": exc.job_id})
+    if isinstance(exc, JobConflictError):
+        return ApiError(
+            ErrorCode.JOB_CONFLICT,
+            str(exc),
+            details={"project": exc.project, "active_job_id": exc.active_job_id},
+        )
     if isinstance(exc, ProjectExistsError):
         return ApiError(
             ErrorCode.VALIDATION_ERROR,  # GAP: no frozen "exists"/conflict code

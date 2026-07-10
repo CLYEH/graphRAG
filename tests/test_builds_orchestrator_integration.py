@@ -247,9 +247,15 @@ async def test_a_stage_crash_fails_the_build_not_the_worker(migrated: None) -> N
         async with engine.connect() as conn:
             job = await get_job(conn, job_id)
         assert job is not None and job.status == "failed"
-        # the full §15 Error shape the jobs.error column documents (code+message+
-        # details), not a bare message — BA2e passes it straight through
-        assert job.error == {"code": "INTERNAL", "message": outcome.error, "details": None}
+        # the FULL §15 Error shape the jobs.error column documents (code+message+
+        # details+request_id), not a bare message — GET /jobs/{id} passes it
+        # straight through, so a partial object would be contract-invalid
+        assert job.error is not None
+        assert set(job.error) == {"code", "message", "details", "request_id"}
+        assert job.error["code"] == "INTERNAL"
+        assert job.error["message"] == outcome.error
+        assert job.error["details"] is None
+        uuid.UUID(job.error["request_id"])  # a real uuid, not a placeholder
     finally:
         await _cleanup(engine, project)
         await engine.dispose()

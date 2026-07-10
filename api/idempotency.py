@@ -56,6 +56,39 @@ def request_hash(method: str, path: str, body: bytes) -> str:
     return h.hexdigest()
 
 
+async def replay_stored(
+    conn: AsyncConnection, *, key: str, req_hash: str
+) -> tuple[int, dict[str, Any]] | None:
+    """Replay a stored, unexpired response for ``key`` WITHOUT reserving — the
+    pre-step for an endpoint whose scope row can legitimately vanish after the
+    first response was stored (cancel's job row CASCADE-deletes with its
+    project): §27 says a live key + same hash replays even then, so this must
+    run BEFORE the endpoint's existence precheck. A different hash on a live
+    key is the §27 conflict — also decided here, before any 404. Returns None
+    for an absent or expired key (a fresh request: the caller prechecks its
+    scope and hands the rest to ``run_idempotent``, whose reserve-first PK
+    serialization owns the concurrent-first-request race — an in-flight
+    reservation is uncommitted and thus invisible here, so that request falls
+    through to the same path and blocks on the reservation's PK)."""
+    idem = tables.idempotency_keys
+    row = (
+        await conn.execute(
+            sa.select(idem.c.request_hash, idem.c.response, idem.c.status).where(
+                idem.c.key == key, idem.c.expires_at > sa.func.now()
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    if row.request_hash != req_hash:
+        raise ApiError(
+            ErrorCode.IDEMPOTENCY_CONFLICT,
+            "idempotency key reused with a different request",
+            details={"key": key},
+        )
+    return int(row.status), row.response
+
+
 async def run_idempotent(
     conn: AsyncConnection,
     *,

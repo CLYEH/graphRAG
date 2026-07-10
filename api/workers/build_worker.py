@@ -19,6 +19,9 @@ executes builds; the API (BA2e) only enqueues. This wires arq + Redis onto core:
   found by an expired execution lease — so crash recovery is fast (~1 min) and
   decoupled from arq's generous job_timeout; the DB lease keeps it a single
   executor. This makes the BA2d-1 heartbeat-lease the sole build-liveness authority.
+  BA2e adds a second sweep to the same cron: ``queued`` jobs that never acquired a
+  lease past a grace period (a trigger's lost enqueue — the class-12 crash window
+  before any lease exists) get the trigger's enqueue replayed.
 
 Two dedup layers, by design: arq's ``_job_id`` refuses to *enqueue* a duplicate
 while one is queued/running (the cheap first line); the DB heartbeat-lease is the
@@ -49,6 +52,7 @@ from core.llm.factory import chat_model, embedding_model
 from core.registry import (
     capture_config_snapshot,
     find_reapable_jobs,
+    find_unenqueued_jobs,
     get_project,
     set_progress,
 )
@@ -66,13 +70,17 @@ def _redis_settings() -> RedisSettings:
     return RedisSettings.from_dsn(get_settings().redis_url)
 
 
-async def enqueue_build(redis: ArqRedis, project: str, job_id: uuid.UUID) -> None:
-    """Enqueue a build for the worker. ``_job_id=str(job_id)`` gives arq's own
+async def enqueue_build(redis: ArqRedis, project: str, job_id: uuid.UUID) -> bool:
+    """Enqueue a build for the worker; True if a new dispatch was enqueued,
+    False if arq dedup-refused it. ``_job_id=str(job_id)`` gives arq's own
     dispatch dedup — it refuses to enqueue a duplicate while the job is
     queued/running — the cheap first line of defense; the DB execution lease is
-    the crash-safe backstop. BA2e's trigger endpoint calls this after create_job.
+    the crash-safe backstop. BA2e's trigger endpoint calls this after create_job;
+    the reaper's queued-sweep re-runs the exact same call for a job whose
+    original enqueue was lost (see ``find_unenqueued_jobs``).
     """
-    await redis.enqueue_job(BUILD_TASK, project, str(job_id), _job_id=str(job_id))
+    job = await redis.enqueue_job(BUILD_TASK, project, str(job_id), _job_id=str(job_id))
+    return job is not None
 
 
 async def reenqueue_build(
@@ -110,24 +118,37 @@ async def reap_stuck_builds(ctx: dict[str, Any]) -> int:
     held lease + non-terminal job) and re-enqueues each under a deterministic
     per-stale-lease arq id, so a fresh dispatch reclaims the now-free lease and
     resumes (~1-min recovery vs the 24h backstop) while re-ticks over the same
-    stale lease dedup instead of piling up duplicates. An idle tick is a no-op;
-    ``unique=True`` (see WorkerSettings) runs this on one worker per tick.
-    Returns the number of NEW dispatches enqueued (dedup-suppressed ones don't
-    count)."""
+    stale lease dedup instead of piling up duplicates. A second sweep (BA2e)
+    covers the window BEFORE any lease exists: ``queued`` jobs that never
+    acquired one past the enqueue grace (``find_unenqueued_jobs``) get the
+    trigger's ``enqueue_build`` replayed under the job's own arq id. An idle
+    tick is a no-op; ``unique=True`` (see WorkerSettings) runs this on one
+    worker per tick. Returns the number of NEW dispatches enqueued
+    (dedup-suppressed ones don't count)."""
     engine: AsyncEngine = ctx["engine"]
     redis: ArqRedis = ctx["redis"]
     async with engine.connect() as conn:
         reapable = await find_reapable_jobs(conn)
+        unenqueued = await find_unenqueued_jobs(conn, get_settings().job_enqueue_grace_seconds)
     enqueued = 0
     for job_id, project, stale_expiry in reapable:
         if await reenqueue_build(redis, project, job_id, stale_expiry=stale_expiry):
             enqueued += 1
-    if reapable:
+    # BA2e queued-sweep: a job whose trigger-time enqueue was lost (class-12
+    # window BEFORE any lease exists — invisible to the expired-lease sweep
+    # above) gets the trigger's lost step replayed verbatim; the two predicates
+    # are disjoint on lease_owner, so no job is swept twice. A job merely
+    # backlogged past the grace is dedup-refused under its own arq id (no-op).
+    for job_id, project in unenqueued:
+        if await enqueue_build(redis, project, job_id):
+            enqueued += 1
+    if reapable or unenqueued:
         logger.info(
-            "reaper: %d stuck build(s), %d newly re-dispatched: %s",
+            "reaper: %d stuck + %d unenqueued build(s), %d newly (re-)dispatched: %s",
             len(reapable),
+            len(unenqueued),
             enqueued,
-            [str(j) for j, _, _ in reapable],
+            [str(j) for j, _, _ in reapable] + [str(j) for j, _ in unenqueued],
         )
     return enqueued
 
@@ -208,7 +229,14 @@ async def _fail_job(engine: AsyncEngine, job_id: uuid.UUID, exc: Exception) -> N
             job_id,
             status="failed",
             finished_at=sa.func.now(),
-            error={"code": "INTERNAL", "message": str(exc), "details": None},
+            # the FULL frozen Error shape (§27.2 requires request_id; no HTTP
+            # request exists here, so the id names this failure record)
+            error={
+                "code": "INTERNAL",
+                "message": str(exc),
+                "details": None,
+                "request_id": str(uuid.uuid4()),
+            },
         )
 
 

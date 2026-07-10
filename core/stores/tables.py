@@ -921,10 +921,12 @@ jobs = sa.Table(
     sa.Column("step", sa.Text),
     sa.Column("progress", sa.REAL, nullable=False, server_default=sa.text("0")),
     sa.Column("message", sa.Text),
-    # The §15 Error shape {code, message, details} verbatim, so GET /jobs/{id}
-    # passes it straight through as Job.error. none_as_null: an un-errored job
-    # stores SQL NULL, not a JSONB 'null' literal (a real error is always an
-    # object) — same trap as idempotency_keys.response.
+    # The FULL §15 Error shape {code, message, details, request_id} verbatim
+    # (the frozen Error requires all four — writers mint a request_id naming
+    # the failure record, since no HTTP request exists worker-side), so
+    # GET /jobs/{id} passes it straight through as Job.error. none_as_null: an
+    # un-errored job stores SQL NULL, not a JSONB 'null' literal (a real error
+    # is always an object) — same trap as idempotency_keys.response.
     sa.Column("error", postgresql.JSONB(none_as_null=True)),
     # Cooperative-cancel flag the worker checks between steps. Internal only —
     # not part of the frozen Job contract shape (DR-002 freezes contracts/, not
@@ -964,6 +966,15 @@ jobs = sa.Table(
     sa.CheckConstraint(
         "lease_owner IS NULL OR lease_owner <> ''", name="jobs_lease_owner_nonempty"
     ),
+    # a stored error is the FULL frozen Error or nothing — GET /jobs/{id} passes
+    # it through verbatim, so a partial object (the pre-0014 3-field shape) would
+    # be a contract-invalid response. Storage invariant, not writer discipline
+    # (jsonb_typeof: ?& alone would admit an array of those four strings).
+    sa.CheckConstraint(
+        "error IS NULL OR (jsonb_typeof(error) = 'object' "
+        "AND error ?& ARRAY['code','message','details','request_id'])",
+        name="jobs_error_frozen_shape",
+    ),
 )
 
 # List/dashboard reads a project's jobs newest-first.
@@ -977,4 +988,14 @@ jobs_reapable = sa.Index(
     "jobs_reapable",
     jobs.c.lease_expires_at,
     postgresql_where=sa.text("lease_owner IS NOT NULL AND status IN ('queued','running')"),
+)
+
+# BA2e queued-sweep scan: the same cron's second predicate (find_unenqueued_jobs
+# — "queued, never leased, older than the grace"). The sibling of jobs_reapable:
+# partial on the near-empty awaiting-first-dispatch set, so each tick probes
+# instead of scanning job history.
+jobs_unenqueued = sa.Index(
+    "jobs_unenqueued",
+    jobs.c.created_at,
+    postgresql_where=sa.text("lease_owner IS NULL AND status = 'queued'"),
 )

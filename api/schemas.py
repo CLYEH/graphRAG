@@ -1,4 +1,4 @@
-"""Request DTOs and response serializers for the registry endpoints (BA1b).
+"""Request DTOs and response serializers for the registry/job endpoints (BA1b/BA2e).
 
 The request models mirror the frozen contract ProjectCreate/ProjectUpdate/
 SourceCreate (min_length on the required strings, so FastAPI rejects empties as
@@ -6,15 +6,23 @@ VALIDATION_ERROR before the handler). The serializers project the BA1a
 dataclasses onto exactly the contract Project/Source field sets — Source drops
 the internal ``project`` (the contract Source does not carry it). Datetimes/
 UUIDs stay as objects; the envelope's jsonable_encoder renders them.
+
+IngestRequest/BuildRequest carry fields the pipeline cannot honor yet
+(``source_ids`` — core's ingest stage has no source filter; ``reason`` — builds
+have no note column). Owner decision (2026-07-10): reject them LOUDLY (400)
+rather than accept-and-ignore — running a full ingest against an explicit
+restriction, or dropping an operator's note, would silently disobey the request.
+Lifting a rejection later is additive (no contract bump).
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import Annotated, Any
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
-from core.registry import Project, Source
+from core.registry import Job, Project, Source
 
 
 def _reject_null_config(v: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -58,6 +66,45 @@ class SourceCreate(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class IngestRequest(BaseModel):
+    """The contract IngestRequest — parsed to its shape, then ``source_ids``
+    is loudly rejected while PRESENT (even as an explicit null — the contract
+    types it as a non-nullable array, same strictness as config's null) until
+    the pipeline can honor the restriction."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_ids: list[uuid.UUID] | None = None
+
+    @model_validator(mode="after")
+    def _reject_source_ids(self) -> IngestRequest:
+        # see the module docstring: no source filter exists in the pipeline
+        # yet, so a restricted ingest must fail loud, never silently run
+        # unrestricted.
+        if "source_ids" in self.model_fields_set:
+            raise ValueError(
+                "source_ids restriction is not supported yet; omit it to ingest all sources"
+            )
+        return self
+
+
+class BuildRequest(BaseModel):
+    """The contract BuildRequest — parsed to its shape, then ``reason`` is
+    loudly rejected while PRESENT until builds can record it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _reject_reason(self) -> BuildRequest:
+        # see the module docstring: builds carry no note column yet, so a
+        # reason must fail loud, never be silently dropped.
+        if "reason" in self.model_fields_set:
+            raise ValueError("reason is not recorded on builds yet; omit it")
+        return self
+
+
 def project_dto(p: Project) -> dict[str, Any]:
     """The contract Project shape."""
     return {
@@ -78,3 +125,28 @@ def source_dto(s: Source) -> dict[str, Any]:
         "metadata": s.metadata,
         "added_at": s.added_at,
     }
+
+
+def job_dto(j: Job) -> dict[str, Any]:
+    """The contract Job shape, FULL and always present (nullable fields are
+    null, never absent — §27.2's no-branching-on-missing-fields doctrine).
+    ``id`` becomes the contract's ``job_id``; the internal cancel_requested /
+    lease / config_snapshot fields are not part of the frozen shape."""
+    return {
+        "job_id": j.id,
+        "status": j.status,
+        "kind": j.kind,
+        "project": j.project,
+        "build_id": j.build_id,
+        "step": j.step,
+        "progress": j.progress,
+        "message": j.message,
+        "error": j.error,
+        "created_at": j.created_at,
+        "finished_at": j.finished_at,
+    }
+
+
+def job_accepted_dto(j: Job) -> dict[str, Any]:
+    """The contract JobAccepted shape — the 202 payload for long operations."""
+    return {"job_id": j.id, "status": j.status}

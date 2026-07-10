@@ -1,4 +1,4 @@
-"""API dependencies: the database seam (BA1b).
+"""API dependencies: the database and queue seams (BA1b/BA2e).
 
 The FastAPI app owns one async engine for its lifetime (``lifespan``); every
 request borrows a connection inside a transaction (``db_conn``) that commits on
@@ -7,15 +7,23 @@ a handler as an ``ApiError`` propagating through the dependency's ``yield``, the
 rollback also undoes any idempotency reservation — a failed write never poisons
 the key. The engine is built connection-lazily, so the DB-less TestClient tests
 (BA0) still start and stop the app without a live Postgres.
+
+The arq Redis pool (``arq_redis`` — the trigger endpoints' enqueue seam) is the
+same shape but must be created lazily by hand: ``create_pool`` connects eagerly,
+and the app has to start without Redis for those same DB-less tests. First use
+creates it (behind a lock, so concurrent first-triggers race to one pool);
+lifespan disposes it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
+from arq.connections import ArqRedis, RedisSettings, create_pool
 from fastapi import Depends, FastAPI, Request
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
@@ -29,12 +37,17 @@ def _async_dsn() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Hold one async engine for the app's lifetime."""
+    """Hold one async engine (and, once first used, one arq pool) for the
+    app's lifetime."""
     engine = create_async_engine(_async_dsn())
     app.state.engine = engine
+    app.state.arq_redis = None
+    app.state.arq_redis_lock = asyncio.Lock()
     try:
         yield
     finally:
+        if app.state.arq_redis is not None:
+            await app.state.arq_redis.aclose()
         await engine.dispose()
 
 
@@ -48,6 +61,38 @@ async def db_conn(request: Request) -> AsyncIterator[AsyncConnection]:
 
 #: Handler signature sugar: ``conn: Conn``.
 Conn = Annotated[AsyncConnection, Depends(db_conn)]
+
+
+async def arq_redis(request: Request) -> ArqRedis:
+    """The shared arq Redis pool, created on first use (see the module
+    docstring for why it can't live eagerly in lifespan)."""
+    state = request.app.state
+    if state.arq_redis is None:
+        async with state.arq_redis_lock:
+            if state.arq_redis is None:
+                state.arq_redis = await create_pool(
+                    RedisSettings.from_dsn(get_settings().redis_url)
+                )
+    redis: ArqRedis = state.arq_redis
+    return redis
+
+
+def arq_redis_provider(request: Request) -> Callable[[], Awaitable[ArqRedis]]:
+    """A LAZY handle on the shared arq pool — resolving the dependency does no
+    I/O; the pool is opened only when the handler actually enqueues. A trigger
+    must serve its §27 replay and conflict/not-found responses even with Redis
+    unreachable, so the queue connection is a cost of the fresh-enqueue path
+    only, never a precondition of the route."""
+
+    def _get() -> Awaitable[ArqRedis]:
+        return arq_redis(request)
+
+    return _get
+
+
+#: Handler signature sugar: ``get_redis: Queue`` — call ``await get_redis()``
+#: at the enqueue point.
+Queue = Annotated[Callable[[], Awaitable[ArqRedis]], Depends(arq_redis_provider)]
 
 
 def response_meta(request: Request) -> dict[str, Any]:

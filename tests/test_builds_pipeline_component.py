@@ -308,10 +308,16 @@ async def test_stage_crash_fails_the_build(monkeypatch: pytest.MonkeyPatch) -> N
     assert calls == ["ingest", "clean", "graph"]
     assert spy.recorded is not None and spy.recorded["error"] is not None
     assert [s.step_name for s in spy.recorded["steps"]] == ["ingest", "clean"]
-    # the last job update carries the failure status + the full §15 Error shape
+    # the last job update carries the failure status + the FULL §15 Error shape
+    # (request_id included — a 3-field error would be contract-invalid on
+    # GET /jobs/{id}, which passes jobs.error straight through)
     last = spy.progress_calls[-1]
     assert last["status"] == "failed"
-    assert last["error"] == {"code": "INTERNAL", "message": outcome.error, "details": None}
+    assert set(last["error"]) == {"code", "message", "details", "request_id"}
+    assert last["error"]["code"] == "INTERNAL"
+    assert last["error"]["message"] == outcome.error
+    assert last["error"]["details"] is None
+    uuid.UUID(last["error"]["request_id"])  # a real uuid, not a placeholder
 
 
 async def test_failure_ratio_over_threshold_aborts(monkeypatch: pytest.MonkeyPatch) -> None:

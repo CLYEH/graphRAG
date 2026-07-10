@@ -9,11 +9,14 @@ land in BA1b/BA2.
 
 from core.registry.jobs import (
     Job,
+    JobConflictError,
     JobNotFoundError,
     capture_config_snapshot,
     count_active_jobs,
     create_job,
+    create_job_exclusive,
     find_reapable_jobs,
+    find_unenqueued_jobs,
     get_job,
     is_cancel_requested,
     request_cancel,
@@ -37,6 +40,7 @@ from core.registry.store import (
 
 __all__ = [
     "Job",
+    "JobConflictError",
     "JobNotFoundError",
     "Project",
     "ProjectExistsError",
@@ -48,9 +52,11 @@ __all__ = [
     "capture_config_snapshot",
     "count_active_jobs",
     "create_job",
+    "create_job_exclusive",
     "create_project",
     "delete_project",
     "find_reapable_jobs",
+    "find_unenqueued_jobs",
     "get_job",
     "get_project",
     "is_cancel_requested",
