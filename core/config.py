@@ -74,6 +74,12 @@ class Settings(BaseSettings):
     # so the only cost of a small value is reaper chatter, not duplicate builds.
     job_enqueue_grace_seconds: int = 120
 
+    # BA2e-2 SSE (tunable 🔧): how often GET /jobs/{id}/events re-reads the jobs
+    # SoR row between emitted frames. Lower = snappier progress at more DB
+    # round-trips per open stream; each poll is a short-lived single-row
+    # indexed SELECT on its own connection.
+    sse_poll_interval_seconds: float = 0.5
+
     # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-nano"

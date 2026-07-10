@@ -11,12 +11,15 @@ is the integration suite's job.
 
 from __future__ import annotations
 
+import json
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api.app import create_app
@@ -358,6 +361,140 @@ def test_trigger_unknown_body_field_rejected(
     r = client.post("/projects/p/ingest", json={"sources": ["x"]})  # typo'd field
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+# ── GET /jobs/{id}/events (SSE, BA2e-2) ─────────────────────────────────────
+
+
+def _script_poller(client: TestClient, frames: Sequence[tuple[Job, datetime] | None]) -> None:
+    """Override the stream's SoR seam with scripted observations, consumed one
+    per poll (the endpoint's 404 precheck consumes the first); an exhausted
+    script observes the row as vanished."""
+    from api.routers.jobs import job_poller
+
+    it = iter(frames)
+
+    async def _poll(job_id: uuid.UUID) -> tuple[Job, datetime] | None:
+        try:
+            return next(it)
+        except StopIteration:
+            return None
+
+    cast("FastAPI", client.app).dependency_overrides[job_poller] = lambda: _poll
+
+
+def _fast_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub(
+        monkeypatch,
+        "jobs",
+        "get_settings",
+        lambda: SimpleNamespace(sse_poll_interval_seconds=0.001),
+    )
+
+
+def _sse_frames(client: TestClient, url: str) -> list[tuple[str, dict[str, Any]]]:
+    """GET the stream to completion and parse (event, data) frames."""
+    with client.stream("GET", url) as r:
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
+        body = "".join(r.iter_text())
+    frames = []
+    for block in body.strip().split("\n\n"):
+        event_line, data_line = block.split("\n")
+        frames.append(
+            (event_line.removeprefix("event: "), json.loads(data_line.removeprefix("data: ")))
+        )
+    return frames
+
+
+def test_sse_emits_updates_on_change_then_terminal(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY §27.2: the stream is the Console's live progress feed — the initial
+    # state arrives immediately, an unchanged poll emits NOTHING (a fresh
+    # clock alone is not progress), every frame carries the FULL frozen shape
+    # (step/message null, never absent), and the terminal event ends the
+    # stream exactly once.
+    _fast_poll(monkeypatch)
+    job = _job()
+    running = _job(id=job.id, status="running", step="ingest", progress=0.2)
+    later = _job(id=job.id, status="running", step="ingest", progress=0.7)
+    done = _job(id=job.id, status="done", progress=1.0, message="build ready", finished_at=_TS)
+    _script_poller(
+        client,
+        [(job, _TS), (running, _TS), (running, _TS), (later, _TS), (done, _TS)],
+    )
+
+    frames = _sse_frames(client, f"/jobs/{job.id}/events")
+    assert [e for e, _ in frames] == ["job.update", "job.update", "job.update", "job.done"]
+    for _, data in frames:
+        assert set(data) == {"job_id", "status", "step", "progress", "message", "ts"}
+        assert data["job_id"] == str(job.id)
+    assert frames[0][1]["status"] == "queued" and frames[0][1]["step"] is None
+    assert frames[1][1]["progress"] == pytest.approx(0.2)  # the unchanged poll emitted nothing
+    assert frames[2][1]["progress"] == pytest.approx(0.7)
+    assert frames[3][1]["message"] == "build ready"
+
+
+def test_sse_terminal_at_connect_emits_exactly_the_terminal_frame(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a late subscriber to a finished job gets its closure, not silence
+    _fast_poll(monkeypatch)
+    done = _job(status="done", progress=1.0, finished_at=_TS)
+    _script_poller(client, [(done, _TS)])
+    frames = _sse_frames(client, f"/jobs/{done.id}/events")
+    assert [e for e, _ in frames] == ["job.done"]
+
+
+def test_sse_cancelled_maps_to_job_failed_with_exact_status(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY: the frozen event vocabulary has no job.cancelled — a cancelled job
+    # is failure-flavored terminal (§14 build precedent), and the frame's
+    # status field still carries the exact 'cancelled'.
+    _fast_poll(monkeypatch)
+    cancelled = _job(status="cancelled", finished_at=_TS)
+    _script_poller(client, [(cancelled, _TS)])
+    frames = _sse_frames(client, f"/jobs/{cancelled.id}/events")
+    assert frames == [
+        (
+            "job.failed",
+            {
+                "job_id": str(cancelled.id),
+                "status": "cancelled",
+                "step": None,
+                "progress": 0.0,
+                "message": None,
+                "ts": _TS.isoformat(),
+            },
+        )
+    ]
+
+
+def test_sse_unknown_job_is_the_enveloped_404(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fast_poll(monkeypatch)
+    _script_poller(client, [None])
+    jid = uuid.uuid4()
+    r = client.get(f"/jobs/{jid}/events")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "JOB_NOT_FOUND"
+
+
+def test_sse_vanished_row_ends_stream_without_a_fabricated_terminal(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY: a job's row can legally vanish mid-stream (terminal job → project
+    # CASCADE) — the SoR never held a terminal state this stream observed, so
+    # inventing job.failed would lie; the stream just ends and a reconnect
+    # gets an honest 404.
+    _fast_poll(monkeypatch)
+    job = _job()
+    _script_poller(client, [(job, _TS)])  # exhausted after the first poll → vanished
+    frames = _sse_frames(client, f"/jobs/{job.id}/events")
+    assert [e for e, _ in frames] == ["job.update"]  # no terminal frame
 
 
 # ── DTO shapes ───────────────────────────────────────────────────────────────

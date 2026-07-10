@@ -165,6 +165,22 @@ async def get_job(conn: AsyncConnection, job_id: uuid.UUID) -> Job | None:
     return Job(*row) if row is not None else None
 
 
+async def get_job_at(conn: AsyncConnection, job_id: uuid.UUID) -> tuple[Job, datetime] | None:
+    """The job row plus the DB clock, read in the SAME statement — the SSE
+    stream stamps ``JobEvent.ts`` from this, so event timestamps come from the
+    single clock source (the database) rather than the API host's wall time,
+    and the stamp is exactly as fresh as the observed state. None if the job
+    does not exist (or vanished mid-stream — its project was deleted)."""
+    row = (
+        await conn.execute(
+            sa.select(*_COLS, sa.func.now().label("observed_at")).where(tables.jobs.c.id == job_id)
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    return Job(*row[:-1]), row.observed_at
+
+
 async def lock_job(conn: AsyncConnection, job_id: uuid.UUID) -> Job | None:
     """`SELECT … FOR UPDATE` the job row and return it (or None if absent).
     Serializes concurrent workers dispatched the same job while they resolve
