@@ -1465,6 +1465,49 @@ def test_r29_abbreviated_ref_spellings(toy_repo: Path) -> None:
     assert "md-only" in denied.stderr
 
 
+def test_r30_process_substitution_and_docs_destinations(toy_repo: Path) -> None:
+    """Codex #64 R30 (both executed repros): (a) a process substitution
+    (>(...)/<(...)) runs a NESTED command outside the gate — a receipted
+    transfer redirected into one carried a second, ungated transfer; the
+    literal-command deny covers them now (bare projection: they expand
+    only outside quotes); (b) docs DESTINATIONS route to the doc lane —
+    HEAD:docs/x from a task checkout rode the task lane and published
+    non-md code onto a fast-lane branch without the md-only review."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B1")
+    (toy_repo / "a.md").write_text("b1 content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b1"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    # (a) the nested-transfer repro returned 0 (all checks blessed the
+    # FIRST transfer; bash then ran the second one ungated)
+    procsub = (
+        '{"tool_input": {"command": "PUSHVERB -u origin task/B1 > >(PUSHVERB origin other)"}}'
+    ).replace("PUSHVERB", _PUSH)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=procsub, extra_env=env)
+    assert denied.returncode == 2, f"process substitution slipped: {denied.stdout}"
+    assert "process substitution" in denied.stderr
+
+    # (b) an md-only worktree may route its content to a docs branch...
+    allowed = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin HEAD:docs/x", extra_env=env
+    )
+    assert allowed.returncode == 0, f"md-only docs destination blocked: {allowed.stderr}"
+    # ...but with non-md outgoing the doc lane must deny (0 before: the
+    # task lane never ran the md-only review on a docs destination)
+    (toy_repo / "p.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=toy_repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "code"], cwd=toy_repo, check=True, capture_output=True)
+    _stamp(toy_repo)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin HEAD:docs/x", extra_env=env)
+    assert denied.returncode == 2, f"code reached a docs destination: {denied.stdout}"
+    assert "md-only" in denied.stderr
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING

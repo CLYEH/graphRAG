@@ -219,7 +219,7 @@ if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
   # substitution, or no such word) exit here as before. $ and backtick
   # expand inside double quotes (residue keeps that text); braces expand
   # only OUTSIDE quotes entirely, so they read from bare (Codex #64 R22).
-  if { printf '%s' "$residue" | grep -Eq '[$`]' || printf '%s' "$bare" | grep -Eq '\{'; } &&
+  if { printf '%s' "$residue" | grep -Eq '[$`]' || printf '%s' "$bare" | grep -Eq '\{|[<>]\('; } &&
     printf '%s' "$payload" | grep -Eq '(^|[[:space:]])(push|pr)([[:space:];&|]|$)'; then
     # trailing class includes shell operators: `$g push; echo` still runs a
     # push before the semicolon (Codex #64 R13)
@@ -351,11 +351,12 @@ printf '%s' "$payload" | grep -Eq "^(git${flags}[[:space:]]+push|gh${flags}[[:sp
 # #64 R11, P1): an engaged command must be LITERAL. Deny substitution syntax
 # outright; shlex keeps it un-expanded, so the pattern sees it. $ and
 # backtick expand inside double quotes too — they read from the residue —
-# while braces expand only OUTSIDE quotes entirely: a "{x}" in a
-# double-quoted body is text, so the brace check reads bare (Codex #64
-# R22, P2 — quoted JSON/placeholder bodies were denied).
-{ printf '%s' "$residue" | grep -Eq '[$`]' || printf '%s' "$bare" | grep -Eq '\{'; } &&
-  deny "shell expansion (including brace expansion) in a push/PR command hides destinations from the gate — write the command literally (no variables, no command substitution, no braces; single-quoted TEXT arguments are fine — quotes suppress expansion)."
+# while braces and PROCESS SUBSTITUTIONS (<(...) / >(...) — a nested
+# command running outside the gate; Codex #64 R30, P1 executed repro:
+# a receipted transfer redirected into a process substitution carrying a
+# second transfer) expand only OUTSIDE quotes entirely, so they read bare.
+{ printf '%s' "$residue" | grep -Eq '[$`]' || printf '%s' "$bare" | grep -Eq '\{|[<>]\('; } &&
+  deny "shell expansion (including brace expansion and process substitution) in a push/PR command hides destinations from the gate — write the command literally (no variables, no command substitution, no braces, no process substitutions; single-quoted TEXT arguments are fine — quotes suppress expansion)."
 
 # the scans below read PUSH grammar out of the payload TEXT — refspecs,
 # push flags, git chaining. On a gh payload the shlex rejoin has ERASED the
@@ -539,7 +540,10 @@ fi
 # match body/title prose (same erased-quoting class as the engagement and
 # flag scans, Codex #64 R21), so it runs for git-engaged payloads only;
 # gh lane classification rests on the branch itself.
-if { [ "$git_engaged" = 1 ] && printf '%s' "$payload" | grep -Eq ":((refs/)?heads/)?main([[:space:]\"']|$)"; } \
+# docs DESTINATIONS route to the doc lane too (Codex #64 R30, P2 executed
+# repro: HEAD:docs/x from a task checkout rode the task lane, publishing
+# non-md code onto a fast-lane branch without the md-only review).
+if { [ "$git_engaged" = 1 ] && printf '%s' "$payload" | grep -Eq ":((refs/)?heads/)?(main([[:space:]\"']|$)|docs/)"; } \
   || [ "$current" = "main" ] || [[ "$current" == docs/* ]]; then
   lane=doc
 else
