@@ -609,7 +609,7 @@ async def test_drift_probe_degrades_and_failed_build_short_circuits(
             return _rows(self._build_rows if self.calls == 1 else [])
 
     def _build(bid: Any, status: str) -> Any:
-        return (bid, status, None, None, None)
+        return (bid, status, None, None, None, "p", None, None, None, None)
 
     async def _boom(*args: Any, **kwargs: Any) -> Any:
         raise ServiceUnavailable("neo4j down")
