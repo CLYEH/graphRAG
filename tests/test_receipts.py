@@ -421,6 +421,47 @@ def test_non_head_src_and_all_branch_forms_are_rejected(toy_repo: Path) -> None:
     )
     assert allowed.returncode == 0, f"safe config still denied: {allowed.stderr}"
 
+    # (e) configured push refspecs route bare pushes invisibly (Codex #64
+    # R10, executed repro: remote.origin.push=HEAD:refs/heads/task/FE1 makes
+    # `origin` land on the FE branch with nothing in the payload)
+    subprocess.run(
+        ["git", "config", "remote.origin.push", "HEAD:refs/heads/task/FE1"],
+        cwd=toy_repo,
+        check=True,
+        capture_output=True,
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin", extra_env=env)
+    assert denied.returncode == 2, f"configured refspec bypassed the gate: {denied.stdout}"
+    assert "remote.<name>.push" in denied.stderr
+    subprocess.run(
+        ["git", "config", "--unset-all", "remote.origin.push"],
+        cwd=toy_repo,
+        check=True,
+        capture_output=True,
+    )
+    allowed = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/FE1", extra_env=env
+    )
+    assert allowed.returncode == 0, f"unset config still denied: {allowed.stderr}"
+
+    # (f) the upstream sibling (reviewer-executed): push.default=upstream
+    # with a CROSS-NAMED branch.<name>.merge routes a bare push onto a
+    # branch the payload never names; an aligned upstream stays green
+    for cfg in (["push.default", "upstream"], ["branch.task/FE1.merge", "refs/heads/other"]):
+        subprocess.run(["git", "config", *cfg], cwd=toy_repo, check=True, capture_output=True)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin", extra_env=env)
+    assert denied.returncode == 2 and "cross-named upstream" in denied.stderr
+    subprocess.run(
+        ["git", "config", "branch.task/FE1.merge", "refs/heads/task/FE1"],
+        cwd=toy_repo,
+        check=True,
+        capture_output=True,
+    )
+    allowed = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/FE1", extra_env=env
+    )
+    assert allowed.returncode == 0, f"aligned upstream denied: {allowed.stderr}"
+
 
 def test_json_envelope_is_parsed_to_the_command(toy_repo: Path) -> None:
     """The hook receives a JSON envelope whose own `":"` key separators

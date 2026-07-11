@@ -63,6 +63,8 @@ if ! printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b" &&
   exit 0
 fi
 cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."
+current="$(git branch --show-current)"
+[ -z "$current" ] && deny "detached HEAD — push from a branch."
 
 # all-branch/mirror forms push refs the worktree-bound receipts never spoke
 # for (an unreceipted local task/FE* rides along invisibly — Codex #64 R7,
@@ -77,10 +79,23 @@ printf '%s' "$payload" | grep -Eq "[[:space:]\"']\+?:([[:space:]\"']|\$)" &&
   deny "the matching-refspec push form (: / +:) updates every matching branch — push the branch explicitly."
 [ "$(git config --get push.default 2>/dev/null)" = "matching" ] &&
   deny "push.default=matching makes pushes fan out to every matching branch — set push.default to simple, then push explicitly."
+# configured push refspecs are the same invisibility one level deeper: with
+# remote.<name>.push set, a bare `git push origin` lands wherever the CONFIG
+# says (e.g. HEAD:refs/heads/task/FE1) with nothing in the payload at all
+# (Codex #64 R10, executed repro) — deny while any are set.
+[ -n "$(git config --get-regexp '^remote\..*\.push$' 2>/dev/null)" ] &&
+  deny "remote.<name>.push refspecs route bare pushes to unstated destinations — unset them (git config --unset-all remote.<name>.push) and push explicitly."
+# push.default=upstream sends HEAD to branch.<name>.merge — a CROSS-NAMED
+# upstream routes a bare push onto a branch the payload never names (the
+# local reviewer executed the work -> FE case; same config family)
+if [ "$(git config --get push.default 2>/dev/null)" = "upstream" ]; then
+  upstream_ref="$(git config --get "branch.${current}.merge" 2>/dev/null)"
+  if [ -n "$upstream_ref" ] && [ "$upstream_ref" != "refs/heads/$current" ]; then
+    deny "push.default=upstream with a cross-named upstream ($upstream_ref) routes bare pushes onto an unstated branch — push explicitly or align the upstream."
+  fi
+fi
 
 git fetch -q origin main 2>/dev/null
-current="$(git branch --show-current)"
-[ -z "$current" ] && deny "detached HEAD — push from a branch."
 
 # lane: a ':main' / ':refs/heads/main' refspec, pushing while on main, or a docs/* branch
 # (whose whole purpose is the fast lane, incl. its own branch push) = doc-only lane
