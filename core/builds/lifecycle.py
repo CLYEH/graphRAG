@@ -96,13 +96,20 @@ class _DriftedUnderLock(Exception):
 
 @dataclass(frozen=True)
 class BuildInfo:
-    """One row of ``graphrag builds``."""
+    """One row of ``graphrag builds`` (and the API's frozen Build DTO source —
+    BA8: every contract field rides here so the facade never re-reads raw
+    columns)."""
 
     id: uuid.UUID
     status: str
     started_at: datetime | None
     finished_at: datetime | None
     activated_at: datetime | None
+    project: str
+    config_hash: str | None = None
+    source_hash: str | None = None
+    metrics: dict[str, Any] | None = None
+    eval: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +135,11 @@ async def list_builds(conn: AsyncConnection, project: str) -> list[BuildInfo]:
             tables.builds.c.started_at,
             tables.builds.c.finished_at,
             tables.builds.c.activated_at,
+            tables.builds.c.project,
+            tables.builds.c.config_hash,
+            tables.builds.c.source_hash,
+            tables.builds.c.metrics,
+            tables.builds.c.eval,
         )
         .where(tables.builds.c.project == project)
         # NULLS LAST: a never-started row sorts OLDEST — coalescing to now()
@@ -136,6 +148,53 @@ async def list_builds(conn: AsyncConnection, project: str) -> list[BuildInfo]:
         .order_by(sa.desc(tables.builds.c.started_at).nulls_last())
     )
     return [BuildInfo(*row) for row in rows]
+
+
+_BUILD_INFO_COLS = (
+    tables.builds.c.id,
+    tables.builds.c.status,
+    tables.builds.c.started_at,
+    tables.builds.c.finished_at,
+    tables.builds.c.activated_at,
+    tables.builds.c.project,
+    tables.builds.c.config_hash,
+    tables.builds.c.source_hash,
+    tables.builds.c.metrics,
+    tables.builds.c.eval,
+)
+
+
+async def get_build_info(
+    conn: AsyncConnection, project: str, build_id: uuid.UUID
+) -> BuildInfo | None:
+    """One build by id, project-scoped (None = not found in THIS project)."""
+    row = (
+        await conn.execute(
+            sa.select(*_BUILD_INFO_COLS).where(
+                tables.builds.c.id == build_id, tables.builds.c.project == project
+            )
+        )
+    ).one_or_none()
+    return BuildInfo(*row) if row else None
+
+
+async def list_builds_page(
+    conn: AsyncConnection,
+    project: str,
+    *,
+    limit: int,
+    after_id: uuid.UUID | None = None,
+) -> tuple[list[BuildInfo], uuid.UUID | None]:
+    """One keyset page of builds, id desc — the API list convention (BA3:
+    stable order, opaque cursor; ``list_builds`` keeps its unpaginated
+    newest-first shape for the CLI and Health)."""
+    query = sa.select(*_BUILD_INFO_COLS).where(tables.builds.c.project == project)
+    if after_id is not None:
+        query = query.where(tables.builds.c.id < after_id)
+    rows = (await conn.execute(query.order_by(sa.desc(tables.builds.c.id)).limit(limit + 1))).all()
+    page = [BuildInfo(*row) for row in rows[:limit]]
+    next_after = page[-1].id if len(rows) > limit else None
+    return page, next_after
 
 
 async def _pg_counts(conn: AsyncConnection, project: str, build_id: uuid.UUID) -> dict[str, int]:
@@ -386,6 +445,7 @@ async def preflight(
     build_id: uuid.UUID,
     *,
     allow_archived: bool = False,
+    apply_eval_gate: bool = True,
 ) -> PreflightReport:
     """§14 activation preflight, run OUTSIDE the activation transaction.
 
@@ -423,6 +483,16 @@ async def preflight(
 
     failures.extend(await drift_failures(conn, qdrant, graph_session, project, build_id))
 
+    if not apply_eval_gate:
+        # the HISTORY-RESTORE exemption (same text as rollback's): the gate
+        # compares candidates, not history — surfaced as deferred, never silent
+        return PreflightReport(
+            tuple(failures),
+            (
+                "eval gate (§20) not applied — rollback restores a previously-active, "
+                "already-vetted build; the regression gate compares candidates, not history",
+            ),
+        )
     eval_failures, eval_deferred = await _eval_gate(conn, project, build_id)
     failures.extend(eval_failures)
     return PreflightReport(tuple(failures), tuple(eval_deferred))
@@ -443,22 +513,60 @@ async def activate(
     the target; the partial unique index on ``builds`` makes a concurrent
     second activation lose loudly rather than produce two actives. On
     preflight failure NOTHING is changed — the report says why."""
+    # end any auto-begun read transaction so the activation transaction below
+    # is the connection's ONLY one (the same explicit-rollback idiom as the
+    # MCP binding path)
+    await conn.rollback()
+    async with conn.begin():
+        return await activate_in_caller_txn(
+            conn, qdrant, graph_session, project, build_id, allow_archived=allow_archived
+        )
+
+
+async def activate_in_caller_txn(
+    conn: AsyncConnection,
+    qdrant: AsyncQdrantClient,
+    graph_session: AsyncSession,
+    project: str,
+    build_id: uuid.UUID,
+    *,
+    allow_archived: bool = False,
+    apply_eval_gate: bool = True,
+) -> PreflightReport:
+    """Preflight + promotion inside the CALLER's open transaction — the API
+    facade's seam (BA8, the run_bounded_query precedent: one machinery, two
+    facades). The caller owns the transaction boundaries, so it can compose
+    the promotion with its own atomic concerns (the §27 idempotency
+    reservation commits or rolls back WITH the promotion); this function
+    takes the project lifecycle lock and either returns a failure report
+    with NOTHING mutated (every _promote_in_tx raise precedes its UPDATEs)
+    or promotes. ``apply_eval_gate=False`` is the HISTORY-RESTORE path only
+    (rollback to an archived, previously-vetted build) — a ready target must
+    keep the gate, or /rollback becomes a §20 bypass."""
     report = await preflight(
-        conn, qdrant, graph_session, project, build_id, allow_archived=allow_archived
+        conn,
+        qdrant,
+        graph_session,
+        project,
+        build_id,
+        allow_archived=allow_archived,
+        apply_eval_gate=apply_eval_gate,
     )
     if not report.ok:
         return report
-    # preflight's SELECTs auto-began a read transaction — end it so the
-    # activation transaction below is the connection's ONLY one (the same
-    # explicit-rollback idiom as the MCP binding path)
-    await conn.rollback()
+    await _take_project_lock(conn, project)
     promotable = ("ready", "archived") if allow_archived else ("ready",)
     try:
-        async with conn.begin():
-            await _take_project_lock(conn, project)
-            return await _promote_in_tx(
-                conn, qdrant, graph_session, project, build_id, promotable, report
-            )
+        return await _promote_in_tx(
+            conn,
+            qdrant,
+            graph_session,
+            project,
+            build_id,
+            promotable,
+            report,
+            apply_eval_gate=apply_eval_gate,
+        )
     except _DriftedUnderLock as exc:
         return PreflightReport(tuple(exc.failures), report.deferred)
 

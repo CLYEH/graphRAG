@@ -23,6 +23,7 @@ from typing import Annotated, Any
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
+from core.builds.lifecycle import BuildInfo
 from core.registry import Job, Project, Source
 
 
@@ -230,6 +231,25 @@ def source_dto(s: Source) -> dict[str, Any]:
         "uri": s.uri,
         "metadata": s.metadata,
         "added_at": s.added_at,
+    }
+
+
+def build_dto(b: BuildInfo) -> dict[str, Any]:
+    """The contract Build shape, field-for-field against the frozen schema
+    (checklist item 5's named-list diff): required id/project/status; every
+    other field is contract-NULLABLE, so null is emitted, never omitted
+    (omit-when-null is the optional NON-nullable rule — #55)."""
+    return {
+        "id": b.id,
+        "project": b.project,
+        "status": b.status,
+        "config_hash": b.config_hash,
+        "source_hash": b.source_hash,
+        "started_at": b.started_at,
+        "finished_at": b.finished_at,
+        "activated_at": b.activated_at,
+        "metrics": b.metrics,
+        "eval": b.eval,
     }
 
 
