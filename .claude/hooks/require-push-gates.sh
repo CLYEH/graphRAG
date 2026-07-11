@@ -185,7 +185,12 @@ fi
 # The gh pattern tolerates global/persistent flags in BOTH positions
 # (`gh -R o/r pr create`, `gh pr --repo o/r create`) and the documented
 # `gh pr new` alias (Codex #64 R4) — the same flags idiom as the git pattern.
-flags='([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*'
+# the attached-value alternative tolerates an EMPTY value (=[^ ]* not =[^ ]+):
+# on the bare projection a quoted value is stripped ("--git-dir='.git' push"
+# reads as "--git-dir= push"), and requiring a non-empty value made the
+# engagement grep miss a real transfer entirely — exit 0 before receipts
+# (Codex #64 R22, P1 executed repro).
+flags='([[:space:]]+-[A-Za-z-]+(=[^[:space:]]*|[[:space:]]+[^[:space:]]+)?)*'
 git_engaged=0
 gh_engaged=0
 # engagement reads BARE (all quoted spans stripped), not the rejoined norm:
@@ -200,8 +205,10 @@ if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
   # P1): a command we cannot statically clear must not be cleared. When
   # substitution syntax coexists with a push/pr word, engage fail-closed —
   # the literal-command rule below then denies it. Plain commands (no
-  # substitution, or no such word) exit here as before.
-  if printf '%s' "$residue" | grep -Eq '[$`{]' &&
+  # substitution, or no such word) exit here as before. $ and backtick
+  # expand inside double quotes (residue keeps that text); braces expand
+  # only OUTSIDE quotes entirely, so they read from bare (Codex #64 R22).
+  if { printf '%s' "$residue" | grep -Eq '[$`]' || printf '%s' "$bare" | grep -Eq '\{'; } &&
     printf '%s' "$payload" | grep -Eq '(^|[[:space:]])(push|pr)([[:space:];&|]|$)'; then
     # trailing class includes shell operators: `$g push; echo` still runs a
     # push before the semicolon (Codex #64 R13)
@@ -239,8 +246,12 @@ printf '%s' "$payload" | grep -Eq "^(git${flags}[[:space:]]+push|gh${flags}[[:sp
 # shell expansion assembles destinations at runtime (HEAD:task/$suffix reads
 # as an FE refspec to git but is invisible to every static pattern — Codex
 # #64 R11, P1): an engaged command must be LITERAL. Deny substitution syntax
-# outright; shlex keeps it un-expanded, so the pattern sees it.
-printf '%s' "$residue" | grep -Eq '[$`{]' &&
+# outright; shlex keeps it un-expanded, so the pattern sees it. $ and
+# backtick expand inside double quotes too — they read from the residue —
+# while braces expand only OUTSIDE quotes entirely: a "{x}" in a
+# double-quoted body is text, so the brace check reads bare (Codex #64
+# R22, P2 — quoted JSON/placeholder bodies were denied).
+{ printf '%s' "$residue" | grep -Eq '[$`]' || printf '%s' "$bare" | grep -Eq '\{'; } &&
   deny "shell expansion (including brace expansion) in a push/PR command hides destinations from the gate — write the command literally (no variables, no command substitution, no braces; single-quoted TEXT arguments are fine — quotes suppress expansion)."
 
 # the scans below read PUSH grammar out of the payload TEXT — refspecs,
@@ -383,11 +394,19 @@ snapshot_tree() {
 require_receipt() {
   # receipts are content-addressed (H5): .claude/receipts/<tree>, one per
   # reviewed state — parallel branches don't clobber each other's stamps
-  local tree reviewer rest now
+  local tree reviewer rest now head_tree
   now="$(snapshot_tree)"
   [ -f ".claude/receipts/$now" ] || deny "no review receipt for this content — a reviewer subagent must PASS this exact state (it stamps .claude/receipts/<tree>); anything edited after its PASS needs a re-review."
   read -r tree reviewer rest < ".claude/receipts/$now"
   [ "$tree" = "$now" ] || deny "receipt .claude/receipts/$now is corrupt (names tree '$tree') — re-run the reviewer."
+  # the push sends HEAD while receipts bind the WORKTREE: with unreviewed
+  # commits under a worktree restored to stamped content, valid receipts
+  # escort unstamped commits out. R12 pinned this on FE pushes only; Codex
+  # #64 R22 executed the SAME repro on a plain task branch — the equality
+  # holds for EVERY receipted transfer, both lanes (gh pr create pushes
+  # HEAD too). Uncommitted side files at push time now deny: commit them.
+  head_tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null)"
+  [ "$now" = "$head_tree" ] || deny "the push sends HEAD, but the worktree (which the receipts bind) differs from it — commit exactly the reviewed content (re-stamp if it changed), then push."
   case "$lane:$reviewer" in
     task:code-reviewer | doc:doc-reviewer | doc:code-reviewer) : ;;
     *) deny "receipt from '$reviewer' does not satisfy the $lane lane (task lane needs code-reviewer)." ;;
@@ -404,14 +423,10 @@ require_browser_receipt_if_fe() {
   # FE destination too, e.g. `HEAD:task/FE1` from a docs/* branch (Codex #64
   # R5 — lane classification must not outrank the destination).
   if [[ "$current" == task/FE* ]] || printf '%s' "$payload" | grep -q 'task/FE'; then
-    local fe_tree bq_tree bq_kind bq_rest ev_path ev_count tok head_tree
-    # the push sends HEAD while receipts bind the WORKTREE: with untested
-    # commits under a worktree restored to stamped content, valid receipts
-    # would escort unstamped commits out (Codex #64 R12, executed repro) —
-    # the two trees must be IDENTICAL on an FE push.
-    head_tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null)"
-    [ "$(snapshot_tree)" = "$head_tree" ] || deny "FE push sends HEAD, but the worktree (which the receipts bind) differs from it — commit exactly the passed content (re-run the pass and re-stamp if it changed), then push."
-    # (the FE ref-token legality check runs earlier, BEFORE the no-op fast
+    local fe_tree bq_tree bq_kind bq_rest ev_path ev_count tok
+    # (the worktree==HEAD equality this block pinned since R12 now lives in
+    # require_receipt — Codex #64 R22 generalized it to every lane. The FE
+    # ref-token legality check runs earlier too, BEFORE the no-op fast
     # path — see validate_task_ref_tokens)
     # H10: the FE browser pass is tree-bound like the review — its own
     # namespace, so neither receipt kind can satisfy the other's gate

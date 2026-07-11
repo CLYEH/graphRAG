@@ -1015,6 +1015,71 @@ def test_r21_quoted_prose_never_engages_or_selects_a_head(toy_repo: Path) -> Non
     assert allowed.returncode == 0, f":main prose forced the doc lane: {allowed.stderr}"
 
 
+def test_r22_head_equality_engagement_and_quoted_braces(toy_repo: Path) -> None:
+    """Codex #64 R22: (a) quoted global-flag VALUES erased the token shape
+    in bare, so a real transfer escaped engagement and exited 0 BEFORE
+    receipts (both executed repros) — the flags regex now tolerates the
+    emptied attached value; (b) braces do not expand inside double quotes,
+    so a quoted JSON/placeholder body is text, not brace expansion; (c) the
+    worktree==HEAD equality R12 pinned on FE pushes holds on EVERY receipted
+    transfer — git sends HEAD, and a worktree restored to the stamped state
+    escorted an unreviewed commit out on a plain task branch."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B1")
+    (toy_repo / "a.md").write_text("b1 content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b1"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+
+    # (a) UNRECEIPTED content: both quoted-flag transfers exited 0 before
+    # (the engagement grep missed them); they must reach the receipt deny
+    quoted_git = (
+        '{"tool_input": {"command": "git --git-dir=\'.git\' PUSHTAIL -u origin task/B1"}}'
+    ).replace("PUSHTAIL", _PUSH.split(" ", 1)[1])
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=quoted_git, extra_env=env)
+    assert denied.returncode == 2, f"quoted --git-dir escaped engagement: {denied.stdout}"
+    assert "receipt" in denied.stderr
+    quoted_gh = (
+        '{"tool_input": {"command": "gh --repo=\'CLYEH/graphRAG\' PRTAIL --fill"}}'
+    ).replace("PRTAIL", _PR_CREATE.split(" ", 1)[1])
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=quoted_gh, extra_env=env)
+    assert denied.returncode == 2, f"quoted --repo escaped engagement: {denied.stdout}"
+    assert "receipt" in denied.stderr
+
+    # (b) a double-quoted body with braces is prose (denied "braces" before)
+    _stamp(toy_repo)
+    braced = (
+        '{"tool_input": {"command": "PRCREATE --fill --body \\"Use {x} in docs\\""}}'
+    ).replace("PRCREATE", _PR_CREATE)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=braced, extra_env=env)
+    assert allowed.returncode == 0, f"quoted braces denied as expansion: {allowed.stderr}"
+    # ...while an unquoted brace refspec still denies (guard not removed)
+    brace_ref = ('{"tool_input": {"command": "PUSHVERB origin HEAD:task/{FE1,B1}"}}').replace(
+        "PUSHVERB", _PUSH
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=brace_ref, extra_env=env)
+    assert denied.returncode == 2 and "brace" in denied.stderr
+
+    # (c) Codex's executed repro: unreviewed commit + worktree restored to
+    # the stamped state returned 0 on this non-FE branch — git sends HEAD
+    (toy_repo / "a.md").write_text("unreviewed commit\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-qam", "unreviewed"], cwd=toy_repo, check=True, capture_output=True
+    )
+    (toy_repo / "a.md").write_text("b1 content\n", encoding="utf-8")
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/B1", extra_env=env)
+    assert denied.returncode == 2, f"divergent HEAD escorted out on non-FE: {denied.stdout}"
+    assert "differs" in denied.stderr
+    # committing exactly the stamped content re-aligns the trees -> passes
+    subprocess.run(
+        ["git", "commit", "-qam", "restore stamped"], cwd=toy_repo, check=True, capture_output=True
+    )
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/B1", extra_env=env)
+    assert allowed.returncode == 0, f"aligned trees denied: {allowed.stderr}"
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING
