@@ -394,6 +394,33 @@ def test_non_head_src_and_all_branch_forms_are_rejected(toy_repo: Path) -> None:
         assert denied.returncode == 2, f"{flag} bypassed the gate: {denied.stdout}"
         assert "push the branch explicitly" in denied.stderr
 
+    # (c) the matching-refspec form fans out the same way (Codex #64 R8):
+    # `origin :` names no branch yet updates every matching one
+    for refspec in (":", "+:", '":"', "'+:'"):  # quoted forms evade a space-only anchor
+        denied = _run(
+            [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin {refspec}", extra_env=env
+        )
+        assert denied.returncode == 2, f"matching refspec '{refspec}' bypassed: {denied.stdout}"
+        assert "matching" in denied.stderr
+
+    # (d) the config sibling: push.default=matching makes even a bare push
+    # fan out — the gate denies until the config is safe again
+    subprocess.run(
+        ["git", "config", "push.default", "matching"],
+        cwd=toy_repo,
+        check=True,
+        capture_output=True,
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/FE1", extra_env=env)
+    assert denied.returncode == 2 and "push.default" in denied.stderr
+    subprocess.run(
+        ["git", "config", "push.default", "simple"], cwd=toy_repo, check=True, capture_output=True
+    )
+    allowed = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/FE1", extra_env=env
+    )
+    assert allowed.returncode == 0, f"safe config still denied: {allowed.stderr}"
+
 
 def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:
     """Codex #64 (class 9 — every constructor of the effect): `gh pr create`

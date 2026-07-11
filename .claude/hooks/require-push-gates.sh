@@ -45,6 +45,14 @@ cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."
 # executed repro) — reject the forms outright; push refs explicitly
 printf '%s' "$payload" | grep -Eq -- '--(all|branches|mirror)\b' &&
   deny "all-branch push forms (--all/--branches/--mirror) bypass the content-bound receipts — push the branch explicitly."
+# the matching-refspec form (`:` / `+:`) and a `matching` push.default fan out
+# to every branch existing on both ends — the same invisible ride for an
+# unreceipted local task/FE* (Codex #64 R8): deny the refspec form, and deny
+# pushing at all under a matching default (a bare push would fan out too).
+printf '%s' "$payload" | grep -Eq "[[:space:]\"']\+?:([[:space:]\"']|\$)" &&
+  deny "the matching-refspec push form (: / +:) updates every matching branch — push the branch explicitly."
+[ "$(git config --get push.default 2>/dev/null)" = "matching" ] &&
+  deny "push.default=matching makes pushes fan out to every matching branch — set push.default to simple, then push explicitly."
 
 git fetch -q origin main 2>/dev/null
 current="$(git branch --show-current)"
