@@ -26,7 +26,7 @@ loop back to step 3.
    GIF evidence that goes into the PR body. Findings → back to step 3. This is a
    supplementary verification step (agent-session only, not CI-runnable), so it
    does not replace the Playwright gate; it is mechanically enforced by the
-   browser-QA receipt hook (H6) — no receipt for the current tree on a `task/FE*`
+   browser-QA receipt hook (H10) — no receipt for the current tree on a `task/FE*`
    branch ⇒ push/PR blocked.
 5. **Agent review (local gate)** — run the `code-reviewer` subagent on the diff
    (`doc-reviewer` for doc-only changes taking the fast lane).
