@@ -33,12 +33,22 @@ deny() { printf 'push-gate: %s\n' "$1" >&2; exit 2; }
 # hook (the poe re-run), so this adds none; a parse failure falls back to
 # the raw payload — over-matching, never under (fail-closed).
 raw_payload="$(cat)"
+# ... and NORMALIZE it with shell tokenization (shlex): quoted fragments
+# concatenate before git ever sees them — `other:task/"FE1"` reads as
+# task/FE1 to git but defeats a literal grep, and the same evasion works on
+# the engagement verb and every flag pattern (Codex #64 R9, executed repro).
+# Unbalanced quoting keeps the un-normalized command (the over-match side).
 payload="$(printf '%s' "$raw_payload" | python -c '
-import json, sys
+import json, shlex, sys
 try:
-    print(json.load(sys.stdin).get("tool_input", {}).get("command", ""))
+    cmd = json.load(sys.stdin).get("tool_input", {}).get("command", "")
 except Exception:
     sys.exit(1)
+try:
+    cmd = " ".join(shlex.split(cmd, posix=True))
+except ValueError:
+    pass
+print(cmd)
 ' 2>/dev/null)" || payload="$raw_payload"
 [ -n "$payload" ] || payload="$raw_payload"
 # engage on `git [flags] push` incl. `git -C <path> push` and `git --git-dir=<p> push`

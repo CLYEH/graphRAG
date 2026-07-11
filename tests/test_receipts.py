@@ -447,6 +447,50 @@ def test_json_envelope_is_parsed_to_the_command(toy_repo: Path) -> None:
     assert denied.returncode == 2 and "matching" in denied.stderr
 
 
+def test_shell_quoting_cannot_evade_the_patterns(toy_repo: Path) -> None:
+    """Codex #64 R9 (executed repro): bash concatenates quoted fragments
+    before git sees them, so `other:task/'FE1'` updates task/FE1 while a
+    literal grep sees no FE token — and the same evasion works on the
+    engagement verb and flags. The envelope command is now shlex-normalized
+    before any grep. Discriminating: the un-normalized scan returned 0 on
+    both cases below."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/FE1")
+    (toy_repo / "a.md").write_text("fe content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "fe"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    shot = toy_repo / "shot.png"
+    shot.write_bytes(b"\x89PNG fake-but-non-empty")
+    _stamp(toy_repo)
+    _browser_stamp(toy_repo, shot)
+
+    # quoted FE refspec: git sees other:task/FE1; the literal grep saw nothing
+    quoted_fe = ('{"tool_input": {"command": "PUSHVERB origin other:task/\'FE1\'"}}').replace(
+        "PUSHVERB", _PUSH
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=quoted_fe, extra_env=env)
+    assert denied.returncode == 2, f"quoted FE refspec evaded the scan: {denied.stdout}"
+    assert "never the local ref" in denied.stderr
+
+    # quoted flag: --a"ll" is --all to the shell; the flag grep saw nothing
+    quoted_flag = ('{"tool_input": {"command": "PUSHVERB origin --a\\"ll\\""}}').replace(
+        "PUSHVERB", _PUSH
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=quoted_flag, extra_env=env)
+    assert denied.returncode == 2, f"quoted flag evaded the scan: {denied.stdout}"
+    assert "push the branch explicitly" in denied.stderr
+
+    # normalization must not break the legitimate quoted push
+    ok = ('{"tool_input": {"command": "PUSHVERB -u origin \\"task/FE1\\""}}').replace(
+        "PUSHVERB", _PUSH
+    )
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=ok, extra_env=env)
+    assert allowed.returncode == 0, f"legit quoted own-branch push blocked: {allowed.stderr}"
+
+
 def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:
     """Codex #64 (class 9 — every constructor of the effect): `gh pr create`
     can push an unpushed branch itself, so a payload creating a PR must run
