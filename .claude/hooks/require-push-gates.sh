@@ -58,24 +58,61 @@ py_bin="$(command -v python3 || command -v python)" ||
 # substitution, while $ inside double quotes IS. The substitution and
 # wildcard checks run on the residue, everything else on the normalized.
 extracted="$(printf '%s' "$raw_payload" | "$py_bin" -c '
-import json, re, shlex, sys
+import json, shlex, sys
 try:
     cmd = json.load(sys.stdin).get("tool_input", {}).get("command", "")
 except Exception:
     sys.exit(1)
-residue = re.sub(r"\x27[^\x27]*\x27", " ", cmd)
+# SHELL-AWARE residue (Codex #64 R17): drop characters only inside REAL
+# single-quoted spans — a quote opened OUTSIDE double quotes. An apostrophe
+# inside double quotes is text; the old regex treated it as a delimiter and
+# swallowed live code (including expansions) between two contractions.
+out = []
+in_s = in_d = False
+for ch in cmd:
+    if in_s:
+        if ch == chr(39):
+            in_s = False
+        continue
+    if ch == chr(39) and not in_d:
+        in_s = True
+        out.append(" ")
+        continue
+    if ch == chr(34):
+        in_d = not in_d
+    out.append(ch)
+residue = "".join(out)
 try:
-    norm = " ".join(shlex.split(cmd, posix=True))
+    toks = shlex.split(cmd, posix=True)
 except ValueError:
-    norm = cmd
-sys.stdout.write(norm.replace("\n", " ") + "\n" + residue.replace("\n", " ") + "\n")
+    toks = []
+norm = " ".join(toks) if toks else cmd
+# the gh head value by TOKEN WALK, never by text grep (Codex #64 R17: the
+# words "--head x" inside a --body STRING are one token here, so prose can
+# never masquerade as the option)
+head = ""
+i = 0
+while i < len(toks):
+    t = toks[i]
+    if t in ("--head", "-H") and i + 1 < len(toks):
+        head = toks[i + 1]
+        i += 2
+        continue
+    if t.startswith("--head="):
+        head = t[7:]
+    i += 1
+sys.stdout.write(
+    norm.replace("\n", " ") + "\n" + residue.replace("\n", " ") + "\n" + head.replace("\n", " ") + "\n"
+)
 ' 2>/dev/null)" || extracted=""
 if [ -n "$extracted" ]; then
   payload="$(printf '%s\n' "$extracted" | sed -n 1p)"
   residue="$(printf '%s\n' "$extracted" | sed -n 2p)"
+  gh_head="$(printf '%s\n' "$extracted" | sed -n 3p)"
 else
   payload="$raw_payload"
   residue="$raw_payload"
+  gh_head=""
 fi
 [ -n "$payload" ] || payload="$raw_payload"
 [ -n "$residue" ] || residue="$payload"
@@ -119,20 +156,19 @@ printf '%s' "$residue" | grep -Eq '[$`{]' &&
 # a branch switch chained before the push changes the checkout this gate
 # evaluated (switch dash then push — Codex #64 R16, executed repro): engaged
 # commands must not change branches — switch and push separately.
-printf '%s' "$payload" | grep -Eq 'git[[:space:]]+(switch|checkout)\b' &&
+printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+(switch|checkout)\b" &&
   deny "branch switches chained with a push/PR command change the checkout the gate evaluated — switch and push in separate commands."
 
 # gh --head names the PR's source branch; the receipts only vouch for the
 # CURRENT checkout (Codex #64 R16, P1: a --head naming another branch from a
 # clean checkout exited through the no-op shortcut with no receipt checks).
-if [ "$gh_engaged" = 1 ]; then
-  head_arg="$(printf '%s' "$payload" | grep -Eo '(--head|-H)[= ][^[:space:]]+' | head -1 | sed -E 's/^(--head|-H)[= ]//')"
-  if [ -n "$head_arg" ]; then
-    case "$head_arg" in
-      "$current" | *:"$current" | refs/heads/"$current" | *:refs/heads/"$current") : ;;
-      *) deny "gh --head names '$head_arg' but the gate can only vouch for the current checkout '$current' — create the PR from that branch's own checkout." ;;
-    esac
-  fi
+# The value comes from the extraction's TOKEN WALK (R17: prose inside a
+# --body string can never masquerade as the option).
+if [ "$gh_engaged" = 1 ] && [ -n "$gh_head" ]; then
+  case "$gh_head" in
+    "$current" | *:"$current" | refs/heads/"$current" | *:refs/heads/"$current") : ;;
+    *) deny "gh --head names '$gh_head' but the gate can only vouch for the current checkout '$current' — create the PR from that branch's own checkout." ;;
+  esac
 fi
 # wildcard REFSPECS fan out (quoted or not — git receives them either way,
 # Codex #64 R15): a token combining a glob star with a ref separator (/ or

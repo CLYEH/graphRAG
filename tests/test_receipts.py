@@ -727,6 +727,56 @@ def test_r16_chain_brace_and_head_binding(toy_repo: Path) -> None:
     assert denied.returncode == 2 and "current checkout" in denied.stderr
 
 
+def test_r17_parsing_precision(toy_repo: Path) -> None:
+    """Codex #64 R17 (three roots, all executed repros): (a) '--head x' as
+    PROSE inside a --body string must not read as the option — the head
+    value comes from a token walk now; (b) the switch deny gains git's
+    global-flag grammar; (c) the residue quote-stripping is shell-aware —
+    an apostrophe INSIDE double quotes is text, not a delimiter, so real
+    code between two contractions keeps its expansions visible."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B7")
+    (toy_repo / "a.md").write_text("edit\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b7"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    # (a) prose --head in the body + REAL --head naming another branch:
+    # denied on the real option (old: the prose token matched first → 0)
+    smuggle = (
+        '{"tool_input": {"command": '
+        "\"PRCREATE --body 'document --head task/B7 usage' --head task/B2\"}}"
+    ).replace("PRCREATE", _PR_CREATE)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=smuggle, extra_env=env)
+    assert denied.returncode == 2 and "current checkout" in denied.stderr
+    # ... while prose --head with the REAL option naming the current branch passes
+    ok = (
+        '{"tool_input": {"command": '
+        "\"PRCREATE --body 'document --head task/B2 usage' --head task/B7\"}}"
+    ).replace("PRCREATE", _PR_CREATE)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=ok, extra_env=env)
+    assert allowed.returncode == 0, f"prose --head over-blocked: {allowed.stderr}"
+
+    # (b) global flags before the switch subcommand still deny the chain
+    flagged = '{"tool_input": {"command": "git -C . switch - && PUSHVERB origin"}}'.replace(
+        "PUSHVERB", _PUSH
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=flagged, extra_env=env)
+    assert denied.returncode == 2 and "separate commands" in denied.stderr
+
+    # (c) apostrophes inside double quotes are TEXT: the expansion between
+    # two contractions stays visible and denies (old: swallowed → 0)
+    contraction = (
+        '{"tool_input": {"command": '
+        '"suffix=FE1; echo \\"don\'t\\"; PUSHVERB origin HEAD:task/$suffix; echo \\"don\'t\\""}}'
+    ).replace("PUSHVERB", _PUSH)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=contraction, extra_env=env)
+    assert denied.returncode == 2 and "literally" in denied.stderr
+
+
 def test_gh_owner_qualified_head_is_not_a_refspec(toy_repo: Path) -> None:
     """Codex #64 R15 (over-block): gh's documented `--head owner:branch` form
     is not a git refspec — on the fully-receipted FE checkout it must pass
