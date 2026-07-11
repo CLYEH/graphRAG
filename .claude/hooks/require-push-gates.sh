@@ -82,7 +82,7 @@ out = []
 bare = []
 sep = False
 in_s = in_d = False
-for ch in cmd:
+for idx, ch in enumerate(cmd):
     if in_s:
         if ch == chr(39):
             in_s = False
@@ -95,8 +95,18 @@ for ch in cmd:
     if ch == chr(34):
         in_d = not in_d
         continue
-    if not in_d and ch in ";&|\n":
-        sep = True
+    if not in_d:
+        if ch in ";|\n":
+            sep = True
+        elif ch == "&" and not (
+            (idx > 0 and cmd[idx - 1] == ">")
+            or (idx + 1 < len(cmd) and cmd[idx + 1] == ">")
+        ):
+            # >& and &> are REDIRECTIONS (2>&1, &>log): no second command
+            # starts there, and denying them blocked ordinary receipted
+            # transfers (Codex #64 R23, P2). && and a background & remain
+            # control operators and stay flagged; |& is caught by its |.
+            sep = True
     out.append(ch)
     if not in_d:
         bare.append(ch)
@@ -285,9 +295,13 @@ if [ "$git_engaged" = 1 ]; then
 
   # all-branch/mirror forms push refs the worktree-bound receipts never spoke
   # for (an unreceipted local task/FE* rides along invisibly — Codex #64 R7,
-  # executed repro) — reject the forms outright; push refs explicitly
-  printf '%s' "$payload" | grep -Eq -- '--(all|branches|mirror)\b' &&
-    deny "all-branch push forms (--all/--branches/--mirror) bypass the content-bound receipts — push the branch explicitly."
+  # executed repro) — reject the forms outright; push refs explicitly.
+  # --tags/--follow-tags are the same ride through the TAG namespace: a tag
+  # can point at an unreviewed commit the branch checks never see (Codex
+  # #64 R23, executed repro on a receipted doc push). --no-tags stays legal
+  # (the leading no- fails the alternation).
+  printf '%s' "$payload" | grep -Eq -- '--(all|branches|mirror|tags|follow-tags)\b' &&
+    deny "all-branch/tag push forms (--all/--branches/--mirror/--tags/--follow-tags) bypass the content-bound receipts — push the branch explicitly."
   # the matching-refspec form (`:` / `+:`) and a `matching` push.default fan out
   # to every branch existing on both ends — the same invisible ride for an
   # unreceipted local task/FE* (Codex #64 R8): deny the refspec form, and deny
@@ -297,6 +311,12 @@ if [ "$git_engaged" = 1 ]; then
 fi
 [ "$(git config --get push.default 2>/dev/null)" = "matching" ] &&
   deny "push.default=matching makes pushes fan out to every matching branch — set push.default to simple, then push explicitly."
+# the config sibling of --follow-tags (Codex #64 R23 flag deny; the same
+# invisible ride as push.default/remote.*.push/remote.*.mirror): with
+# push.followTags set, a bare push carries tag refs with nothing in the
+# payload. --type=bool canonicalizes yes/on/1 (the mirror lesson).
+[ "$(git config --type=bool --get push.followTags 2>/dev/null)" = "true" ] &&
+  deny "push.followTags makes every push carry tag refs the receipts never spoke for — unset it (git config --unset push.followTags), then push."
 # configured push refspecs are the same invisibility one level deeper: with
 # remote.<name>.push set, a bare `git push origin` lands wherever the CONFIG
 # says (e.g. HEAD:refs/heads/task/FE1) with nothing in the payload at all

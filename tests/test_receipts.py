@@ -1080,6 +1080,71 @@ def test_r22_head_equality_engagement_and_quoted_braces(toy_repo: Path) -> None:
     assert allowed.returncode == 0, f"aligned trees denied: {allowed.stderr}"
 
 
+def test_r23_tag_forms_and_redirection_ampersands(toy_repo: Path) -> None:
+    """Codex #64 R23: (a) --tags/--follow-tags transfer TAG refs the
+    worktree-bound receipts never spoke for — a tag can point at an
+    unreviewed commit that every branch check misses (executed repro on a
+    receipted doc push); (b) >& and &> are redirections, not control
+    operators — flagging their ampersand as a separator denied ordinary
+    receipted transfers, while && and a background & must stay denied."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B1")
+    (toy_repo / "a.md").write_text("b1 content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b1"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    # (a) tag-pushing forms deny even fully receipted (returned 0 before);
+    # --no-tags pushes nothing extra and stays legal
+    for flag in ("--tags", "--follow-tags"):
+        cmd = f"{_PUSH} origin task/B1 {flag}"
+        denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=cmd, extra_env=env)
+        assert denied.returncode == 2, f"{flag} rode past the receipts: {denied.stdout}"
+        assert "push the branch explicitly" in denied.stderr
+    allowed = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/B1 --no-tags", extra_env=env
+    )
+    assert allowed.returncode == 0, f"--no-tags over-blocked: {allowed.stderr}"
+    # ...and the CONFIG sibling rides the same way with nothing in the
+    # payload (the push.default/remote.*.push/remote.*.mirror family)
+    for value in ("true", "1"):
+        subprocess.run(
+            ["git", "config", "push.followTags", value],
+            cwd=toy_repo,
+            check=True,
+            capture_output=True,
+        )
+        denied = _run(
+            [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/B1", extra_env=env
+        )
+        assert denied.returncode == 2, f"push.followTags={value} rode past: {denied.stdout}"
+        assert "followTags" in denied.stderr
+    subprocess.run(
+        ["git", "config", "--unset", "push.followTags"],
+        cwd=toy_repo,
+        check=True,
+        capture_output=True,
+    )
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/B1", extra_env=env)
+    assert allowed.returncode == 0, f"unset followTags still denied: {allowed.stderr}"
+
+    # (b) redirection ampersands are not separators (denied before)...
+    redirected = ('{"tool_input": {"command": "PUSHVERB -u origin task/B1 2>&1"}}').replace(
+        "PUSHVERB", _PUSH
+    )
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=redirected, extra_env=env)
+    assert allowed.returncode == 0, f"2>&1 denied as a separator: {allowed.stderr}"
+    # ...while a background & (a real control operator) still denies
+    background = ('{"tool_input": {"command": "PUSHVERB -u origin task/B1 &"}}').replace(
+        "PUSHVERB", _PUSH
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=background, extra_env=env)
+    assert denied.returncode == 2 and "ENTIRE payload" in denied.stderr
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING
