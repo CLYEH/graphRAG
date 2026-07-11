@@ -422,6 +422,31 @@ def test_non_head_src_and_all_branch_forms_are_rejected(toy_repo: Path) -> None:
     assert allowed.returncode == 0, f"safe config still denied: {allowed.stderr}"
 
 
+def test_json_envelope_is_parsed_to_the_command(toy_repo: Path) -> None:
+    """The hook receives a JSON envelope whose own `":"` key separators
+    false-positived the quote-anchored matching-refspec deny (executed: it
+    blocked this PR's own push). The command field is now extracted first —
+    a harmless envelope passes, one whose COMMAND carries the matching
+    refspec still denies, and a raw non-JSON payload keeps working."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(".claude/receipts/\norigin.git/\n", encoding="utf-8")
+    _origin_and_branch(toy_repo, "docs/x")
+    (toy_repo / "a.md").write_text("doc edit\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "docs"], cwd=toy_repo, check=True, capture_output=True)
+    _stamp(toy_repo)
+
+    envelope = (
+        '{"tool_input": {"command": "PUSHVERB -u origin docs/x"}, '
+        '"description": "Push: the branch"}'
+    ).replace("PUSHVERB", _PUSH)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=envelope)
+    assert allowed.returncode == 0, f"JSON separators still false-positive: {allowed.stderr}"
+
+    bad = '{"tool_input": {"command": "PUSHVERB origin :"}}'.replace("PUSHVERB", _PUSH)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=bad)
+    assert denied.returncode == 2 and "matching" in denied.stderr
+
+
 def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:
     """Codex #64 (class 9 — every constructor of the effect): `gh pr create`
     can push an unpushed branch itself, so a payload creating a PR must run

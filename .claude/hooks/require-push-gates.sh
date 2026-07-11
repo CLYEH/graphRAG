@@ -26,7 +26,21 @@
 set -o pipefail
 deny() { printf 'push-gate: %s\n' "$1" >&2; exit 2; }
 
-payload="$(cat)"
+# parse the COMMAND out of the PreToolUse JSON envelope: the raw envelope's
+# own `":"` key separators false-positive quote-anchored patterns (the
+# matching-refspec deny blocked this very PR's push), and descriptions
+# should never engage gates. Python is already a hard dependency of this
+# hook (the poe re-run), so this adds none; a parse failure falls back to
+# the raw payload — over-matching, never under (fail-closed).
+raw_payload="$(cat)"
+payload="$(printf '%s' "$raw_payload" | python -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("tool_input", {}).get("command", ""))
+except Exception:
+    sys.exit(1)
+' 2>/dev/null)" || payload="$raw_payload"
+[ -n "$payload" ] || payload="$raw_payload"
 # engage on `git [flags] push` incl. `git -C <path> push` and `git --git-dir=<p> push`
 # (must not engage on e.g. `git log push-fix`) — AND on gh PR creation, which
 # can push the branch itself (the same effect through a sibling command).
