@@ -462,6 +462,13 @@ def test_non_head_src_and_all_branch_forms_are_rejected(toy_repo: Path) -> None:
     )
     assert allowed.returncode == 0, f"aligned upstream denied: {allowed.stderr}"
 
+    # `tracking` is the documented deprecated synonym of upstream (Codex #64
+    # R11) — the cross-named deny must treat both identically
+    for cfg in (["push.default", "tracking"], ["branch.task/FE1.merge", "refs/heads/other"]):
+        subprocess.run(["git", "config", *cfg], cwd=toy_repo, check=True, capture_output=True)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin", extra_env=env)
+    assert denied.returncode == 2 and "cross-named upstream" in denied.stderr
+
 
 def test_json_envelope_is_parsed_to_the_command(toy_repo: Path) -> None:
     """The hook receives a JSON envelope whose own `":"` key separators
@@ -530,6 +537,16 @@ def test_shell_quoting_cannot_evade_the_patterns(toy_repo: Path) -> None:
     )
     allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=ok, extra_env=env)
     assert allowed.returncode == 0, f"legit quoted own-branch push blocked: {allowed.stderr}"
+
+    # Codex #64 R11 (P1): runtime-assembled destinations (HEAD:task/$suffix)
+    # are invisible to EVERY static pattern — engaged commands must be
+    # literal, so substitution syntax denies outright. Discriminating: the
+    # old gate returned 0 (receipts valid, no literal FE token needed here).
+    expanded = (
+        '{"tool_input": {"command": "suffix=FE1; PUSHVERB origin HEAD:task/$suffix"}}'
+    ).replace("PUSHVERB", _PUSH)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=expanded, extra_env=env)
+    assert denied.returncode == 2 and "literally" in denied.stderr
 
 
 def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:

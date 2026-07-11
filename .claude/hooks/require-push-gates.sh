@@ -38,7 +38,9 @@ raw_payload="$(cat)"
 # task/FE1 to git but defeats a literal grep, and the same evasion works on
 # the engagement verb and every flag pattern (Codex #64 R9, executed repro).
 # Unbalanced quoting keeps the un-normalized command (the over-match side).
-payload="$(printf '%s' "$raw_payload" | python -c '
+py_bin="$(command -v python3 || command -v python)" ||
+  deny "the push gate needs python3 (or python) on PATH to parse the tool payload — fail-closed (Codex #64 R11: the raw-JSON fallback would false-positive on every envelope)."
+payload="$(printf '%s' "$raw_payload" | "$py_bin" -c '
 import json, shlex, sys
 try:
     cmd = json.load(sys.stdin).get("tool_input", {}).get("command", "")
@@ -66,6 +68,13 @@ cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."
 current="$(git branch --show-current)"
 [ -z "$current" ] && deny "detached HEAD — push from a branch."
 
+# shell expansion assembles destinations at runtime (HEAD:task/$suffix reads
+# as an FE refspec to git but is invisible to every static pattern — Codex
+# #64 R11, P1): an engaged command must be LITERAL. Deny substitution syntax
+# outright; shlex keeps it un-expanded, so the pattern sees it.
+printf '%s' "$payload" | grep -Eq '[$`]' &&
+  deny "shell expansion in a push/PR command hides destinations from the gate — write the command literally (no variables, no command substitution)."
+
 # all-branch/mirror forms push refs the worktree-bound receipts never spoke
 # for (an unreceipted local task/FE* rides along invisibly — Codex #64 R7,
 # executed repro) — reject the forms outright; push refs explicitly
@@ -88,12 +97,15 @@ printf '%s' "$payload" | grep -Eq "[[:space:]\"']\+?:([[:space:]\"']|\$)" &&
 # push.default=upstream sends HEAD to branch.<name>.merge — a CROSS-NAMED
 # upstream routes a bare push onto a branch the payload never names (the
 # local reviewer executed the work -> FE case; same config family)
-if [ "$(git config --get push.default 2>/dev/null)" = "upstream" ]; then
+case "$(git config --get push.default 2>/dev/null)" in
+upstream | tracking) # tracking = documented deprecated synonym (Codex #64 R11)
   upstream_ref="$(git config --get "branch.${current}.merge" 2>/dev/null)"
   if [ -n "$upstream_ref" ] && [ "$upstream_ref" != "refs/heads/$current" ]; then
-    deny "push.default=upstream with a cross-named upstream ($upstream_ref) routes bare pushes onto an unstated branch — push explicitly or align the upstream."
+    deny "an upstream/tracking push.default with a cross-named upstream ($upstream_ref) routes bare pushes onto an unstated branch — push explicitly or align the upstream."
   fi
-fi
+  ;;
+*) : ;;
+esac
 
 git fetch -q origin main 2>/dev/null
 
