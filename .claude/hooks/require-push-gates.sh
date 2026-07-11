@@ -146,6 +146,21 @@ cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."
 current="$(git branch --show-current)"
 [ -z "$current" ] && deny "detached HEAD — push from a branch."
 
+# an engaged command must STAND ALONE (Codex #64 R18, P1): any preceding
+# command in the same payload can mutate the tree AFTER the receipts were
+# validated (write file && add && commit && push slipped an unreviewed
+# commit out) — the transfer verb must OPEN the command. Trailing pipes and
+# suffix commands are harmless: post-transfer mutations cannot alter what
+# was already sent.
+printf '%s' "$payload" | grep -Eq "^(git${flags}[[:space:]]+push|gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new))\b" ||
+  deny "the push/PR command must stand alone — earlier commands in the same payload can mutate state after the receipts were checked; run them separately, then push."
+
+# gh --head selects an ALREADY-REMOTE ref (the gh manual: --head skips
+# pushing) — no local receipt can vouch for a remote SHA, and gh defaults
+# to the current branch anyway (Codex #64 R18): the flag is banned outright.
+[ "$gh_engaged" = 1 ] && [ -n "$gh_head" ] &&
+  deny "gh --head selects an already-remote ref the local receipts cannot vouch for — drop the flag; gh defaults to the current branch."
+
 # shell expansion assembles destinations at runtime (HEAD:task/$suffix reads
 # as an FE refspec to git but is invisible to every static pattern — Codex
 # #64 R11, P1): an engaged command must be LITERAL. Deny substitution syntax
@@ -159,17 +174,8 @@ printf '%s' "$residue" | grep -Eq '[$`{]' &&
 printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+(switch|checkout)\b" &&
   deny "branch switches chained with a push/PR command change the checkout the gate evaluated — switch and push in separate commands."
 
-# gh --head names the PR's source branch; the receipts only vouch for the
-# CURRENT checkout (Codex #64 R16, P1: a --head naming another branch from a
-# clean checkout exited through the no-op shortcut with no receipt checks).
-# The value comes from the extraction's TOKEN WALK (R17: prose inside a
-# --body string can never masquerade as the option).
-if [ "$gh_engaged" = 1 ] && [ -n "$gh_head" ]; then
-  case "$gh_head" in
-    "$current" | *:"$current" | refs/heads/"$current" | *:refs/heads/"$current") : ;;
-    *) deny "gh --head names '$gh_head' but the gate can only vouch for the current checkout '$current' — create the PR from that branch's own checkout." ;;
-  esac
-fi
+# (the earlier R16/R17 --head binding logic is superseded by the R18
+# outright ban above — the flag selects a remote ref, full stop)
 # wildcard REFSPECS fan out (quoted or not — git receives them either way,
 # Codex #64 R15): a token combining a glob star with a ref separator (/ or
 # :) denies on the NORMALIZED command, so quoting cannot hide it while
@@ -229,41 +235,31 @@ esac
 
 git fetch -q origin main 2>/dev/null
 
-validate_fe_ref_tokens() {
-  # every explicit token naming an FE branch must carry content the
-  # receipts bind: HEAD:<dst>, or the CURRENT FE branch itself (bare or as
-  # the refspec src). Any other src pushes a ref the worktree receipts
-  # never spoke for — `origin task/FE1` from another checkout (Codex #64
-  # R6) and `origin other:task/FE1` even ON the FE checkout (R7, both
-  # executed repros). Runs BEFORE the no-op fast path: a clean checkout can
-  # still push a divergent local FE ref by naming it (R13, executed repro).
+validate_task_ref_tokens() {
+  # every explicit token naming ANY task branch must carry content the
+  # receipts bind: HEAD:<dst>, or the CURRENT branch itself (bare or as the
+  # refspec src). Any other src pushes a ref the worktree receipts never
+  # spoke for — this held only for task/FE until Codex #64 R18 showed the
+  # REVIEW receipt has the identical binding (a clean main checkout pushed
+  # an unreviewed local task/B2 through the no-op shortcut). Runs BEFORE
+  # the no-op fast path (R13). The R15 owner-qualified gh allowance is gone
+  # with the R18 --head ban — such tokens simply deny.
   local tok
   while IFS= read -r tok; do
     [ -n "$tok" ] || continue
     case "$tok" in
       HEAD:* | +HEAD:*) : ;; # the worktree's own commit
       "$current" | "$current":* | +"$current":* | refs/heads/"$current" | refs/heads/"$current":*)
-        # the checked-out FE branch itself — only valid when we ARE on it
-        [[ "$current" == task/FE* ]] || deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok'."
+        # the checked-out branch itself — valid on its own checkout
+        [[ "$current" == task/* ]] || deny "push task content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok'."
         ;;
       *)
-        # gh's documented head form `--head owner:branch` is NOT a git
-        # refspec (Codex #64 R15, over-block): on a gh-only engagement,
-        # an owner-qualified token naming the CURRENT FE checkout is the
-        # legitimate fully-receipted flow — any other branch still denies
-        # (the receipts cannot speak for a branch we are not on).
-        if [ "$gh_engaged" = 1 ] && [ "$git_engaged" != 1 ] &&
-          [[ "$current" == task/FE* ]] &&
-          printf '%s' "$tok" | grep -Eq "^[A-Za-z0-9][A-Za-z0-9-]*:(refs/heads/)?${current}\$"; then
-          :
-        else
-          deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok' (re-run the pass on that content and push from there)."
-        fi
+        deny "push task content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok' (review it on that checkout and push from there)."
         ;;
     esac
-  done < <(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']*task/FE[^[:space:]\"']*" || true)
+  done < <(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']*task/[^[:space:]\"']*" || true)
 }
-validate_fe_ref_tokens
+validate_task_ref_tokens
 
 # lane: a ':main' / ':refs/heads/main' refspec, pushing while on main, or a docs/* branch
 # (whose whole purpose is the fast lane, incl. its own branch push) = doc-only lane
@@ -324,7 +320,7 @@ require_browser_receipt_if_fe() {
     head_tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null)"
     [ "$(snapshot_tree)" = "$head_tree" ] || deny "FE push sends HEAD, but the worktree (which the receipts bind) differs from it — commit exactly the passed content (re-run the pass and re-stamp if it changed), then push."
     # (the FE ref-token legality check runs earlier, BEFORE the no-op fast
-    # path — see validate_fe_ref_tokens)
+    # path — see validate_task_ref_tokens)
     # H10: the FE browser pass is tree-bound like the review — its own
     # namespace, so neither receipt kind can satisfy the other's gate
     fe_tree="$(snapshot_tree)"

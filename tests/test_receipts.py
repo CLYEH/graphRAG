@@ -551,7 +551,7 @@ def test_shell_quoting_cannot_evade_the_patterns(toy_repo: Path) -> None:
         '{"tool_input": {"command": "suffix=FE1; PUSHVERB origin HEAD:task/$suffix"}}'
     ).replace("PUSHVERB", _PUSH)
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=expanded, extra_env=env)
-    assert denied.returncode == 2 and "literally" in denied.stderr
+    assert denied.returncode == 2 and "stand alone" in denied.stderr
 
     # Codex #64 R12 (P1): substitution can hide the VERB itself — a command
     # the engagement regex cannot clear must engage fail-closed and hit the
@@ -560,7 +560,7 @@ def test_shell_quoting_cannot_evade_the_patterns(toy_repo: Path) -> None:
         "PUSHWORD", _PUSH.split()[1]
     )
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=hidden_verb, extra_env=env)
-    assert denied.returncode == 2 and "literally" in denied.stderr
+    assert denied.returncode == 2 and "stand alone" in denied.stderr
     # a plain non-push command with substitution still exits clean (scoped)
     harmless = '{"tool_input": {"command": "echo $HOME && ls -la"}}'
     clean = _run([BASH, GATE_SCRIPT], toy_repo, stdin=harmless, extra_env=env)
@@ -597,7 +597,7 @@ def test_r13_hardening_quartet(toy_repo: Path) -> None:
         "PUSHWORD", _PUSH.split()[1]
     )
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=hidden, extra_env=env)
-    assert denied.returncode == 2 and "literally" in denied.stderr
+    assert denied.returncode == 2 and "stand alone" in denied.stderr
 
     # (c) inline config on an engaged command denies outright
     inline = (
@@ -709,7 +709,7 @@ def test_r16_chain_brace_and_head_binding(toy_repo: Path) -> None:
         "PUSHVERB", _PUSH
     )
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=chain, extra_env=env)
-    assert denied.returncode == 2 and "separate commands" in denied.stderr
+    assert denied.returncode == 2 and "stand alone" in denied.stderr
 
     brace = '{"tool_input": {"command": "PUSHVERB origin HEAD:task/{FE1,B1}"}}'.replace(
         "PUSHVERB", _PUSH
@@ -724,7 +724,7 @@ def test_r16_chain_brace_and_head_binding(toy_repo: Path) -> None:
         "PRCREATE", _PR_CREATE
     )
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=head_other, extra_env=env)
-    assert denied.returncode == 2 and "current checkout" in denied.stderr
+    assert denied.returncode == 2 and "already-remote" in denied.stderr
 
 
 def test_r17_parsing_precision(toy_repo: Path) -> None:
@@ -751,21 +751,28 @@ def test_r17_parsing_precision(toy_repo: Path) -> None:
         "\"PRCREATE --body 'document --head task/B7 usage' --head task/B2\"}}"
     ).replace("PRCREATE", _PR_CREATE)
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=smuggle, extra_env=env)
-    assert denied.returncode == 2 and "current checkout" in denied.stderr
+    assert denied.returncode == 2 and "already-remote" in denied.stderr
     # ... while prose --head with the REAL option naming the current branch passes
     ok = (
         '{"tool_input": {"command": '
         "\"PRCREATE --body 'document --head task/B2 usage' --head task/B7\"}}"
     ).replace("PRCREATE", _PR_CREATE)
-    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=ok, extra_env=env)
-    assert allowed.returncode == 0, f"prose --head over-blocked: {allowed.stderr}"
+    # R18: ANY real --head is banned (already-remote ref) — prose-only stays
+    # legal because the token walk emits no value for it
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=ok, extra_env=env)
+    assert denied.returncode == 2 and "already-remote" in denied.stderr
+    prose_only = (
+        '{"tool_input": {"command": "PRCREATE --fill --body \'document --head usage in prose\'"}}'
+    ).replace("PRCREATE", _PR_CREATE)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=prose_only, extra_env=env)
+    assert allowed.returncode == 0, f"prose-only --head over-blocked: {allowed.stderr}"
 
     # (b) global flags before the switch subcommand still deny the chain
     flagged = '{"tool_input": {"command": "git -C . switch - && PUSHVERB origin"}}'.replace(
         "PUSHVERB", _PUSH
     )
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=flagged, extra_env=env)
-    assert denied.returncode == 2 and "separate commands" in denied.stderr
+    assert denied.returncode == 2 and "stand alone" in denied.stderr
 
     # (c) apostrophes inside double quotes are TEXT: the expansion between
     # two contractions stays visible and denies (old: swallowed → 0)
@@ -774,7 +781,15 @@ def test_r17_parsing_precision(toy_repo: Path) -> None:
         '"suffix=FE1; echo \\"don\'t\\"; PUSHVERB origin HEAD:task/$suffix; echo \\"don\'t\\""}}'
     ).replace("PUSHVERB", _PUSH)
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=contraction, extra_env=env)
-    assert denied.returncode == 2 and "literally" in denied.stderr
+    assert denied.returncode == 2 and "stand alone" in denied.stderr
+    # ... and the VERB-FIRST form keeps the residue state machine itself
+    # revert-provable (the stand-alone rule passes this one; only the
+    # machine sees the $VAR between two double-quoted contractions)
+    verb_first = (
+        '{"tool_input": {"command": "PRCREATE --fill --body \\"don\'t $VAR won\'t\\""}}'
+    ).replace("PRCREATE", _PR_CREATE)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=verb_first, extra_env=env)
+    assert denied.returncode == 2 and "hides destinations" in denied.stderr
 
 
 def test_gh_owner_qualified_head_is_not_a_refspec(toy_repo: Path) -> None:
@@ -795,18 +810,58 @@ def test_gh_owner_qualified_head_is_not_a_refspec(toy_repo: Path) -> None:
     _stamp(toy_repo)
     _browser_stamp(toy_repo, shot)
 
-    ok = ('{"tool_input": {"command": "PRCREATE --head CLYEH:task/FE1 --fill"}}').replace(
-        "PRCREATE", _PR_CREATE
-    )
-    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=ok, extra_env=env)
-    assert allowed.returncode == 0, f"owner-qualified head over-blocked: {allowed.stderr}"
+    # R18 supersedes the R15 allowance: --head is banned OUTRIGHT — it
+    # selects an already-remote SHA no local receipt can vouch for, and gh
+    # defaults to the current branch anyway. Both forms deny now.
+    for head in ("CLYEH:task/FE1", "CLYEH:task/FE2"):
+        cmd = (
+            ('{"tool_input": {"command": "PRCREATE --head HEADVAL --fill"}}')
+            .replace("PRCREATE", _PR_CREATE)
+            .replace("HEADVAL", head)
+        )
+        denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=cmd, extra_env=env)
+        assert denied.returncode == 2 and "already-remote" in denied.stderr
+    # the flagless form on the receipted checkout remains the green path
+    plain = ('{"tool_input": {"command": "PRCREATE --fill"}}').replace("PRCREATE", _PR_CREATE)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=plain, extra_env=env)
+    assert allowed.returncode == 0, f"flagless creation blocked: {allowed.stderr}"
 
-    other = ('{"tool_input": {"command": "PRCREATE --head CLYEH:task/FE2 --fill"}}').replace(
-        "PRCREATE", _PR_CREATE
+
+def test_r18_standalone_and_all_task_refs(toy_repo: Path) -> None:
+    """Codex #64 R18: (a) a mutation chained before the transfer changes
+    state after the receipts were validated — the verb must OPEN the
+    command; (b) the off-checkout ref rule covers ALL task branches (the
+    review receipt has the identical worktree binding the FE rule guarded)."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
     )
-    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=other, extra_env=env)
-    # the R16 general --head binding fires first (earlier layer, same deny)
-    assert denied.returncode == 2 and "current checkout" in denied.stderr
+    _origin_and_branch(toy_repo, "docs/y")
+    (toy_repo / "a.md").write_text("doc edit\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "docs"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    # (a) the doc-lane mutation smuggle: write+add+commit+transfer in one
+    # payload returned 0 before — the stand-alone rule denies the chain
+    smuggle = (
+        '{"tool_input": {"command": '
+        '"echo bad > p.py && git add p.py && git commit -m bad && PUSHVERB origin docs/y"}}'
+    ).replace("PUSHVERB", _PUSH)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=smuggle, extra_env=env)
+    assert denied.returncode == 2 and "stand alone" in denied.stderr
+
+    # (b) a clean main checkout naming a divergent non-FE task ref: the old
+    # scan only guarded task/FE — now every task ref demands its own checkout
+    subprocess.run(
+        ["git", "switch", "-qc", "task/B2"], cwd=toy_repo, check=True, capture_output=True
+    )
+    (toy_repo / "a.md").write_text("unreviewed b2\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b2"], cwd=toy_repo, check=True, capture_output=True)
+    subprocess.run(["git", "switch", "-q", "main"], cwd=toy_repo, check=True, capture_output=True)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin task/B2", extra_env=env)
+    assert denied.returncode == 2, f"non-FE task ref slipped: {denied.stdout}"
+    assert "never the local ref" in denied.stderr
 
 
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
