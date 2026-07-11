@@ -32,6 +32,13 @@ GIT_INDEX_FILE="$tmp_index" git add -A >/dev/null 2>&1
 tree="$(GIT_INDEX_FILE="$tmp_index" git write-tree)"
 
 mkdir -p .claude/receipts
-printf '%s browser-qa %s %s\n' "$tree" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" \
-  > ".claude/receipts/browser-qa-$tree"
+# line 1 = header; then ONE evidence path per line (paths may contain spaces).
+# The push gate re-validates each path is still a non-empty file at push time:
+# evidence is untracked/ignored, so it never enters the bound tree — without
+# the liveness re-check, deleting/truncating it after the stamp would go
+# unnoticed (bind-time stamp ≠ invariant; Codex #64 R2, class 10).
+{
+  printf '%s browser-qa %s %s\n' "$tree" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$#"
+  printf '%s\n' "$@"
+} > ".claude/receipts/browser-qa-$tree"
 echo "browser-qa receipt stamped: tree=$tree evidence=$#"

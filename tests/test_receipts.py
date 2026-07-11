@@ -173,8 +173,10 @@ def _browser_stamp(repo: Path, *evidence: Path) -> str:
     tree = result.stdout.split("tree=")[1].split()[0]
     assert len(tree) == 40
     receipt = (repo / ".claude" / "receipts" / f"browser-qa-{tree}").read_text(encoding="utf-8")
-    fields = receipt.split()
+    lines = receipt.splitlines()
+    fields = lines[0].split()
     assert fields[0] == tree and fields[1] == "browser-qa"
+    assert lines[1:] == [e.as_posix() for e in evidence]  # one auditable path per line
     return tree
 
 
@@ -232,6 +234,21 @@ def test_fe_push_gate_requires_the_browser_receipt(toy_repo: Path) -> None:
         [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/FE1", extra_env=env
     )
     assert allowed.returncode == 0, f"gate blocked a fully-receipted FE push: {allowed.stderr}"
+
+    # evidence LIVENESS (Codex #64 R2, class 10): the artifacts are ignored/
+    # untracked, so deleting them after the stamp does NOT change the tree —
+    # the gate must re-check them at push time, not trust the stamp
+    shot.unlink()
+    gone = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/FE1", extra_env=env)
+    assert gone.returncode == 2 and "evidence missing or empty" in gone.stderr
+    shot.write_bytes(b"")  # truncation is the same lie as deletion
+    hollow = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/FE1", extra_env=env)
+    assert hollow.returncode == 2 and "evidence missing or empty" in hollow.stderr
+    shot.write_bytes(b"\x89PNG fake-but-non-empty")  # restored → passes again
+    restored = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/FE1", extra_env=env
+    )
+    assert restored.returncode == 0, f"gate blocked restored evidence: {restored.stderr}"
 
     # tree-bound: an edit AFTER the browser pass invalidates its receipt even
     # with a fresh code-review stamp for the new tree

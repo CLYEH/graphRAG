@@ -94,6 +94,17 @@ else
     [ -f ".claude/receipts/browser-qa-$fe_tree" ] || deny "FE task: no browser-QA receipt for this content — run the Claude in Chrome pass (LOOP.md step 4) and stamp it with the evidence via .claude/hooks/write-browser-qa-receipt.sh; anything edited after the pass needs a re-run + re-stamp."
     read -r bq_tree bq_kind bq_rest < ".claude/receipts/browser-qa-$fe_tree"
     { [ "$bq_tree" = "$fe_tree" ] && [ "$bq_kind" = "browser-qa" ]; } || deny "browser-QA receipt for $fe_tree is corrupt — re-stamp via write-browser-qa-receipt.sh."
+    # the evidence must STILL exist non-empty at push time: it is untracked/
+    # ignored, so it never enters the bound tree — without this liveness
+    # re-check, deleting or truncating it after the stamp would go unnoticed
+    # and the PR body would have nothing auditable (Codex #64 R2, class 10)
+    ev_count=0
+    while IFS= read -r ev_path; do
+      [ -n "$ev_path" ] || continue
+      [ -s "$ev_path" ] || deny "browser-QA evidence missing or empty at push time: $ev_path — re-run the pass and re-stamp (write-browser-qa-receipt.sh)."
+      ev_count=$((ev_count + 1))
+    done < <(tail -n +2 ".claude/receipts/browser-qa-$fe_tree")
+    [ "$ev_count" -ge 1 ] || deny "browser-QA receipt records no evidence paths — re-stamp with the artifacts."
   fi
   uv run poe check >/dev/null 2>&1 || deny "backend gates are red — run 'uv run poe check', fix, re-review, then push."
   if printf '%s\n' "$outgoing" | grep -q '^web/'; then
