@@ -167,11 +167,24 @@ async def health_report(
             # the frozen STORE_UNAVAILABLE warning instead of a 500
             warnings = (f"drift check unavailable: {exc.__class__.__name__}",)
 
+    # §19 names "active/last-success/last-failed build" — last SUCCESS is the
+    # newest build that ever completed (every non-building, non-failed state)
+    last_success = next((b for b in builds if b.status in ("ready", "active", "archived")), None)
+
     e, r, ev = tables.entities, tables.relations, tables.relation_evidence
     metrics: dict[str, Any] = {
         "builds_total": len(builds),
         "active_build": str(active.id) if active else None,
+        "last_success_build": str(last_success.id) if last_success else None,
         "last_failed_build": str(last_failed.id) if last_failed else None,
+        # §19's source count is PROJECT-scoped (sources register before any
+        # build exists — a bootstrap project must still show them, Codex #62)
+        "sources": await _count(
+            conn,
+            sa.select(sa.func.count())
+            .select_from(tables.sources)
+            .where(tables.sources.c.project == project),
+        ),
         "pending_merge_candidates": await _count(
             conn,
             sa.select(sa.func.count())

@@ -23,7 +23,7 @@ from sqlalchemy.pool import NullPool
 from api.app import create_app
 from core.config import get_settings
 from core.registry import create_project
-from core.stores.tables import builds, entities, projects
+from core.stores.tables import builds, entities, projects, sources
 
 pytestmark = pytest.mark.integration
 
@@ -49,6 +49,7 @@ async def test_health_metrics_eval_end_to_end(migrated: None) -> None:
     try:
         async with engine.connect() as conn, conn.begin():
             await create_project(conn, name=project)
+            await conn.execute(sources.insert().values(project=project, uri="file:///raw.csv"))
 
         async with (
             app.router.lifespan_context(app),
@@ -60,6 +61,9 @@ async def test_health_metrics_eval_end_to_end(migrated: None) -> None:
             data = r.json()["data"]
             assert data["status"] == "healthy" and data["active_build_id"] is None
             assert r.json()["meta"]["build_id"] is None
+            # §19's source count is project-scoped: visible BEFORE any build
+            # exists (Codex #62 R2 — the old producer had no sources key)
+            assert data["counts"]["sources"] == 1
 
             r = await client.get(f"/projects/{project}/eval")
             assert r.status_code == 200
@@ -73,6 +77,8 @@ async def test_health_metrics_eval_end_to_end(migrated: None) -> None:
             r = await client.get(f"/projects/{project}/metrics")
             assert r.status_code == 200
             assert r.json()["data"]["builds_total"] == 0
+            assert r.json()["data"]["sources"] == 1
+            assert r.json()["data"]["last_success_build"] is None
 
             r = await client.get(f"/projects/ghost-{uuid.uuid4().hex[:6]}/health")
             assert r.status_code == 404
@@ -111,6 +117,7 @@ async def test_health_metrics_eval_end_to_end(migrated: None) -> None:
             assert r.status_code == 200
             assert r.json()["data"]["entities"] == 1
             assert r.json()["data"]["builds_total"] == 1
+            assert r.json()["data"]["last_success_build"] == str(active_id)
 
             # eval, live §20 predicates: active scored 0.8, a NEWER ready
             # build scored 0.5 on the SAME fingerprint → served report is the
@@ -176,6 +183,7 @@ async def test_health_metrics_eval_end_to_end(migrated: None) -> None:
     finally:
         async with engine.connect() as cleanup, cleanup.begin():
             await cleanup.execute(entities.delete().where(entities.c.project == project))
+            await cleanup.execute(sources.delete().where(sources.c.project == project))
             await cleanup.execute(builds.delete().where(builds.c.project == project))
             await cleanup.execute(projects.delete().where(projects.c.name == project))
         await engine.dispose()
