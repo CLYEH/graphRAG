@@ -295,6 +295,33 @@ def test_fe_destination_refspec_engages_the_gate(toy_repo: Path) -> None:
     assert allowed.returncode == 0, f"gate blocked a fully-receipted refspec push: {allowed.stderr}"
 
 
+def test_doc_lane_cannot_reach_an_fe_destination_unreceipted(toy_repo: Path) -> None:
+    """Codex #64 R5 (executed repro): on a docs/* branch with md-only
+    outgoing, `HEAD:task/FE1` classified as the DOC lane and skipped the FE
+    block entirely — the browser receipt must key on the destination in BOTH
+    lanes. Discriminating: the task-lane-only nesting returned 0 here."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "docs/x")
+    (toy_repo / "a.md").write_text("md-only edit bound for an FE branch\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "docs"], cwd=toy_repo, check=True, capture_output=True)
+
+    _stamp(toy_repo)  # the doc lane's review receipt alone
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin HEAD:task/FE1")
+    assert denied.returncode == 2, f"doc lane reached an FE destination: {denied.stdout}"
+    assert "browser-QA receipt" in denied.stderr
+
+    shot = toy_repo / "shot.png"
+    shot.write_bytes(b"\x89PNG fake-but-non-empty")
+    _browser_stamp(toy_repo, shot)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin HEAD:task/FE1")
+    assert allowed.returncode == 0, (
+        f"gate blocked a fully-receipted doc-lane push: {allowed.stderr}"
+    )
+
+
 def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:
     """Codex #64 (class 9 — every constructor of the effect): `gh pr create`
     can push an unpushed branch itself, so a payload creating a PR must run

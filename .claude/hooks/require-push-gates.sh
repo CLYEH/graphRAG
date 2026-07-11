@@ -85,21 +85,19 @@ require_receipt() {
   esac
 }
 
-if [ "$lane" = doc ]; then
-  nonmd="$(printf '%s\n' "$outgoing" | grep -v '\.md$' || true)"
-  [ -n "$nonmd" ] && deny "the doc lane (docs/* branch or direct-to-main) is *.md-only; non-.md outgoing: $(printf '%s' "$nonmd" | tr '\n' ' ')— use a task branch + PR."
-  require_receipt
-else
-  require_receipt
+require_browser_receipt_if_fe() {
   # the FE receipt keys on the DESTINATION, not only the checked-out branch:
   # `git push origin HEAD:task/FE1` lands on an FE branch from ANY local name
   # (Codex #64 R3 — the doc lane's `:main` refspec detection is the same
   # idea). Any push/PR payload naming task/FE engages, deliberately
   # over-matching (multi-branch and deletion forms included) — fail-closed,
-  # like the rest of this hook.
+  # like the rest of this hook. Runs in BOTH lanes: the doc lane can push an
+  # FE destination too, e.g. `HEAD:task/FE1` from a docs/* branch (Codex #64
+  # R5 — lane classification must not outrank the destination).
   if [[ "$current" == task/FE* ]] || printf '%s' "$payload" | grep -q 'task/FE'; then
     # H10: the FE browser pass is tree-bound like the review — its own
     # namespace, so neither receipt kind can satisfy the other's gate
+    local fe_tree bq_tree bq_kind bq_rest ev_path ev_count
     fe_tree="$(snapshot_tree)"
     [ -f ".claude/receipts/browser-qa-$fe_tree" ] || deny "FE task: no browser-QA receipt for this content — run the Claude in Chrome pass (LOOP.md step 4) and stamp it with the evidence via .claude/hooks/write-browser-qa-receipt.sh; anything edited after the pass needs a re-run + re-stamp."
     read -r bq_tree bq_kind bq_rest < ".claude/receipts/browser-qa-$fe_tree"
@@ -116,6 +114,16 @@ else
     done < <(tail -n +2 ".claude/receipts/browser-qa-$fe_tree")
     [ "$ev_count" -ge 1 ] || deny "browser-QA receipt records no evidence paths — re-stamp with the artifacts."
   fi
+}
+
+if [ "$lane" = doc ]; then
+  nonmd="$(printf '%s\n' "$outgoing" | grep -v '\.md$' || true)"
+  [ -n "$nonmd" ] && deny "the doc lane (docs/* branch or direct-to-main) is *.md-only; non-.md outgoing: $(printf '%s' "$nonmd" | tr '\n' ' ')— use a task branch + PR."
+  require_receipt
+  require_browser_receipt_if_fe
+else
+  require_receipt
+  require_browser_receipt_if_fe
   uv run poe check >/dev/null 2>&1 || deny "backend gates are red — run 'uv run poe check', fix, re-review, then push."
   if printf '%s\n' "$outgoing" | grep -q '^web/'; then
     uv run poe web-check >/dev/null 2>&1 || deny "frontend gates are red — run 'uv run poe web-check', fix, re-review, then push."
