@@ -71,7 +71,15 @@ except Exception:
 # a ; & | or newline the shell would execute chains a second command onto
 # the payload, while the same characters inside quotes are prose and stay
 # legal — a regex on the flat text cannot make that distinction.
+# It also emits BARE — the payload with EVERY quoted span removed (single
+# and double) — for the engagement greps (Codex #64 R21, P2): body prose
+# mentioning a push cannot flip the payload git-engaged. Honest commands
+# write their verb path unquoted (quoting an ARGUMENT keeps the verb in
+# bare); a deliberately split verb (g"it" pu"sh") does execute yet escapes
+# bare — that is the verb-obfuscation family the THREAT MODEL above places
+# out of scope, backstopped by branch protection and the Codex gate.
 out = []
+bare = []
 sep = False
 in_s = in_d = False
 for ch in cmd:
@@ -82,13 +90,18 @@ for ch in cmd:
     if ch == chr(39) and not in_d:
         in_s = True
         out.append(" ")
+        bare.append(" ")
         continue
     if ch == chr(34):
         in_d = not in_d
-    elif not in_d and ch in ";&|\n":
+        continue
+    if not in_d and ch in ";&|\n":
         sep = True
     out.append(ch)
+    if not in_d:
+        bare.append(ch)
 residue = "".join(out)
+bare_s = "".join(bare)
 try:
     toks = shlex.split(cmd, posix=True)
 except ValueError:
@@ -98,6 +111,18 @@ norm = " ".join(toks) if toks else cmd
 # words "--head x" inside a --body STRING are one token here, so prose can
 # never masquerade as the option)
 head = ""
+# gh pr create option ARGUMENTS are values, not flags (the gh manual lists
+# each): the walk must skip them before shorthand detection, or a body like
+# chr(39) + "- Hand-tested in Chrome" + chr(39) reads as -H (Codex #64 R21,
+# P2). Separated form skips the next token; attached short form (-bTEXT) is
+# recognized by its option letter. Unknown future value options fall back to
+# over-matching (fail-closed), never under.
+VALOPTS = {
+    "-a", "--assignee", "-B", "--base", "-b", "--body", "-F", "--body-file",
+    "-l", "--label", "-m", "--milestone", "-p", "--project", "-r",
+    "--reviewer", "-T", "--template", "-t", "--title", "--recover",
+}
+SHORTVAL = ("-a", "-B", "-b", "-F", "-l", "-m", "-p", "-r", "-T", "-t")
 i = 0
 while i < len(toks):
     t = toks[i]
@@ -105,14 +130,20 @@ while i < len(toks):
         head = toks[i + 1]
         i += 2
         continue
+    if t in VALOPTS:
+        i += 2  # the option and its VALUE token — never head syntax
+        continue
     if t.startswith("--head="):
         head = t[7:]
-    elif len(t) > 1 and t[0] == "-" and t[1] != "-" and "H" in t:
-        # pflag SHORTHAND surface (Codex #64 R20, P1): -Htask/B2 attaches
-        # the value, -H= attaches empty, -fH clusters after booleans, a
-        # trailing bare -H dangles — every spelling still selects a head.
-        # The ban needs existence, not the value: flag the token itself.
-        head = t
+    elif len(t) > 1 and t[0] == "-" and t[1] != "-":
+        if t[:2] in SHORTVAL:
+            pass  # attached value of a TEXT option (-b..., -t..., ...)
+        elif "H" in t:
+            # pflag SHORTHAND surface (Codex #64 R20, P1): -Htask/B2
+            # attaches the value, -H= attaches empty, -fH clusters after
+            # booleans, a trailing bare -H dangles — every spelling still
+            # selects a head. The ban needs existence, not the value.
+            head = t
     i += 1
 sys.stdout.write(
     norm.replace("\n", " ")
@@ -123,6 +154,8 @@ sys.stdout.write(
     + "\n"
     + ("1" if sep else "0")
     + "\n"
+    + bare_s.replace("\n", " ")
+    + "\n"
 )
 ' 2>/dev/null)" || extracted=""
 if [ -n "$extracted" ]; then
@@ -130,10 +163,12 @@ if [ -n "$extracted" ]; then
   residue="$(printf '%s\n' "$extracted" | sed -n 2p)"
   gh_head="$(printf '%s\n' "$extracted" | sed -n 3p)"
   has_sep="$(printf '%s\n' "$extracted" | sed -n 4p)"
+  bare="$(printf '%s\n' "$extracted" | sed -n 5p)"
 else
   payload="$raw_payload"
   residue="$raw_payload"
   gh_head=""
+  bare="$raw_payload"
   # no quote-aware walk on the fallback path — flag the characters raw
   # (over-matching, never under: quoted prose can only FALSE-deny here)
   case "$raw_payload" in
@@ -143,6 +178,7 @@ else
 fi
 [ -n "$payload" ] || payload="$raw_payload"
 [ -n "$residue" ] || residue="$payload"
+[ -n "$bare" ] || bare="$payload"
 # engage on `git [flags] push` incl. `git -C <path> push` and `git --git-dir=<p> push`
 # (must not engage on e.g. `git log push-fix`) — AND on gh PR creation, which
 # can push the branch itself (the same effect through a sibling command).
@@ -152,8 +188,13 @@ fi
 flags='([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*'
 git_engaged=0
 gh_engaged=0
-printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b" && git_engaged=1
-printf '%s' "$payload" | grep -Eq "gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new)\b" && gh_engaged=1
+# engagement reads BARE (all quoted spans stripped), not the rejoined norm:
+# shlex erases the quoting, so body prose naming a push verb would engage
+# the git scans on a pure gh payload (Codex #64 R21, P2). Honest verbs are
+# unquoted (quoted ARGUMENTS keep the verb in bare); split-verb quoting is
+# the out-of-scope obfuscation family per the THREAT MODEL header.
+printf '%s' "$bare" | grep -Eq "git${flags}[[:space:]]+push\b" && git_engaged=1
+printf '%s' "$bare" | grep -Eq "gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new)\b" && gh_engaged=1
 if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
   # substitution can hide the VERB itself (g=git; $g push — Codex #64 R12,
   # P1): a command we cannot statically clear must not be cleared. When
@@ -309,8 +350,12 @@ validate_task_ref_tokens() {
 [ "$git_engaged" = 1 ] && validate_task_ref_tokens
 
 # lane: a ':main' / ':refs/heads/main' refspec, pushing while on main, or a docs/* branch
-# (whose whole purpose is the fast lane, incl. its own branch push) = doc-only lane
-if printf '%s' "$payload" | grep -Eq ":(refs/heads/)?main([[:space:]\"']|$)" \
+# (whose whole purpose is the fast lane, incl. its own branch push) = doc-only lane.
+# The refspec grep is a GIT construct — on a gh payload it could only ever
+# match body/title prose (same erased-quoting class as the engagement and
+# flag scans, Codex #64 R21), so it runs for git-engaged payloads only;
+# gh lane classification rests on the branch itself.
+if { [ "$git_engaged" = 1 ] && printf '%s' "$payload" | grep -Eq ":(refs/heads/)?main([[:space:]\"']|$)"; } \
   || [ "$current" = "main" ] || [[ "$current" == docs/* ]]; then
   lane=doc
 else

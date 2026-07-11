@@ -956,6 +956,65 @@ def test_r20_attached_head_shorthand_and_gh_flag_prose(toy_repo: Path) -> None:
     assert denied.returncode == 2 and "all-branch" in denied.stderr
 
 
+def test_r21_quoted_prose_never_engages_or_selects_a_head(toy_repo: Path) -> None:
+    """Codex #64 R21: quoted --body/--title values are DATA, not command
+    syntax. (a) a body naming a git transfer must not flip the payload
+    git-engaged (the erased quoting made the flag scans read prose);
+    (b) a dashed body value containing H is not the -H shorthand — the
+    walk skips documented gh value options; (c) :main inside a body is
+    not a doc-lane refspec (same erased-quoting class, swept together).
+    Engagement now reads the BARE projection (every quoted span stripped):
+    honest verbs are unquoted, and split-verb quoting is the hook's
+    documented out-of-scope obfuscation family."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B1")
+    (toy_repo / "a.md").write_text("b1 content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b1"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    # (a) denied as an all-branch push before: the body was the payload's
+    # ONLY git text, yet it engaged the git-scoped flag scans
+    prose_all = (
+        ('{"tool_input": {"command": "PRCREATE --fill --body \'Do not run PUSHVERB --all\'"}}')
+        .replace("PRCREATE", _PR_CREATE)
+        .replace("PUSHVERB", _PUSH)
+    )
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=prose_all, extra_env=env)
+    assert allowed.returncode == 0, f"body prose engaged the git scans: {allowed.stderr}"
+
+    # (b) denied "already-remote" before: the value token starts with a
+    # dash and contains H, and the walk read it as the head shorthand
+    dashed = (
+        '{"tool_input": {"command": "PRCREATE --fill --body \'- Hand-tested in Chrome\'"}}'
+    ).replace("PRCREATE", _PR_CREATE)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=dashed, extra_env=env)
+    assert allowed.returncode == 0, f"body value read as a head flag: {allowed.stderr}"
+
+    # ...while the REAL separated shorthand still denies (the value-option
+    # skip must not swallow -H itself)
+    real_head = ('{"tool_input": {"command": "PRCREATE --fill -H task/B2"}}').replace(
+        "PRCREATE", _PR_CREATE
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=real_head, extra_env=env)
+    assert denied.returncode == 2 and "already-remote" in denied.stderr
+
+    # (c) with non-md content outgoing, the misread :main refspec forced
+    # the doc lane and denied the PR outright before
+    (toy_repo / "p.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=toy_repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "code"], cwd=toy_repo, check=True, capture_output=True)
+    _stamp(toy_repo)
+    lane_prose = (
+        '{"tool_input": {"command": "PRCREATE --fill --body \'see :main notes\'"}}'
+    ).replace("PRCREATE", _PR_CREATE)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=lane_prose, extra_env=env)
+    assert allowed.returncode == 0, f":main prose forced the doc lane: {allowed.stderr}"
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING
