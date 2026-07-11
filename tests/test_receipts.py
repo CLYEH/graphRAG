@@ -616,6 +616,45 @@ def test_r13_hardening_quartet(toy_repo: Path) -> None:
     assert "never the local ref" in denied.stderr
 
 
+def test_r14_quote_context_and_wildcards(toy_repo: Path) -> None:
+    """Codex #64 R14 (the LAST grammar patches before the structural
+    pre-push redesign): (a) single-quoted TEXT never expands — Markdown
+    backticks in a quoted PR body must NOT read as substitution
+    (discriminating: the quote-blind check denied it); dollar inside DOUBLE
+    quotes DOES expand and still denies; (b) wildcard refspecs fan out to FE
+    branches — the literal rule's char class now includes the glob star."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B9")
+    (toy_repo / "a.md").write_text("edit\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b9"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    # (a) legit: backticks inside SINGLE quotes are inert text
+    body_cmd = (
+        '{"tool_input": {"command": "PRCREATE --title ok --body \'Ran `uv run` fine\'"}}'
+    ).replace("PRCREATE", _PR_CREATE)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=body_cmd, extra_env=env)
+    assert allowed.returncode == 0, f"quoted Markdown body blocked: {allowed.stderr}"
+
+    # ... while $ inside DOUBLE quotes genuinely expands — still denied
+    dq_cmd = ('{"tool_input": {"command": "PRCREATE --title ok --body \\"has $VAR\\""}}').replace(
+        "PRCREATE", _PR_CREATE
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=dq_cmd, extra_env=env)
+    assert denied.returncode == 2 and "literally" in denied.stderr
+
+    # (b) wildcard refspecs fan out (executed repro upstream): denied
+    wild = (
+        '{"tool_input": {"command": "PUSHVERB origin refs/heads/task/*:refs/heads/task/*"}}'
+    ).replace("PUSHVERB", _PUSH)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=wild, extra_env=env)
+    assert denied.returncode == 2 and "wildcard" in denied.stderr
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING

@@ -51,19 +51,34 @@ raw_payload="$(cat)"
 # Unbalanced quoting keeps the un-normalized command (the over-match side).
 py_bin="$(command -v python3 || command -v python)" ||
   deny "the push gate needs python3 (or python) on PATH to parse the tool payload — fail-closed (Codex #64 R11: the raw-JSON fallback would false-positive on every envelope)."
-payload="$(printf '%s' "$raw_payload" | "$py_bin" -c '
-import json, shlex, sys
+# TWO projections of the command (Codex #64 R14): line 1 = shlex-NORMALIZED
+# (verb/flag/refspec patterns see shell-collapsed tokens); line 2 = the
+# RESIDUE with single-quoted spans removed — bash never expands inside
+# single quotes, so Markdown backticks in a quoted --body are NOT
+# substitution, while $ inside double quotes IS. The substitution and
+# wildcard checks run on the residue, everything else on the normalized.
+extracted="$(printf '%s' "$raw_payload" | "$py_bin" -c '
+import json, re, shlex, sys
 try:
     cmd = json.load(sys.stdin).get("tool_input", {}).get("command", "")
 except Exception:
     sys.exit(1)
+residue = re.sub(r"\x27[^\x27]*\x27", " ", cmd)
 try:
-    cmd = " ".join(shlex.split(cmd, posix=True))
+    norm = " ".join(shlex.split(cmd, posix=True))
 except ValueError:
-    pass
-print(cmd)
-' 2>/dev/null)" || payload="$raw_payload"
+    norm = cmd
+sys.stdout.write(norm.replace("\n", " ") + "\n" + residue.replace("\n", " ") + "\n")
+' 2>/dev/null)" || extracted=""
+if [ -n "$extracted" ]; then
+  payload="$(printf '%s\n' "$extracted" | sed -n 1p)"
+  residue="$(printf '%s\n' "$extracted" | sed -n 2p)"
+else
+  payload="$raw_payload"
+  residue="$raw_payload"
+fi
 [ -n "$payload" ] || payload="$raw_payload"
+[ -n "$residue" ] || residue="$payload"
 # engage on `git [flags] push` incl. `git -C <path> push` and `git --git-dir=<p> push`
 # (must not engage on e.g. `git log push-fix`) — AND on gh PR creation, which
 # can push the branch itself (the same effect through a sibling command).
@@ -78,7 +93,7 @@ if ! printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b" &&
   # substitution syntax coexists with a push/pr word, engage fail-closed —
   # the literal-command rule below then denies it. Plain commands (no
   # substitution, or no such word) exit here as before.
-  if printf '%s' "$payload" | grep -Eq '[$`]' &&
+  if printf '%s' "$residue" | grep -Eq '[$`]' &&
     printf '%s' "$payload" | grep -Eq '(^|[[:space:]])(push|pr)([[:space:];&|]|$)'; then
     # trailing class includes shell operators: `$g push; echo` still runs a
     # push before the semicolon (Codex #64 R13)
@@ -95,8 +110,8 @@ current="$(git branch --show-current)"
 # as an FE refspec to git but is invisible to every static pattern — Codex
 # #64 R11, P1): an engaged command must be LITERAL. Deny substitution syntax
 # outright; shlex keeps it un-expanded, so the pattern sees it.
-printf '%s' "$payload" | grep -Eq '[$`]' &&
-  deny "shell expansion in a push/PR command hides destinations from the gate — write the command literally (no variables, no command substitution)."
+printf '%s' "$residue" | grep -Eq '[$`*]' &&
+  deny "shell expansion or wildcards in a push/PR command hide destinations from the gate — write the command literally (no variables, no command substitution, no wildcard refspecs; single-quoted TEXT arguments are fine — quotes suppress expansion)."
 
 # inline config rewrites push semantics for ONE invocation (`git -c
 # push.default=matching push` fans out past the persisted-config checks —
