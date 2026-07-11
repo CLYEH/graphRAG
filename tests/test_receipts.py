@@ -356,6 +356,45 @@ def test_off_checkout_fe_ref_push_is_rejected(toy_repo: Path) -> None:
     assert allowed.returncode == 0, f"HEAD: form blocked despite receipts: {allowed.stderr}"
 
 
+def test_non_head_src_and_all_branch_forms_are_rejected(toy_repo: Path) -> None:
+    """Codex #64 R7 (both executed repros): (a) ON the FE checkout,
+    `other:task/FE1` sends the `other` ref's content while receipts bind the
+    worktree; (b) `--all` from a non-FE checkout pushes an unreceipted local
+    FE branch with no task/FE token in the payload. Both deny now; the bare
+    current-branch push on its own checkout still passes."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/FE1")
+    (toy_repo / "a.md").write_text("fe content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "fe"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    shot = toy_repo / "shot.png"
+    shot.write_bytes(b"\x89PNG fake-but-non-empty")
+    _stamp(toy_repo)
+    _browser_stamp(toy_repo, shot)
+
+    # (a) fully receipted, ON the FE checkout — but the src is another ref
+    denied = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin other:task/FE1", extra_env=env
+    )
+    assert denied.returncode == 2, f"non-HEAD src reached the FE branch: {denied.stdout}"
+    assert "never the local ref" in denied.stderr
+
+    # the checked-out branch itself (bare and as src) stays valid
+    for payload in (f"{_PUSH} -u origin task/FE1", f"{_PUSH} origin task/FE1:task/FE1"):
+        allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=payload, extra_env=env)
+        assert allowed.returncode == 0, f"own-checkout push blocked ({payload}): {allowed.stderr}"
+
+    # (b) --all/--branches/--mirror bypass content binding — denied outright,
+    # from ANY checkout (here the FE one; the payload names no ref at all)
+    for flag in ("--all", "--branches", "--mirror"):
+        denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin {flag}", extra_env=env)
+        assert denied.returncode == 2, f"{flag} bypassed the gate: {denied.stdout}"
+        assert "push the branch explicitly" in denied.stderr
+
+
 def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:
     """Codex #64 (class 9 — every constructor of the effect): `gh pr create`
     can push an unpushed branch itself, so a payload creating a PR must run

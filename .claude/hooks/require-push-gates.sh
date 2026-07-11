@@ -40,6 +40,12 @@ if ! printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b" &&
 fi
 cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."
 
+# all-branch/mirror forms push refs the worktree-bound receipts never spoke
+# for (an unreceipted local task/FE* rides along invisibly — Codex #64 R7,
+# executed repro) — reject the forms outright; push refs explicitly
+printf '%s' "$payload" | grep -Eq -- '--(all|branches|mirror)\b' &&
+  deny "all-branch push forms (--all/--branches/--mirror) bypass the content-bound receipts — push the branch explicitly."
+
 git fetch -q origin main 2>/dev/null
 current="$(git branch --show-current)"
 [ -z "$current" ] && deny "detached HEAD — push from a branch."
@@ -95,16 +101,26 @@ require_browser_receipt_if_fe() {
   # FE destination too, e.g. `HEAD:task/FE1` from a docs/* branch (Codex #64
   # R5 — lane classification must not outrank the destination).
   if [[ "$current" == task/FE* ]] || printf '%s' "$payload" | grep -q 'task/FE'; then
-    local fe_tree bq_tree bq_kind bq_rest ev_path ev_count bad_ref
-    if [[ "$current" != task/FE* ]]; then
-      # off-checkout FE pushes may only use the HEAD:<dst> form: the receipts
-      # bind the WORKING TREE, and `git push origin task/FE1` from another
-      # checkout sends the local ref's content — which no receipt ever spoke
-      # for (Codex #64 R6, executed repro). Fail-closed: any task/FE token
-      # not HEAD-anchored is denied.
-      bad_ref="$(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']*task/FE[^[:space:]\"']*" | grep -Ev '^\+?HEAD:' | head -1 || true)"
-      [ -n "$bad_ref" ] && deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$bad_ref' (re-run the pass on that checkout and push from there)."
-    fi
+    local fe_tree bq_tree bq_kind bq_rest ev_path ev_count tok
+    # every explicit token naming an FE branch must carry content the
+    # receipts bind: HEAD:<dst>, or the CURRENT FE branch itself (bare or as
+    # the refspec src). Any other src pushes a ref the worktree receipts
+    # never spoke for — `origin task/FE1` from another checkout (Codex #64
+    # R6) and `origin other:task/FE1` even ON the FE checkout (Codex #64 R7,
+    # both executed repros). Fail-closed on every checkout.
+    while IFS= read -r tok; do
+      [ -n "$tok" ] || continue
+      case "$tok" in
+        HEAD:* | +HEAD:*) : ;; # the worktree's own commit
+        "$current" | "$current":* | +"$current":* | refs/heads/"$current" | refs/heads/"$current":*)
+          # the checked-out FE branch itself — only valid when we ARE on it
+          [[ "$current" == task/FE* ]] || deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok'."
+          ;;
+        *)
+          deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok' (re-run the pass on that content and push from there)."
+          ;;
+      esac
+    done < <(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']*task/FE[^[:space:]\"']*" || true)
     # H10: the FE browser pass is tree-bound like the review — its own
     # namespace, so neither receipt kind can satisfy the other's gate
     fe_tree="$(snapshot_tree)"
