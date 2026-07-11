@@ -567,6 +567,55 @@ def test_shell_quoting_cannot_evade_the_patterns(toy_repo: Path) -> None:
     assert clean.returncode == 0, f"harmless substitution engaged: {clean.stderr}"
 
 
+def test_r13_hardening_quartet(toy_repo: Path) -> None:
+    """Codex #64 R13 (four findings, three executed repros): (a) unignored
+    in-repo evidence would deadlock the worktree==HEAD gate — the STAMP now
+    refuses it with guidance; (b) `$g push; echo` hid the verb behind a
+    shell operator; (c) `git -c push.default=matching push` overrides the
+    persisted-config checks inline; (d) a clean checkout naming a divergent
+    local FE ref slipped out through the no-op fast path."""
+    assert BASH is not None
+    # (a) evidence must be gitignored or outside the repo — toy_repo's
+    # default gitignore does NOT list shot.png
+    shot = toy_repo / "shot.png"
+    shot.write_bytes(b"\x89PNG fake-but-non-empty")
+    refused = _run([BASH, BROWSER_STAMP_SCRIPT, shot.as_posix()], toy_repo)
+    assert refused.returncode != 0 and "must be gitignored" in refused.stderr
+    receipts = toy_repo / ".claude" / "receipts"
+    assert not receipts.exists() or not list(receipts.glob("browser-qa-*"))
+
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/FE1")
+    (toy_repo / "a.md").write_text("fe content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "fe"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+
+    # (b) a shell operator after the hidden verb still engages fail-closed
+    hidden = '{"tool_input": {"command": "g=git; $g PUSHWORD; echo done"}}'.replace(
+        "PUSHWORD", _PUSH.split()[1]
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=hidden, extra_env=env)
+    assert denied.returncode == 2 and "literally" in denied.stderr
+
+    # (c) inline config on an engaged command denies outright
+    inline = (
+        '{"tool_input": {"command": "git -c PUSHWORD.default=matching PUSHWORD origin"}}'.replace(
+            "PUSHWORD", _PUSH.split()[1]
+        )
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=inline, extra_env=env)
+    assert denied.returncode == 2 and "inline git config" in denied.stderr
+
+    # (d) from a CLEAN main checkout, naming the divergent local FE ref must
+    # deny BEFORE the no-op fast path (the old order exited 0 here)
+    subprocess.run(["git", "switch", "-q", "main"], cwd=toy_repo, check=True, capture_output=True)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin task/FE1", extra_env=env)
+    assert denied.returncode == 2, f"clean-checkout FE ref slipped the shortcut: {denied.stdout}"
+    assert "never the local ref" in denied.stderr
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING

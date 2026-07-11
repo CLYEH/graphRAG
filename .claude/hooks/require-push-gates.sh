@@ -79,7 +79,9 @@ if ! printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b" &&
   # the literal-command rule below then denies it. Plain commands (no
   # substitution, or no such word) exit here as before.
   if printf '%s' "$payload" | grep -Eq '[$`]' &&
-    printf '%s' "$payload" | grep -Eq '(^|[[:space:]])(push|pr)([[:space:]]|$)'; then
+    printf '%s' "$payload" | grep -Eq '(^|[[:space:]])(push|pr)([[:space:];&|]|$)'; then
+    # trailing class includes shell operators: `$g push; echo` still runs a
+    # push before the semicolon (Codex #64 R13)
     : # engaged fail-closed — fall through to the literal-command deny
   else
     exit 0
@@ -95,6 +97,12 @@ current="$(git branch --show-current)"
 # outright; shlex keeps it un-expanded, so the pattern sees it.
 printf '%s' "$payload" | grep -Eq '[$`]' &&
   deny "shell expansion in a push/PR command hides destinations from the gate — write the command literally (no variables, no command substitution)."
+
+# inline config rewrites push semantics for ONE invocation (`git -c
+# push.default=matching push` fans out past the persisted-config checks —
+# Codex #64 R13, P1): engaged commands take no inline config at all.
+printf '%s' "$payload" | grep -Eq '[[:space:]](-c|--config-env)([[:space:]]|=)' &&
+  deny "inline git config (-c/--config-env) on a push/PR command rewrites push semantics for that invocation — the gate checks persisted config only; drop the flag."
 
 # all-branch/mirror forms push refs the worktree-bound receipts never spoke
 # for (an unreceipted local task/FE* rides along invisibly — Codex #64 R7,
@@ -129,6 +137,31 @@ upstream | tracking) # tracking = documented deprecated synonym (Codex #64 R11)
 esac
 
 git fetch -q origin main 2>/dev/null
+
+validate_fe_ref_tokens() {
+  # every explicit token naming an FE branch must carry content the
+  # receipts bind: HEAD:<dst>, or the CURRENT FE branch itself (bare or as
+  # the refspec src). Any other src pushes a ref the worktree receipts
+  # never spoke for — `origin task/FE1` from another checkout (Codex #64
+  # R6) and `origin other:task/FE1` even ON the FE checkout (R7, both
+  # executed repros). Runs BEFORE the no-op fast path: a clean checkout can
+  # still push a divergent local FE ref by naming it (R13, executed repro).
+  local tok
+  while IFS= read -r tok; do
+    [ -n "$tok" ] || continue
+    case "$tok" in
+      HEAD:* | +HEAD:*) : ;; # the worktree's own commit
+      "$current" | "$current":* | +"$current":* | refs/heads/"$current" | refs/heads/"$current":*)
+        # the checked-out FE branch itself — only valid when we ARE on it
+        [[ "$current" == task/FE* ]] || deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok'."
+        ;;
+      *)
+        deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok' (re-run the pass on that content and push from there)."
+        ;;
+    esac
+  done < <(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']*task/FE[^[:space:]\"']*" || true)
+}
+validate_fe_ref_tokens
 
 # lane: a ':main' / ':refs/heads/main' refspec, pushing while on main, or a docs/* branch
 # (whose whole purpose is the fast lane, incl. its own branch push) = doc-only lane
@@ -188,25 +221,8 @@ require_browser_receipt_if_fe() {
     # the two trees must be IDENTICAL on an FE push.
     head_tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null)"
     [ "$(snapshot_tree)" = "$head_tree" ] || deny "FE push sends HEAD, but the worktree (which the receipts bind) differs from it — commit exactly the passed content (re-run the pass and re-stamp if it changed), then push."
-    # every explicit token naming an FE branch must carry content the
-    # receipts bind: HEAD:<dst>, or the CURRENT FE branch itself (bare or as
-    # the refspec src). Any other src pushes a ref the worktree receipts
-    # never spoke for — `origin task/FE1` from another checkout (Codex #64
-    # R6) and `origin other:task/FE1` even ON the FE checkout (Codex #64 R7,
-    # both executed repros). Fail-closed on every checkout.
-    while IFS= read -r tok; do
-      [ -n "$tok" ] || continue
-      case "$tok" in
-        HEAD:* | +HEAD:*) : ;; # the worktree's own commit
-        "$current" | "$current":* | +"$current":* | refs/heads/"$current" | refs/heads/"$current":*)
-          # the checked-out FE branch itself — only valid when we ARE on it
-          [[ "$current" == task/FE* ]] || deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok'."
-          ;;
-        *)
-          deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok' (re-run the pass on that content and push from there)."
-          ;;
-      esac
-    done < <(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']*task/FE[^[:space:]\"']*" || true)
+    # (the FE ref-token legality check runs earlier, BEFORE the no-op fast
+    # path — see validate_fe_ref_tokens)
     # H10: the FE browser pass is tree-bound like the review — its own
     # namespace, so neither receipt kind can satisfy the other's gate
     fe_tree="$(snapshot_tree)"

@@ -18,8 +18,21 @@
 set -e
 [ "$#" -ge 1 ] || { echo "usage: write-browser-qa-receipt.sh <evidence-file> [...]" >&2; exit 1; }
 cd "${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}"
+top="$(git rev-parse --show-toplevel)"
 for f in "$@"; do
   [ -s "$f" ] || { echo "evidence file missing or empty: $f — the browser pass needs real artifacts" >&2; exit 1; }
+  # evidence must NEVER enter the content trees: the receipt snapshot and
+  # the push gate's worktree==HEAD check both assume it (an unignored
+  # in-repo artifact would deadlock the FE gate — Codex #64 R13). Inside
+  # the repo it must be gitignored; outside (e.g. the session scratchpad)
+  # is always safe.
+  # compare git TOPLEVELS, not string prefixes — Git Bash mixes /c/... and
+  # C:/... path forms, and only git normalizes both sides consistently
+  ev_top="$(git -C "$(dirname "$f")" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ "$ev_top" = "$top" ]; then
+    git check-ignore -q -- "$f" ||
+      { echo "evidence inside the repo must be gitignored (or store it outside, e.g. the session scratchpad): $f — an unignored artifact enters the receipt trees and deadlocks the worktree==HEAD gate" >&2; exit 1; }
+  fi
 done
 
 # git refuses a zero-byte index file, so reserve a name and DELETE it — git then
