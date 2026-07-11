@@ -39,10 +39,12 @@ GATE_SCRIPT = (REPO_ROOT / ".claude" / "hooks" / "require-push-gates.sh").as_pos
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash not available")
 
-#: the gate engages on the pushing git verb; tests build the stdin payload
-#: from parts so the PreToolUse hook watching THIS repo's tool calls does not
-#: engage on the test source itself (it greps command payloads for the verb)
+#: the gate engages on the pushing git verb and on the PR-creating gh verb;
+#: tests build the stdin payloads from parts so the PreToolUse hook watching
+#: THIS repo's tool calls does not engage on the test source itself (it greps
+#: command payloads for the verbs)
 _PUSH = "git " + "pu" + "sh"
+_PR_CREATE = "gh pr " + "cre" + "ate"
 
 
 def _run(
@@ -244,3 +246,33 @@ def test_fe_push_gate_requires_the_browser_receipt(toy_repo: Path) -> None:
     )
     nonfe = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/B1", extra_env=env)
     assert nonfe.returncode == 0, f"non-FE branch demanded a browser receipt: {nonfe.stderr}"
+
+
+def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:
+    """Codex #64 (class 9 — every constructor of the effect): `gh pr create`
+    can push an unpushed branch itself, so a payload creating a PR must run
+    the SAME gate as the push verb — deny without the receipts, pass with
+    them. Discriminating: the push-verb-only matcher exited 0 on this."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/FE2")
+    (toy_repo / "a.md").write_text("fe edit via pr\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "fe"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+
+    denied = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PR_CREATE} --fill --base main", extra_env=env
+    )
+    assert denied.returncode == 2, f"PR creation bypassed the gate: {denied.stdout}"
+    assert "receipt" in denied.stderr
+
+    shot = toy_repo / "shot.png"
+    shot.write_bytes(b"\x89PNG fake-but-non-empty")
+    _stamp(toy_repo)
+    _browser_stamp(toy_repo, shot)
+    allowed = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PR_CREATE} --fill --base main", extra_env=env
+    )
+    assert allowed.returncode == 0, f"gate blocked a fully-receipted PR creation: {allowed.stderr}"

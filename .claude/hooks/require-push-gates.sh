@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# PreToolUse gate on `git push`: CPU-verifies the loop's feed-forward claims at
-# the transition point instead of trusting the agent's narrative.
+# PreToolUse gate on `git push` AND `gh pr create`: CPU-verifies the loop's
+# feed-forward claims at the transition point instead of trusting the agent's
+# narrative. `gh pr create` is gated too because it can ITSELF push an
+# unpushed branch (per the gh manual) — a sibling API producing the push
+# effect (class 9: one guard covers every constructor of the effect;
+# Codex #64).
 #
 #   Task-branch push (full lane):
 #     - requires a code-reviewer PASS receipt whose tree hash matches the
@@ -23,9 +27,13 @@ set -o pipefail
 deny() { printf 'push-gate: %s\n' "$1" >&2; exit 2; }
 
 payload="$(cat)"
-# engage on `git [flags] push` incl. `git -C <path> push` and `git --git-dir=<p> push`;
-# must not engage on e.g. `git log push-fix`
-printf '%s' "$payload" | grep -Eq 'git([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*[[:space:]]+push\b' || exit 0
+# engage on `git [flags] push` incl. `git -C <path> push` and `git --git-dir=<p> push`
+# (must not engage on e.g. `git log push-fix`) — AND on `gh pr create`, which
+# can push the branch itself (the same effect through a sibling command)
+if ! printf '%s' "$payload" | grep -Eq 'git([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*[[:space:]]+push\b' &&
+  ! printf '%s' "$payload" | grep -Eq 'gh[[:space:]]+pr[[:space:]]+create\b'; then
+  exit 0
+fi
 cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."
 
 git fetch -q origin main 2>/dev/null
