@@ -244,21 +244,45 @@ if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
         deny "defining a git alias that reaches the push verb (or shells out) hides the transfer from the gate — run the literal command."
       # persisted aliases: invoking one whose expansion starts at push,
       # contains the push word, or shells out (!) is an invisible transfer
+      alias_cfg="$(git -C "${CLAUDE_PROJECT_DIR:-.}" config --get-regexp '^alias\.' 2>/dev/null)"
       alias_hit=""
       while IFS= read -r alias_line; do
         [ -n "$alias_line" ] || continue
         alias_name="${alias_line%% *}"
         alias_name="${alias_name#alias.}"
         alias_exp="${alias_line#* }"
+        alias_transfer=0
         case "$alias_exp" in
-        push* | *" push"* | "!"*)
+        push* | *" push"* | "!"*) alias_transfer=1 ;;
+        *)
+          # alias CHAINS (Codex #64 R25, P1 executed repro: p=q, q=push
+          # reaches push with NEITHER token in the payload): an expansion
+          # REFERENCING any configured alias is opaque one level down.
+          # git honors leading -c flags inside an expansion and THEN
+          # resolves the next word as an alias (reviewer-executed bypass:
+          # a "-c x.y=z p" expansion with p reaching the verb), so EVERY
+          # word is checked, not just the head — deny without resolving
+          # the chain (fail-closed; static chain resolution is the
+          # fragility this constructor approach exists to avoid).
+          # read -ra avoids pathname-expanding expansion words.
+          read -ra alias_words <<<"$alias_exp"
+          for alias_word in "${alias_words[@]}"; do
+            case "$alias_cfg" in
+            *"alias.${alias_word} "*)
+              alias_transfer=1
+              break
+              ;;
+            esac
+          done
+          ;;
+        esac
+        if [ "$alias_transfer" = 1 ]; then
           alias_esc="$(printf '%s' "$alias_name" | sed 's/[^A-Za-z0-9_-]/./g')"
           printf '%s' "$bare" | grep -Eq "git${flags}[[:space:]]+${alias_esc}([[:space:]]|\$)" &&
             alias_hit="$alias_name = $alias_exp"
-          ;;
-        esac
+        fi
         [ -n "$alias_hit" ] && break
-      done < <(git -C "${CLAUDE_PROJECT_DIR:-.}" config --get-regexp '^alias\.' 2>/dev/null)
+      done <<<"$alias_cfg"
       [ -n "$alias_hit" ] &&
         deny "git alias '$alias_hit' reaches a transfer the literal matcher cannot see — run the expanded command."
     fi
@@ -431,6 +455,26 @@ validate_task_ref_tokens() {
 if [ "$git_engaged" = 1 ] && [ "$current" != "main" ]; then
   printf '%s' "$payload" | grep -Eq "(^|[[:space:]\"'])\+?(refs/heads/)?main(:[^[:space:]\"']*)?([[:space:]\"']|$)" &&
     deny "this names the LOCAL main ref as a push source from a non-main checkout — the receipts bind THIS worktree, never local main; push main from its own checkout, or send reviewed content via HEAD:main."
+fi
+# ...and the DESTINATION side (Codex #64 R25, P1 executed repro): a :main
+# refspec whose source is NOT this worktree (other:main) updates remote
+# main with an unrelated local ref, while the doc-lane checks validate the
+# CURRENT checkout's receipt. The source must be HEAD or the checked-out
+# branch; an empty source (:main) is a remote DELETION and denies too.
+if [ "$git_engaged" = 1 ]; then
+  while IFS= read -r tok; do
+    [ -n "$tok" ] || continue
+    case "$tok" in
+    *:main | *:refs/heads/main)
+      src="${tok%%:*}"
+      src="${src#+}"
+      case "$src" in
+      HEAD | "$current" | refs/heads/"$current") : ;;
+      *) deny "a :main destination must carry THIS worktree's content — the source must be HEAD or the current branch, not '${src:-<empty (deletion)>}'." ;;
+      esac
+      ;;
+    esac
+  done < <(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']+" || true)
 fi
 
 # lane: a ':main' / ':refs/heads/main' refspec, pushing while on main, or a docs/* branch

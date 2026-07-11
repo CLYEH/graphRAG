@@ -1224,6 +1224,72 @@ def test_r24_local_main_src_and_alias_indirection(toy_repo: Path) -> None:
     assert denied.returncode == 2 and "gh alias" in denied.stderr
 
 
+def test_r25_main_destination_sources_and_alias_chains(toy_repo: Path) -> None:
+    """Codex #64 R25 (both P1, executed repros): (a) a :main refspec with a
+    NON-worktree source (other:main) updates remote main with an unrelated
+    local ref while the doc lane validates the CURRENT checkout's receipt —
+    the source must be HEAD or the checked-out branch, and an empty source
+    (:main) is a remote deletion; (b) git resolves alias CHAINS (p=q,
+    q=push), so a one-level expansion classifier exits 0 before receipts —
+    an expansion whose first word is itself a configured alias denies
+    without resolving the chain."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "docs/x")
+    (toy_repo / "a.md").write_text("doc edit\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "docs"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    # (a) non-worktree sources for a :main destination deny (Codex's repro
+    # returned 0: the doc lane blessed the CURRENT checkout while git would
+    # send the unrelated 'other' ref); deletion (:main) denies too
+    for refspec in ("other:main", "refs/heads/other:main", ":main"):
+        denied = _run(
+            [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin {refspec}", extra_env=env
+        )
+        assert denied.returncode == 2, f"foreign :main source slipped ({refspec}): {denied.stdout}"
+        assert "must carry THIS worktree" in denied.stderr
+    # worktree-carrying sources stay legal on the doc lane
+    for refspec in ("HEAD:main", "docs/x:main"):
+        allowed = _run(
+            [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin {refspec}", extra_env=env
+        )
+        assert allowed.returncode == 0, (
+            f"worktree :main source blocked ({refspec}): {allowed.stderr}"
+        )
+
+    # (b) the chain: p -> q -> transfer verb; the direct classifier saw only
+    # 'q' and exited 0 before receipts
+    subprocess.run(
+        ["git", "config", "alias.q", _PUSH.split()[1]],
+        cwd=toy_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "config", "alias.p", "q"], cwd=toy_repo, check=True, capture_output=True)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin="git p origin task/B1", extra_env=env)
+    assert denied.returncode == 2, f"alias chain slipped: {denied.stdout}"
+    assert "alias" in denied.stderr
+    # ...including a FLAG-PREFIXED chain (reviewer-executed bypass): git
+    # honors a leading -c inside the expansion, then resolves the alias —
+    # so any word of the expansion naming a configured alias must deny
+    subprocess.run(
+        ["git", "config", "alias.pcq", "-c x.y=z q"], cwd=toy_repo, check=True, capture_output=True
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin="git pcq origin task/B1", extra_env=env)
+    assert denied.returncode == 2, f"flag-prefixed chain slipped: {denied.stdout}"
+    assert "alias" in denied.stderr
+    # a dangling chain head (q removed) no longer reaches a transfer
+    subprocess.run(
+        ["git", "config", "--unset", "alias.q"], cwd=toy_repo, check=True, capture_output=True
+    )
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin="git p origin task/B1", extra_env=env)
+    assert allowed.returncode == 0, f"dangling chain over-blocked: {allowed.stderr}"
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING
