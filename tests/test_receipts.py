@@ -1411,6 +1411,60 @@ def test_r28_attached_repo_flag_env_aliases_and_fe_prose(toy_repo: Path) -> None
     assert allowed.returncode == 0, f"FE prose demanded a browser receipt: {allowed.stderr}"
 
 
+def test_r29_abbreviated_ref_spellings(toy_repo: Path) -> None:
+    """Codex #64 R29 (both executed repros): git's revision docs accept the
+    ABBREVIATED spellings heads/<name> and tags/<name> for refs/heads/ and
+    refs/tags/ — both rode the no-op shortcut on a clean checkout while
+    transferring a local main ref / tag the worktree receipts never
+    reviewed. The main source/destination walks, the doc-lane refspec
+    grep, and the tag deny all accept the short spellings now."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B1")
+    (toy_repo / "a.md").write_text("b1 content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b1"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin heads/main", extra_env=env)
+    assert denied.returncode == 2, f"heads/main source slipped: {denied.stdout}"
+    assert "LOCAL main" in denied.stderr
+
+    denied = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin other:heads/main", extra_env=env
+    )
+    assert denied.returncode == 2, f"foreign heads/main dest slipped: {denied.stdout}"
+    assert "must carry THIS worktree" in denied.stderr
+
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin tags/badtag", extra_env=env)
+    assert denied.returncode == 2, f"tags/ shorthand slipped: {denied.stdout}"
+    assert "tag refs" in denied.stderr
+
+    # negative pin: a branch merely CONTAINING the spelling is not main —
+    # the boundary class must sit immediately before heads/ or main
+    allowed = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin arrowheads/main", extra_env=env
+    )
+    assert allowed.returncode == 0, f"arrowheads/main over-blocked: {allowed.stderr}"
+
+    # the LANE grep is the load-bearing extension (reviewer revert-probe:
+    # dropping it alone kept the suite green): a worktree-carrying
+    # abbreviated main destination must route to the DOC lane, where
+    # non-md outgoing content denies — under the task lane it would have
+    # reached main without the md-only review
+    (toy_repo / "p.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=toy_repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "code"], cwd=toy_repo, check=True, capture_output=True)
+    _stamp(toy_repo)
+    denied = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin HEAD:heads/main", extra_env=env
+    )
+    assert denied.returncode == 2, f"abbreviated main dest skipped the doc lane: {denied.stdout}"
+    assert "md-only" in denied.stderr
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING

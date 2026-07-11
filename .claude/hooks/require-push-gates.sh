@@ -485,8 +485,11 @@ validate_task_ref_tokens() {
 # (the doc lane then applies); destinations stay legal — HEAD:main carries
 # THIS worktree's content and docs/x:main carries the checkout's own ref.
 # Same git-only scoping as the task walk (a gh body naming main is prose).
+# (the ((refs/)?heads/)? alternation covers git's abbreviated ref spellings
+# too — heads/main selects refs/heads/main per the revision docs, and the
+# bare-main pattern missed it; Codex #64 R29, P1 executed repro)
 if [ "$git_engaged" = 1 ] && [ "$current" != "main" ]; then
-  printf '%s' "$payload" | grep -Eq "(^|[[:space:]\"'])\+?(refs/heads/)?main(:[^[:space:]\"']*)?([[:space:]\"']|$)" &&
+  printf '%s' "$payload" | grep -Eq "(^|[[:space:]\"'])\+?((refs/)?heads/)?main(:[^[:space:]\"']*)?([[:space:]\"']|$)" &&
     deny "this names the LOCAL main ref as a push source from a non-main checkout — the receipts bind THIS worktree, never local main; push main from its own checkout, or send reviewed content via HEAD:main."
 fi
 # ...and the DESTINATION side (Codex #64 R25, P1 executed repro): a :main
@@ -498,7 +501,7 @@ if [ "$git_engaged" = 1 ]; then
   while IFS= read -r tok; do
     [ -n "$tok" ] || continue
     case "$tok" in
-    *:main | *:refs/heads/main)
+    *:main | *:heads/main | *:refs/heads/main)
       src="${tok%%:*}"
       src="${src#+}"
       case "$src" in
@@ -516,7 +519,10 @@ fi
 # this closes the last spelled-out tag surface. Denied on either refspec
 # side (source, +forced, or :destination).
 if [ "$git_engaged" = 1 ]; then
-  printf '%s' "$payload" | grep -Eq "(^|[[:space:]\"':+])refs/tags/" &&
+  # (refs/)?tags/ covers the abbreviated spelling too — tags/x selects
+  # refs/tags/x per the revision docs (Codex #64 R29, P2); a path segment
+  # like docs/tags/x cannot false-match (the boundary class excludes /)
+  printf '%s' "$payload" | grep -Eq "(^|[[:space:]\"':+])(refs/)?tags/" &&
     deny "explicit tag refspecs transfer tag refs the receipts never covered — push receipted branch content only."
   # ...including the documented SHORTHAND (git push origin tag <name>
   # expands to a tag ref update — Codex #64 R27, P2 executed repro: it
@@ -533,7 +539,7 @@ fi
 # match body/title prose (same erased-quoting class as the engagement and
 # flag scans, Codex #64 R21), so it runs for git-engaged payloads only;
 # gh lane classification rests on the branch itself.
-if { [ "$git_engaged" = 1 ] && printf '%s' "$payload" | grep -Eq ":(refs/heads/)?main([[:space:]\"']|$)"; } \
+if { [ "$git_engaged" = 1 ] && printf '%s' "$payload" | grep -Eq ":((refs/)?heads/)?main([[:space:]\"']|$)"; } \
   || [ "$current" = "main" ] || [[ "$current" == docs/* ]]; then
   lane=doc
 else
