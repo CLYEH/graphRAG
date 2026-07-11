@@ -35,6 +35,9 @@
 # what is actually being sent, in a handful of lines and with no grammar to
 # bypass. Until then the independent backstops stand: server-side branch
 # protection and the Codex +1 merge gate (require-codex-approval.sh).
+# ONE surface stays here permanently even after H12: `gh pr create --head`
+# opens a PR from an already-remote ref and skips pushing entirely (gh
+# manual), so NO pre-push hook can ever see it — the flag is banned below.
 # The same text layer over-blocks in one visible way: the FE token scan below
 # reads the WHOLE payload, so an incidental mention of another FE branch (a PR
 # title naming task/FE7 while on task/FE0) denies. Fail-closed and cheap to
@@ -48,8 +51,24 @@ payload="$(cat)"
 # (must not engage on e.g. `git log push-fix`) — AND on gh PR creation, which
 # can push the branch itself (the same effect through a sibling command).
 flags='([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*'
-printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b|gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new)\b" || exit 0
+gh_engaged=0
+printf '%s' "$payload" | grep -Eq "gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new)\b" && gh_engaged=1
+printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b" || [ "$gh_engaged" = 1 ] || exit 0
 cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."
+
+# gh --head selects an ALREADY-REMOTE ref and, per the gh manual, SKIPS
+# pushing — so no local receipt can vouch for the SHA the PR opens from, and
+# this is the one transfer surface H12's pre-push hook can never cover
+# (nothing is pushed, so no pre-push hook runs). The flag is banned outright:
+# gh defaults to the current branch, which the receipts do cover.
+# `-[defw]*H` covers pflag's CLUSTERS: gh pr create's boolean shorthands are
+# -d/-e/-f/-w, and pflag lets a boolean cluster carry a value-taking shorthand
+# (`-fH x` == `--fill --head x` — reviewer-executed bypass of the unclustered
+# ban). The set is gh's booleans TODAY; a new gh boolean shorthand extends it.
+# The anchor keeps the capital H inside a repo VALUE from matching (-RCLYEH/…
+# starts -R, which [defw]* cannot consume).
+[ "$gh_engaged" = 1 ] && printf '%s' "$payload" | grep -Eq "(^|[[:space:]])(--head([=[:space:]]|$)|-[defw]*H)" &&
+  deny "gh --head selects an already-remote ref the local receipts cannot vouch for (and it skips pushing, so no pre-push hook sees it) — drop the flag; gh defaults to the current branch."
 
 git fetch -q origin main 2>/dev/null
 current="$(git branch --show-current)"

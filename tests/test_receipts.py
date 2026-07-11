@@ -466,3 +466,58 @@ def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:
         [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PR_CREATE} --fill --base main", extra_env=env
     )
     assert allowed.returncode == 0, f"gate blocked a fully-receipted PR creation: {allowed.stderr}"
+
+
+def test_gh_head_is_banned_even_when_fully_receipted(toy_repo: Path) -> None:
+    """Codex #64 (post-cutback, P2): `gh pr create --head` opens the PR from an
+    ALREADY-REMOTE ref and SKIPS pushing (gh manual) — the local receipts
+    cannot vouch for that remote SHA, and no pre-push hook can ever see it
+    (nothing is pushed), so H12 will NOT cover this surface: the ban has to
+    live here. Discriminating: with both receipts stamped the gate returned 0
+    on these payloads, and the flagless form must stay green."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/FE1")
+    (toy_repo / "a.md").write_text("fe content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "fe"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    shot = toy_repo / "shot.png"
+    shot.write_bytes(b"\x89PNG fake-but-non-empty")
+    _stamp(toy_repo)
+    _browser_stamp(toy_repo, shot)  # fully receipted: only the flag may deny
+
+    # long, attached-value, short, and pflag CLUSTER spellings. The clusters
+    # are what a naive test misses: `-fH x` == `--fill --head x` (gh's boolean
+    # shorthands cluster with a value-taking one). Their heads are chosen so
+    # the FE token walk CANNOT mask the ban — the CURRENT branch (the walk
+    # allows that token) and a non-FE name (no FE token in the payload at
+    # all) — and the MESSAGE is asserted, not just the exit code, so a deny
+    # from the wrong rule cannot pass for a ban.
+    for flag in (
+        "--head task/FE1",
+        "--head=task/FE2",
+        "-H task/FE2",
+        "-Htask/FE2",
+        "-fH task/FE1",
+        "-fH release-x",
+        "-dfH release-x",
+    ):
+        payload = f"{_PR_CREATE} {flag}"
+        denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=payload, extra_env=env)
+        assert denied.returncode == 2, f"gh head slipped ({flag}): {denied.stdout}"
+        assert "already-remote" in denied.stderr, f"wrong rule denied ({flag}): {denied.stderr}"
+
+    # the flagless form stays green, and the repo flag's value may carry a
+    # capital H without false-matching — in BOTH spellings (the ATTACHED form
+    # is what the anchor exists for: this repo's owner contains an H)
+    for payload in (
+        f"{_PR_CREATE} --fill",
+        f"gh -R CLYEH/graphRAG pr {_PR_CREATE.split()[-1]} --fill",
+        f"gh -RCLYEH/graphRAG pr {_PR_CREATE.split()[-1]} --fill",
+    ):
+        allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=payload, extra_env=env)
+        assert allowed.returncode == 0, (
+            f"receipted PR creation blocked ({payload}): {allowed.stderr}"
+        )
