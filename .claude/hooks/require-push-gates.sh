@@ -6,6 +6,10 @@
 #     - requires a code-reviewer PASS receipt whose tree hash matches the
 #       current content (see write-review-receipt.sh) — editing anything after
 #       the review makes the push mechanically impossible;
+#     - task/FE* additionally requires a browser-QA receipt for the same tree
+#       (H10, LOOP.md step 4 FE-only: the Claude in Chrome pass ran on exactly
+#       this content — write-browser-qa-receipt.sh refuses to stamp without
+#       evidence artifacts);
 #     - re-runs `uv run poe check` itself (and `poe web-check` when web/ files
 #       are outgoing) — "gates were green" is re-executed, not believed.
 #   Direct push to main (doc-only fast lane, LOOP.md):
@@ -75,6 +79,14 @@ if [ "$lane" = doc ]; then
   require_receipt
 else
   require_receipt
+  if [[ "$current" == task/FE* ]]; then
+    # H10: the FE browser pass is tree-bound like the review — its own
+    # namespace, so neither receipt kind can satisfy the other's gate
+    fe_tree="$(snapshot_tree)"
+    [ -f ".claude/receipts/browser-qa-$fe_tree" ] || deny "FE task: no browser-QA receipt for this content — run the Claude in Chrome pass (LOOP.md step 4) and stamp it with the evidence via .claude/hooks/write-browser-qa-receipt.sh; anything edited after the pass needs a re-run + re-stamp."
+    read -r bq_tree bq_kind bq_rest < ".claude/receipts/browser-qa-$fe_tree"
+    { [ "$bq_tree" = "$fe_tree" ] && [ "$bq_kind" = "browser-qa" ]; } || deny "browser-QA receipt for $fe_tree is corrupt — re-stamp via write-browser-qa-receipt.sh."
+  fi
   uv run poe check >/dev/null 2>&1 || deny "backend gates are red — run 'uv run poe check', fix, re-review, then push."
   if printf '%s\n' "$outgoing" | grep -q '^web/'; then
     uv run poe web-check >/dev/null 2>&1 || deny "frontend gates are red — run 'uv run poe web-check', fix, re-review, then push."
