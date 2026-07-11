@@ -28,10 +28,14 @@ deny() { printf 'push-gate: %s\n' "$1" >&2; exit 2; }
 
 payload="$(cat)"
 # engage on `git [flags] push` incl. `git -C <path> push` and `git --git-dir=<p> push`
-# (must not engage on e.g. `git log push-fix`) — AND on `gh pr create`, which
-# can push the branch itself (the same effect through a sibling command)
-if ! printf '%s' "$payload" | grep -Eq 'git([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*[[:space:]]+push\b' &&
-  ! printf '%s' "$payload" | grep -Eq 'gh[[:space:]]+pr[[:space:]]+create\b'; then
+# (must not engage on e.g. `git log push-fix`) — AND on gh PR creation, which
+# can push the branch itself (the same effect through a sibling command).
+# The gh pattern tolerates global/persistent flags in BOTH positions
+# (`gh -R o/r pr create`, `gh pr --repo o/r create`) and the documented
+# `gh pr new` alias (Codex #64 R4) — the same flags idiom as the git pattern.
+flags='([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*'
+if ! printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b" &&
+  ! printf '%s' "$payload" | grep -Eq "gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new)\b"; then
   exit 0
 fi
 cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."

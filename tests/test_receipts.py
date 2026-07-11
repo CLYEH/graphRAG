@@ -309,11 +309,17 @@ def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:
     subprocess.run(["git", "commit", "-qam", "fe"], cwd=toy_repo, check=True, capture_output=True)
     env = _uv_shim(toy_repo)
 
-    denied = _run(
-        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PR_CREATE} --fill --base main", extra_env=env
-    )
-    assert denied.returncode == 2, f"PR creation bypassed the gate: {denied.stdout}"
-    assert "receipt" in denied.stderr
+    # every documented spelling engages: plain, global-flagged, persistent-
+    # flagged, and the `new` alias (Codex #64 R4 — same effect, same gate)
+    for payload in (
+        f"{_PR_CREATE} --fill --base main",
+        f"gh -R CLYEH/graphRAG pr {_PR_CREATE.split()[-1]} --fill",
+        f"gh pr --repo CLYEH/graphRAG {_PR_CREATE.split()[-1]}",
+        "gh pr " + "n" + "ew",
+    ):
+        denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=payload, extra_env=env)
+        assert denied.returncode == 2, f"PR creation bypassed the gate ({payload}): {denied.stdout}"
+        assert "receipt" in denied.stderr
 
     shot = toy_repo / "shot.png"
     shot.write_bytes(b"\x89PNG fake-but-non-empty")
