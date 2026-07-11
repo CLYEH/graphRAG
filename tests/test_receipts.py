@@ -1355,6 +1355,62 @@ def test_r26_quoted_aliases_docs_destinations_and_tag_refspecs(toy_repo: Path) -
     assert "shorthand" in denied.stderr
 
 
+def test_r28_attached_repo_flag_env_aliases_and_fe_prose(toy_repo: Path) -> None:
+    """Codex #64 R28: (a) pflag attaches values to short flags, and the
+    engagement grammar's word-chars-only atom stopped at -Rowner/repo —
+    gh_engaged stayed false and the hook exited 0 before receipts; the
+    OWNER value may contain H, so -R/--repo also join the value-option
+    sets (a head detector false-positive otherwise); (b) --config-env
+    stores an alias value in an ENV VAR the gate cannot read — alias keys
+    through it are banned; (c) an alias expansion can DEFINE a second
+    alias inline (-c alias.x=<verb> x) that the config-snapshot word walk
+    cannot see — any alias./config-env reference inside an expansion is
+    config injection; (d) 'Related task/FE1' in a gh body demanded a
+    browser receipt from a non-FE branch — the FE payload scan is a
+    refspec construct and reads git payloads only."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B1")
+    (toy_repo / "a.md").write_text("b1 content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b1"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    verb = _PUSH.split()[1]
+
+    # (a) attached -R engages and reaches the receipt deny (0 before);
+    # the separated spelling stays covered by the existing R6 test
+    attached = ('{"tool_input": {"command": "gh -RCLYEH/graphRAG PRTAIL --fill"}}').replace(
+        "PRTAIL", _PR_CREATE.split(" ", 1)[1]
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=attached, extra_env=env)
+    assert denied.returncode == 2, f"attached -R escaped engagement: {denied.stdout}"
+    assert "receipt" in denied.stderr
+
+    # (b) alias definition through an env var is opaque — banned (0 before)
+    env_alias = "git --config-env=alias.x=SOMEVAR x origin task/B1"
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=env_alias, extra_env=env)
+    assert denied.returncode == 2, f"config-env alias slipped: {denied.stdout}"
+    assert "config-env" in denied.stderr
+
+    # (c) an expansion defining and invoking a SECOND alias (0 before: the
+    # word walk only saw names configured before the inline definition)
+    with (toy_repo / ".git" / "config").open("a", encoding="utf-8") as fh:
+        fh.write(f"[alias]\n\tp = -c alias.x={verb} x\n")
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin="git p origin task/B1", extra_env=env)
+    assert denied.returncode == 2, f"expansion-defined alias slipped: {denied.stdout}"
+    assert "alias" in denied.stderr
+
+    # (d) FE prose in a gh body is not an FE destination (denied the
+    # browser receipt before); the branch is receipted and non-FE
+    _stamp(toy_repo)
+    fe_prose = (
+        '{"tool_input": {"command": "PRCREATE --fill --body \'Related task/FE1\'"}}'
+    ).replace("PRCREATE", _PR_CREATE)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=fe_prose, extra_env=env)
+    assert allowed.returncode == 0, f"FE prose demanded a browser receipt: {allowed.stderr}"
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING

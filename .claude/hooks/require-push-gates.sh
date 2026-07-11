@@ -131,8 +131,9 @@ VALOPTS = {
     "-a", "--assignee", "-B", "--base", "-b", "--body", "-F", "--body-file",
     "-l", "--label", "-m", "--milestone", "-p", "--project", "-r",
     "--reviewer", "-T", "--template", "-t", "--title", "--recover",
+    "-R", "--repo",  # inherited option; its OWNER value may contain H (R28)
 }
-SHORTVAL = ("-a", "-B", "-b", "-F", "-l", "-m", "-p", "-r", "-T", "-t")
+SHORTVAL = ("-a", "-B", "-b", "-F", "-l", "-m", "-p", "-r", "-T", "-t", "-R")
 i = 0
 while i < len(toks):
     t = toks[i]
@@ -195,12 +196,12 @@ fi
 # The gh pattern tolerates global/persistent flags in BOTH positions
 # (`gh -R o/r pr create`, `gh pr --repo o/r create`) and the documented
 # `gh pr new` alias (Codex #64 R4) — the same flags idiom as the git pattern.
-# the attached-value alternative tolerates an EMPTY value (=[^ ]* not =[^ ]+):
-# on the bare projection a quoted value is stripped ("--git-dir='.git' push"
-# reads as "--git-dir= push"), and requiring a non-empty value made the
-# engagement grep miss a real transfer entirely — exit 0 before receipts
-# (Codex #64 R22, P1 executed repro).
-flags='([[:space:]]+-[A-Za-z-]+(=[^[:space:]]*|[[:space:]]+[^[:space:]]+)?)*'
+# the flag atom accepts ANY attached value (-Rowner/repo, -n1234, --k=v,
+# and the EMPTY value a stripped quote leaves behind — Codex #64 R22 and
+# R28, both P1 executed repros: requiring word-chars-only or a non-empty
+# value made the engagement grep miss a real transfer and exit 0 before
+# receipts), plus the optional separated value.
+flags='([[:space:]]+-[^[:space:]]+([[:space:]]+[^[:space:]]+)?)*'
 git_engaged=0
 gh_engaged=0
 # engagement reads BARE (all quoted spans stripped), not the rejoined norm:
@@ -248,6 +249,12 @@ if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
       payload_flat="$(printf '%s' "$payload" | tr -d "'\"\\\\")"
       printf '%s' "$payload_flat" | grep -Eq 'alias\.[^=[:space:]]+(=|[[:space:]]+)(!|[^[:space:]]*push)' &&
         deny "defining a git alias that reaches the push verb (or shells out) hides the transfer from the gate — run the literal command."
+      # --config-env stores the VALUE in an environment variable (Codex #64
+      # R28, P1 executed repro: alias.x bound to an env var holding the
+      # verb) — statically unclassifiable, so alias keys through it are
+      # banned outright.
+      printf '%s' "$payload_flat" | grep -Eq -- '--config-env[=[:space:]]+alias\.' &&
+        deny "defining a git alias through config-env hides its value in an environment variable the gate cannot read — run the literal command."
       # persisted aliases: invoking one whose expansion starts at push,
       # contains the push word, or shells out (!) is an invisible transfer
       alias_cfg="$(git -C "${CLAUDE_PROJECT_DIR:-.}" config --get-regexp '^alias\.' 2>/dev/null)"
@@ -266,6 +273,15 @@ if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
         alias_transfer=0
         case "$alias_exp_flat" in
         push* | *" push"* | "!"*) alias_transfer=1 ;;
+        *alias.* | *--config-env*)
+          # an expansion can DEFINE a second alias inline and invoke it
+          # (-c alias.x=<verb> x — Codex #64 R28, P1 executed repro: the
+          # word walk below only sees names configured BEFORE the inline
+          # definition), or route config through an env var. Any alias./
+          # config-env reference inside an expansion is config injection —
+          # transfer-capable, fail-closed.
+          alias_transfer=1
+          ;;
         *)
           # alias CHAINS (Codex #64 R25, P1 executed repro: p=q, q=push
           # reaches push with NEITHER token in the payload): an expansion
@@ -573,7 +589,13 @@ require_browser_receipt_if_fe() {
   # like the rest of this hook. Runs in BOTH lanes: the doc lane can push an
   # FE destination too, e.g. `HEAD:task/FE1` from a docs/* branch (Codex #64
   # R5 — lane classification must not outrank the destination).
-  if [[ "$current" == task/FE* ]] || printf '%s' "$payload" | grep -q 'task/FE'; then
+  # the payload scan is a REFSPEC construct — on a gh payload it could only
+  # ever match body/title prose ("Related task/FE1" demanded a browser
+  # receipt from a non-FE branch; Codex #64 R28, P2 — the same erased-
+  # quoting class as R19/R21): git payloads only. gh's FE requirement
+  # rests on the branch itself (--head is banned, so gh cannot name an FE
+  # destination any other way).
+  if [[ "$current" == task/FE* ]] || { [ "$git_engaged" = 1 ] && printf '%s' "$payload" | grep -q 'task/FE'; }; then
     local fe_tree bq_tree bq_kind bq_rest ev_path ev_count tok
     # (the worktree==HEAD equality this block pinned since R12 now lives in
     # require_receipt — Codex #64 R22 generalized it to every lane. The FE
