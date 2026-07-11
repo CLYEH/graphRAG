@@ -1348,6 +1348,11 @@ def test_r26_quoted_aliases_docs_destinations_and_tag_refspecs(toy_repo: Path) -
         )
         assert denied.returncode == 2, f"tag refspec slipped ({refspec}): {denied.stdout}"
         assert "tag refs" in denied.stderr
+    # ...and the documented SHORTHAND (Codex #64 R27: `origin tag badtag`
+    # rode the no-op shortcut on a clean checkout — no refs/tags/ text)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin tag badtag", extra_env=env)
+    assert denied.returncode == 2, f"tag shorthand slipped: {denied.stdout}"
+    assert "shorthand" in denied.stderr
 
 
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:

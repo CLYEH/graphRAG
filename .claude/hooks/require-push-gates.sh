@@ -502,6 +502,13 @@ fi
 if [ "$git_engaged" = 1 ]; then
   printf '%s' "$payload" | grep -Eq "(^|[[:space:]\"':+])refs/tags/" &&
     deny "explicit tag refspecs transfer tag refs the receipts never covered — push receipted branch content only."
+  # ...including the documented SHORTHAND (git push origin tag <name>
+  # expands to a tag ref update — Codex #64 R27, P2 executed repro: it
+  # rode the no-op shortcut on a clean checkout, since no branch content
+  # was outgoing). A standalone tag token in a git transfer denies
+  # outright — branches are never named bare "tag" in this model.
+  printf '%s' "$payload" | grep -Eq "(^|[[:space:]])tag([[:space:]]|$)" &&
+    deny "the tag push shorthand (tag <name>) transfers tag refs the receipts never covered — push receipted branch content only."
 fi
 
 # lane: a ':main' / ':refs/heads/main' refspec, pushing while on main, or a docs/* branch
