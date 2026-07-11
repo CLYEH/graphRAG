@@ -196,6 +196,23 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      their deadline in the queue (BA6a R2 P1). Prechecks take a short-lived
      acquire-use-release connection (or reuse one), never a held dep plus a
      second acquire.
+   - **Eager dependency acquisition couples non-dependent paths to resource
+     availability (class 13; #53 R3 candidate → formalized on #62 R1)**:
+     framework DI is an INVISIBLE eager point — dependencies resolve before
+     any handler logic (gates, replay lookups, 404s), so any work at
+     resolution time (opening a pool, constructing a config-validating
+     client) makes paths that never need the resource fail with it (#53:
+     Redis down broke idempotent replay; #62: invalid Neo4j/Qdrant config
+     broke the missing-project 404). Defenses: providers/deps are zero-I/O
+     AT RESOLUTION (config-validating construction counts as work — defer it
+     to the use point); acquire inside the exact branch that needs the
+     resource (pass providers; invoke where measured); tests pin it
+     discriminatingly (broken-resource + non-dependent path → the domain
+     answer, not 500) and structurally (must-not-acquire raising providers
+     on the branches that measure nothing). When a spec NAMES a list
+     (indicators, fields, lights), diff the list item-by-item against the
+     produced keys (#62 R2: §19's source count and last-success build were
+     absent although the design pass had read §19 for semantics).
    - **A new domain error's completeness face is the function's callers, not
      your diff**: adding an exception to a SHARED function (one an existing HTTP
      entry already calls) pulls in EVERY caller's translation/handling — trace
