@@ -689,6 +689,44 @@ def test_r14_quote_context_and_wildcards(toy_repo: Path) -> None:
     )
 
 
+def test_r16_chain_brace_and_head_binding(toy_repo: Path) -> None:
+    """Codex #64 R16: (a) a chained branch switch changes the checkout the
+    gate evaluated — denied; (b) brace expansion rewrites refspecs with no
+    dollar or backtick in sight — the literal rule's class now includes the
+    open brace; (c) gh --head naming any branch other than the current
+    checkout denies (the no-op shortcut let it out with zero checks)."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B7")
+    (toy_repo / "a.md").write_text("edit\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b7"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    chain = '{"tool_input": {"command": "git switch - && PUSHVERB origin"}}'.replace(
+        "PUSHVERB", _PUSH
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=chain, extra_env=env)
+    assert denied.returncode == 2 and "separate commands" in denied.stderr
+
+    brace = '{"tool_input": {"command": "PUSHVERB origin HEAD:task/{FE1,B1}"}}'.replace(
+        "PUSHVERB", _PUSH
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=brace, extra_env=env)
+    assert denied.returncode == 2 and "brace" in denied.stderr
+
+    # (c) from a CLEAN checkout, --head naming another branch has no receipt
+    # standing for it — denied even where the no-op shortcut used to exit 0
+    subprocess.run(["git", "switch", "-q", "main"], cwd=toy_repo, check=True, capture_output=True)
+    head_other = '{"tool_input": {"command": "PRCREATE --head task/B7 --fill"}}'.replace(
+        "PRCREATE", _PR_CREATE
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=head_other, extra_env=env)
+    assert denied.returncode == 2 and "current checkout" in denied.stderr
+
+
 def test_gh_owner_qualified_head_is_not_a_refspec(toy_repo: Path) -> None:
     """Codex #64 R15 (over-block): gh's documented `--head owner:branch` form
     is not a git refspec — on the fully-receipted FE checkout it must pass
@@ -717,7 +755,8 @@ def test_gh_owner_qualified_head_is_not_a_refspec(toy_repo: Path) -> None:
         "PRCREATE", _PR_CREATE
     )
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=other, extra_env=env)
-    assert denied.returncode == 2 and "never the local ref" in denied.stderr
+    # the R16 general --head binding fires first (earlier layer, same deny)
+    assert denied.returncode == 2 and "current checkout" in denied.stderr
 
 
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:

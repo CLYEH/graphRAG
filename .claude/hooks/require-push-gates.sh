@@ -96,7 +96,7 @@ if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
   # substitution syntax coexists with a push/pr word, engage fail-closed —
   # the literal-command rule below then denies it. Plain commands (no
   # substitution, or no such word) exit here as before.
-  if printf '%s' "$residue" | grep -Eq '[$`]' &&
+  if printf '%s' "$residue" | grep -Eq '[$`{]' &&
     printf '%s' "$payload" | grep -Eq '(^|[[:space:]])(push|pr)([[:space:];&|]|$)'; then
     # trailing class includes shell operators: `$g push; echo` still runs a
     # push before the semicolon (Codex #64 R13)
@@ -113,8 +113,27 @@ current="$(git branch --show-current)"
 # as an FE refspec to git but is invisible to every static pattern — Codex
 # #64 R11, P1): an engaged command must be LITERAL. Deny substitution syntax
 # outright; shlex keeps it un-expanded, so the pattern sees it.
-printf '%s' "$residue" | grep -Eq '[$`]' &&
-  deny "shell expansion in a push/PR command hides destinations from the gate — write the command literally (no variables, no command substitution; single-quoted TEXT arguments are fine — quotes suppress expansion)."
+printf '%s' "$residue" | grep -Eq '[$`{]' &&
+  deny "shell expansion (including brace expansion) in a push/PR command hides destinations from the gate — write the command literally (no variables, no command substitution, no braces; single-quoted TEXT arguments are fine — quotes suppress expansion)."
+
+# a branch switch chained before the push changes the checkout this gate
+# evaluated (switch dash then push — Codex #64 R16, executed repro): engaged
+# commands must not change branches — switch and push separately.
+printf '%s' "$payload" | grep -Eq 'git[[:space:]]+(switch|checkout)\b' &&
+  deny "branch switches chained with a push/PR command change the checkout the gate evaluated — switch and push in separate commands."
+
+# gh --head names the PR's source branch; the receipts only vouch for the
+# CURRENT checkout (Codex #64 R16, P1: a --head naming another branch from a
+# clean checkout exited through the no-op shortcut with no receipt checks).
+if [ "$gh_engaged" = 1 ]; then
+  head_arg="$(printf '%s' "$payload" | grep -Eo '(--head|-H)[= ][^[:space:]]+' | head -1 | sed -E 's/^(--head|-H)[= ]//')"
+  if [ -n "$head_arg" ]; then
+    case "$head_arg" in
+      "$current" | *:"$current" | refs/heads/"$current" | *:refs/heads/"$current") : ;;
+      *) deny "gh --head names '$head_arg' but the gate can only vouch for the current checkout '$current' — create the PR from that branch's own checkout." ;;
+    esac
+  fi
+fi
 # wildcard REFSPECS fan out (quoted or not — git receives them either way,
 # Codex #64 R15): a token combining a glob star with a ref separator (/ or
 # :) denies on the NORMALIZED command, so quoting cannot hide it while
