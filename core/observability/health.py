@@ -30,7 +30,12 @@ SEMANTICS (spec-first — the judge-surface lesson):
     ontology types (``ontology_proposals.status='proposed'``, the §6 待審
     池), and entity/relation rows parked at ``status='needs_review'``.
     Any one of them non-empty lights Needs review — "pending review" is the
-    whole §17 queue, not one table.
+    whole §17 queue, not one table. SCOPE mirrors the Console queue the
+    light points at (Codex #62 R4): the build-scoped members count on the
+    ACTIVE build only — api/routers/review.py serves exactly that queue,
+    and a pending row on an archived/failed build is invisible there, so
+    counting it would light a review demand with nothing to clear.
+    Ontology proposals are not build-scoped and stay project-wide.
 - **Metrics** are point-in-time counts, active-build-scoped where the metric
   is about content (docs/chunks/entities/relations), project-scoped where it
   is about workflow (builds, pending review). ``low_confidence_relations``
@@ -45,11 +50,12 @@ SEMANTICS (spec-first — the judge-surface lesson):
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 import sqlalchemy as sa
-from neo4j import AsyncSession
+from neo4j import AsyncDriver
 from neo4j.exceptions import DriverError, Neo4jError
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.exceptions import ApiException
@@ -120,15 +126,31 @@ async def _count(conn: AsyncConnection, query: sa.Select[Any]) -> int:
     return int((await conn.execute(query)).scalar_one())
 
 
+def _score(value: Any) -> float | None:
+    """An eval score, or None when unscored/malformed. bool is checked FIRST:
+    it subclasses int, and a boolean score must read as UNSCORED, never as
+    1.0/0.0 in the §20 comparison (Codex #62). ONE definition for both
+    readers (the light and the endpoint) — a fork here is a class-5 split."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 async def health_report(
     conn: AsyncConnection,
-    qdrant: AsyncQdrantClient,
-    graph_session: AsyncSession,
     project: str,
     *,
+    vector_provider: Callable[[], Awaitable[AsyncQdrantClient]],
+    graph_provider: Callable[[], Awaitable[AsyncDriver]],
     low_confidence_below: float = 0.5,
 ) -> HealthReport:
-    """Compute §19's report for one project (read-only)."""
+    """Compute §19's report for one project (read-only).
+
+    The projection stores arrive as PROVIDERS, acquired ONLY when the drift
+    probe actually runs — a missing/bootstrap project or a failed-newest
+    build must answer without ever touching Neo4j/Qdrant construction or
+    config (the #53 R3 eager-acquisition class; Codex #62). The Neo4j
+    session opens here, scoped to the probe, and closes with it."""
     builds = await list_builds(conn, project)
     active = next((b for b in builds if b.status == "active"), None)
     newest = builds[0] if builds else None
@@ -141,23 +163,48 @@ async def health_report(
         # skipped when Build failed already wins: the operator's answer must
         # not depend on Neo4j/Qdrant being reachable (Codex round 6)
         try:
-            drift = tuple(await drift_failures(conn, qdrant, graph_session, project, active.id))
+            qdrant = await vector_provider()
+            driver = await graph_provider()
+            async with driver.session() as graph_session:
+                drift = tuple(await drift_failures(conn, qdrant, graph_session, project, active.id))
         except _PROBE_ERRORS as exc:
             # unreachable store = UNMEASURED drift, not drift — degrade to
             # the frozen STORE_UNAVAILABLE warning instead of a 500
             warnings = (f"drift check unavailable: {exc.__class__.__name__}",)
 
+    # §19 names "active/last-success/last-failed build" — last SUCCESS is the
+    # newest build that ever completed (every non-building, non-failed state)
+    last_success = next((b for b in builds if b.status in ("ready", "active", "archived")), None)
+
     e, r, ev = tables.entities, tables.relations, tables.relation_evidence
     metrics: dict[str, Any] = {
         "builds_total": len(builds),
         "active_build": str(active.id) if active else None,
+        "last_success_build": str(last_success.id) if last_success else None,
         "last_failed_build": str(last_failed.id) if last_failed else None,
-        "pending_merge_candidates": await _count(
+        # §19's source count is PROJECT-scoped (sources register before any
+        # build exists — a bootstrap project must still show them, Codex #62)
+        "sources": await _count(
+            conn,
+            sa.select(sa.func.count())
+            .select_from(tables.sources)
+            .where(tables.sources.c.project == project),
+        ),
+        # the BUILD-SCOPED review counts mirror the Console queue's scope
+        # exactly (api/routers/review.py serves the ACTIVE build — Codex #62
+        # R4): a pending row on an archived/failed build is invisible in the
+        # queue, so counting it would light Needs review with nothing to
+        # clear. No active build → the queue is unreachable → 0. Ontology
+        # proposals are NOT build-scoped and stay project-wide (§6).
+        "pending_merge_candidates": 0
+        if active is None
+        else await _count(
             conn,
             sa.select(sa.func.count())
             .select_from(tables.merge_candidates)
             .where(
                 tables.merge_candidates.c.project == project,
+                tables.merge_candidates.c.build_id == active.id,
                 # defer 仍列入待審 (§17) — deferred is still review work
                 tables.merge_candidates.c.status.in_(("pending", "deferred")),
             ),
@@ -171,21 +218,27 @@ async def health_report(
                 tables.ontology_proposals.c.status == "proposed",
             ),
         ),
-        "needs_review_entities": await _count(
+        "needs_review_entities": 0
+        if active is None
+        else await _count(
             conn,
             sa.select(sa.func.count())
             .select_from(tables.entities)
             .where(
                 tables.entities.c.project == project,
+                tables.entities.c.build_id == active.id,
                 tables.entities.c.status == "needs_review",
             ),
         ),
-        "needs_review_relations": await _count(
+        "needs_review_relations": 0
+        if active is None
+        else await _count(
             conn,
             sa.select(sa.func.count())
             .select_from(tables.relations)
             .where(
                 tables.relations.c.project == project,
+                tables.relations.c.build_id == active.id,
                 tables.relations.c.status == "needs_review",
             ),
         ),
@@ -281,6 +334,88 @@ def status_light(
     return "Healthy"
 
 
+async def latest_eval_payload(conn: AsyncConnection, project: str) -> dict[str, Any]:
+    """§20's ``GET /projects/{p}/eval`` payload — the LATEST eval report.
+
+    "Latest" = the newest build (started_at desc, NULLS LAST — the same
+    ordering lesson as `_eval_regressed`) carrying an eval block; none →
+    all-null report (the light's measured-facts rule: absence is reported,
+    never invented). Field mapping onto the FROZEN EvalReport:
+
+    - ``passed`` (boolean|null) — the same predicate the §14 activation gate
+      and the CLI use: a report with ``failed > 0`` per-case min_score
+      misses did NOT pass; a malformed/absent count is null, not a guess.
+      The stored per-case COUNTS ride as ``cases_passed``/``cases_failed``
+      (additionalProperties) — reusing the stored key ``passed`` would clash
+      an int into the contract's boolean.
+    - ``regression`` (boolean|null) — the §20 comparison against the ACTIVE
+      build's report, exactly as the gate/light compute it (numeric scores +
+      same fingerprint → ``is_eval_regression``); vacuous (the served build
+      IS the active, no active, unscored either side, or incomparable
+      fingerprints) → null."""
+    rows = (
+        await conn.execute(
+            sa.select(tables.builds.c.id, tables.builds.c.eval)
+            .where(tables.builds.c.project == project, tables.builds.c.eval.isnot(None))
+            .order_by(sa.desc(tables.builds.c.started_at).nulls_last())
+        )
+    ).all()
+    served = next((row for row in rows if isinstance(row.eval, dict)), None)
+    if served is None:
+        return {"build_id": None, "passed": None, "regression": None, "metrics": {}}
+    block: dict[str, Any] = served.eval
+    failed = block.get("failed")
+    score = _score(block.get("score"))
+    # the gate's FULL predicate, both halves (Codex #62 R3 — citing it while
+    # transcribing half of it forked checker from consumer): measured
+    # per-case failures did not pass; a malformed count (bool included —
+    # type-is, not isinstance) is null; and failed==0 while UNSCORED is null
+    # too — the gate fails closed on an unmeasured candidate, so an unscored
+    # report must never read as passing.
+    passed: bool | None
+    if type(failed) is not int:
+        passed = None
+    elif failed > 0:
+        passed = False
+    elif score is None:
+        passed = None
+    else:
+        passed = True
+
+    regression: bool | None = None
+    active_row = (
+        await conn.execute(
+            sa.select(tables.builds.c.id, tables.builds.c.eval).where(
+                tables.builds.c.project == project, tables.builds.c.status == "active"
+            )
+        )
+    ).one_or_none()
+    if active_row is not None and active_row.id != served.id and isinstance(active_row.eval, dict):
+        active_score = _score(active_row.eval.get("score"))
+        served_fp, active_fp = block.get("fingerprint"), active_row.eval.get("fingerprint")
+        if (
+            score is not None
+            and active_score is not None
+            and isinstance(served_fp, str)
+            and served_fp == active_fp
+        ):
+            regression = is_eval_regression(
+                score, active_score, get_settings().eval_regression_threshold
+            )
+
+    metrics = block.get("metrics")
+    return {
+        "build_id": str(served.id),
+        "passed": passed,
+        "regression": regression,
+        "metrics": metrics if isinstance(metrics, dict) else {},
+        "score": block.get("score"),
+        "fingerprint": block.get("fingerprint"),
+        "cases_passed": block.get("passed"),
+        "cases_failed": block.get("failed"),
+    }
+
+
 async def _eval_regressed(conn: AsyncConnection, project: str, active_id: uuid.UUID) -> bool:
     """§20's light: the newest READY build regresses vs the active on
     COMPARABLE (same-fingerprint) eval reports. Unscored or incomparable is
@@ -303,12 +438,12 @@ async def _eval_regressed(conn: AsyncConnection, project: str, active_id: uuid.U
     ).scalar_one_or_none()
     if not isinstance(active_eval, dict):
         return False
-    candidate_score, active_score = rows.eval.get("score"), active_eval.get("score")
+    candidate_score, active_score = _score(rows.eval.get("score")), _score(active_eval.get("score"))
     candidate_fp, active_fp = rows.eval.get("fingerprint"), active_eval.get("fingerprint")
-    if not isinstance(candidate_score, (int, float)) or not isinstance(active_score, (int, float)):
-        return False
+    if candidate_score is None or active_score is None:
+        return False  # unscored (a boolean score included) is not a regression
     if not isinstance(candidate_fp, str) or candidate_fp != active_fp:
         return False  # incomparable suites — the gate fails closed, the light stays honest
     return is_eval_regression(
-        float(candidate_score), float(active_score), get_settings().eval_regression_threshold
+        candidate_score, active_score, get_settings().eval_regression_threshold
     )

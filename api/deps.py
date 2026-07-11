@@ -26,6 +26,7 @@ from typing import Annotated, Any
 from arq.connections import ArqRedis, RedisSettings, create_pool
 from fastapi import Depends, FastAPI, Request
 from neo4j import AsyncDriver
+from qdrant_client import AsyncQdrantClient
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from core.config import get_settings
@@ -126,6 +127,22 @@ async def neo4j_driver(request: Request) -> AsyncDriver:
 
 #: Handler signature sugar: ``driver: Graph`` — open a session at the use point.
 Graph = Annotated[AsyncDriver, Depends(neo4j_driver)]
+
+
+async def qdrant_client(request: Request) -> AsyncQdrantClient:
+    """The shared Qdrant client, created on first use — construction opens no
+    connection (zero-I/O at resolution, the #53 R3 discipline), and ASYNC for
+    the same event-loop check-then-set atomicity as ``neo4j_driver``.
+    Lifespan closes it if it was ever created."""
+    state = request.app.state
+    if state.qdrant is None:
+        state.qdrant = vector_client()
+    client: AsyncQdrantClient = state.qdrant
+    return client
+
+
+#: Handler signature sugar: ``qdrant: Vectors``.
+Vectors = Annotated[AsyncQdrantClient, Depends(qdrant_client)]
 
 
 def project_query_context(request: Request, project: str) -> ProjectContext:
