@@ -1290,6 +1290,66 @@ def test_r25_main_destination_sources_and_alias_chains(toy_repo: Path) -> None:
     assert allowed.returncode == 0, f"dangling chain over-blocked: {allowed.stderr}"
 
 
+def test_r26_quoted_aliases_docs_destinations_and_tag_refspecs(toy_repo: Path) -> None:
+    """Codex #64 R26: (a) git applies shell quoting inside alias values, so
+    a pu-quoted-sh expansion resolves to the verb while a raw string match
+    misses it — classify quote-stripped (definition side included: the
+    same-payload quoted definition is the R24/R25 sibling); (b) docs/*
+    destinations and sources ride the same worktree-binding rule as task/*
+    and main — other:docs/x escorted an unrelated ref into the doc fast
+    lane; (c) explicit refs/tags/ refspecs transfer tag refs no receipt
+    covered (the flag/config forms were closed at R23)."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "docs/x")
+    (toy_repo / "a.md").write_text("doc edit\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "docs"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    # (a) quoted alias value resolving to the verb (executed repro: 0 before)
+    verb = _PUSH.split()[1]
+    quoted_value = f'{verb[:2]}"{verb[2:]}"'
+    subprocess.run(
+        ["git", "config", "alias.p", quoted_value], cwd=toy_repo, check=True, capture_output=True
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin="git p origin task/B1", extra_env=env)
+    assert denied.returncode == 2, f"quoted alias value slipped: {denied.stdout}"
+    assert "alias" in denied.stderr
+    subprocess.run(
+        ["git", "config", "--unset", "alias.p"], cwd=toy_repo, check=True, capture_output=True
+    )
+    # ...and the same-payload QUOTED definition (the R24 pattern read the
+    # norm, where the stored value still carries its inner quotes)
+    quoted_def = f"git config alias.p '{quoted_value}' && git p origin task/B1"
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=quoted_def, extra_env=env)
+    assert denied.returncode == 2, f"quoted alias definition slipped: {denied.stdout}"
+    assert "alias" in denied.stderr
+
+    # (b) foreign sources into the docs namespace deny; own forms pass
+    for refspec in ("other:docs/x", "docs/y"):
+        denied = _run(
+            [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin {refspec}", extra_env=env
+        )
+        assert denied.returncode == 2, f"foreign docs ref slipped ({refspec}): {denied.stdout}"
+        assert "WORKING TREE" in denied.stderr
+    for refspec in ("docs/x", "HEAD:docs/x"):
+        allowed = _run(
+            [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin {refspec}", extra_env=env
+        )
+        assert allowed.returncode == 0, f"own docs form blocked ({refspec}): {allowed.stderr}"
+
+    # (c) explicit tag refspecs deny on either side (executed repro: 0 before)
+    for refspec in ("refs/tags/badtag", "+refs/tags/v1:refs/tags/v1", "HEAD:refs/tags/v1"):
+        denied = _run(
+            [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin {refspec}", extra_env=env
+        )
+        assert denied.returncode == 2, f"tag refspec slipped ({refspec}): {denied.stdout}"
+        assert "tag refs" in denied.stderr
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING

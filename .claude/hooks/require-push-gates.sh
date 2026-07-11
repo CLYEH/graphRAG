@@ -240,7 +240,13 @@ if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
       # so defining one denies too. Values may be quoted (erased from bare),
       # so this reads the NORM — the git-word guard above keeps prose in
       # non-git payloads out of reach.
-      printf '%s' "$payload" | grep -Eq 'alias\.[^=[:space:]]+(=|[[:space:]]+)(!|[^[:space:]]*push)' &&
+      # ...and read it QUOTE-STRIPPED: git applies shell quoting inside
+      # stored values (a pu-then-quoted-sh value resolves to the verb —
+      # Codex #64 R26, P1 on the invocation side; the definition side is
+      # its same-payload sibling). Stripping never removes verb letters,
+      # so it only widens the match (fail-closed).
+      payload_flat="$(printf '%s' "$payload" | tr -d "'\"\\\\")"
+      printf '%s' "$payload_flat" | grep -Eq 'alias\.[^=[:space:]]+(=|[[:space:]]+)(!|[^[:space:]]*push)' &&
         deny "defining a git alias that reaches the push verb (or shells out) hides the transfer from the gate — run the literal command."
       # persisted aliases: invoking one whose expansion starts at push,
       # contains the push word, or shells out (!) is an invisible transfer
@@ -251,8 +257,14 @@ if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
         alias_name="${alias_line%% *}"
         alias_name="${alias_name#alias.}"
         alias_exp="${alias_line#* }"
+        # git applies shell quoting rules inside expansions (a value of
+        # pu followed by a quoted sh resolves to the verb — Codex #64 R26,
+        # P1 executed repro): classify the QUOTE-STRIPPED expansion,
+        # mirroring the shell's concatenation. Stripping never removes
+        # verb letters, so it can only widen the match (fail-closed).
+        alias_exp_flat="$(printf '%s' "$alias_exp" | tr -d "'\"\\\\")"
         alias_transfer=0
-        case "$alias_exp" in
+        case "$alias_exp_flat" in
         push* | *" push"* | "!"*) alias_transfer=1 ;;
         *)
           # alias CHAINS (Codex #64 R25, P1 executed repro: p=q, q=push
@@ -265,7 +277,7 @@ if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
           # the chain (fail-closed; static chain resolution is the
           # fragility this constructor approach exists to avoid).
           # read -ra avoids pathname-expanding expansion words.
-          read -ra alias_words <<<"$alias_exp"
+          read -ra alias_words <<<"$alias_exp_flat"
           for alias_word in "${alias_words[@]}"; do
             case "$alias_cfg" in
             *"alias.${alias_word} "*)
@@ -424,6 +436,11 @@ validate_task_ref_tokens() {
   # an unreviewed local task/B2 through the no-op shortcut). Runs BEFORE
   # the no-op fast path (R13). The R15 owner-qualified gh allowance is gone
   # with the R18 --head ban — such tokens simply deny.
+  # docs/ tokens ride the SAME rule (Codex #64 R26, P1: other:docs/x from
+  # a receipted docs checkout escorted an unrelated local ref into the doc
+  # fast lane, and a bare foreign docs/y from a task checkout is its
+  # source-side sibling) — the lanes bless main, task/* and docs/*; every
+  # one of those namespaces must carry worktree-bound content only.
   local tok
   while IFS= read -r tok; do
     [ -n "$tok" ] || continue
@@ -431,13 +448,13 @@ validate_task_ref_tokens() {
       HEAD:* | +HEAD:*) : ;; # the worktree's own commit
       "$current" | "$current":* | +"$current":* | refs/heads/"$current" | refs/heads/"$current":*)
         # the checked-out branch itself — valid on its own checkout
-        [[ "$current" == task/* ]] || deny "push task content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok'."
+        [[ "$current" == task/* || "$current" == docs/* ]] || deny "push task/docs content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok'."
         ;;
       *)
-        deny "push task content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok' (review it on that checkout and push from there)."
+        deny "push task/docs content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok' (review it on that checkout and push from there)."
         ;;
     esac
-  done < <(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']*task/[^[:space:]\"']*" || true)
+  done < <(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']*(task|docs)/[^[:space:]\"']*" || true)
 }
 # git payloads only (Codex #64 R19, P2): a task/ token in a git push IS a
 # potential push source, but gh pr create cannot name one — --head is banned
@@ -475,6 +492,16 @@ if [ "$git_engaged" = 1 ]; then
       ;;
     esac
   done < <(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']+" || true)
+fi
+# explicit tag REFSPECS transfer refs the worktree-bound receipts never
+# covered (git push origin refs/tags/x creates the tag remotely even when
+# it points at an unreviewed commit — Codex #64 R26, P2 executed repro);
+# the tag-carrying FLAGS and push.followTags are already denied above, so
+# this closes the last spelled-out tag surface. Denied on either refspec
+# side (source, +forced, or :destination).
+if [ "$git_engaged" = 1 ]; then
+  printf '%s' "$payload" | grep -Eq "(^|[[:space:]\"':+])refs/tags/" &&
+    deny "explicit tag refspecs transfer tag refs the receipts never covered — push receipted branch content only."
 fi
 
 # lane: a ':main' / ':refs/heads/main' refspec, pushing while on main, or a docs/* branch
