@@ -224,6 +224,47 @@ if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
     # push before the semicolon (Codex #64 R13)
     : # engaged fail-closed — fall through to the literal-command deny
   else
+    # NAME INDIRECTION reaches the verbs with no verb token in the payload
+    # (Codex #64 R24, P1 executed repro: git -c alias.p=push p origin
+    # task/B1 exited 0 before receipts). Deny by CONSTRUCTOR — statically
+    # expanding nested aliases is fragile, blocking their creation and
+    # invocation is not. gh aliases already configured before this gate
+    # existed are the documented honest-agent residue (creating them is
+    # blocked below; branch protection and the Codex +1 stay the backstop).
+    if printf '%s' "$bare" | grep -Eq '(^|[[:space:]])git([[:space:]]|$)'; then
+      # alias DEFINITION in the payload: the -c attached form (alias.X=push)
+      # AND the config creation form (git config [--scope] alias.X push) —
+      # the latter can be created and invoked in the SAME payload, where the
+      # persisted-config loop below cannot see it yet (reviewer-executed
+      # blocker on R24). Shell-alias values (leading !) can reach anything,
+      # so defining one denies too. Values may be quoted (erased from bare),
+      # so this reads the NORM — the git-word guard above keeps prose in
+      # non-git payloads out of reach.
+      printf '%s' "$payload" | grep -Eq 'alias\.[^=[:space:]]+(=|[[:space:]]+)(!|[^[:space:]]*push)' &&
+        deny "defining a git alias that reaches the push verb (or shells out) hides the transfer from the gate — run the literal command."
+      # persisted aliases: invoking one whose expansion starts at push,
+      # contains the push word, or shells out (!) is an invisible transfer
+      alias_hit=""
+      while IFS= read -r alias_line; do
+        [ -n "$alias_line" ] || continue
+        alias_name="${alias_line%% *}"
+        alias_name="${alias_name#alias.}"
+        alias_exp="${alias_line#* }"
+        case "$alias_exp" in
+        push* | *" push"* | "!"*)
+          alias_esc="$(printf '%s' "$alias_name" | sed 's/[^A-Za-z0-9_-]/./g')"
+          printf '%s' "$bare" | grep -Eq "git${flags}[[:space:]]+${alias_esc}([[:space:]]|\$)" &&
+            alias_hit="$alias_name = $alias_exp"
+          ;;
+        esac
+        [ -n "$alias_hit" ] && break
+      done < <(git -C "${CLAUDE_PROJECT_DIR:-.}" config --get-regexp '^alias\.' 2>/dev/null)
+      [ -n "$alias_hit" ] &&
+        deny "git alias '$alias_hit' reaches a transfer the literal matcher cannot see — run the expanded command."
+    fi
+    # the gh sibling: gh alias set/import can bind any name to PR creation
+    printf '%s' "$bare" | grep -Eq "gh${flags}[[:space:]]+alias${flags}[[:space:]]+(set|import)\b" &&
+      deny "defining gh aliases is blocked — an alias can reach PR creation with no verb in the payload; run literal gh commands."
     exit 0
   fi
 fi
@@ -379,6 +420,18 @@ validate_task_ref_tokens() {
 # outright above and no other flag selects a push ref, so its task/ tokens
 # are --body/--title PROSE ("Related task/B2" was denied as if pushed).
 [ "$git_engaged" = 1 ] && validate_task_ref_tokens
+
+# `git push origin main` from a task/docs checkout sends the LOCAL main
+# ref — content these worktree-bound receipts never spoke for — and on a
+# clean checkout it even reached the no-op exit below (Codex #64 R24, P1).
+# A token whose SOURCE side is main is valid only on main's own checkout
+# (the doc lane then applies); destinations stay legal — HEAD:main carries
+# THIS worktree's content and docs/x:main carries the checkout's own ref.
+# Same git-only scoping as the task walk (a gh body naming main is prose).
+if [ "$git_engaged" = 1 ] && [ "$current" != "main" ]; then
+  printf '%s' "$payload" | grep -Eq "(^|[[:space:]\"'])\+?(refs/heads/)?main(:[^[:space:]\"']*)?([[:space:]\"']|$)" &&
+    deny "this names the LOCAL main ref as a push source from a non-main checkout — the receipts bind THIS worktree, never local main; push main from its own checkout, or send reviewed content via HEAD:main."
+fi
 
 # lane: a ':main' / ':refs/heads/main' refspec, pushing while on main, or a docs/* branch
 # (whose whole purpose is the fast lane, incl. its own branch push) = doc-only lane.

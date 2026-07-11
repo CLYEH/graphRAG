@@ -1145,6 +1145,85 @@ def test_r23_tag_forms_and_redirection_ampersands(toy_repo: Path) -> None:
     assert denied.returncode == 2 and "ENTIRE payload" in denied.stderr
 
 
+def test_r24_local_main_src_and_alias_indirection(toy_repo: Path) -> None:
+    """Codex #64 R24 (both P1): (a) `origin main` from a task/docs checkout
+    sends the LOCAL main ref the worktree-bound receipts never spoke for —
+    on a clean checkout it even reached the no-op exit; destination forms
+    (HEAD:main, own-branch:main) must stay legal. (b) a git alias reaches
+    push with no verb token (inline -c definition or persisted config) and
+    the literal matcher exits 0 before receipts — deny by constructor;
+    gh alias set is the same class one binary over."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B1")
+    (toy_repo / "a.md").write_text("b1 content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b1"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    # (a) local-main source forms deny from the task checkout (returned 0
+    # before — receipted checkout, task lane, poe shim)
+    for refspec in ("main", "main:main", "refs/heads/main"):
+        denied = _run(
+            [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin {refspec}", extra_env=env
+        )
+        assert denied.returncode == 2, f"local main src slipped ({refspec}): {denied.stdout}"
+        assert "LOCAL main" in denied.stderr
+    # destination forms carry the checkout's own reviewed content: legal.
+    # (:main routes to the doc lane, so it must be .md-only — it is.)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin HEAD:main", extra_env=env)
+    assert allowed.returncode == 0, f"HEAD:main destination over-blocked: {allowed.stderr}"
+
+    # (b) inline alias definition (Codex's executed repro exited 0 before)
+    inline_alias = f"git -c alias.p={_PUSH.split()[1]} p origin task/B1"
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=inline_alias, extra_env=env)
+    assert denied.returncode == 2, f"inline push alias slipped: {denied.stdout}"
+    assert "alias" in denied.stderr
+    # the SAME-PAYLOAD create+invoke sibling (reviewer-executed blocker):
+    # the persisted-config loop cannot see an alias created in this very
+    # payload, so the space-form DEFINITION itself must deny
+    for form in (
+        f"git config alias.p {_PUSH.split()[1]} && git p origin task/B1",
+        f"git config --global alias.zz {_PUSH.split()[1]} && git zz origin task/B1",
+    ):
+        denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=form, extra_env=env)
+        assert denied.returncode == 2, f"same-payload alias slipped ({form}): {denied.stdout}"
+        assert "alias" in denied.stderr
+    # persisted alias: invocation denies while set, passes once removed
+    subprocess.run(
+        ["git", "config", "alias.p", _PUSH.split()[1]],
+        cwd=toy_repo,
+        check=True,
+        capture_output=True,
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin="git p origin task/B1", extra_env=env)
+    assert denied.returncode == 2, f"persisted push alias slipped: {denied.stdout}"
+    assert "alias" in denied.stderr
+    # an innocent alias (no push, no shell-out) never engages the gate
+    subprocess.run(
+        ["git", "config", "alias.lg", "log --graph"],
+        cwd=toy_repo,
+        check=True,
+        capture_output=True,
+    )
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin="git lg", extra_env=env)
+    assert allowed.returncode == 0, f"innocent alias over-blocked: {allowed.stderr}"
+    subprocess.run(
+        ["git", "config", "--unset", "alias.p"], cwd=toy_repo, check=True, capture_output=True
+    )
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin="git p origin task/B1", extra_env=env)
+    assert allowed.returncode == 0, f"removed alias still denied: {allowed.stderr}"
+    # the gh sibling: defining any gh alias is blocked (it can bind a name
+    # to PR creation invisibly)
+    gh_alias = '{"tool_input": {"command": "gh alias set pc \'PRTAIL --fill\'"}}'.replace(
+        "PRTAIL", _PR_CREATE.split(" ", 1)[1]
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=gh_alias, extra_env=env)
+    assert denied.returncode == 2 and "gh alias" in denied.stderr
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING
