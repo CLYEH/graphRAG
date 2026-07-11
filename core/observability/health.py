@@ -30,7 +30,12 @@ SEMANTICS (spec-first — the judge-surface lesson):
     ontology types (``ontology_proposals.status='proposed'``, the §6 待審
     池), and entity/relation rows parked at ``status='needs_review'``.
     Any one of them non-empty lights Needs review — "pending review" is the
-    whole §17 queue, not one table.
+    whole §17 queue, not one table. SCOPE mirrors the Console queue the
+    light points at (Codex #62 R4): the build-scoped members count on the
+    ACTIVE build only — api/routers/review.py serves exactly that queue,
+    and a pending row on an archived/failed build is invisible there, so
+    counting it would light a review demand with nothing to clear.
+    Ontology proposals are not build-scoped and stay project-wide.
 - **Metrics** are point-in-time counts, active-build-scoped where the metric
   is about content (docs/chunks/entities/relations), project-scoped where it
   is about workflow (builds, pending review). ``low_confidence_relations``
@@ -185,12 +190,21 @@ async def health_report(
             .select_from(tables.sources)
             .where(tables.sources.c.project == project),
         ),
-        "pending_merge_candidates": await _count(
+        # the BUILD-SCOPED review counts mirror the Console queue's scope
+        # exactly (api/routers/review.py serves the ACTIVE build — Codex #62
+        # R4): a pending row on an archived/failed build is invisible in the
+        # queue, so counting it would light Needs review with nothing to
+        # clear. No active build → the queue is unreachable → 0. Ontology
+        # proposals are NOT build-scoped and stay project-wide (§6).
+        "pending_merge_candidates": 0
+        if active is None
+        else await _count(
             conn,
             sa.select(sa.func.count())
             .select_from(tables.merge_candidates)
             .where(
                 tables.merge_candidates.c.project == project,
+                tables.merge_candidates.c.build_id == active.id,
                 # defer 仍列入待審 (§17) — deferred is still review work
                 tables.merge_candidates.c.status.in_(("pending", "deferred")),
             ),
@@ -204,21 +218,27 @@ async def health_report(
                 tables.ontology_proposals.c.status == "proposed",
             ),
         ),
-        "needs_review_entities": await _count(
+        "needs_review_entities": 0
+        if active is None
+        else await _count(
             conn,
             sa.select(sa.func.count())
             .select_from(tables.entities)
             .where(
                 tables.entities.c.project == project,
+                tables.entities.c.build_id == active.id,
                 tables.entities.c.status == "needs_review",
             ),
         ),
-        "needs_review_relations": await _count(
+        "needs_review_relations": 0
+        if active is None
+        else await _count(
             conn,
             sa.select(sa.func.count())
             .select_from(tables.relations)
             .where(
                 tables.relations.c.project == project,
+                tables.relations.c.build_id == active.id,
                 tables.relations.c.status == "needs_review",
             ),
         ),

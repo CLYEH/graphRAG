@@ -112,11 +112,40 @@ async def test_health_metrics_eval_end_to_end(migrated: None) -> None:
             assert data["counts"]["entities"] == 1
             assert r.json()["meta"]["build_id"] == str(active_id)
 
+            # scope parity with the Console queue (Codex #62 R4): a
+            # needs_review row ORPHANED on a non-active build is invisible
+            # in the active-scoped review queue, so it must not light or
+            # count — discriminating: the project-wide counts showed 1
+            async with engine.connect() as conn, conn.begin():
+                orphan_build = (
+                    await conn.execute(
+                        builds.insert()
+                        .values(
+                            project=project, status="failed", started_at=NOW - timedelta(hours=1)
+                        )
+                        .returning(builds.c.id)
+                    )
+                ).scalar_one()
+                await conn.execute(
+                    entities.insert().values(
+                        project=project,
+                        build_id=orphan_build,
+                        type="Hall",
+                        canonical_name="Ghost Wing",
+                        entity_key=f"fpv1:hall|ghost-{uuid.uuid4().hex[:6]}",
+                        status="needs_review",
+                    )
+                )
+            r = await client.get(f"/projects/{project}/health")
+            data = r.json()["data"]
+            assert data["pending_review"] == 0
+            assert data["counts"]["needs_review_entities"] == 0
+
             # /metrics: the SAME producer's numbers (class 5, live)
             r = await client.get(f"/projects/{project}/metrics")
             assert r.status_code == 200
             assert r.json()["data"]["entities"] == 1
-            assert r.json()["data"]["builds_total"] == 1
+            assert r.json()["data"]["builds_total"] == 2  # active + the orphan
             assert r.json()["data"]["last_success_build"] == str(active_id)
 
             # eval, live §20 predicates: active scored 0.8, a NEWER ready
