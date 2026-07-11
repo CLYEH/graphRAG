@@ -251,8 +251,13 @@ def test_fe_push_gate_requires_the_browser_receipt(toy_repo: Path) -> None:
     assert restored.returncode == 0, f"gate blocked restored evidence: {restored.stderr}"
 
     # tree-bound: an edit AFTER the browser pass invalidates its receipt even
-    # with a fresh code-review stamp for the new tree
+    # with a fresh code-review stamp for the new tree (committed, so the
+    # worktree==HEAD check is satisfied and the BROWSER staleness is what
+    # fires — the uncommitted-divergence case has its own R12 test)
     (toy_repo / "a.md").write_text("edited after the browser pass\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-qam", "edited"], cwd=toy_repo, check=True, capture_output=True
+    )
     _stamp(toy_repo)
     stale = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/FE1", extra_env=env)
     assert stale.returncode == 2 and "browser-QA receipt" in stale.stderr
@@ -547,6 +552,59 @@ def test_shell_quoting_cannot_evade_the_patterns(toy_repo: Path) -> None:
     ).replace("PUSHVERB", _PUSH)
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=expanded, extra_env=env)
     assert denied.returncode == 2 and "literally" in denied.stderr
+
+    # Codex #64 R12 (P1): substitution can hide the VERB itself — a command
+    # the engagement regex cannot clear must engage fail-closed and hit the
+    # literal rule. Discriminating: the old engagement exited 0 here.
+    hidden_verb = '{"tool_input": {"command": "g=git; $g PUSHWORD -u origin task/FE1"}}'.replace(
+        "PUSHWORD", _PUSH.split()[1]
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=hidden_verb, extra_env=env)
+    assert denied.returncode == 2 and "literally" in denied.stderr
+    # a plain non-push command with substitution still exits clean (scoped)
+    harmless = '{"tool_input": {"command": "echo $HOME && ls -la"}}'
+    clean = _run([BASH, GATE_SCRIPT], toy_repo, stdin=harmless, extra_env=env)
+    assert clean.returncode == 0, f"harmless substitution engaged: {clean.stderr}"
+
+
+def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
+    """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
+    receipts bind the worktree — committing untested content and RESTORING
+    the worktree to a stamped state let valid receipts escort unstamped
+    commits out. The FE gate now requires worktree tree == HEAD tree.
+    Discriminating: the old gate returned 0 on the divergent state."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/FE1")
+    (toy_repo / "a.md").write_text("stamped fe content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "fe"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    shot = toy_repo / "shot.png"
+    shot.write_bytes(b"\x89PNG fake-but-non-empty")
+    _stamp(toy_repo)
+    _browser_stamp(toy_repo, shot)
+
+    # commit UNTESTED content, then restore the worktree to the stamped state
+    (toy_repo / "a.md").write_text("untested commit\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-qam", "untested"], cwd=toy_repo, check=True, capture_output=True
+    )
+    (toy_repo / "a.md").write_text("stamped fe content\n", encoding="utf-8")
+
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/FE1", extra_env=env)
+    assert denied.returncode == 2, f"divergent HEAD escorted out: {denied.stdout}"
+    assert "differs" in denied.stderr
+
+    # committing exactly the stamped content re-aligns the trees -> passes
+    subprocess.run(
+        ["git", "commit", "-qam", "restore stamped"], cwd=toy_repo, check=True, capture_output=True
+    )
+    allowed = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} -u origin task/FE1", extra_env=env
+    )
+    assert allowed.returncode == 0, f"aligned trees denied: {allowed.stderr}"
 
 
 def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:

@@ -23,6 +23,17 @@
 #
 # Like require-codex-approval.sh this is local, honest-agent enforcement.
 # Fail-closed. Wired via .claude/settings.json (matcher Bash|PowerShell).
+#
+# THREAT MODEL (explicit boundary): this gate catches ACCIDENTAL bypasses by
+# an honest agent — mistyped refspecs, config surprises, quoting slips, and
+# the natural command forms. It does NOT claim to contain an adversarial
+# shell author: fully-obfuscated verbs (`p=push; $g $p`, `$(printf ...)`)
+# are statically unanalyzable in a Turing-expressive shell, and denying ALL
+# substitution everywhere would make ordinary tool use impossible. The
+# accepted design point: literal-command discipline for anything push-like,
+# substitution+push/pr-word engagement as the fail-closed net, and the
+# obfuscation residue consciously out of scope (server-side branch
+# protection and the Codex +1 gate remain the independent backstops).
 set -o pipefail
 deny() { printf 'push-gate: %s\n' "$1" >&2; exit 2; }
 
@@ -62,7 +73,17 @@ print(cmd)
 flags='([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*'
 if ! printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b" &&
   ! printf '%s' "$payload" | grep -Eq "gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new)\b"; then
-  exit 0
+  # substitution can hide the VERB itself (g=git; $g push — Codex #64 R12,
+  # P1): a command we cannot statically clear must not be cleared. When
+  # substitution syntax coexists with a push/pr word, engage fail-closed —
+  # the literal-command rule below then denies it. Plain commands (no
+  # substitution, or no such word) exit here as before.
+  if printf '%s' "$payload" | grep -Eq '[$`]' &&
+    printf '%s' "$payload" | grep -Eq '(^|[[:space:]])(push|pr)([[:space:]]|$)'; then
+    : # engaged fail-closed — fall through to the literal-command deny
+  else
+    exit 0
+  fi
 fi
 cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."
 current="$(git branch --show-current)"
@@ -160,7 +181,13 @@ require_browser_receipt_if_fe() {
   # FE destination too, e.g. `HEAD:task/FE1` from a docs/* branch (Codex #64
   # R5 — lane classification must not outrank the destination).
   if [[ "$current" == task/FE* ]] || printf '%s' "$payload" | grep -q 'task/FE'; then
-    local fe_tree bq_tree bq_kind bq_rest ev_path ev_count tok
+    local fe_tree bq_tree bq_kind bq_rest ev_path ev_count tok head_tree
+    # the push sends HEAD while receipts bind the WORKTREE: with untested
+    # commits under a worktree restored to stamped content, valid receipts
+    # would escort unstamped commits out (Codex #64 R12, executed repro) —
+    # the two trees must be IDENTICAL on an FE push.
+    head_tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null)"
+    [ "$(snapshot_tree)" = "$head_tree" ] || deny "FE push sends HEAD, but the worktree (which the receipts bind) differs from it — commit exactly the passed content (re-run the pass and re-stamp if it changed), then push."
     # every explicit token naming an FE branch must carry content the
     # receipts bind: HEAD:<dst>, or the CURRENT FE branch itself (bare or as
     # the refspec src). Any other src pushes a ref the worktree receipts
