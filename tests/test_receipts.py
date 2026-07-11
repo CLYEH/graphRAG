@@ -322,6 +322,40 @@ def test_doc_lane_cannot_reach_an_fe_destination_unreceipted(toy_repo: Path) -> 
     )
 
 
+def test_off_checkout_fe_ref_push_is_rejected(toy_repo: Path) -> None:
+    """Codex #64 R6 (executed repro): `origin task/FE1` from another checkout
+    pushes the LOCAL REF's content, which the worktree-bound receipts never
+    spoke for — only the HEAD:<dst> form is allowed off-checkout.
+    Discriminating: the old gate returned 0 with both receipts stamped for
+    the (different) worktree."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/FE1")
+    (toy_repo / "a.md").write_text("old fe content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "fe"], cwd=toy_repo, check=True, capture_output=True)
+    # move to another branch with DIFFERENT content; task/FE1 stays behind
+    subprocess.run(["git", "switch", "-qc", "work"], cwd=toy_repo, check=True, capture_output=True)
+    (toy_repo / "a.md").write_text("newer reviewed work\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "work"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    shot = toy_repo / "shot.png"
+    shot.write_bytes(b"\x89PNG fake-but-non-empty")
+    _stamp(toy_repo)  # both receipts bind the WORK worktree,
+    _browser_stamp(toy_repo, shot)  # not task/FE1's content
+
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin task/FE1", extra_env=env)
+    assert denied.returncode == 2, f"off-checkout FE ref push passed: {denied.stdout}"
+    assert "HEAD:<dst>" in denied.stderr
+
+    # the HEAD: form pushes the worktree's own commit — receipts speak for it
+    allowed = _run(
+        [BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin HEAD:task/FE1", extra_env=env
+    )
+    assert allowed.returncode == 0, f"HEAD: form blocked despite receipts: {allowed.stderr}"
+
+
 def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:
     """Codex #64 (class 9 — every constructor of the effect): `gh pr create`
     can push an unpushed branch itself, so a payload creating a PR must run

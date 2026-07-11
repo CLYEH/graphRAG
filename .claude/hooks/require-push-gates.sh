@@ -95,9 +95,18 @@ require_browser_receipt_if_fe() {
   # FE destination too, e.g. `HEAD:task/FE1` from a docs/* branch (Codex #64
   # R5 — lane classification must not outrank the destination).
   if [[ "$current" == task/FE* ]] || printf '%s' "$payload" | grep -q 'task/FE'; then
+    local fe_tree bq_tree bq_kind bq_rest ev_path ev_count bad_ref
+    if [[ "$current" != task/FE* ]]; then
+      # off-checkout FE pushes may only use the HEAD:<dst> form: the receipts
+      # bind the WORKING TREE, and `git push origin task/FE1` from another
+      # checkout sends the local ref's content — which no receipt ever spoke
+      # for (Codex #64 R6, executed repro). Fail-closed: any task/FE token
+      # not HEAD-anchored is denied.
+      bad_ref="$(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']*task/FE[^[:space:]\"']*" | grep -Ev '^\+?HEAD:' | head -1 || true)"
+      [ -n "$bad_ref" ] && deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$bad_ref' (re-run the pass on that checkout and push from there)."
+    fi
     # H10: the FE browser pass is tree-bound like the review — its own
     # namespace, so neither receipt kind can satisfy the other's gate
-    local fe_tree bq_tree bq_kind bq_rest ev_path ev_count
     fe_tree="$(snapshot_tree)"
     [ -f ".claude/receipts/browser-qa-$fe_tree" ] || deny "FE task: no browser-QA receipt for this content — run the Claude in Chrome pass (LOOP.md step 4) and stamp it with the evidence via .claude/hooks/write-browser-qa-receipt.sh; anything edited after the pass needs a re-run + re-stamp."
     read -r bq_tree bq_kind bq_rest < ".claude/receipts/browser-qa-$fe_tree"
