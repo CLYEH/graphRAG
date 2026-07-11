@@ -7,4 +7,3 @@
 - [CI 先於 Codex](graphrag-ci-before-codex.md) — push 後先 `gh pr checks` 修 CI 紅燈再 triage Codex;CI 快、Codex 慢,別串起兩個等待;切片任務分支名要對到子項(C3a→task/C3a)
 - [BA 階段真實 LLM 測試](graphrag-ba-real-llm.md) — .env 有真 key,BA 可用真實 API call;harness 兩 lane(快速 hermetic vs 真實 LLM 在 integration/e2e,本地 pre-push,CI fail-loud);只在動到 model 的任務花呼叫
 - [初期落地場景:博物館導覽](graphrag-goal-museum-guide.md) — 外部 no-code agent 平台經 MCP(HTTP)接本平台當場所知識服務;C8b=整合縫;raw data 待 owner 提供;硬約束=不失一般性
-- [BA6b prep](graphrag-ba6b-prep.md) — graph/hybrid REST 端點設計期審計(options 詞彙、hybrid 必吃 remaining_ms、cap chain 查凍結 schema、facade parity);BA6b merge 後刪除
