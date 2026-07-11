@@ -295,6 +295,149 @@ def test_policy_gates_and_typed_errors(client: TestClient, monkeypatch: pytest.M
     assert r.json()["error"]["code"] == "NO_ACTIVE_BUILD"
 
 
+def test_graph_options_thread_to_the_real_runner(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (BA6b): options is the contract's mode-specific channel — the typed
+    # vocabulary must reach GraphQueryParams field-for-field, and the §21
+    # max_graph_hops ceiling must reach run_graph (fake seam drives the REAL
+    # runner closure; a params-construction-only check would be false-green
+    # for the router wiring, the BA6a top_k lesson)
+    _queryable(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    async def fake_run_graph(
+        graph: Any, repo: Any, cypher: Any, params: Any, query: str, max_hops: int
+    ) -> Any:
+        captured.update({"params": params, "query": query, "max_hops": max_hops})
+        return _mcp_dict(tool="graph_query")
+
+    async def fake_bounded(context: Any, policy: Any, tool: str, query: str, runner: Any) -> Any:
+        captured["tool"] = tool
+        return await runner(SimpleNamespace(graph=None, repo=None), 1000)
+
+    _stub(monkeypatch, "run_graph", fake_run_graph)
+    _stub(monkeypatch, "run_bounded_query", fake_bounded)
+    body = {
+        "query": "who neighbors alice",
+        "options": {"template": "neighbors", "entity": "alice", "hops": 2},
+    }
+    r = client.post("/projects/p/query/graph", json=body)
+    assert r.status_code == 200
+    assert r.json()["data"]["mode"] == "graph"
+    p = captured["params"]
+    assert (p.template, p.entity, p.other_entity, p.hops) == ("neighbors", "alice", None, 2)
+    assert captured["max_hops"] == 3  # the §21 ceiling reached the runner
+    assert captured["tool"] == "query_graph" and captured["query"] == "who neighbors alice"
+
+
+def test_graph_guardrail_stays_in_envelope(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (facade parity): template vocabulary and the hop ceiling are CORE's
+    # guardrail — an unknown template degrades typed IN-ENVELOPE (200 +
+    # GUARDRAIL_BLOCKED, rejected-not-clamped) exactly as the MCP graph tool
+    # answers, never a REST-only 400. Drives the REAL run_graph; the fake
+    # deps are never touched (blocked before any store I/O).
+    _queryable(monkeypatch)
+    scope = SimpleNamespace(project="p", build_id=uuid.uuid4())
+
+    async def fake_bounded(context: Any, policy: Any, tool: str, query: str, runner: Any) -> Any:
+        response = await runner(SimpleNamespace(graph=scope, repo=scope), 1000)
+        return response.to_dict()
+
+    _stub(monkeypatch, "run_bounded_query", fake_bounded)
+    for body in (
+        {"query": "q", "options": {"template": "teleport", "entity": "alice"}},
+        {"query": "q", "options": {"template": "neighbors", "entity": "alice", "hops": 99}},
+        # blankness is a VALUE question too — MCP's tool schema passes an
+        # empty string through to the same core guardrail (facade parity).
+        # EMPTY strings exactly: a min_length=1 regression would 400 these
+        # (whitespace would slip past it — non-discriminating)
+        {"query": "q", "options": {"template": "neighbors", "entity": ""}},
+        {"query": "q", "options": {"template": "", "entity": "alice"}},
+    ):
+        r = client.post("/projects/p/query/graph", json=body)
+        assert r.status_code == 200
+        data = r.json()["data"]
+        assert data["results"] == []
+        assert [w["code"] for w in data["warnings"]] == ["GUARDRAIL_BLOCKED"]
+
+
+def test_hybrid_threads_remaining_budget_top_k_and_params(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (the C8 class-11 face): hybrid's pacer must start from what binding
+    # LEFT of the §21 budget — the seam's remaining_ms, never a fresh full
+    # max_latency_ms. The 1234 sentinel discriminates: a fresh-budget
+    # regression would show 10000. top_k clamps through max_top_k (the cap
+    # chain), and options → GraphQueryParams / absent → None (skip-with-reason
+    # parity is core's, tested there).
+    _queryable(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    async def fake_run_hybrid(deps: Any, hpolicy: Any, query: str, params: Any) -> Any:
+        captured.update(
+            {"latency": hpolicy.max_latency_ms, "top_k": hpolicy.top_k, "params": params}
+        )
+        return _mcp_dict(tool="hybrid_query")
+
+    async def fake_bounded(context: Any, policy: Any, tool: str, query: str, runner: Any) -> Any:
+        captured["tool"] = tool
+        return await runner(SimpleNamespace(), 1234)
+
+    _stub(monkeypatch, "run_hybrid", fake_run_hybrid)
+    _stub(monkeypatch, "run_bounded_query", fake_bounded)
+    r = client.post("/projects/p/query/hybrid", json={"query": "q", "top_k": 500})
+    assert r.status_code == 200
+    assert r.json()["data"]["mode"] == "hybrid"
+    assert captured["latency"] == 1234  # binding's remainder, not a fresh budget
+    assert captured["top_k"] == 20  # clamped through max_top_k
+    assert captured["params"] is None  # no options → router skips graph with a reason
+    assert captured["tool"] == "query_hybrid"
+
+    body = {"query": "q", "options": {"template": "path", "entity": "a", "other_entity": "b"}}
+    assert client.post("/projects/p/query/hybrid", json=body).status_code == 200
+    p: Any = captured["params"]
+    assert (p.template, p.entity, p.other_entity, p.hops) == ("path", "a", "b", 1)
+
+
+@pytest.mark.parametrize(
+    ("mode", "body"),
+    [
+        ("graph", {"query": "q"}),  # options REQUIRED for graph
+        ("graph", {"query": "q", "options": {"template": "neighbors"}}),  # entity required
+        ("graph", {"query": "q", "options": {"template": "n", "entity": "a", "beam": 3}}),
+        ("graph", {"query": "q", "top_k": 5, "options": {"template": "n", "entity": "a"}}),
+        ("graph", {"query": "q", "filters": {"t": 1}, "options": {"template": "n", "entity": "a"}}),
+        ("hybrid", {"query": "q", "options": {"entity": "a"}}),  # partial options
+        ("hybrid", {"query": "q", "options": {"template": "n", "entity": "a", "beam": 3}}),
+        ("hybrid", {"query": "q", "filters": {"t": 1}}),
+        # explicit null ≠ omission (the contract's options is an optional
+        # OBJECT, not nullable) — folding null into skip-graph would hide a
+        # malformed request behind incomplete hybrid results (Codex #61 R1)
+        ("hybrid", {"query": "q", "options": None}),
+    ],
+)
+def test_graph_hybrid_shape_rejections(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, mode: str, body: dict[str, Any]
+) -> None:
+    # WHY: the options channel is a VALIDATED vocabulary — unknown keys,
+    # partial invocations, and per-mode unsupported fields (graph top_k: the
+    # MCP tool exposes no per-call cap; accepting-and-ignoring is the #60 R1
+    # lie) all reject loudly at the shape layer, the same layer as the MCP
+    # tool's typed parameters.
+    _queryable(monkeypatch)
+
+    async def fail_bounded(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("must not run")
+
+    _stub(monkeypatch, "run_bounded_query", fail_bounded)
+    r = client.post(f"/projects/p/query/{mode}", json=body)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
 def test_no_active_build_precedes_the_config_gates(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
