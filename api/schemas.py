@@ -186,7 +186,11 @@ class HybridQueryRequest(BaseModel):
     """The hybrid mode's QueryRequest: ``top_k`` threads to fusion, ``options``
     is the OPTIONAL graph invocation — absent means the router skips the graph
     mode with an in-envelope reason (MCP parity: it never fabricates traversal
-    parameters from prose); present it must be complete (GraphOptions)."""
+    parameters from prose); present it must be complete (GraphOptions). The
+    contract types ``options`` as an optional OBJECT, not nullable — an
+    explicit JSON null is a malformed request rejected loudly, never folded
+    into omission (silently skipping graph would hide it — the omitted≠null
+    rule, request side)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -199,6 +203,11 @@ class HybridQueryRequest(BaseModel):
     def _reject_unsupported(self) -> HybridQueryRequest:
         if "filters" in self.model_fields_set:
             raise ValueError("filters is not supported yet; omit it")
+        if "options" in self.model_fields_set and self.options is None:
+            raise ValueError(
+                "options must be an object when present (the contract's optional "
+                "non-nullable field) — omit it to skip the graph mode"
+            )
         return self
 
 

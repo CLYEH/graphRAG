@@ -413,6 +413,10 @@ def test_hybrid_threads_remaining_budget_top_k_and_params(
         ("hybrid", {"query": "q", "options": {"entity": "a"}}),  # partial options
         ("hybrid", {"query": "q", "options": {"template": "n", "entity": "a", "beam": 3}}),
         ("hybrid", {"query": "q", "filters": {"t": 1}}),
+        # explicit null ≠ omission (the contract's options is an optional
+        # OBJECT, not nullable) — folding null into skip-graph would hide a
+        # malformed request behind incomplete hybrid results (Codex #61 R1)
+        ("hybrid", {"query": "q", "options": None}),
     ],
 )
 def test_graph_hybrid_shape_rejections(
