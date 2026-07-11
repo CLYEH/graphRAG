@@ -147,3 +147,124 @@ async def test_global_query_end_to_end_over_the_shared_seam(
             await cleanup.execute(builds.delete().where(builds.c.project == project))
             await cleanup.execute(projects.delete().where(projects.c.name == project))
         await engine.dispose()
+
+
+async def test_graph_and_hybrid_end_to_end_over_the_shared_seam(
+    migrated: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why (BA6b): the router facades must run LIVE on the same seam —
+    hybrid proves §22 typed degradation end-to-end (fake factories: the
+    selector and the semantic mode fail, the router degrades to global and
+    still fuses the REAL community report), and graph proves the in-envelope
+    guardrail parity over live Neo4j (hop ceiling → 200 + GUARDRAIL_BLOCKED,
+    never a REST-only 400; the projection is empty for this build — the
+    C6c/BA3c precedent)."""
+    monkeypatch.setattr("api.deps.embedding_model", lambda: object())
+    monkeypatch.setattr("api.deps.chat_model", lambda: object())
+
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project, config={"query_policy": _QUERY_POLICY})
+            build_id = (
+                await conn.execute(
+                    builds.insert().values(project=project, status="active").returning(builds.c.id)
+                )
+            ).scalar_one()
+            entity_id = (
+                await conn.execute(
+                    entities.insert()
+                    .values(
+                        project=project,
+                        build_id=build_id,
+                        type="Hall",
+                        canonical_name="Main Hall",
+                        entity_key=f"fpv1:hall|main-{uuid.uuid4().hex[:6]}",
+                        status="active",
+                    )
+                    .returning(entities.c.id)
+                )
+            ).scalar_one()
+            await conn.execute(
+                community_reports.insert().values(
+                    project=project,
+                    build_id=build_id,
+                    level=0,
+                    title="Main Hall cluster",
+                    summary="Exhibits around the main hall.",
+                    member_entity_ids=[entity_id],
+                    rating=0.9,
+                )
+            )
+
+        app = create_app()
+        transport = ASGITransport(app=app)
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(transport=transport, base_url="http://t") as client,
+        ):
+            # hybrid: broken selector → breadth; broken semantic → typed
+            # degradation; global still serves — the fusion carries its report
+            r = await client.post(
+                f"/projects/{project}/query/hybrid", json={"query": "main hall", "top_k": 5}
+            )
+            assert r.status_code == 200
+            data = r.json()["data"]
+            assert data["mode"] == "hybrid"
+            assert data["build_id"] == str(build_id)
+            assert "community_report" in [res["result_type"] for res in data["results"]]
+            codes = [w["code"] for w in data["warnings"]]
+            assert "STORE_UNAVAILABLE" in codes  # semantic degraded, not fatal (§22)
+            assert codes.count("MODE_SKIPPED") == 2  # sql disabled, graph unparameterized
+            routing = data["debug"]["routing_decision"]
+            assert "global" in routing["selected"]
+            assert "selector failed" in routing["reason"]
+
+            # graph: the hop ceiling degrades IN-ENVELOPE over the live stack
+            # (facade parity — same answer as the MCP tool), never a 400 …
+            r = await client.post(
+                f"/projects/{project}/query/graph",
+                json={
+                    "query": "q",
+                    "options": {"template": "neighbors", "entity": "Main Hall", "hops": 99},
+                },
+            )
+            assert r.status_code == 200
+            data = r.json()["data"]
+            assert data["mode"] == "graph" and data["results"] == []
+            assert [w["code"] for w in data["warnings"]] == ["GUARDRAIL_BLOCKED"]
+
+            # … while a legal invocation runs the live (empty) projection
+            r = await client.post(
+                f"/projects/{project}/query/graph",
+                json={
+                    "query": "q",
+                    "options": {"template": "neighbors", "entity": "Main Hall", "hops": 2},
+                },
+            )
+            assert r.status_code == 200
+            data = r.json()["data"]
+            assert data["mode"] == "graph" and data["build_id"] == str(build_id)
+            assert data["results"] == []  # empty projection, typed and honest
+            assert all("code" in w for w in data["warnings"])
+
+            # the shape layer is live too: graph top_k rejects loudly
+            r = await client.post(
+                f"/projects/{project}/query/graph",
+                json={
+                    "query": "q",
+                    "top_k": 5,
+                    "options": {"template": "neighbors", "entity": "Main Hall"},
+                },
+            )
+            assert r.status_code == 400
+    finally:
+        async with engine.connect() as cleanup, cleanup.begin():
+            await cleanup.execute(
+                community_reports.delete().where(community_reports.c.project == project)
+            )
+            await cleanup.execute(entities.delete().where(entities.c.project == project))
+            await cleanup.execute(builds.delete().where(builds.c.project == project))
+            await cleanup.execute(projects.delete().where(projects.c.name == project))
+        await engine.dispose()

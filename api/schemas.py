@@ -121,7 +121,8 @@ class QueryRequest(BaseModel):
     then LOUDLY rejected while present (the BA2e owner rule, 2026-07-10): the
     §8 modes take no store-level filters or mode options yet — silently
     running an UNfiltered query against an explicit restriction would return
-    results the client did not ask for. Lifting is additive."""
+    results the client did not ask for. Lifting is additive (BA6b lifts
+    ``options`` for graph/hybrid below, per-mode and typed)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -135,6 +136,69 @@ class QueryRequest(BaseModel):
         for field in ("filters", "options"):
             if field in self.model_fields_set:
                 raise ValueError(f"{field} is not supported yet; omit it")
+        return self
+
+
+class GraphOptions(BaseModel):
+    """The graph invocation carried in the contract's ``options`` channel
+    ("Mode-specific options") — the §27.6 template vocabulary's SHAPE only.
+
+    This model is the same validation layer as the MCP graph tool's typed
+    parameters (strings and an int): unknown keys are rejected loudly (the
+    BA2e owner rule — never accept-and-ignore), but template VOCABULARY,
+    entity BLANKNESS, and the hop CEILING stay core's in-envelope guardrail
+    so both facades answer identically (rejected-not-clamped, 200 +
+    GUARDRAIL_BLOCKED — one machinery, two facades; the MCP tool schema
+    types these as plain strings too, so even an empty string is a VALUE
+    question, not a shape one)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    template: str
+    entity: str
+    other_entity: str | None = None
+    hops: int = 1
+
+
+class GraphQueryRequest(BaseModel):
+    """The graph mode's QueryRequest: ``options`` is REQUIRED (the tool is
+    template-parameterized — there is nothing to run without template+seed),
+    ``top_k`` is rejected while unsupported (the MCP graph tool exposes no
+    per-call cap; accepting-and-ignoring it is the #60 R1 lie), and
+    ``filters`` stays rejected as everywhere."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1)
+    options: GraphOptions
+    top_k: int | None = Field(default=None, ge=1)
+    filters: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _reject_unsupported(self) -> GraphQueryRequest:
+        for field in ("filters", "top_k"):
+            if field in self.model_fields_set:
+                raise ValueError(f"{field} is not supported for the graph mode; omit it")
+        return self
+
+
+class HybridQueryRequest(BaseModel):
+    """The hybrid mode's QueryRequest: ``top_k`` threads to fusion, ``options``
+    is the OPTIONAL graph invocation — absent means the router skips the graph
+    mode with an in-envelope reason (MCP parity: it never fabricates traversal
+    parameters from prose); present it must be complete (GraphOptions)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1)
+    top_k: int | None = Field(default=None, ge=1)
+    options: GraphOptions | None = None
+    filters: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _reject_unsupported(self) -> HybridQueryRequest:
+        if "filters" in self.model_fields_set:
+            raise ValueError("filters is not supported yet; omit it")
         return self
 
 

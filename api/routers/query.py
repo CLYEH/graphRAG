@@ -1,5 +1,5 @@
-"""Query playground endpoints (BA6a) — semantic/sql/global over the ACTIVE
-build; graph/hybrid land in BA6b on the same seam.
+"""Query playground endpoints (BA6a semantic/sql/global + BA6b graph/hybrid)
+over the ACTIVE build.
 
 Each POST runs its §8 mode through ``core.mcp.server.run_bounded_query`` —
 the SAME §21 wall-clock deadline + per-call binding + §22 typed-degradation
@@ -29,11 +29,14 @@ from api.deps import project_query_context, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.registry_errors import translate_registry_error
-from api.schemas import QueryRequest
+from api.schemas import GraphOptions, GraphQueryRequest, HybridQueryRequest, QueryRequest
 from core.llm.factory import LLMNotConfiguredError
-from core.mcp.policy import PolicyError, QueryPolicy, query_policy_from_mapping
+from core.mcp.policy import PolicyError, QueryPolicy, hybrid_policy, query_policy_from_mapping
 from core.mcp.server import run_bounded_query
 from core.query.global_reports import global_summary as run_global
+from core.query.graph import GraphQueryParams
+from core.query.graph import graph_query as run_graph
+from core.query.hybrid import hybrid_query as run_hybrid
 from core.query.semantic import semantic_search as run_semantic
 from core.query.sql import sql_query as run_sql
 from core.registry import ProjectNotFoundError, get_project
@@ -95,11 +98,21 @@ async def _load_policy(request: Request, project: str) -> QueryPolicy:
         ) from exc
 
 
+def _graph_params(options: GraphOptions) -> GraphQueryParams:
+    """The typed options → the §27.6 invocation, field for field."""
+    return GraphQueryParams(
+        template=options.template,
+        entity=options.entity,
+        other_entity=options.other_entity,
+        hops=options.hops,
+    )
+
+
 async def _run_mode(
     request: Request,
     project: str,
     mode: str,
-    body: QueryRequest,
+    query: str,
     runner: Any,
 ) -> dict[str, Any]:
     policy = await _load_policy(request, project)
@@ -110,9 +123,7 @@ async def _run_mode(
         # a typed 503 naming the missing config, never a coarse 500
         raise ApiError(ErrorCode.STORE_UNAVAILABLE, str(exc)) from exc
     try:
-        mcp_dict = await run_bounded_query(
-            context, policy, f"query_{mode}", body.query, runner(policy)
-        )
+        mcp_dict = await run_bounded_query(context, policy, f"query_{mode}", query, runner(policy))
     except NoActiveBuildError as exc:
         raise translate_registry_error(exc) from exc
     build_id = mcp_dict.get("build_id")
@@ -146,7 +157,7 @@ async def query_semantic_endpoint(
 
         return _run
 
-    return await _run_mode(request, project, "semantic", body, runner)
+    return await _run_mode(request, project, "semantic", body.query, runner)
 
 
 @router.post("/projects/{project}/query/sql")
@@ -168,7 +179,7 @@ async def query_sql_endpoint(request: Request, project: str, body: QueryRequest)
 
         return _run
 
-    return await _run_mode(request, project, "sql", body, runner)
+    return await _run_mode(request, project, "sql", body.query, runner)
 
 
 @router.post("/projects/{project}/query/global")
@@ -181,4 +192,56 @@ async def query_global_endpoint(
 
         return _run
 
-    return await _run_mode(request, project, "global", body, runner)
+    return await _run_mode(request, project, "global", body.query, runner)
+
+
+@router.post("/projects/{project}/query/graph")
+async def query_graph_endpoint(
+    request: Request, project: str, body: GraphQueryRequest
+) -> dict[str, Any]:
+    # template vocabulary and the hop ceiling are validated by run_graph
+    # itself, IN-ENVELOPE (200 + GUARDRAIL_BLOCKED, rejected-not-clamped) —
+    # exactly as the MCP graph tool answers; only the SHAPE (GraphOptions)
+    # is this facade's 400 layer, mirroring the tool's typed parameters
+    params = _graph_params(body.options)
+
+    def runner(policy: QueryPolicy) -> Any:
+        async def _run(deps: Any, _remaining_ms: int) -> Any:
+            return await run_graph(
+                deps.graph,
+                deps.repo,
+                policy.cypher_policy(),
+                params,
+                body.query,
+                policy.max_graph_hops,
+            )
+
+        return _run
+
+    return await _run_mode(request, project, "graph", body.query, runner)
+
+
+@router.post("/projects/{project}/query/hybrid")
+async def query_hybrid_endpoint(
+    request: Request, project: str, body: HybridQueryRequest
+) -> dict[str, Any]:
+    # absent options → the router skips the graph mode with an in-envelope
+    # reason (MCP parity: traversal parameters are never fabricated from prose)
+    params = None if body.options is None else _graph_params(body.options)
+
+    def runner(policy: QueryPolicy) -> Any:
+        async def _run(deps: Any, remaining_ms: int) -> Any:
+            # hybrid's internal pacer runs on what binding LEFT of the §21
+            # budget — never a fresh full max_latency_ms — so the whole
+            # request respects the cap (the C8 class-11 face; same rule as
+            # the MCP hybrid tool)
+            return await run_hybrid(
+                deps,
+                hybrid_policy(policy, body.top_k, latency_budget_ms=remaining_ms),
+                body.query,
+                params,
+            )
+
+        return _run
+
+    return await _run_mode(request, project, "hybrid", body.query, runner)
