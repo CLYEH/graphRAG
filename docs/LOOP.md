@@ -19,6 +19,15 @@ loop back to step 3.
    uv run poe check-full       # + integration (first: docker compose up -d --wait)
    cd web && npm run test:e2e  # UI flows (first: npx playwright install)
    ```
+   **FE tasks only (owner 2026-07-11):** after the gates above (incl. Playwright
+   e2e) go green, run the **Claude in Chrome browser pass** — the agent drives a
+   real Chrome (`mcp__claude-in-chrome__*`) through the task's UI flows on the
+   local stack, checks the browser console for errors, and captures screenshots/
+   GIF evidence that goes into the PR body. Findings → back to step 3. This is a
+   supplementary verification step (agent-session only, not CI-runnable), so it
+   does not replace the Playwright gate; it is mechanically enforced by the
+   browser-QA receipt hook (H6) — no receipt for the current tree on a `task/FE*`
+   branch ⇒ push/PR blocked.
 5. **Agent review (local gate)** — run the `code-reviewer` subagent on the diff
    (`doc-reviewer` for doc-only changes taking the fast lane).
    **VERDICT: FAIL → back to step 3** (fix, then re-verify + re-review).
