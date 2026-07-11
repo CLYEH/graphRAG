@@ -180,6 +180,20 @@ async def test_health_metrics_eval_end_to_end(migrated: None) -> None:
             r = await client.get(f"/projects/{project}/eval")
             data = r.json()["data"]
             assert data["passed"] is None and data["regression"] is None
+
+            # failed==0 but UNSCORED (Codex #62 R3): the activation gate
+            # fails closed on an unmeasured candidate, so the endpoint must
+            # not read it as passing. Discriminating: the failed-only
+            # predicate returned passed=true here.
+            async with engine.connect() as conn, conn.begin():
+                await conn.execute(
+                    builds.update()
+                    .where(builds.c.id == ready_id)
+                    .values(eval={"passed": 3, "failed": 0, "fingerprint": "fp"})
+                )
+            r = await client.get(f"/projects/{project}/eval")
+            data = r.json()["data"]
+            assert data["passed"] is None and data["regression"] is None
     finally:
         async with engine.connect() as cleanup, cleanup.begin():
             await cleanup.execute(entities.delete().where(entities.c.project == project))

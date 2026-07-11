@@ -345,9 +345,22 @@ async def latest_eval_payload(conn: AsyncConnection, project: str) -> dict[str, 
         return {"build_id": None, "passed": None, "regression": None, "metrics": {}}
     block: dict[str, Any] = served.eval
     failed = block.get("failed")
-    # type-is, not isinstance: bool subclasses int, and a malformed
-    # {"failed": false} must be null, never a passing report (Codex #62)
-    passed = (failed == 0) if type(failed) is int else None
+    score = _score(block.get("score"))
+    # the gate's FULL predicate, both halves (Codex #62 R3 — citing it while
+    # transcribing half of it forked checker from consumer): measured
+    # per-case failures did not pass; a malformed count (bool included —
+    # type-is, not isinstance) is null; and failed==0 while UNSCORED is null
+    # too — the gate fails closed on an unmeasured candidate, so an unscored
+    # report must never read as passing.
+    passed: bool | None
+    if type(failed) is not int:
+        passed = None
+    elif failed > 0:
+        passed = False
+    elif score is None:
+        passed = None
+    else:
+        passed = True
 
     regression: bool | None = None
     active_row = (
@@ -358,19 +371,16 @@ async def latest_eval_payload(conn: AsyncConnection, project: str) -> dict[str, 
         )
     ).one_or_none()
     if active_row is not None and active_row.id != served.id and isinstance(active_row.eval, dict):
-        served_score, active_score = (
-            _score(block.get("score")),
-            _score(active_row.eval.get("score")),
-        )
+        active_score = _score(active_row.eval.get("score"))
         served_fp, active_fp = block.get("fingerprint"), active_row.eval.get("fingerprint")
         if (
-            served_score is not None
+            score is not None
             and active_score is not None
             and isinstance(served_fp, str)
             and served_fp == active_fp
         ):
             regression = is_eval_regression(
-                served_score, active_score, get_settings().eval_regression_threshold
+                score, active_score, get_settings().eval_regression_threshold
             )
 
     metrics = block.get("metrics")
