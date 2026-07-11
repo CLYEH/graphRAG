@@ -87,7 +87,13 @@ if [ "$lane" = doc ]; then
   require_receipt
 else
   require_receipt
-  if [[ "$current" == task/FE* ]]; then
+  # the FE receipt keys on the DESTINATION, not only the checked-out branch:
+  # `git push origin HEAD:task/FE1` lands on an FE branch from ANY local name
+  # (Codex #64 R3 — the doc lane's `:main` refspec detection is the same
+  # idea). Any push/PR payload naming task/FE engages, deliberately
+  # over-matching (multi-branch and deletion forms included) — fail-closed,
+  # like the rest of this hook.
+  if [[ "$current" == task/FE* ]] || printf '%s' "$payload" | grep -q 'task/FE'; then
     # H10: the FE browser pass is tree-bound like the review — its own
     # namespace, so neither receipt kind can satisfy the other's gate
     fe_tree="$(snapshot_tree)"
