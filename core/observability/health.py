@@ -281,6 +281,73 @@ def status_light(
     return "Healthy"
 
 
+async def latest_eval_payload(conn: AsyncConnection, project: str) -> dict[str, Any]:
+    """§20's ``GET /projects/{p}/eval`` payload — the LATEST eval report.
+
+    "Latest" = the newest build (started_at desc, NULLS LAST — the same
+    ordering lesson as `_eval_regressed`) carrying an eval block; none →
+    all-null report (the light's measured-facts rule: absence is reported,
+    never invented). Field mapping onto the FROZEN EvalReport:
+
+    - ``passed`` (boolean|null) — the same predicate the §14 activation gate
+      and the CLI use: a report with ``failed > 0`` per-case min_score
+      misses did NOT pass; a malformed/absent count is null, not a guess.
+      The stored per-case COUNTS ride as ``cases_passed``/``cases_failed``
+      (additionalProperties) — reusing the stored key ``passed`` would clash
+      an int into the contract's boolean.
+    - ``regression`` (boolean|null) — the §20 comparison against the ACTIVE
+      build's report, exactly as the gate/light compute it (numeric scores +
+      same fingerprint → ``is_eval_regression``); vacuous (the served build
+      IS the active, no active, unscored either side, or incomparable
+      fingerprints) → null."""
+    rows = (
+        await conn.execute(
+            sa.select(tables.builds.c.id, tables.builds.c.eval)
+            .where(tables.builds.c.project == project, tables.builds.c.eval.isnot(None))
+            .order_by(sa.desc(tables.builds.c.started_at).nulls_last())
+        )
+    ).all()
+    served = next((row for row in rows if isinstance(row.eval, dict)), None)
+    if served is None:
+        return {"build_id": None, "passed": None, "regression": None, "metrics": {}}
+    block: dict[str, Any] = served.eval
+    failed = block.get("failed")
+    passed = (failed == 0) if isinstance(failed, int) else None
+
+    regression: bool | None = None
+    active_row = (
+        await conn.execute(
+            sa.select(tables.builds.c.id, tables.builds.c.eval).where(
+                tables.builds.c.project == project, tables.builds.c.status == "active"
+            )
+        )
+    ).one_or_none()
+    if active_row is not None and active_row.id != served.id and isinstance(active_row.eval, dict):
+        served_score, active_score = block.get("score"), active_row.eval.get("score")
+        served_fp, active_fp = block.get("fingerprint"), active_row.eval.get("fingerprint")
+        if (
+            isinstance(served_score, (int, float))
+            and isinstance(active_score, (int, float))
+            and isinstance(served_fp, str)
+            and served_fp == active_fp
+        ):
+            regression = is_eval_regression(
+                float(served_score), float(active_score), get_settings().eval_regression_threshold
+            )
+
+    metrics = block.get("metrics")
+    return {
+        "build_id": str(served.id),
+        "passed": passed,
+        "regression": regression,
+        "metrics": metrics if isinstance(metrics, dict) else {},
+        "score": block.get("score"),
+        "fingerprint": block.get("fingerprint"),
+        "cases_passed": block.get("passed"),
+        "cases_failed": block.get("failed"),
+    }
+
+
 async def _eval_regressed(conn: AsyncConnection, project: str, active_id: uuid.UUID) -> bool:
     """§20's light: the newest READY build regresses vs the active on
     COMPARABLE (same-fingerprint) eval reports. Unscored or incomparable is
