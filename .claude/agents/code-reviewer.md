@@ -45,7 +45,11 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
 4. **Scope** — surgical: every changed line traces to the task; no unrelated refactors,
    no dead code, no debug leftovers.
 5. **Design alignment** — matches the relevant DESIGN.md section; if it diverges,
-   DESIGN.md must be updated in the same change (or it's a FAIL).
+   DESIGN.md must be updated in the same change (or it's a FAIL). When the
+   spec NAMES a list (indicators, fields, lights), diff the list item-by-item
+   against the produced keys — reading the section for semantics is not
+   enumerating it (#62 R2: §19's source count and last-success build were
+   absent although the design pass had read §19).
 6. **DB-constraint sweep** (when the diff touches `core/stores/tables.py` or
    `migrations/` — PR #17 burned 9 Codex rounds on cells of this grid; run it
    BEFORE the first push, cell by cell, and FAIL on any unjustified gap):
@@ -209,10 +213,7 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      resource (pass providers; invoke where measured); tests pin it
      discriminatingly (broken-resource + non-dependent path → the domain
      answer, not 500) and structurally (must-not-acquire raising providers
-     on the branches that measure nothing). When a spec NAMES a list
-     (indicators, fields, lights), diff the list item-by-item against the
-     produced keys (#62 R2: §19's source count and last-success build were
-     absent although the design pass had read §19 for semantics).
+     on the branches that measure nothing).
    - **A new domain error's completeness face is the function's callers, not
      your diff**: adding an exception to a SHARED function (one an existing HTTP
      entry already calls) pulls in EVERY caller's translation/handling — trace
