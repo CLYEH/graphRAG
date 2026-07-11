@@ -864,6 +864,51 @@ def test_r18_standalone_and_all_task_refs(toy_repo: Path) -> None:
     assert "never the local ref" in denied.stderr
 
 
+def test_r19_whole_payload_and_gh_body_prose(toy_repo: Path) -> None:
+    """Codex #64 R19: (a) a transfer that OPENS the payload can still be
+    FOLLOWED by mutate+transfer — the second push ships state the receipts
+    never saw, so an engaged command must be the ENTIRE payload; (b) gh
+    --body/--title prose naming another task branch is not a push source
+    (--head is banned; gh only pushes the current branch) — the ref walk
+    must not deny PR descriptions."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B1")
+    (toy_repo / "a.md").write_text("b1 content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b1"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    # (a) Codex's executed repro returned 0 on this exact receipted checkout:
+    # the R18 prefix rule cleared the chain and the SECOND transfer shipped
+    # the unreviewed commit — the whole-payload rule denies it
+    chained = (
+        '{"tool_input": {"command": '
+        '"PUSHVERB -u origin task/B1 && echo bad > p.py && git add p.py '
+        '&& git commit -m bad && PUSHVERB origin"}}'
+    ).replace("PUSHVERB", _PUSH)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=chained, extra_env=env)
+    assert denied.returncode == 2 and "ENTIRE payload" in denied.stderr
+
+    # ...while the same characters INSIDE quotes are prose, not chains: the
+    # deny must come from the quote-aware walk, not a flat character grep
+    quoted = (
+        '{"tool_input": {"command": "PRCREATE --fill --title \'fix a && b; run c\'"}}'
+    ).replace("PRCREATE", _PR_CREATE)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=quoted, extra_env=env)
+    assert allowed.returncode == 0, f"quoted prose denied as a chain: {allowed.stderr}"
+
+    # (b) a PR body MENTIONING another task branch is not a push of it —
+    # the old walk denied this exact payload ("never the local ref")
+    prose = ('{"tool_input": {"command": "PRCREATE --fill --body \'Related task/B2\'"}}').replace(
+        "PRCREATE", _PR_CREATE
+    )
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=prose, extra_env=env)
+    assert allowed.returncode == 0, f"body prose denied as a ref: {allowed.stderr}"
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING

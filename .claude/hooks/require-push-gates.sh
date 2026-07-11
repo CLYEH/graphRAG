@@ -67,7 +67,12 @@ except Exception:
 # single-quoted spans — a quote opened OUTSIDE double quotes. An apostrophe
 # inside double quotes is text; the old regex treated it as a delimiter and
 # swallowed live code (including expansions) between two contractions.
+# The same walk flags command SEPARATORS outside all quotes (Codex #64 R19):
+# a ; & | or newline the shell would execute chains a second command onto
+# the payload, while the same characters inside quotes are prose and stay
+# legal — a regex on the flat text cannot make that distinction.
 out = []
+sep = False
 in_s = in_d = False
 for ch in cmd:
     if in_s:
@@ -80,6 +85,8 @@ for ch in cmd:
         continue
     if ch == chr(34):
         in_d = not in_d
+    elif not in_d and ch in ";&|\n":
+        sep = True
     out.append(ch)
 residue = "".join(out)
 try:
@@ -102,17 +109,31 @@ while i < len(toks):
         head = t[7:]
     i += 1
 sys.stdout.write(
-    norm.replace("\n", " ") + "\n" + residue.replace("\n", " ") + "\n" + head.replace("\n", " ") + "\n"
+    norm.replace("\n", " ")
+    + "\n"
+    + residue.replace("\n", " ")
+    + "\n"
+    + head.replace("\n", " ")
+    + "\n"
+    + ("1" if sep else "0")
+    + "\n"
 )
 ' 2>/dev/null)" || extracted=""
 if [ -n "$extracted" ]; then
   payload="$(printf '%s\n' "$extracted" | sed -n 1p)"
   residue="$(printf '%s\n' "$extracted" | sed -n 2p)"
   gh_head="$(printf '%s\n' "$extracted" | sed -n 3p)"
+  has_sep="$(printf '%s\n' "$extracted" | sed -n 4p)"
 else
   payload="$raw_payload"
   residue="$raw_payload"
   gh_head=""
+  # no quote-aware walk on the fallback path — flag the characters raw
+  # (over-matching, never under: quoted prose can only FALSE-deny here)
+  case "$raw_payload" in
+  *";"* | *"&"* | *"|"* | *$'\n'*) has_sep=1 ;;
+  *) has_sep=0 ;;
+  esac
 fi
 [ -n "$payload" ] || payload="$raw_payload"
 [ -n "$residue" ] || residue="$payload"
@@ -149,11 +170,18 @@ current="$(git branch --show-current)"
 # an engaged command must STAND ALONE (Codex #64 R18, P1): any preceding
 # command in the same payload can mutate the tree AFTER the receipts were
 # validated (write file && add && commit && push slipped an unreviewed
-# commit out) — the transfer verb must OPEN the command. Trailing pipes and
-# suffix commands are harmless: post-transfer mutations cannot alter what
-# was already sent.
+# commit out) — the transfer verb must OPEN the command...
 printf '%s' "$payload" | grep -Eq "^(git${flags}[[:space:]]+push|gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new))\b" ||
   deny "the push/PR command must stand alone — earlier commands in the same payload can mutate state after the receipts were checked; run them separately, then push."
+# ...and nothing may FOLLOW it either (Codex #64 R19, P1 executed repro):
+# `push && edit && commit && push` opens with a transfer, but the SECOND
+# transfer sends state mutated after this gate ran — the R18 claim that
+# suffixes are harmless held only for suffixes without their own transfer.
+# Stand-alone now means the WHOLE payload: no separators outside quotes
+# (the extraction's quote-aware walk — quoted prose stays legal; the raw
+# fallback over-matches by design).
+[ "${has_sep:-1}" = "0" ] ||
+  deny "an engaged push/PR command must be the ENTIRE payload — a ; & | or newline lets a later command transfer state mutated after the receipts were checked; run the transfer alone."
 
 # gh --head selects an ALREADY-REMOTE ref (the gh manual: --head skips
 # pushing) — no local receipt can vouch for a remote SHA, and gh defaults
@@ -259,7 +287,11 @@ validate_task_ref_tokens() {
     esac
   done < <(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']*task/[^[:space:]\"']*" || true)
 }
-validate_task_ref_tokens
+# git payloads only (Codex #64 R19, P2): a task/ token in a git push IS a
+# potential push source, but gh pr create cannot name one — --head is banned
+# outright above and no other flag selects a push ref, so its task/ tokens
+# are --body/--title PROSE ("Related task/B2" was denied as if pushed).
+[ "$git_engaged" = 1 ] && validate_task_ref_tokens
 
 # lane: a ':main' / ':refs/heads/main' refspec, pushing while on main, or a docs/* branch
 # (whose whole purpose is the fast lane, incl. its own branch push) = doc-only lane
