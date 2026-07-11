@@ -19,25 +19,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.app import create_app
-from api.deps import db_conn, neo4j_driver, qdrant_client
+from api.deps import db_conn
 from core.observability.health import HealthReport
 
 pytestmark = pytest.mark.contract
 
 _BUILD = uuid.uuid4()
-
-
-class _FakeSession:
-    async def __aenter__(self) -> object:
-        return object()
-
-    async def __aexit__(self, *exc: Any) -> None:
-        return None
-
-
-class _FakeDriver:
-    def session(self) -> _FakeSession:
-        return _FakeSession()
 
 
 @pytest.fixture()
@@ -48,8 +35,6 @@ def client() -> Iterator[TestClient]:
         yield object()
 
     app.dependency_overrides[db_conn] = _conn
-    app.dependency_overrides[neo4j_driver] = lambda: _FakeDriver()
-    app.dependency_overrides[qdrant_client] = lambda: object()
     with TestClient(app) as c:
         yield c
 
@@ -91,7 +76,7 @@ def test_health_serves_the_frozen_payload(
         warnings=("drift check unavailable: Neo4jError",),
     )
 
-    async def fake_report(conn: Any, qdrant: Any, session: Any, project: str) -> HealthReport:
+    async def fake_report(conn: Any, project: str, **providers: Any) -> HealthReport:
         return report
 
     _stub(monkeypatch, "health_report", fake_report)
@@ -116,7 +101,7 @@ def test_metrics_reprojects_the_same_report(
     calls: list[str] = []
     metrics = {"documents": 5, "pending_review": 2, "builds_total": 1}
 
-    async def fake_report(conn: Any, qdrant: Any, session: Any, project: str) -> HealthReport:
+    async def fake_report(conn: Any, project: str, **providers: Any) -> HealthReport:
         calls.append(project)
         return _report(metrics=metrics)
 
@@ -137,7 +122,7 @@ def test_bootstrap_is_a_report_never_409(
     # and /eval serves the all-null report (measured facts only).
     _project_exists(monkeypatch)
 
-    async def fake_report(conn: Any, qdrant: Any, session: Any, project: str) -> HealthReport:
+    async def fake_report(conn: Any, project: str, **providers: Any) -> HealthReport:
         return _report(active_build_id=None)
 
     async def fake_eval(conn: Any, project: str) -> dict[str, Any]:
@@ -172,6 +157,28 @@ def test_eval_serves_the_latest_report(client: TestClient, monkeypatch: pytest.M
     assert r.status_code == 200
     assert r.json()["data"] == payload
     assert r.json()["meta"]["build_id"] == str(_BUILD)  # the build the report is ABOUT
+
+
+def test_broken_store_config_cannot_poison_the_404(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (Codex #62, the #53 R3 eager-acquisition class): the projection
+    # stores are PROVIDERS invoked only when the drift probe runs — a missing
+    # project must 404 even when Neo4j/Qdrant construction would raise.
+    # Discriminating: the old shape resolved them as route dependencies, so
+    # this request answered 500 before the 404.
+    async def missing(conn: Any, name: str) -> None:
+        return None
+
+    def boom(request: Any) -> Any:
+        raise ValueError("invalid store config")
+
+    _stub(monkeypatch, "get_project", missing)
+    _stub(monkeypatch, "qdrant_client", boom)
+    _stub(monkeypatch, "neo4j_driver", boom)
+    r = client.get("/projects/ghost/health")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "PROJECT_NOT_FOUND"
 
 
 @pytest.mark.parametrize("path", ["health", "metrics", "eval"])

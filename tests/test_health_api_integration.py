@@ -159,6 +159,20 @@ async def test_health_metrics_eval_end_to_end(migrated: None) -> None:
             r = await client.get(f"/projects/{project}/eval")
             data = r.json()["data"]
             assert data["passed"] is False and data["regression"] is None
+
+            # bool subclasses int (Codex #62): a malformed {"failed": false}
+            # must read as NULL, never a passing report — and a boolean score
+            # is UNSCORED, never 1.0 in the regression comparison.
+            # Discriminating: the old isinstance checks returned passed=true.
+            async with engine.connect() as conn, conn.begin():
+                await conn.execute(
+                    builds.update()
+                    .where(builds.c.id == ready_id)
+                    .values(eval={"score": True, "failed": False, "fingerprint": "fp"})
+                )
+            r = await client.get(f"/projects/{project}/eval")
+            data = r.json()["data"]
+            assert data["passed"] is None and data["regression"] is None
     finally:
         async with engine.connect() as cleanup, cleanup.begin():
             await cleanup.execute(entities.delete().where(entities.c.project == project))

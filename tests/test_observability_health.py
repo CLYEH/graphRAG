@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -42,6 +43,16 @@ def _engine() -> AsyncEngine:
     return create_async_engine(dsn, poolclass=NullPool)
 
 
+def _of(value: Any) -> Any:
+    """A provider handing back an already-built client (health_report now
+    takes PROVIDERS, invoked only when the drift probe runs — Codex #62)."""
+
+    async def _provider() -> Any:
+        return value
+
+    return _provider
+
+
 @pytest_asyncio.fixture()
 async def project(migrated: None) -> AsyncIterator[str]:
     name = f"health-{uuid.uuid4().hex[:10]}"
@@ -63,9 +74,11 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
     qdrant = vector_client()
     driver = graph_driver()
     try:
-        async with engine.connect() as conn, driver.session() as session:
+        async with engine.connect() as conn:
             # no builds at all → Healthy (nothing to report on)
-            report = await health_report(conn, qdrant, session, project)
+            report = await health_report(
+                conn, project, vector_provider=_of(qdrant), graph_provider=_of(driver)
+            )
             assert report.status == "Healthy"
             assert report.metrics["builds_total"] == 0
 
@@ -79,7 +92,9 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
                 )
             ).scalar_one()
             await conn.commit()
-            report = await health_report(conn, qdrant, session, project)
+            report = await health_report(
+                conn, project, vector_provider=_of(qdrant), graph_provider=_of(driver)
+            )
             assert report.status == "Healthy"
             assert report.metrics["entities"] == 0 and report.drift == ()
 
@@ -114,7 +129,9 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
                 )
             )
             await conn.commit()
-            report = await health_report(conn, qdrant, session, project)
+            report = await health_report(
+                conn, project, vector_provider=_of(qdrant), graph_provider=_of(driver)
+            )
             assert report.status == "Needs review"
             assert report.metrics["pending_review"] == 1
 
@@ -131,7 +148,9 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
                 )
             )
             await conn.commit()
-            report = await health_report(conn, qdrant, session, project)
+            report = await health_report(
+                conn, project, vector_provider=_of(qdrant), graph_provider=_of(driver)
+            )
             assert report.status == "Needs review"
             assert report.metrics["pending_review"] == 2
             assert report.metrics["pending_ontology_proposals"] == 1
@@ -178,7 +197,9 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
                 )
             )
             await conn.commit()
-            report = await health_report(conn, qdrant, session, project)
+            report = await health_report(
+                conn, project, vector_provider=_of(qdrant), graph_provider=_of(driver)
+            )
             assert report.status == "Needs review"
             assert report.metrics["needs_review_entities"] == 1
             assert report.metrics["needs_review_relations"] == 1
@@ -202,7 +223,9 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
                 )
             )
             await conn.commit()
-            report = await health_report(conn, qdrant, session, project)
+            report = await health_report(
+                conn, project, vector_provider=_of(qdrant), graph_provider=_of(driver)
+            )
             assert report.status == "Index drift"
             assert any("drift" in d for d in report.drift)
 
@@ -214,7 +237,9 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
                 )
             )
             await conn.commit()
-            report = await health_report(conn, qdrant, session, project)
+            report = await health_report(
+                conn, project, vector_provider=_of(qdrant), graph_provider=_of(driver)
+            )
             assert report.status == "Build failed"
             assert report.metrics["last_failed_build"] is not None
 
@@ -227,7 +252,9 @@ async def test_health_lights_follow_the_documented_precedence(project: str) -> N
                 tables.builds.insert().values(project=project, status="building", started_at=None)
             )
             await conn.commit()
-            report = await health_report(conn, qdrant, session, project)
+            report = await health_report(
+                conn, project, vector_provider=_of(qdrant), graph_provider=_of(driver)
+            )
             assert report.status == "Build failed"
     finally:
         await qdrant.close()
@@ -243,7 +270,7 @@ async def test_eval_regression_light_needs_comparable_reports(project: str) -> N
     qdrant = vector_client()
     driver = graph_driver()
     try:
-        async with engine.connect() as conn, driver.session() as session:
+        async with engine.connect() as conn:
             await ensure_project(conn, project)
             await conn.execute(
                 tables.builds.insert().values(
@@ -264,7 +291,9 @@ async def test_eval_regression_light_needs_comparable_reports(project: str) -> N
                 )
             )
             await conn.commit()
-            report = await health_report(conn, qdrant, session, project)
+            report = await health_report(
+                conn, project, vector_provider=_of(qdrant), graph_provider=_of(driver)
+            )
             assert report.status == "Eval regression"
 
             # different fingerprint → incomparable → the light goes dark
@@ -274,7 +303,9 @@ async def test_eval_regression_light_needs_comparable_reports(project: str) -> N
                 .values(eval={"score": 0.5, "failed": 0, "fingerprint": "other"})
             )
             await conn.commit()
-            report = await health_report(conn, qdrant, session, project)
+            report = await health_report(
+                conn, project, vector_provider=_of(qdrant), graph_provider=_of(driver)
+            )
             assert report.status == "Healthy"
 
             # NULLS LAST discriminator (Codex round 6): a NEVER-STARTED ready
@@ -299,7 +330,9 @@ async def test_eval_regression_light_needs_comparable_reports(project: str) -> N
                 )
             )
             await conn.commit()
-            report = await health_report(conn, qdrant, session, project)
+            report = await health_report(
+                conn, project, vector_provider=_of(qdrant), graph_provider=_of(driver)
+            )
             assert report.status == "Eval regression"  # real regressing row still picked
     finally:
         await qdrant.close()

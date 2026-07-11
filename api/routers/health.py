@@ -24,11 +24,9 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Request
-from neo4j import AsyncDriver
-from qdrant_client import AsyncQdrantClient
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from api.deps import Conn, Graph, Vectors, response_meta
+from api.deps import Conn, neo4j_driver, qdrant_client, response_meta
 from api.envelope import success
 from api.registry_errors import translate_registry_error
 from core.observability.health import HealthReport, health_report, latest_eval_payload
@@ -42,29 +40,31 @@ async def _require_project(conn: AsyncConnection, project: str) -> None:
         raise translate_registry_error(ProjectNotFoundError(project))
 
 
-async def _report(
-    conn: AsyncConnection, qdrant: AsyncQdrantClient, driver: AsyncDriver, project: str
-) -> HealthReport:
-    """Project 404 first, then §19's report — the drift probe opens its Neo4j
-    session at the use point and closes it with the request's report."""
+async def _report(request: Request, conn: AsyncConnection, project: str) -> HealthReport:
+    """Project 404 first, then §19's report. The projection stores go in as
+    PROVIDERS the report invokes only when the drift probe actually runs —
+    a missing/bootstrap project answers without touching Neo4j/Qdrant
+    construction or config (the #53 R3 eager-acquisition class; Codex #62:
+    resolving them as route dependencies made even the 404 depend on store
+    config being valid)."""
     await _require_project(conn, project)
-    async with driver.session() as session:
-        return await health_report(conn, qdrant, session, project)
+    return await health_report(
+        conn,
+        project,
+        vector_provider=lambda: qdrant_client(request),
+        graph_provider=lambda: neo4j_driver(request),
+    )
 
 
 @router.get("/projects/{project}/health")
-async def get_health_endpoint(
-    request: Request, project: str, conn: Conn, qdrant: Vectors, driver: Graph
-) -> dict[str, Any]:
-    report = await _report(conn, qdrant, driver, project)
+async def get_health_endpoint(request: Request, project: str, conn: Conn) -> dict[str, Any]:
+    report = await _report(request, conn, project)
     return success(report.to_payload(), **response_meta(request), build_id=report.active_build_id)
 
 
 @router.get("/projects/{project}/metrics")
-async def get_metrics_endpoint(
-    request: Request, project: str, conn: Conn, qdrant: Vectors, driver: Graph
-) -> dict[str, Any]:
-    report = await _report(conn, qdrant, driver, project)
+async def get_metrics_endpoint(request: Request, project: str, conn: Conn) -> dict[str, Any]:
+    report = await _report(request, conn, project)
     return success(report.metrics, **response_meta(request), build_id=report.active_build_id)
 
 

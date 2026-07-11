@@ -45,11 +45,12 @@ SEMANTICS (spec-first — the judge-surface lesson):
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 import sqlalchemy as sa
-from neo4j import AsyncSession
+from neo4j import AsyncDriver
 from neo4j.exceptions import DriverError, Neo4jError
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.exceptions import ApiException
@@ -120,15 +121,31 @@ async def _count(conn: AsyncConnection, query: sa.Select[Any]) -> int:
     return int((await conn.execute(query)).scalar_one())
 
 
+def _score(value: Any) -> float | None:
+    """An eval score, or None when unscored/malformed. bool is checked FIRST:
+    it subclasses int, and a boolean score must read as UNSCORED, never as
+    1.0/0.0 in the §20 comparison (Codex #62). ONE definition for both
+    readers (the light and the endpoint) — a fork here is a class-5 split."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 async def health_report(
     conn: AsyncConnection,
-    qdrant: AsyncQdrantClient,
-    graph_session: AsyncSession,
     project: str,
     *,
+    vector_provider: Callable[[], Awaitable[AsyncQdrantClient]],
+    graph_provider: Callable[[], Awaitable[AsyncDriver]],
     low_confidence_below: float = 0.5,
 ) -> HealthReport:
-    """Compute §19's report for one project (read-only)."""
+    """Compute §19's report for one project (read-only).
+
+    The projection stores arrive as PROVIDERS, acquired ONLY when the drift
+    probe actually runs — a missing/bootstrap project or a failed-newest
+    build must answer without ever touching Neo4j/Qdrant construction or
+    config (the #53 R3 eager-acquisition class; Codex #62). The Neo4j
+    session opens here, scoped to the probe, and closes with it."""
     builds = await list_builds(conn, project)
     active = next((b for b in builds if b.status == "active"), None)
     newest = builds[0] if builds else None
@@ -141,7 +158,10 @@ async def health_report(
         # skipped when Build failed already wins: the operator's answer must
         # not depend on Neo4j/Qdrant being reachable (Codex round 6)
         try:
-            drift = tuple(await drift_failures(conn, qdrant, graph_session, project, active.id))
+            qdrant = await vector_provider()
+            driver = await graph_provider()
+            async with driver.session() as graph_session:
+                drift = tuple(await drift_failures(conn, qdrant, graph_session, project, active.id))
         except _PROBE_ERRORS as exc:
             # unreachable store = UNMEASURED drift, not drift — degrade to
             # the frozen STORE_UNAVAILABLE warning instead of a 500
@@ -312,7 +332,9 @@ async def latest_eval_payload(conn: AsyncConnection, project: str) -> dict[str, 
         return {"build_id": None, "passed": None, "regression": None, "metrics": {}}
     block: dict[str, Any] = served.eval
     failed = block.get("failed")
-    passed = (failed == 0) if isinstance(failed, int) else None
+    # type-is, not isinstance: bool subclasses int, and a malformed
+    # {"failed": false} must be null, never a passing report (Codex #62)
+    passed = (failed == 0) if type(failed) is int else None
 
     regression: bool | None = None
     active_row = (
@@ -323,16 +345,19 @@ async def latest_eval_payload(conn: AsyncConnection, project: str) -> dict[str, 
         )
     ).one_or_none()
     if active_row is not None and active_row.id != served.id and isinstance(active_row.eval, dict):
-        served_score, active_score = block.get("score"), active_row.eval.get("score")
+        served_score, active_score = (
+            _score(block.get("score")),
+            _score(active_row.eval.get("score")),
+        )
         served_fp, active_fp = block.get("fingerprint"), active_row.eval.get("fingerprint")
         if (
-            isinstance(served_score, (int, float))
-            and isinstance(active_score, (int, float))
+            served_score is not None
+            and active_score is not None
             and isinstance(served_fp, str)
             and served_fp == active_fp
         ):
             regression = is_eval_regression(
-                float(served_score), float(active_score), get_settings().eval_regression_threshold
+                served_score, active_score, get_settings().eval_regression_threshold
             )
 
     metrics = block.get("metrics")
@@ -370,12 +395,12 @@ async def _eval_regressed(conn: AsyncConnection, project: str, active_id: uuid.U
     ).scalar_one_or_none()
     if not isinstance(active_eval, dict):
         return False
-    candidate_score, active_score = rows.eval.get("score"), active_eval.get("score")
+    candidate_score, active_score = _score(rows.eval.get("score")), _score(active_eval.get("score"))
     candidate_fp, active_fp = rows.eval.get("fingerprint"), active_eval.get("fingerprint")
-    if not isinstance(candidate_score, (int, float)) or not isinstance(active_score, (int, float)):
-        return False
+    if candidate_score is None or active_score is None:
+        return False  # unscored (a boolean score included) is not a regression
     if not isinstance(candidate_fp, str) or candidate_fp != active_fp:
         return False  # incomparable suites — the gate fails closed, the light stays honest
     return is_eval_regression(
-        float(candidate_score), float(active_score), get_settings().eval_regression_threshold
+        candidate_score, active_score, get_settings().eval_regression_threshold
     )

@@ -615,13 +615,35 @@ async def test_drift_probe_degrades_and_failed_build_short_circuits(
         raise ServiceUnavailable("neo4j down")
 
     monkeypatch.setattr(health_module, "drift_failures", _boom)
-    # newest failed + active exists: the probe is SKIPPED entirely — a
-    # raising probe would fail this test if it were called
+
+    async def _must_not_acquire() -> Any:
+        raise AssertionError("providers must not be acquired when the probe is skipped")
+
+    class _Session:
+        async def __aenter__(self) -> Any:
+            return None
+
+        async def __aexit__(self, *exc: Any) -> None:
+            return None
+
+    class _Driver:
+        def session(self) -> _Session:
+            return _Session()
+
+    async def _driver() -> Any:
+        return _Driver()
+
+    async def _qdrant() -> Any:
+        return None
+
+    # newest failed + active exists: the probe is SKIPPED entirely — and the
+    # providers are never even ACQUIRED (Codex #62: store config must not be
+    # touched on a path that measures nothing); raising ones prove it
     report = await health_report(
         cast(Any, _Conn([_build(failed_id, "failed"), _build(active_id, "active")])),
-        cast(Any, None),
-        cast(Any, None),
         "p",
+        vector_provider=_must_not_acquire,
+        graph_provider=_must_not_acquire,
     )
     assert report.status == "Build failed"
     assert report.warnings == ()
@@ -629,9 +651,9 @@ async def test_drift_probe_degrades_and_failed_build_short_circuits(
     # healthy path with the store down: degraded warning, light honest
     report = await health_report(
         cast(Any, _Conn([_build(active_id, "active")])),
-        cast(Any, None),
-        cast(Any, None),
         "p",
+        vector_provider=_qdrant,
+        graph_provider=_driver,
     )
     assert report.status == "Healthy"
     assert report.warnings and "drift check unavailable" in report.warnings[0]
@@ -657,7 +679,15 @@ async def test_health_report_shape_without_an_active_build_on_fakes() -> None:
         async def execute(self, statement: Any) -> Any:
             return _Rows()
 
-    report = await health_report(cast(Any, _Conn()), cast(Any, None), cast(Any, None), "p")
+    async def _must_not_acquire() -> Any:
+        raise AssertionError("bootstrap must not acquire projection stores")
+
+    report = await health_report(
+        cast(Any, _Conn()),
+        "p",
+        vector_provider=_must_not_acquire,
+        graph_provider=_must_not_acquire,
+    )
     assert report.status == "Healthy"
     assert report.active_build_id is None and report.drift == ()
     assert report.metrics["builds_total"] == 0
