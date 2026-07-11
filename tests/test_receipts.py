@@ -647,12 +647,77 @@ def test_r14_quote_context_and_wildcards(toy_repo: Path) -> None:
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=dq_cmd, extra_env=env)
     assert denied.returncode == 2 and "literally" in denied.stderr
 
-    # (b) wildcard refspecs fan out (executed repro upstream): denied
-    wild = (
-        '{"tool_input": {"command": "PUSHVERB origin refs/heads/task/*:refs/heads/task/*"}}'
-    ).replace("PUSHVERB", _PUSH)
-    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=wild, extra_env=env)
-    assert denied.returncode == 2 and "wildcard" in denied.stderr
+    # (b) wildcard refspecs fan out (executed repro upstream): denied — in
+    # BOTH quoted and unquoted spellings (Codex #64 R15: the single-quote
+    # residue stripping must not hide a quoted glob from the check), while
+    # Markdown stars in prose (no ref separator in the token) stay legal
+    for refspec in (
+        "refs/heads/task/*:refs/heads/task/*",
+        "'refs/heads/task/*:refs/heads/task/*'",
+    ):
+        wild = (
+            ('{"tool_input": {"command": "PUSHVERB origin REFSPEC"}}')
+            .replace("PUSHVERB", _PUSH)
+            .replace("REFSPEC", refspec.replace('"', '\\"'))
+        )
+        denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=wild, extra_env=env)
+        assert denied.returncode == 2, f"wildcard evaded ({refspec}): {denied.stdout}"
+        assert "wildcard" in denied.stderr
+    prose = (
+        '{"tool_input": {"command": "PRCREATE --title ok --body \'has *bold* stars\'"}}'
+    ).replace("PRCREATE", _PR_CREATE)
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=prose, extra_env=env)
+    assert allowed.returncode == 0, f"Markdown stars blocked: {allowed.stderr}"
+
+    # (c) remote.<name>.mirror makes every push a mirror push invisibly —
+    # in EVERY git-true spelling (yes/on/1 canonicalize to true)
+    for value in ("true", "yes", "1"):
+        subprocess.run(
+            ["git", "config", "remote.origin.mirror", value],
+            cwd=toy_repo,
+            check=True,
+            capture_output=True,
+        )
+        denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=f"{_PUSH} origin", extra_env=env)
+        assert denied.returncode == 2, f"mirror={value} evaded: {denied.stdout}"
+        assert "mirror" in denied.stderr
+    subprocess.run(
+        ["git", "config", "--unset", "remote.origin.mirror"],
+        cwd=toy_repo,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_gh_owner_qualified_head_is_not_a_refspec(toy_repo: Path) -> None:
+    """Codex #64 R15 (over-block): gh's documented `--head owner:branch` form
+    is not a git refspec — on the fully-receipted FE checkout it must pass
+    (discriminating: the refspec-shaped token rule denied it), while the
+    same form naming a DIFFERENT branch still denies."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\nshot.png\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/FE1")
+    (toy_repo / "a.md").write_text("fe content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "fe"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    shot = toy_repo / "shot.png"
+    shot.write_bytes(b"\x89PNG fake-but-non-empty")
+    _stamp(toy_repo)
+    _browser_stamp(toy_repo, shot)
+
+    ok = ('{"tool_input": {"command": "PRCREATE --head CLYEH:task/FE1 --fill"}}').replace(
+        "PRCREATE", _PR_CREATE
+    )
+    allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=ok, extra_env=env)
+    assert allowed.returncode == 0, f"owner-qualified head over-blocked: {allowed.stderr}"
+
+    other = ('{"tool_input": {"command": "PRCREATE --head CLYEH:task/FE2 --fill"}}').replace(
+        "PRCREATE", _PR_CREATE
+    )
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=other, extra_env=env)
+    assert denied.returncode == 2 and "never the local ref" in denied.stderr
 
 
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:

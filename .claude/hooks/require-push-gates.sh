@@ -86,8 +86,11 @@ fi
 # (`gh -R o/r pr create`, `gh pr --repo o/r create`) and the documented
 # `gh pr new` alias (Codex #64 R4) — the same flags idiom as the git pattern.
 flags='([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*'
-if ! printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b" &&
-  ! printf '%s' "$payload" | grep -Eq "gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new)\b"; then
+git_engaged=0
+gh_engaged=0
+printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b" && git_engaged=1
+printf '%s' "$payload" | grep -Eq "gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new)\b" && gh_engaged=1
+if [ "$git_engaged" != 1 ] && [ "$gh_engaged" != 1 ]; then
   # substitution can hide the VERB itself (g=git; $g push — Codex #64 R12,
   # P1): a command we cannot statically clear must not be cleared. When
   # substitution syntax coexists with a push/pr word, engage fail-closed —
@@ -110,8 +113,14 @@ current="$(git branch --show-current)"
 # as an FE refspec to git but is invisible to every static pattern — Codex
 # #64 R11, P1): an engaged command must be LITERAL. Deny substitution syntax
 # outright; shlex keeps it un-expanded, so the pattern sees it.
-printf '%s' "$residue" | grep -Eq '[$`*]' &&
-  deny "shell expansion or wildcards in a push/PR command hide destinations from the gate — write the command literally (no variables, no command substitution, no wildcard refspecs; single-quoted TEXT arguments are fine — quotes suppress expansion)."
+printf '%s' "$residue" | grep -Eq '[$`]' &&
+  deny "shell expansion in a push/PR command hides destinations from the gate — write the command literally (no variables, no command substitution; single-quoted TEXT arguments are fine — quotes suppress expansion)."
+# wildcard REFSPECS fan out (quoted or not — git receives them either way,
+# Codex #64 R15): a token combining a glob star with a ref separator (/ or
+# :) denies on the NORMALIZED command, so quoting cannot hide it while
+# Markdown stars in prose (no separator in the token) stay legal.
+printf '%s' "$payload" | grep -Eq '(/[^[:space:]]*[*]|[*][^[:space:]]*/|:[^[:space:]]*[*]|[*][^[:space:]]*:)' &&
+  deny "wildcard refspecs fan out to unstated branches — name each branch explicitly."
 
 # inline config rewrites push semantics for ONE invocation (`git -c
 # push.default=matching push` fans out past the persisted-config checks —
@@ -138,6 +147,18 @@ printf '%s' "$payload" | grep -Eq "[[:space:]\"']\+?:([[:space:]\"']|\$)" &&
 # (Codex #64 R10, executed repro) — deny while any are set.
 [ -n "$(git config --get-regexp '^remote\..*\.push$' 2>/dev/null)" ] &&
   deny "remote.<name>.push refspecs route bare pushes to unstated destinations — unset them (git config --unset-all remote.<name>.push) and push explicitly."
+# remote.<name>.mirror makes MIRROR mode the default for that remote — every
+# push becomes an all-ref push with no flag in the payload (Codex #64 R15,
+# executed repro; completes the documented config set alongside push.default
+# and remote.<name>.push)
+while IFS= read -r mirror_key; do
+  [ -n "$mirror_key" ] || continue
+  # --type=bool canonicalizes yes/on/1 to true (all git-true spellings) and
+  # keys, not values, drive the loop — a remote NAME containing "true"
+  # cannot false-match (reviewer-verified fix)
+  [ "$(git config --type=bool --get "$mirror_key" 2>/dev/null)" = "true" ] &&
+    deny "remote.<name>.mirror makes every push a mirror push — unset it and push the branch explicitly."
+done < <(git config --get-regexp '^remote\..*\.mirror$' 2>/dev/null | cut -d' ' -f1)
 # push.default=upstream sends HEAD to branch.<name>.merge — a CROSS-NAMED
 # upstream routes a bare push onto a branch the payload never names (the
 # local reviewer executed the work -> FE case; same config family)
@@ -171,7 +192,18 @@ validate_fe_ref_tokens() {
         [[ "$current" == task/FE* ]] || deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok'."
         ;;
       *)
-        deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok' (re-run the pass on that content and push from there)."
+        # gh's documented head form `--head owner:branch` is NOT a git
+        # refspec (Codex #64 R15, over-block): on a gh-only engagement,
+        # an owner-qualified token naming the CURRENT FE checkout is the
+        # legitimate fully-receipted flow — any other branch still denies
+        # (the receipts cannot speak for a branch we are not on).
+        if [ "$gh_engaged" = 1 ] && [ "$git_engaged" != 1 ] &&
+          [[ "$current" == task/FE* ]] &&
+          printf '%s' "$tok" | grep -Eq "^[A-Za-z0-9][A-Za-z0-9-]*:(refs/heads/)?${current}\$"; then
+          :
+        else
+          deny "push FE content from its own checkout or via HEAD:<dst> — the receipts bind the WORKING TREE, never the local ref '$tok' (re-run the pass on that content and push from there)."
+        fi
         ;;
     esac
   done < <(printf '%s' "$payload" | grep -Eo "[^[:space:]\"']*task/FE[^[:space:]\"']*" || true)
