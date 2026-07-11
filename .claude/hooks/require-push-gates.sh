@@ -107,6 +107,12 @@ while i < len(toks):
         continue
     if t.startswith("--head="):
         head = t[7:]
+    elif len(t) > 1 and t[0] == "-" and t[1] != "-" and "H" in t:
+        # pflag SHORTHAND surface (Codex #64 R20, P1): -Htask/B2 attaches
+        # the value, -H= attaches empty, -fH clusters after booleans, a
+        # trailing bare -H dangles — every spelling still selects a head.
+        # The ban needs existence, not the value: flag the token itself.
+        head = t
     i += 1
 sys.stdout.write(
     norm.replace("\n", " ")
@@ -196,38 +202,47 @@ printf '%s' "$payload" | grep -Eq "^(git${flags}[[:space:]]+push|gh${flags}[[:sp
 printf '%s' "$residue" | grep -Eq '[$`{]' &&
   deny "shell expansion (including brace expansion) in a push/PR command hides destinations from the gate — write the command literally (no variables, no command substitution, no braces; single-quoted TEXT arguments are fine — quotes suppress expansion)."
 
-# a branch switch chained before the push changes the checkout this gate
-# evaluated (switch dash then push — Codex #64 R16, executed repro): engaged
-# commands must not change branches — switch and push separately.
-printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+(switch|checkout)\b" &&
-  deny "branch switches chained with a push/PR command change the checkout the gate evaluated — switch and push in separate commands."
+# the scans below read PUSH grammar out of the payload TEXT — refspecs,
+# push flags, git chaining. On a gh payload the shlex rejoin has ERASED the
+# --body/--title quoting, so PR prose false-matches them ("Ran pytest --all
+# successfully" read as an all-branch push — Codex #64 R20, P2): they run
+# for git-engaged payloads only. gh has no refspec surface — its one ref
+# input, the head flag, is banned above — and the repo-STATE config checks
+# further down stay global (they read git config, not the payload).
+if [ "$git_engaged" = 1 ]; then
+  # a branch switch chained before the push changes the checkout this gate
+  # evaluated (switch dash then push — Codex #64 R16, executed repro): engaged
+  # commands must not change branches — switch and push separately.
+  printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+(switch|checkout)\b" &&
+    deny "branch switches chained with a push/PR command change the checkout the gate evaluated — switch and push in separate commands."
 
-# (the earlier R16/R17 --head binding logic is superseded by the R18
-# outright ban above — the flag selects a remote ref, full stop)
-# wildcard REFSPECS fan out (quoted or not — git receives them either way,
-# Codex #64 R15): a token combining a glob star with a ref separator (/ or
-# :) denies on the NORMALIZED command, so quoting cannot hide it while
-# Markdown stars in prose (no separator in the token) stay legal.
-printf '%s' "$payload" | grep -Eq '(/[^[:space:]]*[*]|[*][^[:space:]]*/|:[^[:space:]]*[*]|[*][^[:space:]]*:)' &&
-  deny "wildcard refspecs fan out to unstated branches — name each branch explicitly."
+  # (the earlier R16/R17 --head binding logic is superseded by the R18
+  # outright ban above — the flag selects a remote ref, full stop)
+  # wildcard REFSPECS fan out (quoted or not — git receives them either way,
+  # Codex #64 R15): a token combining a glob star with a ref separator (/ or
+  # :) denies on the NORMALIZED command, so quoting cannot hide it while
+  # Markdown stars in prose (no separator in the token) stay legal.
+  printf '%s' "$payload" | grep -Eq '(/[^[:space:]]*[*]|[*][^[:space:]]*/|:[^[:space:]]*[*]|[*][^[:space:]]*:)' &&
+    deny "wildcard refspecs fan out to unstated branches — name each branch explicitly."
 
-# inline config rewrites push semantics for ONE invocation (`git -c
-# push.default=matching push` fans out past the persisted-config checks —
-# Codex #64 R13, P1): engaged commands take no inline config at all.
-printf '%s' "$payload" | grep -Eq '[[:space:]](-c|--config-env)([[:space:]]|=)' &&
-  deny "inline git config (-c/--config-env) on a push/PR command rewrites push semantics for that invocation — the gate checks persisted config only; drop the flag."
+  # inline config rewrites push semantics for ONE invocation (`git -c
+  # push.default=matching push` fans out past the persisted-config checks —
+  # Codex #64 R13, P1): engaged commands take no inline config at all.
+  printf '%s' "$payload" | grep -Eq '[[:space:]](-c|--config-env)([[:space:]]|=)' &&
+    deny "inline git config (-c/--config-env) on a push/PR command rewrites push semantics for that invocation — the gate checks persisted config only; drop the flag."
 
-# all-branch/mirror forms push refs the worktree-bound receipts never spoke
-# for (an unreceipted local task/FE* rides along invisibly — Codex #64 R7,
-# executed repro) — reject the forms outright; push refs explicitly
-printf '%s' "$payload" | grep -Eq -- '--(all|branches|mirror)\b' &&
-  deny "all-branch push forms (--all/--branches/--mirror) bypass the content-bound receipts — push the branch explicitly."
-# the matching-refspec form (`:` / `+:`) and a `matching` push.default fan out
-# to every branch existing on both ends — the same invisible ride for an
-# unreceipted local task/FE* (Codex #64 R8): deny the refspec form, and deny
-# pushing at all under a matching default (a bare push would fan out too).
-printf '%s' "$payload" | grep -Eq "[[:space:]\"']\+?:([[:space:]\"']|\$)" &&
-  deny "the matching-refspec push form (: / +:) updates every matching branch — push the branch explicitly."
+  # all-branch/mirror forms push refs the worktree-bound receipts never spoke
+  # for (an unreceipted local task/FE* rides along invisibly — Codex #64 R7,
+  # executed repro) — reject the forms outright; push refs explicitly
+  printf '%s' "$payload" | grep -Eq -- '--(all|branches|mirror)\b' &&
+    deny "all-branch push forms (--all/--branches/--mirror) bypass the content-bound receipts — push the branch explicitly."
+  # the matching-refspec form (`:` / `+:`) and a `matching` push.default fan out
+  # to every branch existing on both ends — the same invisible ride for an
+  # unreceipted local task/FE* (Codex #64 R8): deny the refspec form, and deny
+  # pushing at all under a matching default (a bare push would fan out too).
+  printf '%s' "$payload" | grep -Eq "[[:space:]\"']\+?:([[:space:]\"']|\$)" &&
+    deny "the matching-refspec push form (: / +:) updates every matching branch — push the branch explicitly."
+fi
 [ "$(git config --get push.default 2>/dev/null)" = "matching" ] &&
   deny "push.default=matching makes pushes fan out to every matching branch — set push.default to simple, then push explicitly."
 # configured push refspecs are the same invisibility one level deeper: with

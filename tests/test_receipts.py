@@ -909,6 +909,53 @@ def test_r19_whole_payload_and_gh_body_prose(toy_repo: Path) -> None:
     assert allowed.returncode == 0, f"body prose denied as a ref: {allowed.stderr}"
 
 
+def test_r20_attached_head_shorthand_and_gh_flag_prose(toy_repo: Path) -> None:
+    """Codex #64 R20: (a) pflag's ATTACHED shorthand (-Htask/B2) selects a
+    head the standalone-only token walk never saw — with the ref walk gone
+    for gh (R19), the head ban was the only guard and it never fired; every
+    shorthand spelling must trip it. (b) the push-flag TEXT scans read the
+    shlex-rejoined payload where --body quoting is erased, so PR prose
+    false-matched push grammar ('Ran pytest --all successfully' as an
+    all-branch push) — they must run for git payloads only."""
+    assert BASH is not None
+    (toy_repo / ".gitignore").write_text(
+        ".claude/receipts/\norigin.git/\nshim/\n", encoding="utf-8"
+    )
+    _origin_and_branch(toy_repo, "task/B1")
+    (toy_repo / "a.md").write_text("b1 content\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "b1"], cwd=toy_repo, check=True, capture_output=True)
+    env = _uv_shim(toy_repo)
+    _stamp(toy_repo)
+
+    # (a) attached value, attached-empty, and boolean-cluster spellings all
+    # select an already-remote head — each returned 0 before (walk blind)
+    for headform in ("-Htask/B2", "-H=task/B2", "-fH"):
+        cmd = (
+            ('{"tool_input": {"command": "PRCREATE --fill HEADFORM"}}')
+            .replace("PRCREATE", _PR_CREATE)
+            .replace("HEADFORM", headform)
+        )
+        denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=cmd, extra_env=env)
+        assert denied.returncode == 2, f"shorthand head slipped ({headform}): {denied.stdout}"
+        assert "already-remote" in denied.stderr
+
+    # (b) push-flag words inside quoted PR prose are not push flags — both
+    # denied before ("all-branch push forms" / "branch switches chained")
+    for body in ("Ran pytest --all successfully", "then git switch back"):
+        cmd = (
+            ('{"tool_input": {"command": "PRCREATE --fill --body \'BODYTEXT\'"}}')
+            .replace("PRCREATE", _PR_CREATE)
+            .replace("BODYTEXT", body)
+        )
+        allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=cmd, extra_env=env)
+        assert allowed.returncode == 0, f"prose over-blocked ({body}): {allowed.stderr}"
+    # ...while the same flag on a git transfer still denies (scoping must
+    # not have removed the git-side guard)
+    git_all = '{"tool_input": {"command": "PUSHVERB --all origin"}}'.replace("PUSHVERB", _PUSH)
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=git_all, extra_env=env)
+    assert denied.returncode == 2 and "all-branch" in denied.stderr
+
+
 def test_fe_push_requires_worktree_to_equal_head(toy_repo: Path) -> None:
     """Codex #64 R12 (P2, executed repro): the push sends HEAD while the
     receipts bind the worktree — committing untested content and RESTORING
