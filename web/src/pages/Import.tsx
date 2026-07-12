@@ -80,7 +80,12 @@ function isFileUri(raw: string): boolean {
 // loaded list.
 function isResolvableSource(s: Source): boolean {
   if (s.kind !== "text" && s.kind !== "structured") return false;
-  if (!isFileUri(s.uri.trim())) return false;
+  // The worker reads the STORED uri verbatim — Python's urlparse keeps a trailing
+  // space in the path (verified live), while new URL()/trim() normalize it away.
+  // So edge whitespace is itself a display/read divergence: check exactly as
+  // stored, never a trimmed view. (The add form trims before POST, so only
+  // sources registered outside the form can carry it.)
+  if (s.uri !== s.uri.trim() || !isFileUri(s.uri)) return false;
   if (s.kind === "structured") {
     const table = s.metadata?.table;
     const pk = s.metadata?.pk_column;
@@ -124,7 +129,10 @@ export function Import() {
       <RunPipeline
         project={project}
         ontologyMissing={ontologyMissing}
-        gatesLoaded={projects.data !== undefined}
+        // fail closed while the config is loading OR refetching — react-query
+        // keeps the previous config in data during the flight, and a CLI-side
+        // ontology change must not be gated on that stale snapshot
+        gatesLoaded={projects.data !== undefined && !projects.isFetching}
       />
       <section className="import__section">
         <h2>New project</h2>

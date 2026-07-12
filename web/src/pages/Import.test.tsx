@@ -1,4 +1,5 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
+import { focusManager } from "@tanstack/react-query";
 import { Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -309,6 +310,47 @@ describe("Import", () => {
 
     expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+  });
+
+  it("blocks runs when a stored uri carries edge whitespace", async () => {
+    // the worker reads the stored uri verbatim — Python's urlparse KEEPS a
+    // trailing space in the path (verified live), while new URL()/trim() strip
+    // it, so a trimmed check would pass a source whose build reads a different
+    // path than displayed; stored uris must be validated exactly as stored
+    stubImportGets({ ...project("acme"), config: { ontology: { entity_types: ["P"] } } }, [
+      source({ kind: "text", uri: "file:///data/corpus " }),
+    ]);
+    renderImport(projectRoute("acme", "import"));
+
+    expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+  });
+
+  it("keeps the run gate closed while the project config refetches", async () => {
+    // a CLI-side config.ontology change refetches the projects list on refocus;
+    // react-query keeps the previous config in data during the flight, so a gate
+    // keyed on data-presence would decide on the stale snapshot — it must close
+    // until the refetch settles (same TOCTOU as the sources gate)
+    let projectsCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects") {
+        projectsCalls += 1;
+        return projectsCalls === 1
+          ? Promise.resolve({ data: { data: [project("acme")], meta: META }, error: undefined })
+          : new Promise(() => {});
+      }
+      return Promise.resolve({ data: { data: [], meta: META }, error: undefined });
+    }) as never);
+    renderImport(projectRoute("acme", "import"));
+    const build = await screen.findByRole("button", { name: /^build$/i });
+    await waitFor(() => expect(build).toBeEnabled());
+
+    act(() => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+    await waitFor(() => expect(projectsCalls).toBeGreaterThan(1));
+    expect(build).toBeDisabled();
   });
 
   it("blocks runs when a structured source lacks its table/pk_column metadata", async () => {
