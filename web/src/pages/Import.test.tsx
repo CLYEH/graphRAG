@@ -163,14 +163,32 @@ describe("Import", () => {
       // filesystem permits "/" in a filename); %5C springs a Windows separator
       "file:///tmp/corpus%2Fprivate",
       "file:///data/a%5Cb",
+      // url2pathname maps ":" → "|" and reads the letter before the first one as a
+      // DRIVE, so both spellings re-root the path onto another volume outside the
+      // drive position ("file:///a|/corpus" → A:\corpus, "/data/foo:bar" → O:bar).
+      // WHATWG rewrites "a|" to "a:" in url.pathname, so only the raw-derived path
+      // (which this gate validates) ever sees them.
+      "file:///a|/corpus",
+      "file:///data/a%7Cb",
+      "file:///data/foo:bar",
+      "file:///data:x/y",
+      "file:///C:/data/foo:bar",
+      // ...and the drive colon must be LITERAL: url2pathname detects the drive from
+      // the still-encoded path, so "%3A" passes a decoded segment check but reads
+      // "\C:\corpus" (no drive at all)
+      "file:///C%3A/corpus",
     ]) {
       fireEvent.change(uri, { target: { value: bad } });
       expect(screen.getByText(/canonical/i)).toBeInTheDocument();
       expect(add()).toBeDisabled();
     }
-    // the canonical triple-slash form is accepted
-    fireEvent.change(uri, { target: { value: "file:///data/corpus/" } });
-    expect(screen.queryByText(/canonical/i)).not.toBeInTheDocument();
+    // the canonical triple-slash form is accepted — including the Windows drive form,
+    // which the colon rule above must not over-block (it IS what Path.as_uri() emits
+    // on a Windows worker, and url2pathname resolves it to exactly what it displays)
+    for (const good of ["file:///data/corpus/", "file:///C:/corpus"]) {
+      fireEvent.change(uri, { target: { value: good } });
+      expect(screen.queryByText(/canonical/i)).not.toBeInTheDocument();
+    }
     expect(add()).toBeEnabled();
     expect(post).not.toHaveBeenCalled();
   });

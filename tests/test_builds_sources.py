@@ -7,6 +7,7 @@ These hermetic tests pin the dispatch and its fail-loud edges over tmp files.
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from core.builds.sources import SourceResolutionError, resolve_source
+from core.builds.sources import SourceResolutionError, _local_path, resolve_source
 from core.registry.store import Source
 from core.stores.tables import STRUCTURED_MIME
 
@@ -95,6 +96,23 @@ def test_non_file_uri_is_rejected() -> None:
         # so %2e%2e%5C springs a "..\" traversal the "/"-segment checks can't see
         ("file:///C:/safe/%2e%2e%5CWindows", "backslash"),
         ("file:///data/a%5Cb", "backslash"),
+        # url2pathname's first act is replace(":", "|"), so ":" and "|" are the SAME
+        # character to it and the letter before the first one becomes a drive. A pipe
+        # anywhere: file:///a|/corpus reads "A:\\corpus".
+        ("file:///a|/corpus", "pipe"),
+        ("file:///data/a%7Cb", "pipe"),
+        # ...and so does a colon outside the drive position — an ordinary filename
+        # silently re-roots the path onto another volume (/data/foo:bar → "O:bar",
+        # /data:x/y → "A:x\\y"). The last two would otherwise escape as a raw OSError
+        # ("Bad URL: /C|/data/foo|bar"), not a SourceResolutionError.
+        ("file:///data/foo:bar", "colon"),
+        ("file:///data:x/y", "colon"),
+        ("file:///C:/data/foo:bar", "colon"),
+        ("file:///1:/data", "colon"),
+        # url2pathname decides STRUCTURE on the still-encoded path (it detects the
+        # drive from a literal ":"), while the segment checks run on the decoded one —
+        # so an encoded drive colon passes them and yet reads "\\C:\\corpus" (no drive)
+        ("file:///C%3A/corpus", "encodes the drive separator"),
         # an empty path resolves to the worker's cwd; bare "/" is the root
         ("file:", "names no path"),
         ("file://", "names no path"),
@@ -125,6 +143,25 @@ def test_non_canonical_file_uri_is_rejected(uri: str, why: str) -> None:
     # Console gate in front of them, so the source of truth enforces it.
     with pytest.raises(SourceResolutionError, match=why):
         list(resolve_source(_source(uri, kind="text")))
+
+
+def test_windows_drive_uri_is_accepted() -> None:
+    # class-9 dual for the colon rule: the canonical Windows drive form is what
+    # Path.as_uri() emits on a Windows worker, and url2pathname resolves it to exactly
+    # the displayed path — it must stay registerable. Pinned on _local_path directly
+    # because tmp_path.as_uri() carries no colon at all on POSIX CI, leaving the
+    # accept side of the rule unexercised there. The drive must be ANCHORED, which is
+    # what makes this pin able to FAIL: a driveless "\\C:\\corpus" (what an encoded
+    # drive colon produced before %3A was banned) still CONTAINS "C:", so a substring
+    # assertion would be false-green against exactly the regression this guards —
+    # nturl2path's drive handling being reworked in CPython 3.14+.
+    resolved = _local_path(_source("file:///C:/corpus", kind="text"))
+    if os.name == "nt":
+        assert resolved.drive == "C:"  # "" for the driveless "\\C:\\corpus"
+        assert str(resolved) == "C:" + os.sep + "corpus"
+    else:
+        # POSIX url2pathname is literally unquote(): the read IS the displayed path
+        assert str(resolved) == "/C:/corpus"
 
 
 def test_trailing_slash_directory_uri_is_accepted(tmp_path: Path) -> None:

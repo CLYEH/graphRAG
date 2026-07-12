@@ -24,6 +24,7 @@ scheme is required rather than guessed.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -36,6 +37,10 @@ from core.registry.store import Source
 #: accept any kind string; a build over a kind absent from this tuple fails loud
 #: (no connector) rather than ingesting nothing.
 SUPPORTED_SOURCE_KINDS = ("text", "structured")
+
+#: The one path segment a colon may appear in: a Windows drive ("C:"), which
+#: ``Path.as_uri()`` emits and ``url2pathname`` resolves as displayed.
+_WINDOWS_DRIVE = re.compile(r"[A-Za-z]:")
 
 
 class SourceResolutionError(ValueError):
@@ -90,6 +95,15 @@ def _local_path(source: Source) -> Path:
         # boundary from the displayed uri. One canonical shape: separators are
         # literal "/".
         raise _reject("encodes the path separator (%2F) — separators must be literal")
+    if "%3a" in parsed.path.lower():
+        # url2pathname makes its STRUCTURAL decisions on the still-encoded path: it
+        # detects the drive from a LITERAL ":". The checks below run on the decoded
+        # path, so an encoded drive colon would satisfy them ("C:" in segment 0) while
+        # the read silently drops out of the drive branch — "/C%3A/corpus" opens
+        # "\C:\corpus" (no drive), not "C:\corpus". The drive separator must be literal
+        # for the same reason "/" must be: the check and the read have to see the same
+        # structure. (A colon outside the drive position is refused below regardless.)
+        raise _reject("encodes the drive separator (%3A) — the drive colon must be literal")
     decoded = unquote(parsed.path)
     if "\x00" in decoded:
         raise _reject("decodes to a path containing NUL, which no filesystem accepts")
@@ -99,6 +113,13 @@ def _local_path(source: Source) -> Path:
         # below can't see; on POSIX a literal backslash in a filename is exotic
         # at best — one canonical shape, so refuse it everywhere.
         raise _reject("decodes to a path containing backslashes (Windows separators)")
+    if "|" in decoded:
+        # a pipe is the legacy spelling of the DRIVE separator — url2pathname's first
+        # act is url.replace(":", "|"), so the two are the same character to it, and a
+        # pipe anywhere makes the preceding letter a drive ("/a|/corpus" → "A:\corpus").
+        # Windows reserves "|" in filenames outright, so refusing it everywhere costs
+        # nothing — same trade as the backslash above.
+        raise _reject("contains a pipe — the Windows drive separator ('a|' reads as 'a:')")
     if decoded in ("", "/"):
         raise _reject("names no path (the worker's cwd or the filesystem root)")
     if not decoded.startswith("/"):
@@ -113,6 +134,22 @@ def _local_path(source: Source) -> Path:
         segments = segments[:-1]  # one trailing slash: the idiomatic directory form
     if not segments or any(seg in ("", ".", "..") for seg in segments):
         raise _reject("contains empty or dot path segments (resolved away from the display)")
+    for index, seg in enumerate(segments):
+        if ":" in seg and not (index == 0 and _WINDOWS_DRIVE.fullmatch(seg)):
+            # The colon IS the drive separator to url2pathname (it maps ":" → "|" and
+            # takes the letter before the FIRST one as the drive), so a colon in any
+            # other position silently re-roots the path: "/data/foo:bar" opens "O:bar",
+            # "/data:x/y" opens "A:x\y". Two forms ("/C:/data/foo:bar", "/1:/data") even
+            # escape as a raw OSError. Constrain the colon to the drive position rather
+            # than refusing it outright: "file:///C:/…" is the canonical Windows drive
+            # form (Path.as_uri() emits it) and must stay registerable. A POSIX file
+            # named "foo:bar" becomes unregisterable — the same trade as "\" and "|",
+            # and the right one: nothing here knows the worker's OS, and the
+            # alternative is silently opening a different volume.
+            raise _reject(
+                f"has a colon in segment {seg!r}, outside the Windows drive position "
+                "(url2pathname reads every ':' as the drive separator)"
+            )
     # url2pathname handles the leading slash and Windows drive letters.
     return Path(url2pathname(parsed.path))
 

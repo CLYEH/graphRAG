@@ -87,6 +87,12 @@ function isFileUri(raw: string): boolean {
   // SoR rule _local_path now enforces (BA9) - this gate is the pre-submit UX;
   // the backend refuses the same forms at build time for CLI/API/MCP callers.
   if (/%2f/i.test(raw)) return false;
+  // Same reason for the drive separator: url2pathname detects the drive from a LITERAL
+  // ":" in the still-ENCODED path, while the segment checks below run on the decoded
+  // one — so "file:///C%3A/corpus" would pass them and yet read "\C:\corpus" (no
+  // drive) instead of "C:\corpus". Every structural character the gate accepts must be
+  // literal, or the check and the read disagree.
+  if (/%3a/i.test(raw)) return false;
   // Validate the BACKEND-derived path, not the browser-normalized url.pathname:
   // WHATWG normalizes dot segments (raw ".." AND encoded "%2e%2e") away at parse
   // time, so checks on url.pathname never see them — but the backend keeps them
@@ -107,14 +113,30 @@ function isFileUri(raw: string): boolean {
   if (decoded.includes("\0")) return false;
   // a decoded backslash (%5C or literal) is a path SEPARATOR on a Windows worker
   if (decoded.includes("\\")) return false;
+  // ...and so is a pipe: url2pathname's first act is replace(":", "|"), so the pipe IS
+  // the Windows DRIVE separator ("file:///a|/corpus" reads A:\corpus). Windows reserves
+  // "|" in filenames outright, so refusing it everywhere costs nothing.
+  if (decoded.includes("|")) return false;
   if (decoded.length <= 1) return false;
   // Every segment of the path the WORKER will read must be non-empty (an empty
   // segment means a "//" — UNC/root reinterpretation) and not "." / ".." (the
   // filesystem would resolve them away from the displayed path). One trailing
-  // slash is allowed — the idiomatic directory form.
+  // slash is allowed — the idiomatic directory form. A colon is legal only in the
+  // leading DRIVE segment ("file:///C:/data", the canonical Windows form): elsewhere
+  // url2pathname reads it as the drive separator and silently re-roots the path
+  // ("/data/foo:bar" opens "O:bar"). WHATWG rewrites "a|" → "a:" in url.pathname, so
+  // only this raw-derived path — the substring the backend's urlparse returns — sees
+  // these at all. Mirrors the SoR rule _local_path enforces (BA9).
   const path = decoded.endsWith("/") ? decoded.slice(0, -1) : decoded;
   const segments = path.split("/").slice(1);
-  return segments.length > 0 && segments.every((s) => s !== "" && s !== "." && s !== "..");
+  if (segments.length === 0) return false;
+  return segments.every(
+    (s, i) =>
+      s !== "" &&
+      s !== "." &&
+      s !== ".." &&
+      (!s.includes(":") || (i === 0 && /^[A-Za-z]:$/.test(s))),
+  );
 }
 
 // Whether the pipeline can resolve an already-registered source to the path the
