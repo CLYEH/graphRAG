@@ -200,11 +200,14 @@ function Sources({ project }: { project: string }) {
   );
 }
 
-// Trigger ingest/build and watch the returned job. Both buttons disable while a
-// trigger is in flight; a second trigger while a job is already running comes back
-// 409 JOB_CONFLICT (server-side one-job-per-project serialization), surfaced as the
-// fail-loud error line. The accepted job id feeds straight into the shared live
-// watcher so the operator sees progress without pasting an id elsewhere.
+// Trigger a pipeline run and watch the returned job. Both /ingest and /build
+// currently enqueue the identical full six-stage build, differing only in the
+// recorded job kind (api/routers/triggers.py + orchestrator run_build), so the copy
+// says so rather than implying Ingest is a cheaper stage-1 run (Codex #70). Both
+// buttons disable while a trigger is in flight; a second trigger while a job is
+// already running comes back 409 JOB_CONFLICT (server-side one-job-per-project
+// serialization), surfaced as the fail-loud error line. The accepted job id feeds
+// straight into the shared live watcher so the operator sees progress inline.
 function RunPipeline({ project }: { project: string }) {
   const [accepted, setAccepted] = useState<JobAccepted | null>(null);
   const trigger = useTrigger(project);
@@ -217,7 +220,9 @@ function RunPipeline({ project }: { project: string }) {
     <section className="import__section">
       <h2>Run pipeline</h2>
       <p className="runs__muted">
-        Ingest runs stage 1; build runs the full pipeline. One run at a time per project.
+        Both Ingest and Build run the full six-stage pipeline (ingest → summarize) — they differ
+        only in the recorded job kind, and either way spends graph, LLM, and indexing work. One run
+        at a time per project.
       </p>
       <div className="import__actions">
         <button type="button" onClick={() => run("ingest")} disabled={trigger.isPending}>
