@@ -91,6 +91,10 @@ def test_non_file_uri_is_rejected() -> None:
         ("file:///data/corpus#frag", "query/fragment"),
         # NUL can't name a real file on any filesystem
         ("file:///data/%00corpus", "NUL"),
+        # a decoded backslash is a SEPARATOR on a Windows worker (url2pathname),
+        # so %2e%2e%5C springs a "..\" traversal the "/"-segment checks can't see
+        ("file:///C:/safe/%2e%2e%5CWindows", "backslash"),
+        ("file:///data/a%5Cb", "backslash"),
         # an empty path resolves to the worker's cwd; bare "/" is the root
         ("file:", "names no path"),
         ("file://", "names no path"),

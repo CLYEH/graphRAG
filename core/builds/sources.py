@@ -87,6 +87,12 @@ def _local_path(source: Source) -> Path:
     decoded = unquote(parsed.path)
     if "\x00" in decoded:
         raise _reject("decodes to a path containing NUL, which no filesystem accepts")
+    if "\\" in decoded:
+        # on a Windows worker url2pathname treats "\" as a separator, so an
+        # encoded "%2e%2e%5C" springs a "..\" traversal the "/"-segment checks
+        # below can't see; on POSIX a literal backslash in a filename is exotic
+        # at best — one canonical shape, so refuse it everywhere.
+        raise _reject("decodes to a path containing backslashes (Windows separators)")
     if decoded in ("", "/"):
         raise _reject("names no path (the worker's cwd or the filesystem root)")
     if not decoded.startswith("/"):
