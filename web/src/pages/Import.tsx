@@ -65,24 +65,35 @@ type SourceKind = (typeof SOURCE_KINDS)[number];
 // stays placeholder guidance — a page can't stat.
 function isFileUri(raw: string): boolean {
   let url: URL;
-  let decoded: string;
   try {
-    url = new URL(raw);
-    decoded = decodeURIComponent(url.pathname);
+    url = new URL(raw); // must parse as a URL at all
   } catch {
     return false;
+  }
+  if (!/^file:\/\/\//i.test(raw) || url.search !== "" || url.hash !== "") return false;
+  // Validate the BACKEND-derived path, not the browser-normalized url.pathname:
+  // WHATWG normalizes dot segments (raw ".." AND encoded "%2e%2e") away at parse
+  // time, so checks on url.pathname never see them — but the backend keeps them
+  // (urlparse(raw).path), decodes, and the filesystem then resolves them to a
+  // different tree than the stored uri appears to name ("file:///data/%2e%2e/etc"
+  // reads /etc). Mirror the backend read: with the authority forced empty by the
+  // triple-slash check, urlparse's path is the raw substring after "file://" (we
+  // also cut at ?/# to match, though search/hash are already rejected above),
+  // percent-decoded like url2pathname does.
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw.slice("file://".length).split(/[?#]/)[0]);
+  } catch {
+    return false; // malformed escape: the backend would read it literally — refuse
   }
   // An embedded NUL (file:///data/%00corpus) can't name a real file on any
   // supported OS — the connector's read is guaranteed to fail.
   if (decoded.includes("\0")) return false;
-  if (!/^file:\/\/\//i.test(raw) || url.search !== "" || url.hash !== "" || decoded.length <= 1)
-    return false;
-  // Validate EVERY decoded segment, not just the leading slashes: an encoded
-  // separator or dot segment survives URL parsing and only materializes after the
-  // backend decodes ("file:///safe/%2F..%2F..%2Fetc" → "/safe//../../etc"), where
-  // the filesystem resolves it to a different tree than the stored uri displays.
-  // One trailing slash is allowed — the idiomatic directory form; every other
-  // segment must be non-empty and not "." / "..".
+  if (decoded.length <= 1) return false;
+  // Every segment of the path the WORKER will read must be non-empty (an empty
+  // segment means a "//" — UNC/root reinterpretation) and not "." / ".." (the
+  // filesystem would resolve them away from the displayed path). One trailing
+  // slash is allowed — the idiomatic directory form.
   const path = decoded.endsWith("/") ? decoded.slice(0, -1) : decoded;
   const segments = path.split("/").slice(1);
   return segments.length > 0 && segments.every((s) => s !== "" && s !== "." && s !== "..");

@@ -143,13 +143,16 @@ describe("Import", () => {
       "file:///%zz",
       // encoded separators survive URL parsing (%2F stays literal in pathname)
       // and only materialize on the backend's decode — the filesystem then
-      // resolves the sprung "//../.." to a different tree than displayed.
-      // (%2e%2e is NOT here: the browser normalizes it as a dot segment at parse
-      // time, converging with the backend's decode+resolve — both read the same
-      // path, so it is accepted.)
+      // resolves the sprung "//../.." to a different tree than displayed
       "file:///safe/%2F..%2F..%2Fetc",
       // an embedded NUL can't name a real file on any supported OS
       "file:///data/%00corpus",
+      // dot segments — raw or encoded — are resolved by the filesystem to a
+      // different tree than the stored uri appears to name; the gate checks the
+      // BACKEND-derived raw path, because the browser normalizes these out of
+      // url.pathname before any pathname-based check could see them
+      "file:///data/../etc",
+      "file:///data/%2e%2e/etc",
     ]) {
       fireEvent.change(uri, { target: { value: bad } });
       expect(screen.getByText(/canonical/i)).toBeInTheDocument();
