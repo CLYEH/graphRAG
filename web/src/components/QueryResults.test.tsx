@@ -34,6 +34,32 @@ describe("QueryResults", () => {
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
   });
 
+  it("shows a row citation's full lossless id, not a truncated slice", () => {
+    // SQL/row source refs are a lossless table:pk string (core row_source_ref),
+    // not a uuid — slicing to 8 chars would hide the pk and make two row
+    // citations indistinguishable (Codex #69), breaking §16 traceability
+    renderWithProviders(
+      <QueryResults
+        result={queryResult({
+          results: [
+            retrievalResult({
+              result_type: "row",
+              source_refs: [
+                {
+                  source_type: "row",
+                  id: "9:customers:12345",
+                  metadata: { table: "customers", pk: "12345" },
+                },
+              ],
+            }),
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByText("9:customers:12345")).toBeInTheDocument();
+  });
+
   it("shows the routing trace when the debug block is present", () => {
     renderWithProviders(
       <QueryResults

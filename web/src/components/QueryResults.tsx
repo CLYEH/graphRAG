@@ -90,7 +90,10 @@ function Hit({ hit }: { hit: RetrievalResult }) {
         {hit.source_refs.map((s, i) => (
           <li key={i}>
             <span className="runs__badge runs__badge--muted">{s.source_type}</span>{" "}
-            <code>{s.id.slice(0, 8)}</code>
+            {/* the full id, not a slice — row refs are a lossless table:pk string
+                (core row_source_ref), so truncating hides the pk and makes two row
+                citations indistinguishable, breaking §16 traceability */}
+            <code>{s.id}</code>
             {/* source_uri is rendered as text, never an href — an untrusted value
                 in an <a href> would be a fresh injection sink (the FE7 lesson) */}
             {s.source_uri ? <span className="play__uri"> · {s.source_uri}</span> : null}
