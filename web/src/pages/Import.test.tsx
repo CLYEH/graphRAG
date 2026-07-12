@@ -6,6 +6,7 @@ import { Import } from "./Import";
 import { api } from "../api/client";
 import {
   job,
+  project,
   projectRoute,
   renderWithProviders,
   source,
@@ -14,6 +15,8 @@ import {
   stubPostError,
   stubSources,
 } from "../test-utils";
+
+import type { Project, Source } from "../api/queries";
 
 const JOB_ID = "0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f";
 const META = { request_id: "0", build_id: null, elapsed_ms: 1, next_cursor: null };
@@ -29,6 +32,19 @@ function renderImport(route: string) {
     </Routes>,
     { route },
   );
+}
+
+// Routes the two GETs the Import page fires: the projects list (RunPipeline reads
+// the active project's config for the ontology gate) and the source list.
+function stubImportGets(proj: Project, srcs: Source[]) {
+  return vi
+    .spyOn(api, "GET")
+    .mockImplementation(((path: string) =>
+      Promise.resolve(
+        path === "/projects"
+          ? { data: { data: [proj], meta: META }, error: undefined }
+          : { data: { data: srcs, meta: META }, error: undefined },
+      )) as never);
 }
 
 describe("Import", () => {
@@ -146,13 +162,51 @@ describe("Import", () => {
     ).toBeInTheDocument();
   });
 
-  it("reports an un-addressable project instead of calling the API", async () => {
-    const get = vi.spyOn(api, "GET");
+  it("blocks a text build when the project has no ontology", async () => {
+    stubImportGets(project("acme"), [source({ kind: "text", uri: "file:///data/corpus/" })]);
+    const post = stubPost({ job_id: JOB_ID, status: "queued" });
+    renderImport(projectRoute("acme", "import"));
+
+    // create→text-source→build over a UI-created (config-less) project would fail at
+    // the graph stage with OntologyRequiredError — the run must be blocked, not
+    // accepted as a job guaranteed to fail after spending work
+    expect(await screen.findByText(/no ontology configured/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^ingest$/i })).toBeDisabled();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("does not block a text build once an ontology is configured", async () => {
+    stubImportGets({ ...project("acme"), config: { ontology: { entity_types: ["Person"] } } }, [
+      source({ kind: "text", uri: "file:///data/corpus/" }),
+    ]);
+    renderImport(projectRoute("acme", "import"));
+
+    await screen.findByText("file:///data/corpus/"); // the source list resolved
+    expect(screen.queryByText(/no ontology configured/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^build$/i })).toBeEnabled();
+  });
+
+  it("does not block a structured-only build without an ontology", async () => {
+    // structured builds have no text docs, so the graph stage never needs an ontology
+    stubImportGets(project("acme"), [source({ kind: "structured", uri: "file:///data/rows.csv" })]);
+    renderImport(projectRoute("acme", "import"));
+
+    await screen.findByText("file:///data/rows.csv");
+    expect(screen.queryByText(/no ontology configured/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^build$/i })).toBeEnabled();
+  });
+
+  it("reports an un-addressable project without firing a project-scoped call", async () => {
+    const get = vi
+      .spyOn(api, "GET")
+      .mockResolvedValue({ data: { data: [], meta: META }, error: undefined } as never);
     renderImport(projectRoute("a/b", "import"));
 
     // a "/"-bearing key can't ride the single {project} path segment, so the page
-    // must refuse rather than fire a call that would 404 on the wrong endpoint
+    // must refuse rather than fire a project-scoped call that would 404 on the wrong
+    // endpoint. The non-scoped projects list may still load (it carries no key).
     expect(await screen.findByText(/isn't addressable over the api/i)).toBeInTheDocument();
-    expect(get).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalledWith("/projects/{project}/sources", expect.anything());
   });
 });

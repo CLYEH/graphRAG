@@ -1,12 +1,21 @@
 import { useState } from "react";
 
-import { useAddSource, useSources, useTrigger } from "../api/queries";
+import { useAddSource, useProjects, useSources, useTrigger } from "../api/queries";
 import { isPathAddressable, useActiveProject } from "../project/projectRoute";
 import { JobProgress } from "../components/JobProgress";
 import { NewProjectForm } from "../components/NewProjectForm";
 import "./Import.css";
 
-import type { JobAccepted, TriggerKind } from "../api/queries";
+import type { JobAccepted, Project, TriggerKind } from "../api/queries";
+
+// Whether a project's config carries an ontology. The graph stage raises
+// OntologyRequiredError for a build that has ANY text document and no
+// config.ontology (core/builds/stages.py:177-182) — structured-only builds don't
+// need one. NewProjectForm creates config-less projects, so a text build over a
+// UI-created project is otherwise guaranteed to fail (Codex #70).
+function hasOntology(config: Project["config"] | undefined): boolean {
+  return config != null && config.ontology != null;
+}
 
 // The source kinds the ingest pipeline actually wires (core/builds/sources.py
 // SUPPORTED_SOURCE_KINDS + core/ingest/connectors.py): "text" reads a file://
@@ -41,6 +50,7 @@ function isFileUri(raw: string): boolean {
 // project-addressability guards as the other pages.
 export function Import() {
   const project = useActiveProject();
+  const projects = useProjects();
 
   if (project === undefined) return <p className="import__line">Unknown project.</p>;
   if (!isPathAddressable(project))
@@ -52,6 +62,11 @@ export function Import() {
       </p>
     );
 
+  // Once the project resolves, whether it lacks an ontology (undefined while the
+  // list loads → don't gate yet). RunPipeline blocks a text build in that case.
+  const active = projects.data?.find((p) => p.name === project);
+  const ontologyMissing = active !== undefined && !hasOntology(active.config);
+
   return (
     <section className="import">
       <h1 className="import__title">Import</h1>
@@ -59,7 +74,7 @@ export function Import() {
         Registering sources into <code>{project}</code>.
       </p>
       <Sources project={project} />
-      <RunPipeline project={project} />
+      <RunPipeline project={project} ontologyMissing={ontologyMissing} />
       <section className="import__section">
         <h2>New project</h2>
         <p className="runs__muted">Create a different project and switch to it.</p>
@@ -208,9 +223,16 @@ function Sources({ project }: { project: string }) {
 // already running comes back 409 JOB_CONFLICT (server-side one-job-per-project
 // serialization), surfaced as the fail-loud error line. The accepted job id feeds
 // straight into the shared live watcher so the operator sees progress inline.
-function RunPipeline({ project }: { project: string }) {
+function RunPipeline({ project, ontologyMissing }: { project: string; ontologyMissing: boolean }) {
   const [accepted, setAccepted] = useState<JobAccepted | null>(null);
   const trigger = useTrigger(project);
+  const sources = useSources(project);
+
+  // A build with any text source and no ontology fails at the graph stage
+  // (OntologyRequiredError); structured-only builds don't. Block the run rather
+  // than accept a job guaranteed to fail after spending work (Codex #70).
+  const hasTextSource = (sources.data ?? []).some((s) => s.kind === "text");
+  const blocked = ontologyMissing && hasTextSource;
 
   function run(kind: TriggerKind) {
     trigger.mutate(kind, { onSuccess: (job) => setAccepted(job) });
@@ -224,11 +246,18 @@ function RunPipeline({ project }: { project: string }) {
         only in the recorded job kind, and either way spends graph, LLM, and indexing work. One run
         at a time per project.
       </p>
+      {blocked && (
+        <p className="npf__error">
+          This project has no ontology configured, so a build over text sources fails at the graph
+          stage. Set <code>config.ontology</code> via the API/CLI (structured sources don&apos;t
+          need one).
+        </p>
+      )}
       <div className="import__actions">
-        <button type="button" onClick={() => run("ingest")} disabled={trigger.isPending}>
+        <button type="button" onClick={() => run("ingest")} disabled={trigger.isPending || blocked}>
           {trigger.isPending ? "Triggering…" : "Ingest"}
         </button>
-        <button type="button" onClick={() => run("build")} disabled={trigger.isPending}>
+        <button type="button" onClick={() => run("build")} disabled={trigger.isPending || blocked}>
           {trigger.isPending ? "Triggering…" : "Build"}
         </button>
       </div>
