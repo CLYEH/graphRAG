@@ -47,13 +47,33 @@ set -o pipefail
 deny() { printf 'push-gate: %s\n' "$1" >&2; exit 2; }
 
 payload="$(cat)"
+# Bash strips the quoting characters `" ' \` AND the `$` sigil of $'…'/$"…"
+# before the command sees a word, so the RAW text can spell a flag in ways a
+# literal match misses: `--he"ad"`, `\-\-head`, `-f"H"`, `$'--head'` all reach
+# gh as --head. Matching the spellings one by one is the treadmill H12 exists
+# to end; DELETING those characters is the inverse — one filter that collapses
+# every REMOVABLE-CHARACTER quoting of a literal flag at once (double, single,
+# backslash, $'…', $"…"). It can only ever ADD matches (fail-closed), so it
+# feeds the checks that DENY: engagement and the --head ban.
+# Residue, stated rather than implied — deletion is a filter, not an
+# interpreter, so two mechanisms survive it: (a) ENCODED content — an ANSI-C
+# escape like $'\x2d\x2dhead' that spells the bytes instead of typing them;
+# (b) COMPUTED content — an expansion like --$v or $(printf …). Neither is a
+# natural way to write a flag: reaching for a hex escape or a subshell in place
+# of `--head` is affirmative evasion, and this is honest-agent enforcement over
+# the agent's OWN command text (same premise as require-codex-approval.sh) — an
+# agent willing to do that can bypass the hook layer wholesale (a wrapper
+# script, `gh api`, editing settings.json). The ban stops the flag from being
+# reached for in the ordinary course of work, not from being smuggled by
+# someone evading their own gate.
+norm="$(printf '%s' "$payload" | tr -d '"'\''\\$')"
 # engage on `git [flags] push` incl. `git -C <path> push` and `git --git-dir=<p> push`
 # (must not engage on e.g. `git log push-fix`) — AND on gh PR creation, which
 # can push the branch itself (the same effect through a sibling command).
 flags='([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*'
 gh_engaged=0
-printf '%s' "$payload" | grep -Eq "gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new)\b" && gh_engaged=1
-printf '%s' "$payload" | grep -Eq "git${flags}[[:space:]]+push\b" || [ "$gh_engaged" = 1 ] || exit 0
+printf '%s' "$norm" | grep -Eq "gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new)\b" && gh_engaged=1
+printf '%s' "$norm" | grep -Eq "git${flags}[[:space:]]+push\b" || [ "$gh_engaged" = 1 ] || exit 0
 cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."
 
 # gh --head selects an ALREADY-REMOTE ref and, per the gh manual, SKIPS
@@ -67,7 +87,9 @@ cd "${CLAUDE_PROJECT_DIR:-.}" || deny "cannot cd to the project dir -> blocked."
 # ban). The set is gh's booleans TODAY; a new gh boolean shorthand extends it.
 # The anchor keeps the capital H inside a repo VALUE from matching (-RCLYEH/…
 # starts -R, which [defw]* cannot consume).
-[ "$gh_engaged" = 1 ] && printf '%s' "$payload" | grep -Eq "(^|[[:space:]])(--head([=[:space:]]|$)|-[defw]*H)" &&
+# Matched against $norm, so the quoted spellings bash would strip (`--he"ad"`,
+# `\-\-head`, `-f"H"`) are the same string here as they are to gh.
+[ "$gh_engaged" = 1 ] && printf '%s' "$norm" | grep -Eq "(^|[[:space:]])(--head([=[:space:]]|$)|-[defw]*H)" &&
   deny "gh --head selects an already-remote ref the local receipts cannot vouch for (and it skips pushing, so no pre-push hook sees it) — drop the flag; gh defaults to the current branch."
 
 git fetch -q origin main 2>/dev/null

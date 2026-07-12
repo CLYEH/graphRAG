@@ -495,6 +495,14 @@ def test_gh_head_is_banned_even_when_fully_receipted(toy_repo: Path) -> None:
     # allows that token) and a non-FE name (no FE token in the payload at
     # all) — and the MESSAGE is asserted, not just the exit code, so a deny
     # from the wrong rule cannot pass for a ban.
+    # The QUOTED spellings are what a literal grep misses: bash strips the
+    # quoting characters `" ' \` AND the `$` sigil of $'…'/$"…" before gh is
+    # exec'd, so `--he"ad"`, `\-\-head`, `$'--head'` and `$'-fH'` all ARE
+    # --head/-fH to gh while reading as neither to a literal grep. The gate
+    # deletes those characters, collapsing every REMOVABLE-CHARACTER spelling of
+    # a literal flag at once. ($'--head' with literal dashes is a static
+    # constant, the same class as --he"ad" — NOT the deferred dynamic-expansion
+    # residue; Codex #64 post-cutback caught the `$` sigil surviving the strip.)
     for flag in (
         "--head task/FE1",
         "--head=task/FE2",
@@ -503,19 +511,39 @@ def test_gh_head_is_banned_even_when_fully_receipted(toy_repo: Path) -> None:
         "-fH task/FE1",
         "-fH release-x",
         "-dfH release-x",
+        '--he"ad" release-x',
+        r"\-\-head release-x",
+        '-f"H" release-x',
+        "$'--head' release-x",
+        '$"--head" release-x',
+        "$'-fH' release-x",
     ):
         payload = f"{_PR_CREATE} {flag}"
         denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=payload, extra_env=env)
         assert denied.returncode == 2, f"gh head slipped ({flag}): {denied.stdout}"
         assert "already-remote" in denied.stderr, f"wrong rule denied ({flag}): {denied.stderr}"
 
+    # a quote-BROKEN verb (`gh pr cre"ate"`) still reaches gh as `create`, so
+    # ENGAGEMENT must read the normalized text too. This pins the $norm on the
+    # engagement line: reverting it to $payload makes gh_engaged=0 here, the ban
+    # never fires, and the push falls through — so this case flips to rc=0.
+    broken_verb = 'gh pr cre"ate" --head release-x'
+    denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=broken_verb, extra_env=env)
+    assert denied.returncode == 2, f"broken verb slipped: {denied.stdout}"
+    assert "already-remote" in denied.stderr, f"wrong rule denied (verb): {denied.stderr}"
+
     # the flagless form stays green, and the repo flag's value may carry a
     # capital H without false-matching — in BOTH spellings (the ATTACHED form
-    # is what the anchor exists for: this repo's owner contains an H)
+    # is what the anchor exists for: this repo's owner contains an H). The
+    # quoted title is the acceptance case for the normalization (Rule 9's dual:
+    # a deny-rule needs a green pin, or over-blocking is false-green): deleting
+    # quote characters must not make an ordinary PR-creation payload — which
+    # ALWAYS quotes its title — look like something it is not.
     for payload in (
         f"{_PR_CREATE} --fill",
         f"gh -R CLYEH/graphRAG pr {_PR_CREATE.split()[-1]} --fill",
         f"gh -RCLYEH/graphRAG pr {_PR_CREATE.split()[-1]} --fill",
+        f'{_PR_CREATE} --title "H10: browser-QA receipt" --body-file body.md',
     ):
         allowed = _run([BASH, GATE_SCRIPT], toy_repo, stdin=payload, extra_env=env)
         assert allowed.returncode == 0, (
