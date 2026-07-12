@@ -22,8 +22,8 @@ describe("App shell", () => {
 
     // the routed placeholder page
     expect(await screen.findByRole("heading", { name: /project health/i })).toBeInTheDocument();
-    // all four v1 sections are navigable
-    for (const label of ["Health", "Jobs", "Review", "Playground"]) {
+    // every section is navigable
+    for (const label of ["Health", "Import", "Jobs", "Review", "Playground"]) {
       expect(screen.getByRole("link", { name: label })).toBeInTheDocument();
     }
   });

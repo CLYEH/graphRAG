@@ -6,8 +6,10 @@ import { isPathAddressable } from "../project/projectRoute";
 import type { components } from "./schema";
 
 export type Project = components["schemas"]["Project"];
+export type Source = components["schemas"]["Source"];
 export type HealthReport = components["schemas"]["HealthReport"];
 export type Build = components["schemas"]["Build"];
+export type JobAccepted = components["schemas"]["JobAccepted"];
 export type Job = components["schemas"]["Job"];
 export type MergeCandidate = components["schemas"]["MergeCandidate"];
 export type MergeCandidateStatus = components["schemas"]["MergeCandidateStatus"];
@@ -258,6 +260,109 @@ export function useRunQuery(project: string) {
               : form.mode === "graph"
                 ? await api.POST("/projects/{project}/query/graph", { params, body })
                 : await api.POST("/projects/{project}/query/hybrid", { params, body });
+      if (res.error) throw new Error(res.error.error.message);
+      return res.data.data;
+    },
+  });
+}
+
+// ─── FE1 Import (DESIGN §5/§15, BA1b projects/sources + BA2e triggers) ───
+
+// A project's registered sources, newest first. Same path-addressability gate as
+// the other project reads; pages through next_cursor so every source is reachable,
+// and fails loud so a store outage surfaces rather than an empty list that would
+// read as "no sources yet".
+export function useSources(project: string | undefined) {
+  return useQuery({
+    queryKey: ["sources", project],
+    enabled: project !== undefined && isPathAddressable(project),
+    queryFn: async () => {
+      const all: Source[] = [];
+      let cursor: string | undefined;
+      do {
+        const { data, error } = await api.GET("/projects/{project}/sources", {
+          params: { path: { project: project as string }, query: { limit: 200, cursor } },
+        });
+        if (error) throw new Error(error.error.message);
+        all.push(...data.data);
+        cursor = data.meta.next_cursor ?? undefined;
+      } while (cursor);
+      return all;
+    },
+  });
+}
+
+export interface NewProject {
+  name: string;
+  displayName: string;
+  description: string;
+}
+
+// Creates a project. `name` is the projects primary key, so it doubles as the
+// Idempotency-Key: a lost 201 replays on retry instead of the name conflict
+// misreporting a committed create as a failure (a genuinely-taken name 409s
+// either way). Optional text fields are omitted when blank rather than sent as
+// empty strings. Invalidates the project list so the switcher and root redirect
+// pick the new project up.
+export function useCreateProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: NewProject) => {
+      const body: components["schemas"]["ProjectCreate"] = { name: input.name };
+      if (input.displayName.trim() !== "") body.display_name = input.displayName.trim();
+      if (input.description.trim() !== "") body.description = input.description.trim();
+      const { data, error } = await api.POST("/projects", {
+        params: { header: { "Idempotency-Key": input.name } },
+        body,
+      });
+      if (error) throw new Error(error.error.message);
+      return data.data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["projects"] }),
+  });
+}
+
+// Registers a source under a project. No Idempotency-Key by design: `uri` is not
+// unique server-side (each add mints a fresh id, duplicate uris are permitted), so
+// there is no natural key, and a uri-derived one would wrongly suppress an
+// intentional re-registration. The submit button is disabled while the request is
+// in flight, which covers the rapid double-submit. Invalidates the source list so
+// the new row appears.
+export function useAddSource(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: { uri: string; kind: string }) => {
+      const body: components["schemas"]["SourceCreate"] = { uri: input.uri };
+      if (input.kind.trim() !== "") body.kind = input.kind.trim();
+      const { data, error } = await api.POST("/projects/{project}/sources", {
+        params: { path: { project } },
+        body,
+      });
+      if (error) throw new Error(error.error.message);
+      return data.data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["sources", project] }),
+  });
+}
+
+export type TriggerKind = "ingest" | "build";
+
+// Triggers a pipeline run (ingest = stage 1, build = the full pipeline). The body
+// is sent EMPTY: IngestRequest.source_ids and BuildRequest.reason are 400-rejected
+// by presence until the pipeline honors them (BA2e-1), so no field may ride along
+// — the kind rides the URL, switched to keep the typed path a codegen literal. No
+// Idempotency-Key: create_job_exclusive serializes on the projects row and 409s a
+// second concurrent trigger (JOB_CONFLICT "overlapping job"), which is the
+// server-side dedup; the buttons are disabled while pending. Returns the accepted
+// job so the caller can watch it live.
+export function useTrigger(project: string) {
+  return useMutation({
+    mutationFn: async (kind: TriggerKind) => {
+      const params = { path: { project } };
+      const res =
+        kind === "ingest"
+          ? await api.POST("/projects/{project}/ingest", { params })
+          : await api.POST("/projects/{project}/build", { params });
       if (res.error) throw new Error(res.error.error.message);
       return res.data.data;
     },
