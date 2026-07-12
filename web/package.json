@@ -13,11 +13,15 @@
     "typecheck": "tsc -b",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "gen:api": "openapi-typescript ../contracts/openapi.yaml -o src/api/schema.ts && prettier --write src/api/schema.ts",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm run test"
   },
   "dependencies": {
+    "@tanstack/react-query": "^5.101.2",
+    "openapi-fetch": "^0.13.8",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "react-router-dom": "^7.18.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
@@ -28,10 +32,16 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "jsdom": "^29.1.1",
+    "openapi-typescript": "^7.13.0",
     "oxlint": "^1.71.0",
     "prettier": "^3.9.4",
     "typescript": "~6.0.2",
     "vite": "^8.1.1",
     "vitest": "^4.1.9"
+  },
+  "overrides": {
+    "openapi-typescript": {
+      "typescript": "$typescript"
+    }
   }
 }
