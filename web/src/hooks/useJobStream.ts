@@ -31,6 +31,12 @@ export function useJobStream(jobId: string | null): {
     streamJobEvents(jobId, {
       signal: controller.signal,
       onFrame: (frame) => {
+        // The stream aborts on jobId change / unmount, but a chunk that already
+        // resolved can still run its continuation and call onFrame afterwards.
+        // That frame belongs to the old job; dropping it keeps a stale event from
+        // overwriting the new job's freshly-reset state (upholding the invariant
+        // above that no state update lands after cleanup).
+        if (controller.signal.aborted) return;
         try {
           setEvent(JSON.parse(frame.data) as JobEvent);
         } catch {

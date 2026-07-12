@@ -4,6 +4,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as jobStream from "../api/jobStream";
 import { useJobStream } from "./useJobStream";
 
+import type { SseFrame } from "../api/jobStream";
+
+const frameFor = (jobId: string): SseFrame => ({
+  event: "job.update",
+  data: `{"job_id":"${jobId}","status":"running","step":"graph","progress":0.5,"message":null,"ts":"2026-07-02T07:00:00Z"}`,
+});
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
@@ -42,5 +49,35 @@ describe("useJobStream", () => {
     // unmount tears the live stream down too
     unmount();
     expect(calls[1].signal.aborted).toBe(true);
+  });
+
+  it("drops a frame delivered by the old stream after switching jobs", async () => {
+    // A chunk that resolved just before cleanup runs its continuation *after* the
+    // switch, calling the old job's onFrame. Without the aborted-signal guard that
+    // stale event would overwrite job-2's reset state, showing job-2 with job-1's
+    // progress until the next real frame — the race Codex flagged (#67).
+    const calls: { signal: AbortSignal; onFrame: (f: SseFrame) => void }[] = [];
+    vi.spyOn(jobStream, "streamJobEvents").mockImplementation(
+      (_jobId, opts) =>
+        new Promise<void>(() => {
+          calls.push({ signal: opts.signal, onFrame: opts.onFrame });
+        }),
+    );
+
+    const { result, rerender } = renderHook(({ id }) => useJobStream(id), {
+      initialProps: { id: "job-1" as string | null },
+    });
+
+    // job-1's live frame lands while it is the active stream
+    act(() => calls[0].onFrame(frameFor("job-1")));
+    expect(result.current.event?.job_id).toBe("job-1");
+
+    // switch to job-2: the effect resets event to null and aborts stream 1
+    rerender({ id: "job-2" });
+    expect(result.current.event).toBeNull();
+
+    // the old stream delivers one more (late) frame — it must be ignored
+    act(() => calls[0].onFrame(frameFor("job-1")));
+    expect(result.current.event).toBeNull();
   });
 });
