@@ -120,13 +120,17 @@ describe("ProjectHealth", () => {
     expect(spy).not.toHaveBeenCalled(); // the query stays disabled
   });
 
-  it.each([".", ".."])("refuses the un-addressable key %j without a request", async (key) => {
-    // "." / ".." open in the route but normalize to the wrong endpoint as a REST
-    // path segment (Codex #66 P2); the page must say so and never fire the call
-    const spy = stubHealth(healthReport());
-    renderHealthAt(projectRoute(key));
+  it.each([".", "..", "a/b"])(
+    "refuses the un-addressable key %j without a request",
+    async (key) => {
+      // "." / ".." / "/"-bearing keys open in the route but 404 or normalize to the
+      // wrong endpoint as a REST path segment (Codex #66 P2); the page must say so
+      // and never fire the call
+      const spy = stubHealth(healthReport());
+      renderHealthAt(projectRoute(key));
 
-    expect(await screen.findByText(/reserved url path segment/i)).toBeInTheDocument();
-    expect(spy).not.toHaveBeenCalled();
-  });
+      expect(await screen.findByText(/isn't addressable over the api/i)).toBeInTheDocument();
+      expect(spy).not.toHaveBeenCalled();
+    },
+  );
 });

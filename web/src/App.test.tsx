@@ -102,25 +102,25 @@ describe("App shell", () => {
     expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue("p2");
   });
 
-  it("keeps a project whose key has URL-reserved characters openable", async () => {
-    // the frozen contract allows any non-empty project key (store tests use
-    // slashes/unicode); a raw `/p/${key}` would strand it on NotFound, so the
-    // segment is base64url-encoded and the router decodes it back (Codex #65 P2)
-    stubProjects([project("a/b", "Slashy")]);
+  it("keeps a project whose key has URL-reserved characters openable and addressable", async () => {
+    // a reserved char like "?" percent-encodes to a surviving segment (a%3Fb), so
+    // the key is both openable (base64url route, Codex #65) and API-addressable —
+    // health loads end-to-end. Only "/" and "."/".." break (see next test).
+    stubProjects([project("a?b", "Questiony")]);
     renderWithProviders(<App />, { route: "/" });
 
     expect(await screen.findByRole("heading", { name: /project health/i })).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue("a/b");
+    expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue("a?b");
   });
 
-  it("resolves a dot-segment project's route but reports it isn't API-addressable", async () => {
-    // base64url keeps `.` openable in the route (switcher reflects it), but a REST
-    // path can't carry a "." segment (it normalizes to the wrong endpoint), so the
+  it("resolves an un-addressable project's route but reports it can't be fetched", async () => {
+    // base64url keeps "/"-bearing and "."/".." keys openable in the route (switcher
+    // reflects it), but a REST path can't carry them (404 / normalization), so the
     // health page reports that instead of firing the call (Codex #65 P2 / #66 P2)
-    stubProjects([project(".", "Dotty")]);
+    stubProjects([project("a/b", "Slashy")]);
     renderWithProviders(<App />, { route: "/" });
 
-    expect(await screen.findByText(/reserved url path segment/i)).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue(".");
+    expect(await screen.findByText(/isn't addressable over the api/i)).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue("a/b");
   });
 });

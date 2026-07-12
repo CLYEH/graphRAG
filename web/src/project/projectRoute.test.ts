@@ -39,14 +39,15 @@ describe("project route encoding", () => {
 });
 
 describe("isPathAddressable", () => {
-  // Only "." and ".." are un-addressable: encodeURIComponent leaves them as bare
-  // dot segments (normalized away before the request routes), while any key with
-  // a reserved char is percent-encoded into a non-dot segment that survives.
-  it.each([".", ".."])("rejects the dot-segment key %j", (key) => {
+  // The complete un-addressable set (derived from the transport): dot-segment
+  // tokens normalize away, and "/"-bearing keys hit the single-segment {project}
+  // route as a decoded slash (404). Everything else percent-encodes to a
+  // surviving non-dot segment.
+  it.each([".", "..", "a/b", "/", "a/", "a/.."])("rejects the un-addressable key %j", (key) => {
     expect(isPathAddressable(key)).toBe(false);
   });
 
-  it.each(["acme", "a.b", ".hidden", "..leading", "%2e", "a/b", "日本語"])(
+  it.each(["acme", "a.b", ".hidden", "..leading", "%2e", "a?b", "a b", "日本語"])(
     "accepts the addressable key %j",
     (key) => {
       expect(isPathAddressable(key)).toBe(true);
