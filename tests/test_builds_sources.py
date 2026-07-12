@@ -95,6 +95,10 @@ def test_non_file_uri_is_rejected() -> None:
         ("file:", "names no path"),
         ("file://", "names no path"),
         ("file:///", "names no path"),
+        # a relative path resolves against the worker's cwd, not what the uri
+        # names (and would slip past a leading-slash-assuming segment split)
+        ("file:../corpus", "relative path"),
+        ("file:relative/corpus", "relative path"),
         # //-leading (raw four-slash or decoded %2F) is reinterpreted as UNC root
         ("file:////nas/corpus", "//-leading"),
         ("file:///%2Fdata", "//-leading"),

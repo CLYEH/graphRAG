@@ -89,6 +89,11 @@ def _local_path(source: Source) -> Path:
         raise _reject("decodes to a path containing NUL, which no filesystem accepts")
     if decoded in ("", "/"):
         raise _reject("names no path (the worker's cwd or the filesystem root)")
+    if not decoded.startswith("/"):
+        # file:../x or file:relative/x — a relative path resolves against the
+        # WORKER's cwd, not anything the stored uri names; it would also break the
+        # leading-slash assumption of the segment split below.
+        raise _reject("names a relative path (resolved against the worker's cwd)")
     if decoded.startswith("//"):
         raise _reject("decodes to a //-leading path (reinterpreted as a UNC root)")
     segments = decoded.split("/")[1:]
