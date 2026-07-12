@@ -1,11 +1,12 @@
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 
 import { useProjects } from "../api/queries";
+import { encodeProjectSegment, useActiveProject } from "../project/projectRoute";
 
-// The active project is the `:project` route segment; switching navigates to
-// the chosen project (the layout index redirects on to its default section).
+// The active project is the decoded `:project` route segment; switching encodes
+// the chosen key back into the URL (the layout index redirects to its section).
 export function ProjectSwitcher() {
-  const { project } = useParams<{ project: string }>();
+  const active = useActiveProject();
   const navigate = useNavigate();
   const { data: projects, isPending, isError } = useProjects();
 
@@ -19,8 +20,8 @@ export function ProjectSwitcher() {
       <span className="switcher__label">Project</span>
       <select
         className="switcher__select"
-        value={project ?? ""}
-        onChange={(e) => navigate(`/p/${encodeURIComponent(e.target.value)}`)}
+        value={active ?? ""}
+        onChange={(e) => navigate(`/p/${encodeProjectSegment(e.target.value)}`)}
       >
         {projects.map((p) => (
           <option key={p.name} value={p.name}>

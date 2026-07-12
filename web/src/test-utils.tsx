@@ -4,9 +4,16 @@ import { MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
 
 import { api } from "./api/client";
+import { encodeProjectSegment } from "./project/projectRoute";
 
 import type { ReactElement } from "react";
 import type { Project } from "./api/queries";
+
+// Builds the encoded route for a project key, so tests exercise the real
+// encode/decode path rather than hardcoding a raw `/p/<key>` segment.
+export function projectRoute(key: string, section = "health") {
+  return `/p/${encodeProjectSegment(key)}/${section}`;
+}
 
 export function renderWithProviders(ui: ReactElement, { route = "/" }: { route?: string } = {}) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

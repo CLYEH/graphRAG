@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import {
   project,
+  projectRoute,
   renderWithProviders,
   stubProjects,
   stubProjectsError,
@@ -17,7 +18,7 @@ afterEach(() => {
 describe("App shell", () => {
   it("renders the section nav and the routed page for the active project", async () => {
     stubProjects([project("acme", "ACME corpus")]);
-    renderWithProviders(<App />, { route: "/p/acme/health" });
+    renderWithProviders(<App />, { route: projectRoute("acme") });
 
     // the routed placeholder page
     expect(await screen.findByRole("heading", { name: /project health/i })).toBeInTheDocument();
@@ -29,7 +30,7 @@ describe("App shell", () => {
 
   it("populates the project switcher from the API and shows the active one", async () => {
     stubProjects([project("acme", "ACME corpus"), project("beta")]);
-    renderWithProviders(<App />, { route: "/p/acme/health" });
+    renderWithProviders(<App />, { route: projectRoute("acme") });
 
     const select = await screen.findByRole("combobox", { name: /project/i });
     // display_name is preferred over the key; the bare key shows when absent
@@ -40,7 +41,7 @@ describe("App shell", () => {
 
   it("switching the project navigates to that project", async () => {
     stubProjects([project("acme"), project("beta")]);
-    renderWithProviders(<App />, { route: "/p/acme/health" });
+    renderWithProviders(<App />, { route: projectRoute("acme") });
 
     const select = await screen.findByRole("combobox", { name: /project/i });
     fireEvent.change(select, { target: { value: "beta" } });
@@ -68,7 +69,7 @@ describe("App shell", () => {
 
   it("surfaces an API failure instead of an empty switcher", async () => {
     stubProjectsError();
-    renderWithProviders(<App />, { route: "/p/acme/health" });
+    renderWithProviders(<App />, { route: projectRoute("acme") });
 
     expect(await screen.findByText(/projects unavailable/i)).toBeInTheDocument();
   });
@@ -83,7 +84,7 @@ describe("App shell", () => {
 
   it("renders NotFound for an unknown section under a valid project", async () => {
     stubProjects([project("acme")]);
-    renderWithProviders(<App />, { route: "/p/acme/nonsense" });
+    renderWithProviders(<App />, { route: projectRoute("acme", "nonsense") });
 
     expect(await screen.findByRole("heading", { name: /not found/i })).toBeInTheDocument();
   });
@@ -92,7 +93,7 @@ describe("App shell", () => {
     // a switcher that stops at page 1 would drop older projects and blank the
     // select when the user lands on one of their URLs (Codex #65 P2)
     stubProjectsPages([[project("p1")], [project("p2")]]);
-    renderWithProviders(<App />, { route: "/p/p2/health" });
+    renderWithProviders(<App />, { route: projectRoute("p2") });
 
     await screen.findByRole("combobox", { name: /project/i });
     expect(screen.getByRole("option", { name: "p1" })).toBeInTheDocument();
@@ -103,11 +104,22 @@ describe("App shell", () => {
   it("keeps a project whose key has URL-reserved characters openable", async () => {
     // the frozen contract allows any non-empty project key (store tests use
     // slashes/unicode); a raw `/p/${key}` would strand it on NotFound, so the
-    // segment is percent-encoded and the router decodes it back (Codex #65 P2)
+    // segment is base64url-encoded and the router decodes it back (Codex #65 P2)
     stubProjects([project("a/b", "Slashy")]);
     renderWithProviders(<App />, { route: "/" });
 
     expect(await screen.findByRole("heading", { name: /project health/i })).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue("a/b");
+  });
+
+  it("keeps a project whose key is a dot segment openable", async () => {
+    // `.` and `..` are contract-valid keys but browsers normalize dot segments
+    // out of a path, so percent-encoding alone strands them; base64url produces
+    // an opaque segment that never collapses, so `/p/<enc>` resolves (Codex #65 P2)
+    stubProjects([project(".", "Dotty")]);
+    renderWithProviders(<App />, { route: "/" });
+
+    expect(await screen.findByRole("heading", { name: /project health/i })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue(".");
   });
 });
