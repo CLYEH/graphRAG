@@ -7,7 +7,7 @@ import { api } from "./api/client";
 import { encodeProjectSegment } from "./project/projectRoute";
 
 import type { ReactElement } from "react";
-import type { HealthReport, Project } from "./api/queries";
+import type { Build, HealthReport, Job, Project } from "./api/queries";
 
 // Builds the encoded route for a project key, so tests exercise the real
 // encode/decode path rather than hardcoding a raw `/p/<key>` segment.
@@ -84,6 +84,11 @@ export function stubProjectsError() {
   return vi.spyOn(api, "GET").mockResolvedValue(errorEnvelope as never);
 }
 
+// Generic GET-error stub (any endpoint) for the FE8 fail-loud tests.
+export function stubApiError() {
+  return vi.spyOn(api, "GET").mockResolvedValue(errorEnvelope as never);
+}
+
 export function healthReport(overrides: Partial<HealthReport> = {}): HealthReport {
   return {
     status: "healthy",
@@ -114,4 +119,64 @@ export function project(name: string, displayName?: string): Project {
     config: {},
     created_at: "2026-07-01T00:00:00Z",
   };
+}
+
+export function build(overrides: Partial<Build> = {}): Build {
+  return {
+    id: "b0000000-0000-0000-0000-000000000000",
+    project: "acme",
+    status: "ready",
+    config_hash: null,
+    source_hash: null,
+    started_at: "2026-07-01T00:00:00Z",
+    finished_at: null,
+    activated_at: null,
+    metrics: null,
+    eval: null,
+    ...overrides,
+  };
+}
+
+export function job(overrides: Partial<Job> = {}): Job {
+  return {
+    job_id: "0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f",
+    status: "running",
+    kind: "build",
+    project: "acme",
+    build_id: null,
+    step: null,
+    progress: 0,
+    message: null,
+    error: null,
+    created_at: "2026-07-01T00:00:00Z",
+    finished_at: null,
+    ...overrides,
+  };
+}
+
+// Single-purpose GET stubs for the FE8 component tests (each component fetches
+// exactly one resource in isolation, so a flat mockResolvedValue is enough).
+export function stubBuilds(builds: Build[]) {
+  return vi
+    .spyOn(api, "GET")
+    .mockResolvedValue({ data: { data: builds, meta: META }, error: undefined } as never);
+}
+
+export function stubJob(j: Job) {
+  return vi
+    .spyOn(api, "GET")
+    .mockResolvedValue({ data: { data: j, meta: META }, error: undefined } as never);
+}
+
+// A streaming fetch Response carrying the given SSE text chunks — mock global
+// fetch with this to drive the job event stream in tests.
+export function sseResponse(chunks: string[], init: ResponseInit = {}): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const encoder = new TextEncoder();
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200, ...init });
 }

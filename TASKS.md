@@ -91,7 +91,7 @@ Keep items small enough to finish in one loop.
 - [x] ~~H10 browser-QA receipt hook~~ — **DROPPED (owner 2026-07-12; PR #64 closed unmerged).** The browser-QA *rule* stays: FE tasks run the Claude in Chrome pass after e2e (LOOP.md step 4, FE-only) with the evidence linked in the PR — but enforced as an **honest-agent step** (the pass runs; its screenshots/console evidence go in the PR body for the owner and Codex to audit), *not* a push-gate hook. Mechanical enforcement (the receipt + a `gh pr create`/push gate on `task/FE*`) is what dragged in engagement on the PR-creation verb and a permanent command-text `--head` ban whose shell-grammar surface is **unbounded** (~24 review rounds, each fix correct, the surface never bottoming out); the owner paused the loop and dropped it rather than keep chasing spellings. `main` keeps its proven push-gate untouched, and there is no FE task yet, so nothing regresses. Its structural follow-up (H12 pre-push hook) is dropped with it — it existed only to retire that gate's complexity. If mechanical FE enforcement is wanted later, do it **minimally**: a receipt check on the FE branch's `git push` only, with no PR-verb engagement and no command-grammar surface. Rationale + the "wrong layer / unbounded surface — know when to stop and drop" lesson: see [[graphrag-loop-paused-pr5]] class 14.
 - [x] FE0 app shell + OpenAPI codegen client + project switcher
 - [x] FE7 Project Health home
-- [ ] FE8 Pipeline/jobs dashboard
+- [x] FE8 Pipeline/jobs dashboard
 - [ ] FE5 Entity-resolution review UI
 - [ ] FE6 Query playground UI
 - [ ] FE1 Import · [ ] FE2 Clean · [ ] FE3 Inspect · [ ] FE4 Graph explorer  *(v2)*
