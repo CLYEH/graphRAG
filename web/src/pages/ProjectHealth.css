@@ -1,0 +1,122 @@
+.health {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  max-width: 720px;
+}
+
+.health__title {
+  margin: 0;
+  font-family: var(--heading);
+  font-size: 22px;
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+.health h2 {
+  margin: 12px 0 0;
+  font-family: var(--heading);
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.health__line {
+  color: var(--text);
+}
+
+.health__line--error {
+  color: #c0392b;
+}
+
+.health__badge {
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 16px;
+  border: 1px solid transparent;
+}
+
+.health__badge--ok {
+  color: #1a7f45;
+  background: rgba(26, 127, 69, 0.12);
+  border-color: rgba(26, 127, 69, 0.4);
+}
+
+.health__badge--warn {
+  color: #9a6a00;
+  background: rgba(202, 138, 4, 0.12);
+  border-color: rgba(202, 138, 4, 0.4);
+}
+
+.health__badge--bad {
+  color: #c0392b;
+  background: rgba(192, 57, 43, 0.12);
+  border-color: rgba(192, 57, 43, 0.4);
+}
+
+.health__facts,
+.health__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px 24px;
+  margin: 0;
+  width: 100%;
+}
+
+.health__facts div,
+.health__grid div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.health__facts dt,
+.health__grid dt {
+  color: var(--text);
+}
+
+.health__facts dd,
+.health__grid dd {
+  margin: 0;
+  font-family: var(--mono);
+  color: var(--text-h);
+  overflow-wrap: anywhere;
+}
+
+.health__muted {
+  color: var(--text);
+  font-style: italic;
+}
+
+.health__warnings {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-h);
+}
+
+.health__warnings code {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: #9a6a00;
+}
+
+@media (prefers-color-scheme: dark) {
+  .health__badge--ok {
+    color: #4ade80;
+  }
+  .health__badge--warn,
+  .health__warnings code {
+    color: #fbbf24;
+  }
+  .health__badge--bad,
+  .health__line--error {
+    color: #f87171;
+  }
+}

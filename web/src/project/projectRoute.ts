@@ -35,3 +35,23 @@ export function useActiveProject(): string | undefined {
   const { project } = useParams<{ project: string }>();
   return project === undefined ? undefined : decodeProjectSegment(project);
 }
+
+// Whether a key can ride in a REST path segment (e.g. /projects/{key}/health).
+// The app route base64url-encodes the key so any key is *openable*, but a REST
+// call must send the literal key through `encodeURIComponent`, and exactly two
+// families survive that as an un-addressable segment — this is the complete set,
+// derived from the transport, not an open-ended spelling chase:
+//   1. "." / ".." — `encodeURIComponent` leaves them as bare dot tokens, which
+//      the URL parser normalizes away before routing (verified: "." ->
+//      /projects/health, ".." -> /health; %2e/%2E normalize too, so no encoding
+//      survives).
+//   2. keys containing "/" — encoded to %2F, which the ASGI server decodes back
+//      to "/" before routing, so the single-segment {project} route (not
+//      {project:path}) misses it (verified: GET /projects/a%2Fb/health -> 404).
+// Every other char percent-encodes to a non-dot %XX that decodes to itself and
+// the segment survives, so query/hash chars, spaces, unicode and "%" all round-
+// trip. These keys are openable but not API-addressable without a contract
+// change; callers must refuse rather than silently hit the wrong endpoint.
+export function isPathAddressable(key: string): boolean {
+  return key !== "." && key !== ".." && !key.includes("/");
+}

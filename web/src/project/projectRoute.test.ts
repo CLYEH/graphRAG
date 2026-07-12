@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { decodeProjectSegment, encodeProjectSegment } from "./projectRoute";
+import { decodeProjectSegment, encodeProjectSegment, isPathAddressable } from "./projectRoute";
 
 describe("project route encoding", () => {
   // The contract allows any non-empty project key; every one must survive the
@@ -36,4 +36,21 @@ describe("project route encoding", () => {
     // must collapse it to the single "unknown" signal, not a U+FFFD garbage key
     expect(decodeProjectSegment("_w")).toBeUndefined();
   });
+});
+
+describe("isPathAddressable", () => {
+  // The complete un-addressable set (derived from the transport): dot-segment
+  // tokens normalize away, and "/"-bearing keys hit the single-segment {project}
+  // route as a decoded slash (404). Everything else percent-encodes to a
+  // surviving non-dot segment.
+  it.each([".", "..", "a/b", "/", "a/", "a/.."])("rejects the un-addressable key %j", (key) => {
+    expect(isPathAddressable(key)).toBe(false);
+  });
+
+  it.each(["acme", "a.b", ".hidden", "..leading", "%2e", "a?b", "a b", "日本語"])(
+    "accepts the addressable key %j",
+    (key) => {
+      expect(isPathAddressable(key)).toBe(true);
+    },
+  );
 });
