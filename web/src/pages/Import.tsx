@@ -6,7 +6,7 @@ import { JobProgress } from "../components/JobProgress";
 import { NewProjectForm } from "../components/NewProjectForm";
 import "./Import.css";
 
-import type { JobAccepted, Project, TriggerKind } from "../api/queries";
+import type { JobAccepted, Project, Source, TriggerKind } from "../api/queries";
 
 // Whether a project's config carries an ontology. The graph stage raises
 // OntologyRequiredError for a build that has ANY text document and no
@@ -33,19 +33,43 @@ type SourceKind = (typeof SOURCE_KINDS)[number];
 
 // Whether a uri is a canonical file:/// path — the exact form the backend reads.
 // _local_path uses urlparse(uri).path only (core/builds/sources.py:50-57), so a
-// host-bearing "file://nas/corpus" silently drops the host and reads /corpus, and
-// an empty-path "file:" / "file://" resolves to the WORKER's cwd — both register a
-// source the build then misreads (Codex #70). Requiring the triple-slash form with
-// a non-empty path (parse-validated, so a bare local path is rejected too) makes
-// the browser's accept set exactly what the backend will read. Dir-vs-file (text)
-// stays placeholder guidance — a page can't stat the path.
+// host-bearing "file://nas/corpus" silently drops the host and reads /corpus, an
+// empty-path "file:" / "file://" resolves to the WORKER's cwd, and a query/hash
+// suffix ("file:///data?old") is silently stripped — the worker reads a different
+// path than the stored uri displays (Codex #70). Requiring the triple-slash form
+// with a non-root path and no search/hash (parse-validated, so a bare local path
+// is rejected too) makes the browser's accept set exactly what the backend will
+// read. Dir-vs-file (text) stays placeholder guidance — a page can't stat.
 function isFileUri(raw: string): boolean {
+  let url: URL;
   try {
-    new URL(raw); // must parse as a URL at all
+    url = new URL(raw);
   } catch {
     return false;
   }
-  return /^file:\/\/\//i.test(raw) && raw.length > "file:///".length;
+  return (
+    /^file:\/\/\//i.test(raw) && url.search === "" && url.hash === "" && url.pathname.length > 1
+  );
+}
+
+// Whether the pipeline can resolve an already-registered source — the mirror of
+// resolve_source's RAISE conditions (core/builds/sources.py:71-90): a kind outside
+// the wired set, a uri whose scheme isn't file (only the scheme raises — a
+// host-bearing file uri misreads but doesn't raise, so it can't justify blocking a
+// run), or a structured source missing non-empty table/pk_column metadata
+// (_required_meta). Sources created outside this form (CLI/API) can carry any of
+// these; one unresolvable source fails EVERY build at ingest, regardless of
+// ontology, so the run gate checks the whole loaded list (Codex #70).
+function isResolvableSource(s: Source): boolean {
+  if (s.kind !== "text" && s.kind !== "structured") return false;
+  if (!/^file:/i.test(s.uri.trim())) return false;
+  if (s.kind === "structured") {
+    const table = s.metadata?.table;
+    const pk = s.metadata?.pk_column;
+    if (typeof table !== "string" || table.trim() === "") return false;
+    if (typeof pk !== "string" || pk.trim() === "") return false;
+  }
+  return true;
 }
 
 // FE1 Import (DESIGN §5/§15): register sources into the active project by URI/
@@ -253,7 +277,11 @@ function RunPipeline({
   // that only checks presence decides on stale data in exactly the window where
   // the just-added text source dooms the build (a bind-time-vs-invariant TOCTOU).
   const hasTextSource = (sources.data ?? []).some((s) => s.kind === "text");
-  const blocked = ontologyMissing && hasTextSource;
+  const ontologyBlocked = ontologyMissing && hasTextSource;
+  // One unresolvable source (unwired kind / non-file scheme / missing structured
+  // metadata — e.g. registered via CLI/API) fails every build at ingest.
+  const unresolvable = (sources.data ?? []).filter((s) => !isResolvableSource(s));
+  const blocked = ontologyBlocked || unresolvable.length > 0;
   const ready = gatesLoaded && sources.data !== undefined && !sources.isFetching;
 
   function run(kind: TriggerKind) {
@@ -268,11 +296,19 @@ function RunPipeline({
         only in the recorded job kind, and either way spends graph, LLM, and indexing work. One run
         at a time per project.
       </p>
-      {blocked && (
+      {ontologyBlocked && (
         <p className="npf__error">
           This project has no ontology configured, so a build over text sources fails at the graph
           stage. Set <code>config.ontology</code> via the API/CLI (structured sources don&apos;t
           need one).
+        </p>
+      )}
+      {unresolvable.length > 0 && (
+        <p className="npf__error">
+          {unresolvable.length} source{unresolvable.length > 1 ? "s" : ""} can&apos;t be resolved by
+          the pipeline (unwired kind, non-<code>file://</code> uri, or missing structured
+          table/pk_column) — every run fails at ingest until they&apos;re fixed or removed via the
+          API/CLI.
         </p>
       )}
       <div className="import__actions">

@@ -108,9 +108,17 @@ describe("Import", () => {
     // _local_path reads only urlparse(uri).path, so each of these registers a
     // source the build then misreads or rejects — refuse them at the source:
     // a non-file scheme (unwired), a host-bearing file uri (host silently
-    // dropped → wrong path), and an empty-path file uri (resolves to the
-    // worker's cwd)
-    for (const bad of ["https://x/doc", "file://nas/corpus", "file://"]) {
+    // dropped → wrong path), an empty-path file uri (resolves to the worker's
+    // cwd), and query/hash-bearing uris (silently stripped → the worker reads a
+    // different path than the stored uri displays)
+    for (const bad of [
+      "https://x/doc",
+      "file://nas/corpus",
+      "file://",
+      "file:///?x",
+      "file:///data/corpus?old",
+      "file:///a#frag",
+    ]) {
       fireEvent.change(uri, { target: { value: bad } });
       expect(screen.getByText(/canonical/i)).toBeInTheDocument();
       expect(add()).toBeDisabled();
@@ -252,12 +260,45 @@ describe("Import", () => {
 
   it("does not block a structured-only build without an ontology", async () => {
     // structured builds have no text docs, so the graph stage never needs an ontology
-    stubImportGets(project("acme"), [source({ kind: "structured", uri: "file:///data/rows.csv" })]);
+    stubImportGets(project("acme"), [
+      source({
+        kind: "structured",
+        uri: "file:///data/rows.csv",
+        metadata: { table: "documents", pk_column: "id" },
+      }),
+    ]);
     renderImport(projectRoute("acme", "import"));
 
     await screen.findByText("file:///data/rows.csv");
     expect(screen.queryByText(/no ontology configured/i)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^build$/i })).toBeEnabled();
+  });
+
+  it("blocks runs when an existing source is one the pipeline can't resolve", async () => {
+    // sources registered outside this form (CLI/API) can carry an unwired kind, a
+    // non-file scheme, or missing structured metadata — resolve_source raises on
+    // any of them, so ONE such source fails every build at ingest, regardless of
+    // ontology; the run gate must check the whole list
+    stubImportGets({ ...project("acme"), config: { ontology: { entity_types: ["P"] } } }, [
+      source({ kind: "url", uri: "https://example.com/feed" }),
+    ]);
+    renderImport(projectRoute("acme", "import"));
+
+    expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^ingest$/i })).toBeDisabled();
+  });
+
+  it("blocks runs when a structured source lacks its table/pk_column metadata", async () => {
+    // _required_meta raises for a structured source without non-empty table +
+    // pk_column, so it is unresolvable even though its kind and scheme are wired
+    stubImportGets({ ...project("acme"), config: { ontology: { entity_types: ["P"] } } }, [
+      source({ kind: "structured", uri: "file:///data/rows.csv", metadata: {} }),
+    ]);
+    renderImport(projectRoute("acme", "import"));
+
+    expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
   });
 
   it("reports an un-addressable project without firing a project-scoped call", async () => {
