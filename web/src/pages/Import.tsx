@@ -56,6 +56,9 @@ function isFileUri(raw: string): boolean {
   } catch {
     return false;
   }
+  // An embedded NUL (file:///data/%00corpus) can't name a real file on any
+  // supported OS — the connector's read is guaranteed to fail.
+  if (decoded.includes("\0")) return false;
   if (!/^file:\/\/\//i.test(raw) || url.search !== "" || url.hash !== "" || decoded.length <= 1)
     return false;
   // Validate EVERY decoded segment, not just the leading slashes: an encoded
@@ -133,10 +136,11 @@ export function Import() {
       <RunPipeline
         project={project}
         ontologyMissing={ontologyMissing}
-        // fail closed while the config is loading OR refetching — react-query
-        // keeps the previous config in data during the flight, and a CLI-side
-        // ontology change must not be gated on that stale snapshot
-        gatesLoaded={projects.data !== undefined && !projects.isFetching}
+        // fail closed while the config is loading, refetching, OR errored —
+        // react-query keeps the previous config in data during the flight and
+        // after a failed refetch, and a CLI-side ontology change must not be
+        // gated on that stale snapshot
+        gatesLoaded={projects.data !== undefined && !projects.isFetching && !projects.isError}
       />
       <section className="import__section">
         <h2>New project</h2>
@@ -312,7 +316,11 @@ function RunPipeline({
   // metadata — e.g. registered via CLI/API) fails every build at ingest.
   const unresolvable = (sources.data ?? []).filter((s) => !isResolvableSource(s));
   const blocked = ontologyBlocked || unresolvable.length > 0;
-  const ready = gatesLoaded && sources.data !== undefined && !sources.isFetching;
+  // isError matters alongside isFetching: a FAILED refetch (e.g. right after an
+  // add that DID commit server-side) leaves the previous list in data with
+  // isFetching false — the gate must not reopen on that stale snapshot.
+  const ready =
+    gatesLoaded && sources.data !== undefined && !sources.isFetching && !sources.isError;
 
   function run(kind: TriggerKind) {
     trigger.mutate(kind, { onSuccess: (job) => setAccepted(job) });

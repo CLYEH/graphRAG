@@ -135,6 +135,8 @@ describe("Import", () => {
       // time, converging with the backend's decode+resolve — both read the same
       // path, so it is accepted.)
       "file:///safe/%2F..%2F..%2Fetc",
+      // an embedded NUL can't name a real file on any supported OS
+      "file:///data/%00corpus",
     ]) {
       fireEvent.change(uri, { target: { value: bad } });
       expect(screen.getByText(/canonical/i)).toBeInTheDocument();
@@ -331,6 +333,68 @@ describe("Import", () => {
 
     expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+  });
+
+  it("keeps the run gate closed after a failed sources refetch", async () => {
+    // if the post-add invalidation refetch ERRORS, react-query keeps the previous
+    // list in data and isFetching drops back to false — but the POST already
+    // committed server-side, so reopening the gate on the stale snapshot enables
+    // exactly the doomed build the gate exists to block; an errored source list
+    // is not a decidable gate
+    const errorEnvelope = {
+      data: undefined,
+      error: { error: { code: "STORE_UNAVAILABLE", message: "down", details: null } },
+    };
+    let sourcesCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects")
+        return Promise.resolve({ data: { data: [project("acme")], meta: META }, error: undefined });
+      sourcesCalls += 1;
+      return sourcesCalls === 1
+        ? Promise.resolve({ data: { data: [], meta: META }, error: undefined })
+        : Promise.resolve(errorEnvelope);
+    }) as never);
+    stubPost(source({ kind: "text", uri: "file:///data/corpus/" }));
+    renderImport(projectRoute("acme", "import"));
+
+    const build = await screen.findByRole("button", { name: /^build$/i });
+    await waitFor(() => expect(build).toBeEnabled());
+
+    fireEvent.change(screen.getByLabelText("uri"), { target: { value: "file:///data/corpus/" } });
+    fireEvent.click(screen.getByRole("button", { name: /add source/i }));
+
+    // the refetch failed loudly (the sources section shows it) — the gate stays shut
+    expect(await screen.findByText(/could not load sources/i)).toBeInTheDocument();
+    expect(build).toBeDisabled();
+  });
+
+  it("keeps the run gate closed after a failed project-config refetch", async () => {
+    // same class on the config side: a refocus refetch that errors retains the
+    // stale config with isFetching false — the gate must not decide on it
+    const errorEnvelope = {
+      data: undefined,
+      error: { error: { code: "STORE_UNAVAILABLE", message: "down", details: null } },
+    };
+    let projectsCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects") {
+        projectsCalls += 1;
+        return projectsCalls === 1
+          ? Promise.resolve({ data: { data: [project("acme")], meta: META }, error: undefined })
+          : Promise.resolve(errorEnvelope);
+      }
+      return Promise.resolve({ data: { data: [], meta: META }, error: undefined });
+    }) as never);
+    renderImport(projectRoute("acme", "import"));
+    const build = await screen.findByRole("button", { name: /^build$/i });
+    await waitFor(() => expect(build).toBeEnabled());
+
+    act(() => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+    await waitFor(() => expect(projectsCalls).toBeGreaterThan(1));
+    await waitFor(() => expect(build).toBeDisabled());
   });
 
   it("keeps the run gate closed while the project config refetches", async () => {
