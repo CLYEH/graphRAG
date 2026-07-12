@@ -2,7 +2,13 @@ import { fireEvent, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
-import { project, renderWithProviders, stubProjects, stubProjectsError } from "./test-utils";
+import {
+  project,
+  renderWithProviders,
+  stubProjects,
+  stubProjectsError,
+  stubProjectsPages,
+} from "./test-utils";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -80,6 +86,18 @@ describe("App shell", () => {
     renderWithProviders(<App />, { route: "/p/acme/nonsense" });
 
     expect(await screen.findByRole("heading", { name: /not found/i })).toBeInTheDocument();
+  });
+
+  it("pages through next_cursor so a project beyond the first page is reachable", async () => {
+    // a switcher that stops at page 1 would drop older projects and blank the
+    // select when the user lands on one of their URLs (Codex #65 P2)
+    stubProjectsPages([[project("p1")], [project("p2")]]);
+    renderWithProviders(<App />, { route: "/p/p2/health" });
+
+    await screen.findByRole("combobox", { name: /project/i });
+    expect(screen.getByRole("option", { name: "p1" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "p2" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue("p2");
   });
 
   it("keeps a project whose key has URL-reserved characters openable", async () => {

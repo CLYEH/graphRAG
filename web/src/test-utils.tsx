@@ -34,6 +34,20 @@ export function stubProjects(projects: Project[]) {
     .mockResolvedValue({ data: { data: projects, meta: META }, error: undefined } as never);
 }
 
+// Feeds api.GET one call per page, chaining next_cursor across pages (null on
+// the last) — so tests can prove the switcher pages through, not just page 1.
+export function stubProjectsPages(pages: Project[][]) {
+  const spy = vi.spyOn(api, "GET");
+  pages.forEach((page, i) => {
+    const next = i < pages.length - 1 ? `cursor-${i + 1}` : null;
+    spy.mockResolvedValueOnce({
+      data: { data: page, meta: { ...META, next_cursor: next } },
+      error: undefined,
+    } as never);
+  });
+  return spy;
+}
+
 export function stubProjectsError() {
   return vi.spyOn(api, "GET").mockResolvedValue({
     data: undefined,
