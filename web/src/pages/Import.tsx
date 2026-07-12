@@ -36,16 +36,23 @@ type SourceKind = (typeof SOURCE_KINDS)[number];
 // host-bearing "file://nas/corpus" silently drops the host and reads /corpus, an
 // empty-path "file:" / "file://" resolves to the WORKER's cwd, and a query/hash
 // suffix ("file:///data?old") is silently stripped — the worker reads a different
-// path than the stored uri displays; and a four-slash "file:////nas/x" parses to a
-// "//"-leading path that url2pathname reinterprets as a UNC authority instead of
-// the displayed path (Codex #70). Requiring the triple-slash form with a non-root,
-// single-leading-slash path and no search/hash (parse-validated, so a bare local
-// path is rejected too) makes the browser's accept set exactly what the backend
-// will read. Dir-vs-file (text) stays placeholder guidance — a page can't stat.
+// path than the stored uri displays. The structural checks run on the DECODED
+// path, because url2pathname percent-decodes before resolving: a four-slash
+// "file:////nas/x" AND an encoded "file:///%2F…" both land as a "//"-leading path
+// that gets reinterpreted as a UNC authority / server root instead of the
+// displayed path, and a bare "file:///" (or encoded "%2F" alone) is the root
+// (Codex #70). A malformed percent-escape rejects too (decode throws; the backend
+// would read it literally — another display/read divergence). Requiring the
+// triple-slash form with a non-root, single-leading-slash decoded path and no
+// search/hash (parse-validated, so a bare local path is rejected too) makes the
+// browser's accept set exactly what the backend will read. Dir-vs-file (text)
+// stays placeholder guidance — a page can't stat.
 function isFileUri(raw: string): boolean {
   let url: URL;
+  let decoded: string;
   try {
     url = new URL(raw);
+    decoded = decodeURIComponent(url.pathname);
   } catch {
     return false;
   }
@@ -53,8 +60,8 @@ function isFileUri(raw: string): boolean {
     /^file:\/\/\//i.test(raw) &&
     url.search === "" &&
     url.hash === "" &&
-    url.pathname.length > 1 &&
-    !url.pathname.startsWith("//")
+    decoded.length > 1 &&
+    !decoded.startsWith("//")
   );
 }
 

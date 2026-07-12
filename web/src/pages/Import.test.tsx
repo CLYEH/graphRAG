@@ -121,6 +121,12 @@ describe("Import", () => {
       // four slashes parse to a "//"-leading path that url2pathname reinterprets
       // as a UNC authority — the worker can't read the displayed path
       "file:////nas/corpus",
+      // the backend DECODES before resolving, so an encoded leading slash lands
+      // as "//" (server root / UNC) despite a clean-looking raw pathname
+      "file:///%2F",
+      "file:///%2Fdata",
+      // a malformed percent-escape decodes differently than the backend reads it
+      "file:///%zz",
     ]) {
       fireEvent.change(uri, { target: { value: bad } });
       expect(screen.getByText(/canonical/i)).toBeInTheDocument();
