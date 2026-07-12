@@ -153,6 +153,12 @@ describe("Import", () => {
       // url.pathname before any pathname-based check could see them
       "file:///data/../etc",
       "file:///data/%2e%2e/etc",
+      // literal C0 controls: Python's urlsplit strips tab/LF/CR at ANY position
+      // before .path, so "\t.." displays as a segment but READS as a traversal
+      // (newline variants are untypeable here — the input element itself strips
+      // them — but stored uris carrying them hit the same shared gate)
+      "file:///tmp/\t../etc",
+      "file:///data\tcorpus",
     ]) {
       fireEvent.change(uri, { target: { value: bad } });
       expect(screen.getByText(/canonical/i)).toBeInTheDocument();
@@ -300,14 +306,32 @@ describe("Import", () => {
   it("blocks a text build when the ontology is present but malformed", async () => {
     // presence is not validity: _load_ontology/TextOntology reject a block with
     // missing/empty relation_types (BuildConfigError before the pipeline runs), so
-    // a config patched via API/CLI with a half-formed ontology must gate exactly
-    // like a missing one
+    // a config patched via API/CLI with a half-formed ontology must block — with
+    // the present-but-invalid warning, which names the actual failure
     stubImportGets({ ...project("acme"), config: { ontology: { entity_types: ["Person"] } } }, [
       source({ kind: "text", uri: "file:///data/corpus/" }),
     ]);
     renderImport(projectRoute("acme", "import"));
 
-    expect(await screen.findByText(/no valid ontology configured/i)).toBeInTheDocument();
+    expect(await screen.findByText(/present but invalid/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+  });
+
+  it("blocks ALL runs when the ontology is present but invalid — even structured-only", async () => {
+    // "ontology" being present in config is enough to enter _load_ontology's
+    // validation branch (even `ontology: null`), which raises in the worker
+    // preflight regardless of source kinds — unlike an ABSENT ontology, which is
+    // fine for structured-only builds
+    stubImportGets({ ...project("acme"), config: { ontology: null } }, [
+      source({
+        kind: "structured",
+        uri: "file:///data/rows.csv",
+        metadata: { table: "documents", pk_column: "id" },
+      }),
+    ]);
+    renderImport(projectRoute("acme", "import"));
+
+    expect(await screen.findByText(/present but invalid/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
   });
 

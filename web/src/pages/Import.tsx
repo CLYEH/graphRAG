@@ -71,6 +71,13 @@ function isFileUri(raw: string): boolean {
     return false;
   }
   if (!/^file:\/\/\//i.test(raw) || url.search !== "" || url.hash !== "") return false;
+  // No literal C0 control characters anywhere: Python's urlsplit strips tab/LF/CR
+  // at ANY position (and control-or-space at the ends) before .path, so a raw
+  // "file:///tmp/\t../etc" displays a "\t.." segment but READS /tmp/../etc →
+  // /etc. Percent-encoded controls (other than %00, rejected below) decode to
+  // literal filename bytes read verbatim — consistent with the display — so only
+  // raw controls are display≠read fuel.
+  if (/[\u0000-\u001f]/.test(raw)) return false;
   // Validate the BACKEND-derived path, not the browser-normalized url.pathname:
   // WHATWG normalizes dot segments (raw ".." AND encoded "%2e%2e") away at parse
   // time, so checks on url.pathname never see them — but the backend keeps them
@@ -148,10 +155,19 @@ export function Import() {
       </p>
     );
 
-  // Once the project resolves, whether it lacks an ontology (undefined while the
-  // list loads → don't gate yet). RunPipeline blocks a text build in that case.
+  // Three ontology states once the project resolves (undefined while the list
+  // loads → don't gate yet): ABSENT is fine for structured-only builds (gated
+  // only when text sources exist); PRESENT-BUT-INVALID fails _load_ontology in
+  // the worker preflight for EVERY run regardless of source kinds ("ontology" in
+  // config is enough to enter the validation branch — even `ontology: null`), so
+  // RunPipeline blocks all runs on it; PRESENT-VALID gates nothing.
   const active = projects.data?.find((p) => p.name === project);
   const ontologyMissing = active !== undefined && !hasOntology(active.config);
+  const ontologyInvalid =
+    active !== undefined &&
+    active.config != null &&
+    "ontology" in active.config &&
+    !hasOntology(active.config);
 
   return (
     <section className="import">
@@ -163,6 +179,7 @@ export function Import() {
       <RunPipeline
         project={project}
         ontologyMissing={ontologyMissing}
+        ontologyInvalid={ontologyInvalid}
         // fail closed while the config is loading, refetching, OR errored —
         // react-query keeps the previous config in data during the flight and
         // after a failed refetch, and a CLI-side ontology change must not be
@@ -330,10 +347,12 @@ function Sources({ project }: { project: string }) {
 function RunPipeline({
   project,
   ontologyMissing,
+  ontologyInvalid,
   gatesLoaded,
 }: {
   project: string;
   ontologyMissing: boolean;
+  ontologyInvalid: boolean;
   gatesLoaded: boolean;
 }) {
   const [accepted, setAccepted] = useState<JobAccepted | null>(null);
@@ -350,9 +369,11 @@ function RunPipeline({
   const hasTextSource = (sources.data ?? []).some((s) => s.kind === "text");
   const ontologyBlocked = ontologyMissing && hasTextSource;
   // One unresolvable source (unwired kind / non-file scheme / missing structured
-  // metadata — e.g. registered via CLI/API) fails every build at ingest.
+  // metadata — e.g. registered via CLI/API) fails every build at ingest. A
+  // present-but-invalid ontology (ontologyInvalid) fails the worker preflight for
+  // EVERY run — even structured-only — so it blocks unconditionally.
   const unresolvable = (sources.data ?? []).filter((s) => !isResolvableSource(s));
-  const blocked = ontologyBlocked || unresolvable.length > 0;
+  const blocked = ontologyBlocked || ontologyInvalid || unresolvable.length > 0;
   // isError matters alongside isFetching: a FAILED refetch (e.g. right after an
   // add that DID commit server-side) leaves the previous list in data with
   // isFetching false — the gate must not reopen on that stale snapshot.
@@ -386,7 +407,14 @@ function RunPipeline({
         only in the recorded job kind, and either way spends graph, LLM, and indexing work. One run
         at a time per project.
       </p>
-      {ontologyBlocked && (
+      {ontologyInvalid && (
+        <p className="npf__error">
+          <code>config.ontology</code> is present but invalid (needs entity_types + relation_types,
+          both non-empty string arrays) — every run fails at config load. Fix or remove it via the
+          API/CLI.
+        </p>
+      )}
+      {ontologyBlocked && !ontologyInvalid && (
         <p className="npf__error">
           This project has no valid ontology configured (entity_types + relation_types both
           non-empty), so a build over text sources fails before the graph stage. Set{" "}
