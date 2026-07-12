@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { useCancelJob, useJob } from "../api/queries";
 import { useJobStream } from "../hooks/useJobStream";
@@ -21,9 +21,17 @@ const TERMINAL: ReadonlySet<Job["status"]> = new Set(["done", "failed", "cancell
 export function JobWatcher() {
   const [input, setInput] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
-  const { data: job, isPending, isError, error } = useJob(jobId);
+  const { data: job, isPending, isError, error, refetch } = useJob(jobId);
   const stream = useJobStream(jobId);
   const cancel = useCancelJob(jobId);
+
+  // JobEvent carries only the fast-moving fields, so when the stream ends (the
+  // job reached a terminal state) refetch the snapshot to pull the terminal-only
+  // fields — build_id, error, finished_at — instead of leaving the stale
+  // watch-time values on screen until a manual re-watch.
+  useEffect(() => {
+    if (stream.status === "closed") void refetch();
+  }, [stream.status, refetch]);
 
   return (
     <section className="watch">
@@ -50,7 +58,9 @@ export function JobWatcher() {
         </p>
       )}
       {jobId !== null && isPending && <p className="runs__muted">Loading job…</p>}
-      {jobId !== null && isError && (
+      {/* only surface the error when there is no snapshot to show — a failed
+          post-close refetch must not blank (or stack over) an already-loaded job */}
+      {jobId !== null && isError && !job && (
         <p className="runs__muted runs__muted--error">
           Could not load job: {error instanceof Error ? error.message : "unknown error"}
         </p>

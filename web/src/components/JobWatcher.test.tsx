@@ -107,6 +107,43 @@ describe("JobWatcher", () => {
     expect(screen.queryByText("loading")).not.toBeInTheDocument();
   });
 
+  it("refetches the snapshot when the stream closes so terminal-only fields appear", async () => {
+    // the running snapshot has no build_id/error yet; JobEvent never carries them,
+    // so closing the stream must refetch to surface the failure detail (Codex #67)
+    vi.spyOn(api, "GET")
+      .mockResolvedValueOnce({
+        data: { data: job({ status: "running", build_id: null, error: null }), meta: {} },
+        error: undefined,
+      } as never)
+      .mockResolvedValue({
+        data: {
+          data: job({
+            status: "failed",
+            build_id: "b-final",
+            error: { code: "INTERNAL", message: "boom", details: null, request_id: "0" },
+          }),
+          meta: {},
+        },
+        error: undefined,
+      } as never);
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          sseResponse([
+            `event: job.failed\ndata: {"job_id":"${JOB_ID}","status":"failed","step":null,"progress":1,"message":"failed","ts":"2026-07-02T07:00:00Z"}\n\n`,
+          ]),
+        ),
+    );
+    renderWithProviders(<JobWatcher />);
+    enter(JOB_ID);
+
+    // the refetched terminal snapshot supplies the error message and build id
+    expect(await screen.findByText("boom")).toBeInTheDocument();
+    expect(screen.getByText("b-final")).toBeInTheDocument();
+  });
+
   it("fails loud when the job can't be loaded", async () => {
     stubApiError();
     renderWithProviders(<JobWatcher />);
