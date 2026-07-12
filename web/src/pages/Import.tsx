@@ -8,13 +8,29 @@ import "./Import.css";
 
 import type { JobAccepted, Project, Source, TriggerKind } from "../api/queries";
 
-// Whether a project's config carries an ontology. The graph stage raises
-// OntologyRequiredError for a build that has ANY text document and no
-// config.ontology (core/builds/stages.py:177-182) — structured-only builds don't
-// need one. NewProjectForm creates config-less projects, so a text build over a
-// UI-created project is otherwise guaranteed to fail (Codex #70).
+// Whether a project's config carries a KNOWN-VALID ontology — presence is not
+// enough. The graph stage raises OntologyRequiredError for a build with ANY text
+// document and no config.ontology (core/builds/stages.py:177-182; structured-only
+// builds don't need one), and a present-but-malformed block fails even earlier:
+// _load_ontology (core/builds/config.py:161-179) rejects unknown keys, non-string
+// type entries, and a proposal_policy outside {"review","auto"}, and TextOntology
+// requires BOTH entity_types and relation_types to be non-empty with every entry
+// non-blank (core/graph/ontology.py:77-85) — all raising BuildConfigError before
+// the pipeline runs. This mirrors that acceptance exactly, so the gate fails
+// closed on any shape the worker would refuse (Codex #70).
 function hasOntology(config: Project["config"] | undefined): boolean {
-  return config != null && config.ontology != null;
+  const block = config?.ontology;
+  if (typeof block !== "object" || block === null || Array.isArray(block)) return false;
+  const record = block as Record<string, unknown>;
+  const allowed = new Set(["entity_types", "relation_types", "proposal_policy"]);
+  if (Object.keys(record).some((k) => !allowed.has(k))) return false;
+  if ("proposal_policy" in record) {
+    const policy = record.proposal_policy;
+    if (policy !== "review" && policy !== "auto") return false;
+  }
+  const typeList = (v: unknown): boolean =>
+    Array.isArray(v) && v.length > 0 && v.every((t) => typeof t === "string" && t.trim() !== "");
+  return typeList(record.entity_types) && typeList(record.relation_types);
 }
 
 // The source kinds the ingest pipeline actually wires (core/builds/sources.py
@@ -336,9 +352,9 @@ function RunPipeline({
       </p>
       {ontologyBlocked && (
         <p className="npf__error">
-          This project has no ontology configured, so a build over text sources fails at the graph
-          stage. Set <code>config.ontology</code> via the API/CLI (structured sources don&apos;t
-          need one).
+          This project has no valid ontology configured (entity_types + relation_types both
+          non-empty), so a build over text sources fails before the graph stage. Set{" "}
+          <code>config.ontology</code> via the API/CLI (structured sources don&apos;t need one).
         </p>
       )}
       {unresolvable.length > 0 && (

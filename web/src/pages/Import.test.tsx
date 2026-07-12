@@ -248,7 +248,7 @@ describe("Import", () => {
       data: { data: [source({ kind: "text", uri: "file:///data/corpus/" })], meta: META },
       error: undefined,
     });
-    expect(await screen.findByText(/no ontology configured/i)).toBeInTheDocument();
+    expect(await screen.findByText(/no valid ontology configured/i)).toBeInTheDocument();
     expect(build).toBeDisabled();
   });
 
@@ -260,21 +260,39 @@ describe("Import", () => {
     // create→text-source→build over a UI-created (config-less) project would fail at
     // the graph stage with OntologyRequiredError — the run must be blocked, not
     // accepted as a job guaranteed to fail after spending work
-    expect(await screen.findByText(/no ontology configured/i)).toBeInTheDocument();
+    expect(await screen.findByText(/no valid ontology configured/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /^ingest$/i })).toBeDisabled();
     expect(post).not.toHaveBeenCalled();
   });
 
   it("does not block a text build once an ontology is configured", async () => {
+    stubImportGets(
+      {
+        ...project("acme"),
+        config: { ontology: { entity_types: ["Person"], relation_types: ["WORKS_AT"] } },
+      },
+      [source({ kind: "text", uri: "file:///data/corpus/" })],
+    );
+    renderImport(projectRoute("acme", "import"));
+
+    await screen.findByText("file:///data/corpus/"); // the source list resolved
+    expect(screen.queryByText(/no valid ontology configured/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^build$/i })).toBeEnabled();
+  });
+
+  it("blocks a text build when the ontology is present but malformed", async () => {
+    // presence is not validity: _load_ontology/TextOntology reject a block with
+    // missing/empty relation_types (BuildConfigError before the pipeline runs), so
+    // a config patched via API/CLI with a half-formed ontology must gate exactly
+    // like a missing one
     stubImportGets({ ...project("acme"), config: { ontology: { entity_types: ["Person"] } } }, [
       source({ kind: "text", uri: "file:///data/corpus/" }),
     ]);
     renderImport(projectRoute("acme", "import"));
 
-    await screen.findByText("file:///data/corpus/"); // the source list resolved
-    expect(screen.queryByText(/no ontology configured/i)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^build$/i })).toBeEnabled();
+    expect(await screen.findByText(/no valid ontology configured/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
   });
 
   it("does not block a structured-only build without an ontology", async () => {
@@ -289,7 +307,7 @@ describe("Import", () => {
     renderImport(projectRoute("acme", "import"));
 
     await screen.findByText("file:///data/rows.csv");
-    expect(screen.queryByText(/no ontology configured/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/no valid ontology configured/i)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^build$/i })).toBeEnabled();
   });
 
@@ -298,9 +316,10 @@ describe("Import", () => {
     // non-file scheme, or missing structured metadata — resolve_source raises on
     // any of them, so ONE such source fails every build at ingest, regardless of
     // ontology; the run gate must check the whole list
-    stubImportGets({ ...project("acme"), config: { ontology: { entity_types: ["P"] } } }, [
-      source({ kind: "url", uri: "https://example.com/feed" }),
-    ]);
+    stubImportGets(
+      { ...project("acme"), config: { ontology: { entity_types: ["P"], relation_types: ["R"] } } },
+      [source({ kind: "url", uri: "https://example.com/feed" })],
+    );
     renderImport(projectRoute("acme", "import"));
 
     expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
@@ -312,9 +331,10 @@ describe("Import", () => {
     // a host-bearing (or query/hash-bearing) file uri doesn't raise — _local_path
     // reads only urlparse(uri).path, so the build would silently ingest /corpus
     // instead of the registered NAS target: wrong data, worse than a loud failure
-    stubImportGets({ ...project("acme"), config: { ontology: { entity_types: ["P"] } } }, [
-      source({ kind: "text", uri: "file://nas/corpus" }),
-    ]);
+    stubImportGets(
+      { ...project("acme"), config: { ontology: { entity_types: ["P"], relation_types: ["R"] } } },
+      [source({ kind: "text", uri: "file://nas/corpus" })],
+    );
     renderImport(projectRoute("acme", "import"));
 
     expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
@@ -326,9 +346,10 @@ describe("Import", () => {
     // trailing space in the path (verified live), while new URL()/trim() strip
     // it, so a trimmed check would pass a source whose build reads a different
     // path than displayed; stored uris must be validated exactly as stored
-    stubImportGets({ ...project("acme"), config: { ontology: { entity_types: ["P"] } } }, [
-      source({ kind: "text", uri: "file:///data/corpus " }),
-    ]);
+    stubImportGets(
+      { ...project("acme"), config: { ontology: { entity_types: ["P"], relation_types: ["R"] } } },
+      [source({ kind: "text", uri: "file:///data/corpus " })],
+    );
     renderImport(projectRoute("acme", "import"));
 
     expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
@@ -427,9 +448,10 @@ describe("Import", () => {
   it("blocks runs when a structured source lacks its table/pk_column metadata", async () => {
     // _required_meta raises for a structured source without non-empty table +
     // pk_column, so it is unresolvable even though its kind and scheme are wired
-    stubImportGets({ ...project("acme"), config: { ontology: { entity_types: ["P"] } } }, [
-      source({ kind: "structured", uri: "file:///data/rows.csv", metadata: {} }),
-    ]);
+    stubImportGets(
+      { ...project("acme"), config: { ontology: { entity_types: ["P"], relation_types: ["R"] } } },
+      [source({ kind: "structured", uri: "file:///data/rows.csv", metadata: {} })],
+    );
     renderImport(projectRoute("acme", "import"));
 
     expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
