@@ -79,7 +79,7 @@ test("console shell loads with the project switcher and section nav", async ({ p
   await expect(page.getByRole("status")).toHaveText("Healthy");
   await expect(page.getByText("chunks")).toBeVisible();
   await expect(page.getByRole("combobox", { name: /project/i })).toHaveValue("acme");
-  for (const label of ["Health", "Jobs", "Review", "Playground"]) {
+  for (const label of ["Health", "Import", "Inspect", "Jobs", "Review", "Playground"]) {
     await expect(page.getByRole("link", { name: label })).toBeVisible();
   }
 });
@@ -321,4 +321,82 @@ test("the import section registers a source and triggers a build", async ({ page
   // 400-rejected by presence, so nothing may ride along (BA2e-1)
   await expect.poll(() => buildPath).toMatch(/\/build$/);
   expect(buildBody).toBeNull();
+});
+
+function documentsResponse(rows: unknown[], meta: Record<string, unknown> = {}) {
+  return {
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: rows,
+      meta: {
+        request_id: "00000000-0000-0000-0000-000000000000",
+        build_id: "b1111111-aaaa-4aaa-8aaa-000000000001",
+        elapsed_ms: 1,
+        schema_version: "0.5",
+        ...meta,
+      },
+    }),
+  };
+}
+
+test("inspect browses the active build's documents and opens a detail-only field", async ({
+  page,
+}) => {
+  await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+
+  // the list request the page issues — captured so the flow can assert what it did NOT
+  // send: the frozen op params expose sort/filter, but the API 400s any filter[...] and
+  // (on chunks) EVERY explicit sort, so the client must send neither
+  let listUrl: string | null = null;
+  await page.route("**/projects/*/documents?*", (route) => {
+    listUrl = route.request().url();
+    return route.fulfill(
+      documentsResponse([
+        {
+          id: "d1111111-aaaa-4aaa-8aaa-000000000001",
+          build_id: "b1111111-aaaa-4aaa-8aaa-000000000001",
+          source_uri: "file:///data/corpus/a.txt",
+          mime: "text/plain",
+          status: "ingested",
+          ingested_at: "2026-07-13T04:00:00Z",
+        },
+      ]),
+    );
+  });
+  // `raw` comes back on the DETAIL read only — the list omits the key entirely, which
+  // is what a row click is for
+  await page.route("**/projects/*/documents/*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          id: "d1111111-aaaa-4aaa-8aaa-000000000001",
+          build_id: "b1111111-aaaa-4aaa-8aaa-000000000001",
+          source_uri: "file:///data/corpus/a.txt",
+          raw: "Ada Lovelace worked at the Analytical Engine.",
+        },
+        meta: {
+          request_id: "00000000-0000-0000-0000-000000000000",
+          build_id: "b1111111-aaaa-4aaa-8aaa-000000000001",
+          elapsed_ms: 1,
+          schema_version: "0.5",
+        },
+      }),
+    }),
+  );
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "Inspect" }).click();
+  await expect(page.getByRole("heading", { name: /^inspect$/i })).toBeVisible();
+
+  await expect(page.getByRole("button", { name: "file:///data/corpus/a.txt" })).toBeVisible();
+  await expect.poll(() => listUrl).toContain("/documents?");
+  expect(listUrl).not.toContain("sort");
+  expect(listUrl).not.toContain("filter");
+
+  await page.getByRole("button", { name: "file:///data/corpus/a.txt" }).click();
+  await expect(page.getByText("Ada Lovelace worked at the Analytical Engine.")).toBeVisible();
 });

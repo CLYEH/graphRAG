@@ -1,0 +1,156 @@
+.inspect {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.inspect__title {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.inspect__hint,
+.inspect__line,
+.inspect__muted {
+  margin: 0;
+  color: var(--muted, #666);
+  font-size: 0.9rem;
+}
+
+.inspect__line--error,
+.inspect__muted--error {
+  color: var(--bad, #b00020);
+}
+
+.inspect__tabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border, #ddd);
+}
+
+.inspect__tab {
+  padding: 0.4rem 0.8rem;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+.inspect__tab--active {
+  border-bottom-color: currentColor;
+  font-weight: 600;
+}
+
+.inspect__panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.inspect__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.inspect__table th,
+.inspect__table td {
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border, #eee);
+  text-align: left;
+  vertical-align: top;
+}
+
+/* Headers are short known words — never break them mid-word ("Ordina/l"), which is
+   what the value rule below does to a narrow column. */
+.inspect__table th {
+  white-space: nowrap;
+}
+
+/* Corpus values (uris, ids, chunk text) are arbitrary length and can be one
+   unbroken token — wrap anywhere rather than let a single uri stretch the table
+   off-screen. */
+.inspect__table td {
+  overflow-wrap: anywhere;
+}
+
+.inspect__row--selected {
+  background: var(--surface-2, #f5f5f5);
+}
+
+.inspect__rowbtn {
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+}
+
+.inspect__more {
+  align-self: flex-start;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+  font: inherit;
+}
+
+.inspect__detail {
+  padding: 0.75rem;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 4px;
+}
+
+.inspect__detail-title {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.inspect__fields {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+}
+
+.inspect__field {
+  display: grid;
+  grid-template-columns: 9rem 1fr;
+  gap: 0.5rem;
+}
+
+.inspect__field dt {
+  color: var(--muted, #666);
+  font-size: 0.85rem;
+}
+
+.inspect__field dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.inspect__pre {
+  max-height: 20rem;
+  margin: 0;
+  overflow: auto;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+}
+
+.inspect__evidence {
+  margin: 0;
+  padding-left: 1rem;
+}
+
+.inspect__evidence-type {
+  color: var(--muted, #666);
+  font-size: 0.8rem;
+}
+
+.inspect__evidence-src {
+  display: block;
+  color: var(--muted, #666);
+  font-size: 0.8rem;
+}

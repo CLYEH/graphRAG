@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api } from "./client";
 import { isPathAddressable } from "../project/projectRoute";
@@ -13,6 +13,8 @@ export type JobAccepted = components["schemas"]["JobAccepted"];
 export type Job = components["schemas"]["Job"];
 export type MergeCandidate = components["schemas"]["MergeCandidate"];
 export type MergeCandidateStatus = components["schemas"]["MergeCandidateStatus"];
+export type Document = components["schemas"]["Document"];
+export type Chunk = components["schemas"]["Chunk"];
 export type QueryMode = components["schemas"]["QueryMode"];
 export type QueryResult = components["schemas"]["QueryResult"];
 
@@ -383,6 +385,112 @@ export function useTrigger(project: string) {
           : await api.POST("/projects/{project}/build", { params });
       if (res.error) throw new Error(res.error.error.message);
       return res.data.data;
+    },
+  });
+}
+
+// ---- FE3 Inspect (BA3 reads) ------------------------------------------------
+//
+// DESIGN §10.2 names this page 檢視(文件/chunks) — the ingested documents and the
+// chunks they were split into. Entity/relation detail with evidence is the spec'd
+// content of a DIFFERENT page (圖譜互動探索 / FE4: "點邊顯示 type/confidence/
+// evidence/來源"), so the entity/relation reads are FE4's, not this task's.
+//
+// Three things the frozen contract makes non-negotiable here:
+//
+// 1. NEVER send `sort` or `filter[...]`. The op params still expose them, but
+//    `reject_unsupported_query` (api/routers/_query.py) 400s any `filter[...]` and
+//    any sort other than the list's own default — and for CHUNKS, whose default
+//    order is the compound (document_id, ordinal), it rejects EVERY explicit sort
+//    (`sort_field=None`). Verified live: `?sort=id:desc` on chunks → HTTP 400.
+// 2. Each request re-resolves the ACTIVE build, so a build activated mid-pagination
+//    would splice page 1 (old build) with page 2 (new) — a silently mixed corpus.
+//    Every page carries `meta.build_id`; the page pins it and fails loud on a swap.
+//    (No active build at all is a 409 NO_ACTIVE_BUILD, verified live — never a 200
+//    with an empty list, so an empty table really does mean an empty build.)
+// 3. A missing row answers 404 with `error.code = "VALIDATION_ERROR"` — `code_for_status`
+//    maps EVERY 4xx to that code, so it cannot distinguish "gone" from "bad request".
+//    Branch on the HTTP STATUS.
+
+const INSPECT_PAGE = 50;
+
+/** One page of a build-scoped list: its rows, the build that served them, and the
+ *  cursor to the next page (absent = last page). */
+export type InspectPage<T> = { rows: T[]; buildId: string | null; next?: string };
+
+function useInspectList<T>(
+  key: string,
+  project: string | undefined,
+  fetchPage: (project: string, cursor?: string) => Promise<InspectPage<T>>,
+) {
+  return useInfiniteQuery({
+    queryKey: [key, project],
+    enabled: project !== undefined && isPathAddressable(project),
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) => fetchPage(project as string, pageParam),
+    getNextPageParam: (last: InspectPage<T>) => last.next,
+  });
+}
+
+async function fetchDocuments(project: string, cursor?: string): Promise<InspectPage<Document>> {
+  const { data, error } = await api.GET("/projects/{project}/documents", {
+    params: { path: { project }, query: { limit: INSPECT_PAGE, cursor } },
+  });
+  if (error) throw new Error(error.error.message);
+  return { rows: data.data, buildId: data.meta.build_id, next: data.meta.next_cursor ?? undefined };
+}
+
+async function fetchChunks(project: string, cursor?: string): Promise<InspectPage<Chunk>> {
+  const { data, error } = await api.GET("/projects/{project}/chunks", {
+    params: { path: { project }, query: { limit: INSPECT_PAGE, cursor } },
+  });
+  if (error) throw new Error(error.error.message);
+  return { rows: data.data, buildId: data.meta.build_id, next: data.meta.next_cursor ?? undefined };
+}
+
+export const useDocuments = (project: string | undefined) =>
+  useInspectList("documents", project, fetchDocuments);
+export const useChunks = (project: string | undefined) =>
+  useInspectList("chunks", project, fetchChunks);
+
+// A 404 here means "no such row IN THE ACTIVE BUILD" — ids are minted per build, so a
+// row id from a superseded build cannot resolve in the current one. Say that, rather
+// than echoing the generic VALIDATION_ERROR message every 4xx carries.
+function detailError(status: number, message: string): Error {
+  return new Error(
+    status === 404
+      ? "Not found in the active build — it may belong to an older build, or the active build changed. Reload the list."
+      : message,
+  );
+}
+
+// Detail reads. `Document.raw` is returned ONLY here — the list omits the key entirely
+// (verified against a real build), which is what a row click is for.
+export function useDocument(project: string | undefined, id: string | undefined) {
+  return useQuery({
+    queryKey: ["document", project, id],
+    enabled: project !== undefined && isPathAddressable(project) && id !== undefined,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET(
+        "/projects/{project}/documents/{document_id}",
+        { params: { path: { project: project as string, document_id: id as string } } },
+      );
+      if (error) throw detailError(response.status, error.error.message);
+      return data.data;
+    },
+  });
+}
+
+export function useChunk(project: string | undefined, id: string | undefined) {
+  return useQuery({
+    queryKey: ["chunk", project, id],
+    enabled: project !== undefined && isPathAddressable(project) && id !== undefined,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/projects/{project}/chunks/{chunk_id}", {
+        params: { path: { project: project as string, chunk_id: id as string } },
+      });
+      if (error) throw detailError(response.status, error.error.message);
+      return data.data;
     },
   });
 }
