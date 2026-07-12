@@ -10,7 +10,7 @@ export function RootRedirect() {
   if (isPending) return <p className="root-status">Loading…</p>;
   if (isError) return <p className="root-status">Could not reach the API.</p>;
   if (projects && projects.length > 0)
-    return <Navigate to={`/p/${projects[0].name}/health`} replace />;
+    return <Navigate to={`/p/${encodeURIComponent(projects[0].name)}/health`} replace />;
 
   return (
     <section className="root-status">

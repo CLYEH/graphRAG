@@ -81,4 +81,15 @@ describe("App shell", () => {
 
     expect(await screen.findByRole("heading", { name: /not found/i })).toBeInTheDocument();
   });
+
+  it("keeps a project whose key has URL-reserved characters openable", async () => {
+    // the frozen contract allows any non-empty project key (store tests use
+    // slashes/unicode); a raw `/p/${key}` would strand it on NotFound, so the
+    // segment is percent-encoded and the router decodes it back (Codex #65 P2)
+    stubProjects([project("a/b", "Slashy")]);
+    renderWithProviders(<App />, { route: "/" });
+
+    expect(await screen.findByRole("heading", { name: /project health/i })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue("a/b");
+  });
 });

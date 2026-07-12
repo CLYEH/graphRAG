@@ -20,7 +20,7 @@ export function ProjectSwitcher() {
       <select
         className="switcher__select"
         value={project ?? ""}
-        onChange={(e) => navigate(`/p/${e.target.value}`)}
+        onChange={(e) => navigate(`/p/${encodeURIComponent(e.target.value)}`)}
       >
         {projects.map((p) => (
           <option key={p.name} value={p.name}>
