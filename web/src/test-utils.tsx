@@ -7,7 +7,7 @@ import { api } from "./api/client";
 import { encodeProjectSegment } from "./project/projectRoute";
 
 import type { ReactElement } from "react";
-import type { Project } from "./api/queries";
+import type { HealthReport, Project } from "./api/queries";
 
 // Builds the encoded route for a project key, so tests exercise the real
 // encode/decode path rather than hardcoding a raw `/p/<key>` segment.
@@ -31,42 +31,79 @@ const META = {
   next_cursor: null,
 };
 
+const HEALTH_PATH = "/projects/{project}/health";
+
 // The typed client binds globalThis.fetch at construction, so tests mock the
 // client method rather than the global fetch — this also keeps the
 // query→component contract (envelope unwrapping) under test. `as never` sidesteps
-// openapi-fetch's overloaded GET signature for a fixture value.
-export function stubProjects(projects: Project[]) {
+// openapi-fetch's overloaded GET signature. The mock routes by path so a view
+// that lands on the health route (which fetches /health) gets a valid report
+// instead of the projects envelope; pass `health` to override the default.
+export function stubProjects(projects: Project[], health: HealthReport = healthReport()) {
   return vi
     .spyOn(api, "GET")
-    .mockResolvedValue({ data: { data: projects, meta: META }, error: undefined } as never);
+    .mockImplementation(((path: string) =>
+      Promise.resolve(
+        path === HEALTH_PATH
+          ? { data: { data: health, meta: META }, error: undefined }
+          : { data: { data: projects, meta: META }, error: undefined },
+      )) as never);
 }
 
-// Feeds api.GET one call per page, chaining next_cursor across pages (null on
-// the last) — so tests can prove the switcher pages through, not just page 1.
-export function stubProjectsPages(pages: Project[][]) {
-  const spy = vi.spyOn(api, "GET");
-  pages.forEach((page, i) => {
+// Feeds the /projects query one call per page, chaining next_cursor across pages
+// (null on the last) — so tests can prove the switcher pages through, not just
+// page 1. The interleaved /health call is answered separately and does not
+// advance the page cursor.
+export function stubProjectsPages(pages: Project[][], health: HealthReport = healthReport()) {
+  let call = 0;
+  return vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+    if (path === HEALTH_PATH)
+      return Promise.resolve({ data: { data: health, meta: META }, error: undefined });
+    const i = call++;
     const next = i < pages.length - 1 ? `cursor-${i + 1}` : null;
-    spy.mockResolvedValueOnce({
-      data: { data: page, meta: { ...META, next_cursor: next } },
+    return Promise.resolve({
+      data: { data: pages[i] ?? [], meta: { ...META, next_cursor: next } },
       error: undefined,
-    } as never);
-  });
-  return spy;
+    });
+  }) as never);
 }
+
+const errorEnvelope = {
+  data: undefined,
+  error: {
+    error: {
+      code: "STORE_UNAVAILABLE",
+      message: "down",
+      details: null,
+      request_id: META.request_id,
+    },
+  },
+};
 
 export function stubProjectsError() {
-  return vi.spyOn(api, "GET").mockResolvedValue({
-    data: undefined,
-    error: {
-      error: {
-        code: "STORE_UNAVAILABLE",
-        message: "down",
-        details: null,
-        request_id: META.request_id,
-      },
-    },
-  } as never);
+  return vi.spyOn(api, "GET").mockResolvedValue(errorEnvelope as never);
+}
+
+export function healthReport(overrides: Partial<HealthReport> = {}): HealthReport {
+  return {
+    status: "healthy",
+    active_build_id: null,
+    counts: {},
+    pending_review: 0,
+    drift: null,
+    warnings: [],
+    ...overrides,
+  };
+}
+
+export function stubHealth(report: HealthReport) {
+  return vi
+    .spyOn(api, "GET")
+    .mockResolvedValue({ data: { data: report, meta: META }, error: undefined } as never);
+}
+
+export function stubHealthError() {
+  return vi.spyOn(api, "GET").mockResolvedValue(errorEnvelope as never);
 }
 
 export function project(name: string, displayName?: string): Project {

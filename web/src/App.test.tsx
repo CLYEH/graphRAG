@@ -47,9 +47,10 @@ describe("App shell", () => {
     fireEvent.change(select, { target: { value: "beta" } });
 
     // navigating to /p/beta redirects to its health page and the switcher
-    // reflects the new active project (read back from the URL param)
+    // reflects the new active project (read back from the URL param). The health
+    // page loads async now, so await its heading rather than reading it sync.
     expect(await screen.findByRole("combobox", { name: /project/i })).toHaveValue("beta");
-    expect(screen.getByRole("heading", { name: /project health/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /project health/i })).toBeInTheDocument();
   });
 
   it("shows an empty state at the root when there are no projects", async () => {
