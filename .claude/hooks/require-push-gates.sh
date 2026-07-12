@@ -70,7 +70,16 @@ norm="$(printf '%s' "$payload" | tr -d '"'\''\\$')"
 # engage on `git [flags] push` incl. `git -C <path> push` and `git --git-dir=<p> push`
 # (must not engage on e.g. `git log push-fix`) — AND on gh PR creation, which
 # can push the branch itself (the same effect through a sibling command).
-flags='([[:space:]]+-[A-Za-z-]+(=[^[:space:]]+|[[:space:]]+[^[:space:]]+)?)*'
+# A flag TOKEN runs from `-` to the next whitespace — that is what bash hands
+# the program — so pflag's ATTACHED shorthand value lives INSIDE the one token
+# (`-RCLYEH/graphRAG`, `-nNNN`, `--repo=X`). The class must therefore be
+# [^space], not [A-Za-z-]: the latter stopped at the `/` in `-RCLYEH/graphRAG`,
+# so `gh -RCLYEH/graphRAG pr create` never matched and slipped engagement —
+# skipping BOTH the receipt checks and the --head ban (Codex #64 P1). Modeling
+# the token (delimited by whitespace) rather than enumerating value spellings
+# closes the whole attached-shorthand class at once. The optional trailing
+# group still catches a SPACE-separated value (`--repo X`, `-C /path`).
+flags='([[:space:]]+-[^[:space:]]+([[:space:]]+[^[:space:]]+)?)*'
 gh_engaged=0
 printf '%s' "$norm" | grep -Eq "gh${flags}[[:space:]]+pr${flags}[[:space:]]+(create|new)\b" && gh_engaged=1
 printf '%s' "$norm" | grep -Eq "git${flags}[[:space:]]+push\b" || [ "$gh_engaged" = 1 ] || exit 0

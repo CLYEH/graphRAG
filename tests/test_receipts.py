@@ -446,12 +446,16 @@ def test_pr_create_engages_the_gate_too(toy_repo: Path) -> None:
     subprocess.run(["git", "commit", "-qam", "fe"], cwd=toy_repo, check=True, capture_output=True)
     env = _uv_shim(toy_repo)
 
-    # every documented spelling engages: plain, global-flagged, persistent-
-    # flagged, and the `new` alias (Codex #64 R4 — same effect, same gate)
+    # every documented spelling engages: plain, global-flagged (space AND
+    # ATTACHED pflag shorthand — `-RCLYEH/graphRAG`, Codex #64 P1: the `/` is
+    # part of the flag token, so a [A-Za-z-] class stopped short and let this
+    # slip engagement), persistent-flagged, and the `new` alias (Codex #64 R4).
     for payload in (
         f"{_PR_CREATE} --fill --base main",
         f"gh -R CLYEH/graphRAG pr {_PR_CREATE.split()[-1]} --fill",
+        f"gh -RCLYEH/graphRAG pr {_PR_CREATE.split()[-1]} --fill",
         f"gh pr --repo CLYEH/graphRAG {_PR_CREATE.split()[-1]}",
+        f"gh pr --repo=CLYEH/graphRAG {_PR_CREATE.split()[-1]}",
         "gh pr " + "n" + "ew",
     ):
         denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=payload, extra_env=env)
@@ -531,6 +535,23 @@ def test_gh_head_is_banned_even_when_fully_receipted(toy_repo: Path) -> None:
     denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=broken_verb, extra_env=env)
     assert denied.returncode == 2, f"broken verb slipped: {denied.stdout}"
     assert "already-remote" in denied.stderr, f"wrong rule denied (verb): {denied.stderr}"
+
+    # ATTACHED pflag shorthand for the inherited repo flag (`-RCLYEH/graphRAG`)
+    # must ENGAGE so the ban still fires (Codex #64 P1). This is the
+    # DISCRIMINATING pin the old `-RCLYEH… --fill` green case could not be: on a
+    # fully-receipted repo a non-engaging payload ALSO returns 0, so only a
+    # payload that must DENY when engaged (— has --head —) proves engagement.
+    for pref in (
+        "gh -RCLYEH/graphRAG pr",
+        "gh -R CLYEH/graphRAG pr",
+        "gh pr --repo=CLYEH/graphRAG",
+    ):
+        payload = f"{pref} {_PR_CREATE.split()[-1]} --head release-x"
+        denied = _run([BASH, GATE_SCRIPT], toy_repo, stdin=payload, extra_env=env)
+        assert denied.returncode == 2, (
+            f"attached -R slipped engagement ({payload}): {denied.stdout}"
+        )
+        assert "already-remote" in denied.stderr, f"wrong rule ({payload}): {denied.stderr}"
 
     # the flagless form stays green, and the repo flag's value may carry a
     # capital H without false-matching — in BOTH spellings (the ATTACHED form
