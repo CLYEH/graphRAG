@@ -157,7 +157,16 @@ export function useDecideMergeCandidate(project: string) {
       verb: ReviewVerb;
       reason: string | null;
     }) => {
-      const params = { path: { project, candidate_id: candidateId } };
+      // A deterministic key per (candidate, verb): if a response is lost after the
+      // server commits the decision, the curator's retry replays the stored 200
+      // instead of hitting an illegal-transition 400 on the now-decided candidate
+      // (which would misreport a successful review as failed). The transition model
+      // makes each (candidate, verb) a once-only operation, so this natural key is
+      // stable across retries without extra state; the endpoints dedupe on it.
+      const params = {
+        path: { project, candidate_id: candidateId },
+        header: { "Idempotency-Key": `${candidateId}:${verb}` },
+      };
       const body = { reason };
       const res =
         verb === "approve"

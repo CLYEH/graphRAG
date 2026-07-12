@@ -89,7 +89,10 @@ describe("CandidatesTable", () => {
       expect(post).toHaveBeenCalledWith(
         "/projects/{project}/merge-candidates/{candidate_id}/reject",
         {
-          params: { path: { project: "acme", candidate_id: CID } },
+          params: {
+            path: { project: "acme", candidate_id: CID },
+            header: { "Idempotency-Key": `${CID}:reject` },
+          },
           body: { reason: "obvious dupes" },
         },
       ),
@@ -106,8 +109,40 @@ describe("CandidatesTable", () => {
     await waitFor(() =>
       expect(post).toHaveBeenCalledWith(
         "/projects/{project}/merge-candidates/{candidate_id}/approve",
-        { params: { path: { project: "acme", candidate_id: CID } }, body: { reason: null } },
+        {
+          params: {
+            path: { project: "acme", candidate_id: CID },
+            header: { "Idempotency-Key": `${CID}:approve` },
+          },
+          body: { reason: null },
+        },
       ),
     );
+  });
+
+  it("reuses one idempotency key across retries of the same decision (Codex #68)", async () => {
+    // if the first response is lost after the server commits, the retry must carry
+    // the SAME key so the endpoint replays the 200 rather than 400-ing on the
+    // already-decided candidate — a random-per-click key would defeat that.
+    stubMergeCandidates([mergeCandidate({ id: CID, status: "pending" })]);
+    const post = stubDecision(mergeCandidate({ id: CID, status: "approved" }));
+    renderWithProviders(<CandidatesTable project="acme" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /approve/i }));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByRole("button", { name: /approve/i })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: /approve/i }));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+
+    const expected = {
+      params: {
+        path: { project: "acme", candidate_id: CID },
+        header: { "Idempotency-Key": `${CID}:approve` },
+      },
+      body: { reason: null },
+    };
+    const path = "/projects/{project}/merge-candidates/{candidate_id}/approve";
+    expect(post).toHaveBeenNthCalledWith(1, path, expected);
+    expect(post).toHaveBeenNthCalledWith(2, path, expected);
   });
 });
