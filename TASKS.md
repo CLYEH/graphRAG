@@ -93,5 +93,5 @@ Keep items small enough to finish in one loop.
 - [x] FE7 Project Health home
 - [x] FE8 Pipeline/jobs dashboard
 - [x] FE5 Entity-resolution review UI
-- [ ] FE6 Query playground UI
+- [x] FE6 Query playground UI
 - [ ] FE1 Import · [ ] FE2 Clean · [ ] FE3 Inspect · [ ] FE4 Graph explorer  *(v2)*

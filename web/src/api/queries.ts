@@ -11,6 +11,8 @@ export type Build = components["schemas"]["Build"];
 export type Job = components["schemas"]["Job"];
 export type MergeCandidate = components["schemas"]["MergeCandidate"];
 export type MergeCandidateStatus = components["schemas"]["MergeCandidateStatus"];
+export type QueryMode = components["schemas"]["QueryMode"];
+export type QueryResult = components["schemas"]["QueryResult"];
 
 // Lists every project for the switcher. The switcher must reach any project,
 // so page through meta.next_cursor to exhaustion rather than showing only the
@@ -197,5 +199,67 @@ export function useDecideMergeCandidate(project: string) {
       return res.data.data;
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["merge-candidates", project] }),
+  });
+}
+
+// The graph invocation carried in the contract's `options` channel (DESIGN §27.6).
+// The generated schema types `options` as an open object, so the shape the runtime
+// GraphOptions model enforces (api/schemas.py, extra="forbid") is declared here.
+export type GraphOptions = {
+  template: "neighbors" | "path" | "subgraph";
+  entity: string;
+  other_entity?: string | null;
+  hops?: number;
+};
+
+export interface QueryForm {
+  mode: QueryMode;
+  query: string;
+  topK: number | null;
+  options: GraphOptions | null;
+}
+
+// Builds the per-mode request body. The codegen types all five query endpoints
+// with one permissive QueryRequest, but the runtime enforces per-mode
+// `extra="forbid"` models that reject a field by its PRESENCE (model_fields_set),
+// so keys are included conditionally, never sent as null: semantic/sql/global
+// take query + optional top_k; graph takes query + options (no top_k); hybrid
+// takes query, optional top_k, and optional options (omitted — never null — to
+// skip the graph mode). `query` is required for every mode, graph included.
+export function queryBody(form: QueryForm): components["schemas"]["QueryRequest"] {
+  const body: components["schemas"]["QueryRequest"] = { query: form.query };
+  if (form.mode === "graph") {
+    if (form.options) body.options = form.options;
+    return body;
+  }
+  if (form.topK !== null) body.top_k = form.topK;
+  if (form.mode === "hybrid" && form.options) body.options = form.options;
+  return body;
+}
+
+// Runs a query against the active build (DESIGN §21/§22). A query is a read-only
+// RPC — no Idempotency-Key and no cache invalidation (nothing changes server-side)
+// — run on submit. The mode rides the URL, so switch to keep the path a codegen
+// literal. Errors (503 unconfigured / 409 no active build / 400 rejected field /
+// 404) throw so the page fails loud; §22 degradation instead comes back 200 with
+// warnings, which the caller renders from the returned QueryResult.
+export function useRunQuery(project: string) {
+  return useMutation({
+    mutationFn: async (form: QueryForm) => {
+      const params = { path: { project } };
+      const body = queryBody(form);
+      const res =
+        form.mode === "semantic"
+          ? await api.POST("/projects/{project}/query/semantic", { params, body })
+          : form.mode === "sql"
+            ? await api.POST("/projects/{project}/query/sql", { params, body })
+            : form.mode === "global"
+              ? await api.POST("/projects/{project}/query/global", { params, body })
+              : form.mode === "graph"
+                ? await api.POST("/projects/{project}/query/graph", { params, body })
+                : await api.POST("/projects/{project}/query/hybrid", { params, body });
+      if (res.error) throw new Error(res.error.error.message);
+      return res.data.data;
+    },
   });
 }
