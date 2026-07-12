@@ -1,0 +1,110 @@
+import { useState } from "react";
+
+import { useBuilds } from "../api/queries";
+
+import type { Build } from "../api/queries";
+
+// BuildStatus (DESIGN §4/§14) → badge tone shared with the health status light.
+const TONE: Record<Build["status"], string> = {
+  active: "ok",
+  ready: "info",
+  building: "warn",
+  failed: "bad",
+  archived: "muted",
+};
+
+function fmt(ts: string | null | undefined): string {
+  return ts ? ts.replace("T", " ").replace(/\..*$/, "").replace("Z", " UTC") : "—";
+}
+
+export function RunsTable({ project }: { project: string }) {
+  const { data: builds, isPending, isError, error } = useBuilds(project);
+  const [open, setOpen] = useState<string | null>(null);
+
+  if (isPending) return <p className="runs__muted">Loading runs…</p>;
+  if (isError)
+    return (
+      <p className="runs__muted runs__muted--error">
+        Could not load runs: {error instanceof Error ? error.message : "unknown error"}
+      </p>
+    );
+  if (builds.length === 0) return <p className="runs__muted">No builds yet.</p>;
+
+  return (
+    <table className="runs">
+      <thead>
+        <tr>
+          <th>Build</th>
+          <th>Status</th>
+          <th>Started</th>
+          <th>Finished</th>
+        </tr>
+      </thead>
+      <tbody>
+        {builds.map((b) => (
+          <BuildRow
+            key={b.id}
+            build={b}
+            open={open === b.id}
+            onToggle={() => setOpen(open === b.id ? null : b.id)}
+          />
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function BuildRow({
+  build,
+  open,
+  onToggle,
+}: {
+  build: Build;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <>
+      <tr className="runs__row" onClick={onToggle} aria-expanded={open}>
+        <td className="runs__id">{build.id.slice(0, 8)}</td>
+        <td>
+          <span className={`runs__badge runs__badge--${TONE[build.status]}`}>{build.status}</span>
+        </td>
+        <td>{fmt(build.started_at)}</td>
+        <td>{fmt(build.finished_at)}</td>
+      </tr>
+      {open && (
+        <tr className="runs__detail">
+          <td colSpan={4}>
+            <dl>
+              <div>
+                <dt>build id</dt>
+                <dd>{build.id}</dd>
+              </div>
+              <div>
+                <dt>activated</dt>
+                <dd>{fmt(build.activated_at)}</dd>
+              </div>
+              <div>
+                <dt>config hash</dt>
+                <dd>{build.config_hash ?? "—"}</dd>
+              </div>
+              <div>
+                <dt>source hash</dt>
+                <dd>{build.source_hash ?? "—"}</dd>
+              </div>
+              <div>
+                <dt>metrics</dt>
+                <dd>{build.metrics ? JSON.stringify(build.metrics) : "—"}</dd>
+              </div>
+              <div>
+                <dt>eval</dt>
+                <dd>{build.eval ? JSON.stringify(build.eval) : "—"}</dd>
+              </div>
+            </dl>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}

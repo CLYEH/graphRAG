@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 
 import { AppShell } from "./components/AppShell";
 import { RootRedirect } from "./components/RootRedirect";
+import { JobsDashboard } from "./pages/JobsDashboard";
 import { NotFound } from "./pages/NotFound";
 import { Placeholder } from "./pages/Placeholder";
 import { ProjectHealth } from "./pages/ProjectHealth";
@@ -13,7 +14,7 @@ export default function App() {
       <Route path="/p/:project" element={<AppShell />}>
         <Route index element={<Navigate to="health" replace />} />
         <Route path="health" element={<ProjectHealth />} />
-        <Route path="jobs" element={<Placeholder title="Jobs & Pipeline" task="FE8" />} />
+        <Route path="jobs" element={<JobsDashboard />} />
         <Route path="review" element={<Placeholder title="Entity Review" task="FE5" />} />
         <Route path="playground" element={<Placeholder title="Query Playground" task="FE6" />} />
         <Route path="*" element={<NotFound />} />

@@ -1,0 +1,222 @@
+.pipeline {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  max-width: 860px;
+}
+
+.pipeline__title {
+  margin: 0;
+  font-family: var(--heading);
+  font-size: 22px;
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+.pipeline h2 {
+  margin: 16px 0 0;
+  font-family: var(--heading);
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.pipeline__line {
+  color: var(--text);
+}
+
+.pipeline__line--error,
+.runs__muted--error {
+  color: #c0392b;
+}
+
+.runs__muted {
+  color: var(--text);
+  font-style: italic;
+}
+
+/* ---- runs (builds) table ---- */
+.runs {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.runs th {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-weight: 500;
+}
+
+.runs__row {
+  cursor: pointer;
+}
+
+.runs__row:hover {
+  background: var(--social-bg);
+}
+
+.runs__row td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.runs__id {
+  font-family: var(--mono);
+  color: var(--text-h);
+}
+
+.runs__detail td {
+  padding: 8px 10px 14px;
+  background: var(--social-bg);
+}
+
+.runs__detail dl {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 4px 12px;
+  margin: 0;
+}
+
+.runs__detail dt {
+  color: var(--text);
+}
+
+.runs__detail dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-h);
+  overflow-wrap: anywhere;
+}
+
+/* ---- status badges (shared build + job tones) ---- */
+.runs__badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.runs__badge--ok {
+  color: #1a7f45;
+  background: rgba(26, 127, 69, 0.12);
+}
+.runs__badge--info {
+  color: #1d6fb8;
+  background: rgba(29, 111, 184, 0.12);
+}
+.runs__badge--warn {
+  color: #9a6a00;
+  background: rgba(202, 138, 4, 0.12);
+}
+.runs__badge--bad {
+  color: #c0392b;
+  background: rgba(192, 57, 43, 0.12);
+}
+.runs__badge--muted {
+  color: var(--text);
+  background: var(--social-bg);
+}
+
+/* ---- job watcher ---- */
+.watch {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+
+.watch__form {
+  display: flex;
+  gap: 8px;
+}
+
+.watch__input {
+  flex: 1;
+  max-width: 420px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.watch__job {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.watch__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.watch__kind {
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+.watch__bar {
+  width: 100%;
+  max-width: 480px;
+  height: 10px;
+}
+
+.watch__pct {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text);
+}
+
+.watch__facts {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 4px 12px;
+  margin: 0;
+}
+
+.watch__facts dt {
+  color: var(--text);
+}
+
+.watch__facts dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-h);
+  overflow-wrap: anywhere;
+}
+
+.watch__stream {
+  font-size: 12px;
+  color: var(--text);
+}
+
+@media (prefers-color-scheme: dark) {
+  .runs__badge--ok {
+    color: #4ade80;
+  }
+  .runs__badge--info {
+    color: #60a5fa;
+  }
+  .runs__badge--warn {
+    color: #fbbf24;
+  }
+  .runs__badge--bad,
+  .pipeline__line--error,
+  .runs__muted--error {
+    color: #f87171;
+  }
+}
