@@ -248,11 +248,13 @@ function RunPipeline({
   // A build with any text source and no ontology fails at the graph stage
   // (OntologyRequiredError); structured-only builds don't. Block the run rather
   // than accept a job guaranteed to fail after spending work (Codex #70). Fail
-  // CLOSED while the config/source lists are still loading — unresolved data must
-  // not read as "safe", or a cold load briefly enables the doomed trigger.
+  // CLOSED while the source gate is loading OR refetching — react-query keeps the
+  // previous list in `data` during the post-add invalidation refetch, so a gate
+  // that only checks presence decides on stale data in exactly the window where
+  // the just-added text source dooms the build (a bind-time-vs-invariant TOCTOU).
   const hasTextSource = (sources.data ?? []).some((s) => s.kind === "text");
   const blocked = ontologyMissing && hasTextSource;
-  const ready = gatesLoaded && sources.data !== undefined;
+  const ready = gatesLoaded && sources.data !== undefined && !sources.isFetching;
 
   function run(kind: TriggerKind) {
     trigger.mutate(kind, { onSuccess: (job) => setAccepted(job) });

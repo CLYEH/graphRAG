@@ -189,6 +189,42 @@ describe("Import", () => {
     expect(screen.getByRole("button", { name: /^ingest$/i })).toBeDisabled();
   });
 
+  it("keeps the run gate closed through the post-add refetch window", async () => {
+    // TOCTOU: after adding a text source, invalidation refetches the list but
+    // react-query keeps the previous [] in data during the flight — a gate that
+    // only checks presence would decide on stale data in exactly the window where
+    // the just-added text source dooms the (ontology-less) build
+    const sourceCalls: Array<(v: unknown) => void> = [];
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      path === "/projects"
+        ? Promise.resolve({ data: { data: [project("acme")], meta: META }, error: undefined })
+        : new Promise((res) => {
+            sourceCalls.push(res);
+          })) as never);
+    stubPost(source({ kind: "text", uri: "file:///data/corpus/" }));
+    renderImport(projectRoute("acme", "import"));
+
+    // initial source list: empty → no text source → runnable
+    await waitFor(() => expect(sourceCalls).toHaveLength(1));
+    sourceCalls[0]({ data: { data: [], meta: META }, error: undefined });
+    const build = await screen.findByRole("button", { name: /^build$/i });
+    await waitFor(() => expect(build).toBeEnabled());
+
+    // add a text source → the refetch is in flight → the gate must fail closed
+    fireEvent.change(screen.getByLabelText("uri"), { target: { value: "file:///data/corpus/" } });
+    fireEvent.click(screen.getByRole("button", { name: /add source/i }));
+    await waitFor(() => expect(sourceCalls).toHaveLength(2));
+    expect(build).toBeDisabled();
+
+    // the refetch lands with the text source → the ontology block engages
+    sourceCalls[1]({
+      data: { data: [source({ kind: "text", uri: "file:///data/corpus/" })], meta: META },
+      error: undefined,
+    });
+    expect(await screen.findByText(/no ontology configured/i)).toBeInTheDocument();
+    expect(build).toBeDisabled();
+  });
+
   it("blocks a text build when the project has no ontology", async () => {
     stubImportGets(project("acme"), [source({ kind: "text", uri: "file:///data/corpus/" })]);
     const post = stubPost({ job_id: JOB_ID, status: "queued" });
