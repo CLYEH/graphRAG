@@ -170,6 +170,55 @@ test("the review section shows the queue and records a decision", async ({ page 
   await expect.poll(() => approvePath).toMatch(/\/merge-candidates\/[^/]+\/approve$/);
 });
 
+function queryResponse() {
+  return {
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: {
+        mode: "hybrid",
+        build_id: "b1111111-aaaa-4aaa-8aaa-000000000001",
+        results: [
+          {
+            result_type: "chunk",
+            id: "d1111111-aaaa-4aaa-8aaa-000000000001",
+            title: null,
+            text: "the answer is 42",
+            score: 0.9,
+            confidence: null,
+            source_refs: [{ source_type: "document", id: "aaaaaaaa-1111-2222-3333-444444444444" }],
+          },
+        ],
+        graph_context: null,
+        warnings: [],
+        debug: null,
+      },
+      meta: META,
+    }),
+  };
+}
+
+test("the playground runs a query and shows results", async ({ page }) => {
+  await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  let queryPath = "";
+  await page.route("**/projects/*/query/*", (route) => {
+    queryPath = new URL(route.request().url()).pathname;
+    return route.fulfill(queryResponse());
+  });
+  await page.goto("/");
+
+  await page.getByRole("link", { name: "Playground" }).click();
+  await expect(page.getByRole("heading", { name: /query playground/i })).toBeVisible();
+
+  await page.getByLabel("query", { exact: true }).fill("what is the answer?");
+  await page.getByRole("button", { name: /run query/i }).click();
+
+  await expect(page.getByText("the answer is 42")).toBeVisible();
+  // the default mode routes to the hybrid endpoint
+  await expect.poll(() => queryPath).toMatch(/\/query\/hybrid$/);
+});
+
 test("console shows an empty state when there are no projects", async ({ page }) => {
   await page.route("**/projects*", (route) => route.fulfill(projectsResponse([])));
   await page.goto("/");

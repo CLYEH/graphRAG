@@ -1,0 +1,163 @@
+.play {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  max-width: 900px;
+}
+
+.play__title {
+  margin: 0;
+  font-family: var(--heading);
+  font-size: 22px;
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+.play__line {
+  color: var(--text);
+}
+
+.play__line--error {
+  color: #c0392b;
+}
+
+.play__console {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+}
+
+.play__form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.play__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.play__field--wide {
+  flex: 1 1 320px;
+}
+
+.play__field--check {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+
+.play__field input,
+.play__field select,
+.play__field textarea {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+  font-size: 13px;
+}
+
+.play__field textarea {
+  font-family: inherit;
+  resize: vertical;
+}
+
+.play__graph-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.play__graph-opts legend {
+  font-size: 12px;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.play__results {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.play__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.play__meta {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.play__warnings {
+  margin: 0;
+  padding: 8px 12px;
+  list-style: none;
+  border: 1px solid #caa300;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.play__hits {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.play__hit-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.play__text {
+  margin: 4px 0;
+  color: var(--text-h);
+  overflow-wrap: anywhere;
+}
+
+.play__sources {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.play__uri {
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.play__graph,
+.play__routing {
+  font-size: 13px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+@media (prefers-color-scheme: dark) {
+  .play__line--error {
+    color: #f87171;
+  }
+}

@@ -7,7 +7,9 @@ import { api } from "./api/client";
 import { encodeProjectSegment } from "./project/projectRoute";
 
 import type { ReactElement } from "react";
-import type { Build, HealthReport, Job, MergeCandidate, Project } from "./api/queries";
+import type { Build, HealthReport, Job, MergeCandidate, Project, QueryResult } from "./api/queries";
+
+type RetrievalResult = QueryResult["results"][number];
 
 // Builds the encoded route for a project key, so tests exercise the real
 // encode/decode path rather than hardcoding a raw `/p/<key>` segment.
@@ -199,6 +201,38 @@ export function stubDecision(updated: MergeCandidate) {
   return vi
     .spyOn(api, "POST")
     .mockResolvedValue({ data: { data: updated, meta: META }, error: undefined } as never);
+}
+
+export function retrievalResult(overrides: Partial<RetrievalResult> = {}): RetrievalResult {
+  return {
+    result_type: "chunk",
+    id: "d0000000-0000-0000-0000-000000000000",
+    title: null,
+    text: null,
+    score: 0.5,
+    confidence: null,
+    source_refs: [{ source_type: "chunk", id: "50000000-0000-0000-0000-000000000000" }],
+    ...overrides,
+  };
+}
+
+export function queryResult(overrides: Partial<QueryResult> = {}): QueryResult {
+  return {
+    mode: "hybrid",
+    build_id: "b0000000-0000-0000-0000-000000000000",
+    results: [],
+    graph_context: null,
+    warnings: [],
+    debug: null,
+    ...overrides,
+  };
+}
+
+// POST stub for the query endpoints — resolves with the given QueryResult.
+export function stubQuery(result: QueryResult) {
+  return vi
+    .spyOn(api, "POST")
+    .mockResolvedValue({ data: { data: result, meta: META }, error: undefined } as never);
 }
 
 // A streaming fetch Response carrying the given SSE text chunks — mock global

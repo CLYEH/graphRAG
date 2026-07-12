@@ -4,7 +4,7 @@ import { AppShell } from "./components/AppShell";
 import { RootRedirect } from "./components/RootRedirect";
 import { JobsDashboard } from "./pages/JobsDashboard";
 import { NotFound } from "./pages/NotFound";
-import { Placeholder } from "./pages/Placeholder";
+import { Playground } from "./pages/Playground";
 import { ProjectHealth } from "./pages/ProjectHealth";
 import { ReviewQueue } from "./pages/ReviewQueue";
 
@@ -17,7 +17,7 @@ export default function App() {
         <Route path="health" element={<ProjectHealth />} />
         <Route path="jobs" element={<JobsDashboard />} />
         <Route path="review" element={<ReviewQueue />} />
-        <Route path="playground" element={<Placeholder title="Query Playground" task="FE6" />} />
+        <Route path="playground" element={<Playground />} />
         <Route path="*" element={<NotFound />} />
       </Route>
       <Route path="*" element={<NotFound />} />
