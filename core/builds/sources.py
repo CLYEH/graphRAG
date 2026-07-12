@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
 from core.ingest.connectors import DocumentPayload, read_csv_rows, read_text_documents
@@ -40,19 +40,62 @@ SUPPORTED_SOURCE_KINDS = ("text", "structured")
 
 class SourceResolutionError(ValueError):
     """A registered source cannot be turned into a payload stream — an
-    unsupported/missing ``kind``, a non-``file://`` uri, or ``structured``
+    unsupported/missing ``kind``, a non-canonical ``file://`` uri (one whose
+    displayed path is not what the worker would read), or ``structured``
     metadata missing ``table``/``pk_column``. Loud at ingest time, never a
     silent empty ingest."""
 
 
 def _local_path(source: Source) -> Path:
-    """The local filesystem path a ``file://`` source uri names."""
-    parsed = urlparse(source.uri)
+    """The local filesystem path a ``file://`` source uri names — verbatim.
+
+    Raises unless the DISPLAYED uri reads back to exactly the path the worker
+    opens. ``urlsplit``/``url2pathname`` silently reinterpret a whole family of
+    non-canonical forms — tab/newline stripped at any position, edge whitespace
+    stripped, a host dropped (``file://nas/corpus`` reads ``/corpus``), query/
+    fragment stripped, percent-decoding springing separators or dot segments the
+    filesystem then resolves (``%2F..%2F`` → ``//../``), ``//``-leading paths
+    read as UNC roots, an empty path as the worker's cwd. A build over any of
+    those ingests a DIFFERENT tree than the registered uri appears to name —
+    wrong data, strictly worse than a loud failure. The Console mirrors this
+    gate client-side, but CLI/API/MCP-triggered builds reach here directly, so
+    the source of truth enforces it (Codex #70 family).
+    """
+    uri = source.uri
+
+    def _reject(why: str) -> SourceResolutionError:
+        return SourceResolutionError(
+            f"source {source.id} uri {uri!r} {why} — the worker would read a "
+            "different path than the stored uri displays; register a canonical "
+            "file:///absolute/path uri"
+        )
+
+    if uri != uri.strip():
+        raise _reject("has leading/trailing whitespace (urlsplit strips it)")
+    if any(ord(ch) < 0x20 for ch in uri):
+        raise _reject("contains control characters (urlsplit strips tab/newline anywhere)")
+    parsed = urlparse(uri)
     if parsed.scheme != "file":
         raise SourceResolutionError(
             f"source {source.id} uri {source.uri!r} is not a file:// URI — only "
             f"file-backed sources are wired ({', '.join(SUPPORTED_SOURCE_KINDS)})"
         )
+    if parsed.netloc:
+        raise _reject(f"names a host {parsed.netloc!r} that url2pathname drops")
+    if parsed.query or parsed.fragment:
+        raise _reject("carries a query/fragment that urlparse strips from the path")
+    decoded = unquote(parsed.path)
+    if "\x00" in decoded:
+        raise _reject("decodes to a path containing NUL, which no filesystem accepts")
+    if decoded in ("", "/"):
+        raise _reject("names no path (the worker's cwd or the filesystem root)")
+    if decoded.startswith("//"):
+        raise _reject("decodes to a //-leading path (reinterpreted as a UNC root)")
+    segments = decoded.split("/")[1:]
+    if segments and segments[-1] == "":
+        segments = segments[:-1]  # one trailing slash: the idiomatic directory form
+    if not segments or any(seg in ("", ".", "..") for seg in segments):
+        raise _reject("contains empty or dot path segments (resolved away from the display)")
     # url2pathname handles the leading slash and Windows drive letters.
     return Path(url2pathname(parsed.path))
 

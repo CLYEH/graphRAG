@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 import { useCancelJob, useJob } from "../api/queries";
 import { useJobStream } from "../hooks/useJobStream";
@@ -28,6 +28,18 @@ export function JobProgress({ jobId }: { jobId: string | null }) {
   const stream = useJobStream(jobId);
   const cancel = useCancelJob(jobId);
 
+  // One Idempotency-Key per cancel intent, per job: minted on the first click and
+  // REUSED on retries (a lost response replays the stored cancellation instead of
+  // re-posting against a job whose state moved on); a different job gets a fresh
+  // key. Same lost-2xx class as the trigger keys.
+  const cancelKey = useRef<{ id: string; key: string } | null>(null);
+  function onCancel() {
+    if (jobId === null) return;
+    if (cancelKey.current === null || cancelKey.current.id !== jobId)
+      cancelKey.current = { id: jobId, key: crypto.randomUUID() };
+    cancel.mutate(cancelKey.current.key);
+  }
+
   // JobEvent carries only the fast-moving fields, so when the stream ends (the
   // job reached a terminal state) refetch the snapshot to pull the terminal-only
   // fields — build_id, error, finished_at — instead of leaving the stale
@@ -54,7 +66,7 @@ export function JobProgress({ jobId }: { jobId: string | null }) {
       event={stream.event}
       streamStatus={stream.status}
       streamError={stream.error}
-      onCancel={() => cancel.mutate()}
+      onCancel={onCancel}
       cancelPending={cancel.isPending}
       cancelError={cancel.error instanceof Error ? cancel.error.message : null}
     />

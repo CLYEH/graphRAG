@@ -42,19 +42,36 @@ describe("JobWatcher", () => {
     expect(await screen.findByText("60%")).toBeInTheDocument();
   });
 
-  it("requests cancellation of a running job", async () => {
+  it("requests cancellation with a per-attempt idempotency key, reused on retry", async () => {
     stubJob(job({ status: "running" }));
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(sseResponse([])));
-    const post = vi.spyOn(api, "POST").mockResolvedValue({
-      data: { data: { job_id: JOB_ID, status: "cancelled" }, meta: {} },
-      error: undefined,
-    } as never);
+    // first attempt fails (a lost response looks the same client-side); the retry
+    // must carry the SAME key so the server replays the stored cancellation
+    // instead of re-posting against a job whose state moved on (the trigger
+    // lost-2xx class applied to cancel)
+    const post = vi
+      .spyOn(api, "POST")
+      .mockResolvedValueOnce({
+        data: undefined,
+        error: { error: { code: "STORE_UNAVAILABLE", message: "down", details: null } },
+      } as never)
+      .mockResolvedValue({
+        data: { data: { job_id: JOB_ID, status: "cancelled" }, meta: {} },
+        error: undefined,
+      } as never);
 
     renderWithProviders(<JobWatcher />);
     enter(JOB_ID);
 
     fireEvent.click(await screen.findByRole("button", { name: /^cancel$/i }));
-    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    await screen.findByText(/cancel failed/i);
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+
+    type Call = [string, { params: { header: { "Idempotency-Key": string } } }];
+    const keys = post.mock.calls.map((c) => (c as Call)[1].params.header["Idempotency-Key"]);
+    expect(keys[0]).toBeTruthy();
+    expect(keys[1]).toBe(keys[0]);
   });
 
   it("disables cancel for a job that already finished", async () => {

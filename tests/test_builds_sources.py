@@ -77,6 +77,51 @@ def test_non_file_uri_is_rejected() -> None:
         list(resolve_source(_source("https://example.com/data.csv", kind="structured")))
 
 
+@pytest.mark.parametrize(
+    ("uri", "why"),
+    [
+        # urlsplit strips edge whitespace and tab/newline ANYWHERE, so the worker
+        # reads a different path than the stored uri displays
+        ("file:///data/corpus ", "whitespace"),
+        ("file:///tmp/\t../etc", "control characters"),
+        # url2pathname drops the host: file://nas/corpus reads /corpus
+        ("file://nas/corpus", "names a host"),
+        # query/fragment are stripped from the path the worker reads
+        ("file:///data/corpus?old", "query/fragment"),
+        ("file:///data/corpus#frag", "query/fragment"),
+        # NUL can't name a real file on any filesystem
+        ("file:///data/%00corpus", "NUL"),
+        # an empty path resolves to the worker's cwd; bare "/" is the root
+        ("file:", "names no path"),
+        ("file://", "names no path"),
+        ("file:///", "names no path"),
+        # //-leading (raw four-slash or decoded %2F) is reinterpreted as UNC root
+        ("file:////nas/corpus", "//-leading"),
+        ("file:///%2Fdata", "//-leading"),
+        # dot segments — raw or percent-encoded — get resolved by the filesystem
+        # to a different tree than the display names (%2F..%2F springs "../")
+        ("file:///data/../etc", "dot path segments"),
+        ("file:///data/%2e%2e/etc", "dot path segments"),
+        ("file:///safe/%2F..%2F..%2Fetc", "dot path segments"),
+    ],
+)
+def test_non_canonical_file_uri_is_rejected(uri: str, why: str) -> None:
+    # the displayed path must be exactly what the worker reads (display==read):
+    # a build over a reinterpreted uri ingests the WRONG tree — silent wrong data,
+    # strictly worse than this loud failure. CLI/API/MCP-triggered builds have no
+    # Console gate in front of them, so the source of truth enforces it.
+    with pytest.raises(SourceResolutionError, match=why):
+        list(resolve_source(_source(uri, kind="text")))
+
+
+def test_trailing_slash_directory_uri_is_accepted(tmp_path: Path) -> None:
+    # the idiomatic directory form must not be over-blocked (class 9 dual:
+    # deny-rules need an acceptance pin)
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    payloads = list(resolve_source(_source(tmp_path.as_uri() + "/", kind="text")))
+    assert {p.raw for p in payloads} == {"alpha"}
+
+
 def test_structured_missing_table_or_pk_column_fails_loud(tmp_path: Path) -> None:
     csv = tmp_path / "t.csv"
     csv.write_text("id,name\n1,x\n", encoding="utf-8")
