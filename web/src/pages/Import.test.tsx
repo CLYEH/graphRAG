@@ -128,6 +128,13 @@ describe("Import", () => {
       "file:///%2Fdata",
       // a malformed percent-escape decodes differently than the backend reads it
       "file:///%zz",
+      // encoded separators survive URL parsing (%2F stays literal in pathname)
+      // and only materialize on the backend's decode — the filesystem then
+      // resolves the sprung "//../.." to a different tree than displayed.
+      // (%2e%2e is NOT here: the browser normalizes it as a dot segment at parse
+      // time, converging with the backend's decode+resolve — both read the same
+      // path, so it is accepted.)
+      "file:///safe/%2F..%2F..%2Fetc",
     ]) {
       fireEvent.change(uri, { target: { value: bad } });
       expect(screen.getByText(/canonical/i)).toBeInTheDocument();

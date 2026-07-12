@@ -56,13 +56,17 @@ function isFileUri(raw: string): boolean {
   } catch {
     return false;
   }
-  return (
-    /^file:\/\/\//i.test(raw) &&
-    url.search === "" &&
-    url.hash === "" &&
-    decoded.length > 1 &&
-    !decoded.startsWith("//")
-  );
+  if (!/^file:\/\/\//i.test(raw) || url.search !== "" || url.hash !== "" || decoded.length <= 1)
+    return false;
+  // Validate EVERY decoded segment, not just the leading slashes: an encoded
+  // separator or dot segment survives URL parsing and only materializes after the
+  // backend decodes ("file:///safe/%2F..%2F..%2Fetc" → "/safe//../../etc"), where
+  // the filesystem resolves it to a different tree than the stored uri displays.
+  // One trailing slash is allowed — the idiomatic directory form; every other
+  // segment must be non-empty and not "." / "..".
+  const path = decoded.endsWith("/") ? decoded.slice(0, -1) : decoded;
+  const segments = path.split("/").slice(1);
+  return segments.length > 0 && segments.every((s) => s !== "" && s !== "." && s !== "..");
 }
 
 // Whether the pipeline can resolve an already-registered source to the path the
