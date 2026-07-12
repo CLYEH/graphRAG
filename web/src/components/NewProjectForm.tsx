@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { useCreateProject } from "../api/queries";
-import { encodeProjectSegment } from "../project/projectRoute";
+import { encodeProjectSegment, isPathAddressable } from "../project/projectRoute";
 import "./NewProjectForm.css";
 
 // Creates a project and drops the operator into it (its health page — the nav
@@ -23,7 +23,13 @@ export function NewProjectForm() {
   const navigate = useNavigate();
   const create = useCreateProject();
 
-  const canCreate = name.trim() !== "" && !create.isPending;
+  // Block a name the rest of the console can't address ("/"-bearing, or "."/"..") —
+  // creating one would strand the operator on an unusable project the moment the
+  // switcher/pages try to load it (Codex #70). The route encodes any key, but a
+  // REST path segment can't carry these; refuse them at the source.
+  const trimmed = name.trim();
+  const unaddressable = trimmed !== "" && !isPathAddressable(trimmed);
+  const canCreate = trimmed !== "" && !unaddressable && !create.isPending;
 
   function submit() {
     create.mutate(
@@ -63,6 +69,12 @@ export function NewProjectForm() {
       <button type="submit" disabled={!canCreate}>
         {create.isPending ? "Creating…" : "Create project"}
       </button>
+      {unaddressable && (
+        <p className="npf__error">
+          Name can&apos;t contain &quot;/&quot; or be &quot;.&quot; / &quot;..&quot; — the console
+          addresses each project by this key in the URL.
+        </p>
+      )}
       {create.isError && (
         <p className="npf__error">
           Create failed: {create.error instanceof Error ? create.error.message : "unknown error"}

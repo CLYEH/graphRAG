@@ -29,7 +29,7 @@ function renderForm(route = "/") {
 }
 
 describe("NewProjectForm", () => {
-  it("creates with a name-keyed idempotency key and lands in the new project", async () => {
+  it("creates a project and lands in it, sending no client idempotency key", async () => {
     const post = stubPost(project("acme", "Acme Inc"));
     renderForm();
 
@@ -39,21 +39,32 @@ describe("NewProjectForm", () => {
 
     // navigation lands in the created project (health, matching RootRedirect)
     expect(await screen.findByText(/health for acme/i)).toBeInTheDocument();
-    // name is the projects PK, so it doubles as the Idempotency-Key: a lost 201
-    // replays on retry rather than the name conflict misreporting a committed create
-    expect(post).toHaveBeenCalledWith(
-      "/projects",
-      expect.objectContaining({
-        params: { header: { "Idempotency-Key": "acme" } },
-        body: { name: "acme", display_name: "Acme Inc" },
-      }),
-    );
+    // no Idempotency-Key: `name` allows unicode / >255 chars, which isn't a valid
+    // HTTP header value — keying on it would break exactly the names the contract
+    // permits; the projects PK dedups a retry instead (Codex #70)
+    const [path, init] = post.mock.calls[0] as [string, { params?: unknown; body: unknown }];
+    expect(path).toBe("/projects");
+    expect(init.body).toEqual({ name: "acme", display_name: "Acme Inc" });
+    expect(init.params).toBeUndefined();
   });
 
   it("cannot submit without a name (the required primary key)", () => {
     stubPost(project("acme"));
     renderForm();
     expect(screen.getByRole("button", { name: /create project/i })).toBeDisabled();
+  });
+
+  it("blocks a name the console can't address before POSTing", () => {
+    const post = stubPost(project("acme"));
+    renderForm();
+
+    // a "/"-bearing (or "."/"..") key can't ride the single {project} REST segment,
+    // so creating it would strand the operator on an unusable project — the submit
+    // gate must refuse it rather than POST (Codex #70)
+    fireEvent.change(screen.getByLabelText("name"), { target: { value: "a/b" } });
+    expect(screen.getByText(/can't contain "\/"/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /create project/i })).toBeDisabled();
+    expect(post).not.toHaveBeenCalled();
   });
 
   it("fails loud when the create is rejected instead of silently no-op'ing", async () => {

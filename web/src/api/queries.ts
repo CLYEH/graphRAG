@@ -298,12 +298,16 @@ export interface NewProject {
   description: string;
 }
 
-// Creates a project. `name` is the projects primary key, so it doubles as the
-// Idempotency-Key: a lost 201 replays on retry instead of the name conflict
-// misreporting a committed create as a failure (a genuinely-taken name 409s
-// either way). Optional text fields are omitted when blank rather than sent as
-// empty strings. Invalidates the project list so the switcher and root redirect
-// pick the new project up.
+// Creates a project. No client Idempotency-Key: `name` is the projects primary
+// key, so a duplicate — including a lost-201 retry — 409s "already exists" and
+// fails loud (the operator sees the project in the switcher and moves on). A
+// name-derived header key was rejected on purpose: `ProjectCreate.name` allows any
+// non-empty string (unicode, or >255 chars), which is not a valid HTTP header
+// value, so keying on it would break creating exactly the names the contract
+// permits (Codex #70); and a stable name key would additionally replay a stale 201
+// across a delete-then-recreate of the same name within the key TTL. Optional text
+// fields are omitted when blank. Invalidates the project list so the switcher and
+// root redirect pick the new project up.
 export function useCreateProject() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -311,10 +315,7 @@ export function useCreateProject() {
       const body: components["schemas"]["ProjectCreate"] = { name: input.name };
       if (input.displayName.trim() !== "") body.display_name = input.displayName.trim();
       if (input.description.trim() !== "") body.description = input.description.trim();
-      const { data, error } = await api.POST("/projects", {
-        params: { header: { "Idempotency-Key": input.name } },
-        body,
-      });
+      const { data, error } = await api.POST("/projects", { body });
       if (error) throw new Error(error.error.message);
       return data.data;
     },
