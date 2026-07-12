@@ -113,14 +113,14 @@ describe("App shell", () => {
     expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue("a/b");
   });
 
-  it("keeps a project whose key is a dot segment openable", async () => {
-    // `.` and `..` are contract-valid keys but browsers normalize dot segments
-    // out of a path, so percent-encoding alone strands them; base64url produces
-    // an opaque segment that never collapses, so `/p/<enc>` resolves (Codex #65 P2)
+  it("resolves a dot-segment project's route but reports it isn't API-addressable", async () => {
+    // base64url keeps `.` openable in the route (switcher reflects it), but a REST
+    // path can't carry a "." segment (it normalizes to the wrong endpoint), so the
+    // health page reports that instead of firing the call (Codex #65 P2 / #66 P2)
     stubProjects([project(".", "Dotty")]);
     renderWithProviders(<App />, { route: "/" });
 
-    expect(await screen.findByRole("heading", { name: /project health/i })).toBeInTheDocument();
+    expect(await screen.findByText(/reserved url path segment/i)).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue(".");
   });
 });

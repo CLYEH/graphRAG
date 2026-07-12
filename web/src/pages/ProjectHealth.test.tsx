@@ -119,4 +119,14 @@ describe("ProjectHealth", () => {
     expect(await screen.findByText(/unknown project/i)).toBeInTheDocument();
     expect(spy).not.toHaveBeenCalled(); // the query stays disabled
   });
+
+  it.each([".", ".."])("refuses the un-addressable key %j without a request", async (key) => {
+    // "." / ".." open in the route but normalize to the wrong endpoint as a REST
+    // path segment (Codex #66 P2); the page must say so and never fire the call
+    const spy = stubHealth(healthReport());
+    renderHealthAt(projectRoute(key));
+
+    expect(await screen.findByText(/reserved url path segment/i)).toBeInTheDocument();
+    expect(spy).not.toHaveBeenCalled();
+  });
 });

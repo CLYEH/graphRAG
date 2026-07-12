@@ -1,5 +1,5 @@
 import { useHealth } from "../api/queries";
-import { useActiveProject } from "../project/projectRoute";
+import { isPathAddressable, useActiveProject } from "../project/projectRoute";
 import "./ProjectHealth.css";
 
 import type { HealthReport } from "../api/queries";
@@ -20,6 +20,15 @@ export function ProjectHealth() {
 
   // A route segment that doesn't decode is an unknown project, not a spinner.
   if (project === undefined) return <Status text="Unknown project." />;
+  // "." / ".." open in the route but can't be a REST path segment; say so
+  // rather than fire a request that normalizes to the wrong endpoint.
+  if (!isPathAddressable(project))
+    return (
+      <Status
+        text={`Project "${project}" can't be opened over the API — a "." or ".." key is a reserved URL path segment.`}
+        error
+      />
+    );
   if (isPending) return <Status text="Loading health…" />;
   if (isError) {
     const message = error instanceof Error ? error.message : "unknown error";

@@ -35,3 +35,16 @@ export function useActiveProject(): string | undefined {
   const { project } = useParams<{ project: string }>();
   return project === undefined ? undefined : decodeProjectSegment(project);
 }
+
+// Whether a key can ride in a REST path segment (e.g. /projects/{key}/health).
+// The app route base64url-encodes the key so any key is *openable*, but a REST
+// call must send the literal key, and `encodeURIComponent` leaves "." / ".."
+// untouched — so those two segments get normalized away before the request is
+// routed (verified: "." -> /projects/health, ".." -> /health; %2e/%2E normalize
+// too, so no encoding survives). They are the ONLY problematic keys: any key
+// containing a URL-reserved char is percent-encoded into a non-dot segment.
+// Such keys are openable but not API-addressable without a contract change, so
+// callers must refuse rather than silently hit the wrong endpoint.
+export function isPathAddressable(key: string): boolean {
+  return key !== "." && key !== "..";
+}

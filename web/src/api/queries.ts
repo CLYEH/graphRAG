@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { api } from "./client";
+import { isPathAddressable } from "../project/projectRoute";
+
 import type { components } from "./schema";
 
 export type Project = components["schemas"]["Project"];
@@ -31,13 +33,14 @@ export function useProjects() {
 
 // Project Health home (DESIGN §19): status light + counts + drift for the
 // active build. `project` is the decoded key from the route; the query stays
-// disabled until it resolves so a malformed segment never hits the API. Errors
-// throw so the page fails loud (a health page that blanks hides the outage it
-// exists to report) rather than rendering an empty shell.
+// disabled until it resolves (a malformed segment never hits the API) and while
+// the key is not path-addressable ("." / ".." would normalize to the wrong
+// endpoint — the page reports that instead). Errors throw so the page fails loud
+// (a health page that blanks hides the outage it exists to report).
 export function useHealth(project: string | undefined) {
   return useQuery({
     queryKey: ["health", project],
-    enabled: project !== undefined,
+    enabled: project !== undefined && isPathAddressable(project),
     queryFn: async () => {
       const { data, error } = await api.GET("/projects/{project}/health", {
         params: { path: { project: project as string } },
