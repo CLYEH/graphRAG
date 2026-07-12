@@ -31,16 +31,21 @@ function hasOntology(config: Project["config"] | undefined): boolean {
 const SOURCE_KINDS = ["text", "structured"] as const;
 type SourceKind = (typeof SOURCE_KINDS)[number];
 
-// Whether a uri's scheme is the one wired resolver (file://). Parse rather than
-// prefix-match so a bare local path (no scheme) is also rejected. The browser can
-// only check the scheme — dir-vs-file (text) is guided by the placeholder, since a
-// page can't stat the path.
+// Whether a uri is a canonical file:/// path — the exact form the backend reads.
+// _local_path uses urlparse(uri).path only (core/builds/sources.py:50-57), so a
+// host-bearing "file://nas/corpus" silently drops the host and reads /corpus, and
+// an empty-path "file:" / "file://" resolves to the WORKER's cwd — both register a
+// source the build then misreads (Codex #70). Requiring the triple-slash form with
+// a non-empty path (parse-validated, so a bare local path is rejected too) makes
+// the browser's accept set exactly what the backend will read. Dir-vs-file (text)
+// stays placeholder guidance — a page can't stat the path.
 function isFileUri(raw: string): boolean {
   try {
-    return new URL(raw).protocol === "file:";
+    new URL(raw); // must parse as a URL at all
   } catch {
     return false;
   }
+  return /^file:\/\/\//i.test(raw) && raw.length > "file:///".length;
 }
 
 // FE1 Import (DESIGN §5/§15): register sources into the active project by URI/
@@ -74,7 +79,11 @@ export function Import() {
         Registering sources into <code>{project}</code>.
       </p>
       <Sources project={project} />
-      <RunPipeline project={project} ontologyMissing={ontologyMissing} />
+      <RunPipeline
+        project={project}
+        ontologyMissing={ontologyMissing}
+        gatesLoaded={projects.data !== undefined}
+      />
       <section className="import__section">
         <h2>New project</h2>
         <p className="runs__muted">Create a different project and switch to it.</p>
@@ -180,8 +189,8 @@ function Sources({ project }: { project: string }) {
         </button>
         {badScheme && (
           <p className="npf__error">
-            The uri must be a <code>file://</code> path — it&apos;s the only wired connector scheme,
-            so any other uri&apos;s build is guaranteed to fail.
+            The uri must be a canonical <code>file:///</code> path (three slashes, no host) — the
+            backend reads only the path part, so any other form is unwired or misread.
           </p>
         )}
         {add.isError && (
@@ -223,16 +232,27 @@ function Sources({ project }: { project: string }) {
 // already running comes back 409 JOB_CONFLICT (server-side one-job-per-project
 // serialization), surfaced as the fail-loud error line. The accepted job id feeds
 // straight into the shared live watcher so the operator sees progress inline.
-function RunPipeline({ project, ontologyMissing }: { project: string; ontologyMissing: boolean }) {
+function RunPipeline({
+  project,
+  ontologyMissing,
+  gatesLoaded,
+}: {
+  project: string;
+  ontologyMissing: boolean;
+  gatesLoaded: boolean;
+}) {
   const [accepted, setAccepted] = useState<JobAccepted | null>(null);
   const trigger = useTrigger(project);
   const sources = useSources(project);
 
   // A build with any text source and no ontology fails at the graph stage
   // (OntologyRequiredError); structured-only builds don't. Block the run rather
-  // than accept a job guaranteed to fail after spending work (Codex #70).
+  // than accept a job guaranteed to fail after spending work (Codex #70). Fail
+  // CLOSED while the config/source lists are still loading — unresolved data must
+  // not read as "safe", or a cold load briefly enables the doomed trigger.
   const hasTextSource = (sources.data ?? []).some((s) => s.kind === "text");
   const blocked = ontologyMissing && hasTextSource;
+  const ready = gatesLoaded && sources.data !== undefined;
 
   function run(kind: TriggerKind) {
     trigger.mutate(kind, { onSuccess: (job) => setAccepted(job) });
@@ -254,10 +274,18 @@ function RunPipeline({ project, ontologyMissing }: { project: string; ontologyMi
         </p>
       )}
       <div className="import__actions">
-        <button type="button" onClick={() => run("ingest")} disabled={trigger.isPending || blocked}>
+        <button
+          type="button"
+          onClick={() => run("ingest")}
+          disabled={!ready || trigger.isPending || blocked}
+        >
           {trigger.isPending ? "Triggering…" : "Ingest"}
         </button>
-        <button type="button" onClick={() => run("build")} disabled={trigger.isPending || blocked}>
+        <button
+          type="button"
+          onClick={() => run("build")}
+          disabled={!ready || trigger.isPending || blocked}
+        >
           {trigger.isPending ? "Triggering…" : "Build"}
         </button>
       </div>

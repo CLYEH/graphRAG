@@ -98,16 +98,27 @@ describe("Import", () => {
     });
   });
 
-  it("blocks a non-file:// uri before POSTing", async () => {
+  it("blocks a uri the backend would misread, before POSTing", async () => {
     stubSources([]);
     const post = stubPost(source());
     renderImport(projectRoute("acme", "import"));
 
-    // the only wired resolver is file://; an https:// (or bare-path) source would
-    // pass registration but its every build fails loud — refuse it at the source
-    fireEvent.change(screen.getByLabelText("uri"), { target: { value: "https://x/doc" } });
-    expect(screen.getByText(/only wired connector scheme/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /add source/i })).toBeDisabled();
+    const uri = screen.getByLabelText("uri");
+    const add = () => screen.getByRole("button", { name: /add source/i });
+    // _local_path reads only urlparse(uri).path, so each of these registers a
+    // source the build then misreads or rejects — refuse them at the source:
+    // a non-file scheme (unwired), a host-bearing file uri (host silently
+    // dropped → wrong path), and an empty-path file uri (resolves to the
+    // worker's cwd)
+    for (const bad of ["https://x/doc", "file://nas/corpus", "file://"]) {
+      fireEvent.change(uri, { target: { value: bad } });
+      expect(screen.getByText(/canonical/i)).toBeInTheDocument();
+      expect(add()).toBeDisabled();
+    }
+    // the canonical triple-slash form is accepted
+    fireEvent.change(uri, { target: { value: "file:///data/corpus/" } });
+    expect(screen.queryByText(/canonical/i)).not.toBeInTheDocument();
+    expect(add()).toBeEnabled();
     expect(post).not.toHaveBeenCalled();
   });
 
@@ -136,7 +147,10 @@ describe("Import", () => {
     const post = stubPost({ job_id: JOB_ID, status: "queued" });
     renderImport(projectRoute("acme", "import"));
 
-    fireEvent.click(await screen.findByRole("button", { name: /^build$/i }));
+    // the run buttons fail closed until the config/source gates load
+    const build = await screen.findByRole("button", { name: /^build$/i });
+    await waitFor(() => expect(build).toBeEnabled());
+    fireEvent.click(build);
 
     expect(await screen.findByText(/accepted job/i)).toBeInTheDocument();
     // the accepted job feeds the shared live watcher (its status badge appears)
@@ -153,13 +167,26 @@ describe("Import", () => {
     stubPostError("JOB_CONFLICT", "a job is already running for this project");
     renderImport(projectRoute("acme", "import"));
 
-    fireEvent.click(await screen.findByRole("button", { name: /^build$/i }));
+    const build = await screen.findByRole("button", { name: /^build$/i });
+    await waitFor(() => expect(build).toBeEnabled());
+    fireEvent.click(build);
 
     // create_job_exclusive serializes one job per project; the 409 must surface
     // (§22) rather than the trigger appearing to succeed
     expect(
       await screen.findByText(/trigger failed: a job is already running/i),
     ).toBeInTheDocument();
+  });
+
+  it("fails closed: run buttons stay disabled until the config/source gates load", async () => {
+    // unresolved query data must not read as "safe" — on a cold load the gates
+    // (project config + source kinds) are unknown, and enabling the buttons for
+    // that window lets an operator enqueue the very build the gate exists to block
+    vi.spyOn(api, "GET").mockImplementation((() => new Promise(() => {})) as never);
+    renderImport(projectRoute("acme", "import"));
+
+    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^ingest$/i })).toBeDisabled();
   });
 
   it("blocks a text build when the project has no ontology", async () => {
