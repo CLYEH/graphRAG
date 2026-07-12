@@ -9,16 +9,30 @@ import "./Import.css";
 import type { JobAccepted, TriggerKind } from "../api/queries";
 
 // The source kinds the ingest pipeline actually wires (core/builds/sources.py
-// SUPPORTED_SOURCE_KINDS): "text" reads a file:// text file/dir; "structured"
-// reads a file:// CSV and requires table + pk_column in metadata. The store/API
-// accept any kind string, but resolve_source fails the build loud for any other
-// kind (or a blank one), so the UI offers only these two, collects the structured
-// metadata, and points the uri at a file:// path (the only wired scheme) — never
-// letting the operator register a source whose build is guaranteed to fail. The
-// contract's Source.kind doc lists file/directory/url/database as illustrative
-// connector kinds, but those have no C2 connector yet (Codex #70).
+// SUPPORTED_SOURCE_KINDS + core/ingest/connectors.py): "text" reads a file://
+// DIRECTORY of .txt/.md files (read_text_documents raises NotADirectoryError on a
+// single file); "structured" reads a file:// CSV FILE and requires table +
+// pk_column in metadata. Both require a file:// uri — the only wired scheme
+// (_local_path rejects others). The store/API accept any kind/uri string, but
+// resolve_source fails the build loud otherwise, so the UI offers only these kinds,
+// collects the structured metadata, and blocks a non-file:// uri — never letting
+// the operator register a source whose build is guaranteed to fail. The contract's
+// Source.kind doc lists file/directory/url/database as illustrative connector
+// kinds, but those have no C2 connector yet (Codex #70).
 const SOURCE_KINDS = ["text", "structured"] as const;
 type SourceKind = (typeof SOURCE_KINDS)[number];
+
+// Whether a uri's scheme is the one wired resolver (file://). Parse rather than
+// prefix-match so a bare local path (no scheme) is also rejected. The browser can
+// only check the scheme — dir-vs-file (text) is guided by the placeholder, since a
+// page can't stat the path.
+function isFileUri(raw: string): boolean {
+  try {
+    return new URL(raw).protocol === "file:";
+  } catch {
+    return false;
+  }
+}
 
 // FE1 Import (DESIGN §5/§15): register sources into the active project by URI/
 // connector, then trigger ingest (stage 1) or a full build and watch the job live.
@@ -72,7 +86,10 @@ function Sources({ project }: { project: string }) {
   // so gate the submit on them exactly as read_csv_rows requires.
   const structured = kind === "structured";
   const metaReady = !structured || (table.trim() !== "" && pkColumn.trim() !== "");
-  const canAdd = uri.trim() !== "" && metaReady && !add.isPending;
+  // The only wired resolver is file://; anything else (https://, a bare path) is a
+  // guaranteed build failure, so refuse it at the source rather than POST it.
+  const badScheme = uri.trim() !== "" && !isFileUri(uri.trim());
+  const canAdd = uri.trim() !== "" && !badScheme && metaReady && !add.isPending;
 
   function submit() {
     add.mutate(
@@ -95,8 +112,8 @@ function Sources({ project }: { project: string }) {
     <section className="import__section">
       <h2>Sources</h2>
       <p className="runs__muted">
-        Sources are read from a local <code>file://</code> path — a text file or folder (text), or a
-        CSV (structured).
+        Sources are read from a local <code>file://</code> path: <b>text</b> reads a directory of
+        <code>.txt</code>/<code>.md</code> files; <b>structured</b> reads a CSV file.
       </p>
       <form
         className="npf__form"
@@ -110,7 +127,7 @@ function Sources({ project }: { project: string }) {
           <input
             value={uri}
             onChange={(e) => setUri(e.target.value)}
-            placeholder="file:///data/corpus.txt"
+            placeholder={structured ? "file:///data/rows.csv" : "file:///data/corpus/"}
           />
         </label>
         <label className="npf__field">
@@ -146,6 +163,12 @@ function Sources({ project }: { project: string }) {
         <button type="submit" disabled={!canAdd}>
           {add.isPending ? "Adding…" : "Add source"}
         </button>
+        {badScheme && (
+          <p className="npf__error">
+            The uri must be a <code>file://</code> path — it&apos;s the only wired connector scheme,
+            so any other uri&apos;s build is guaranteed to fail.
+          </p>
+        )}
         {add.isError && (
           <p className="npf__error">
             Add failed: {add.error instanceof Error ? add.error.message : "unknown error"}

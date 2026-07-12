@@ -234,7 +234,7 @@ function sourceResponse() {
       data: {
         id: "50000000-0000-0000-0000-000000000000",
         kind: "text",
-        uri: "file:///data/corpus.txt",
+        uri: "file:///data/corpus/",
         metadata: {},
         added_at: "2026-07-01T00:00:00Z",
       },
@@ -310,9 +310,9 @@ test("the import section registers a source and triggers a build", async ({ page
 
   // register a text source by file:// uri (no byte upload — the contract models a
   // uri reference, and text is the ingest-wired default kind)
-  await page.getByLabel("uri").fill("file:///data/corpus.txt");
+  await page.getByLabel("uri").fill("file:///data/corpus/");
   await page.getByRole("button", { name: /add source/i }).click();
-  await expect.poll(() => sourceBody).toContain("file:///data/corpus.txt");
+  await expect.poll(() => sourceBody).toContain("file:///data/corpus/");
 
   // trigger a full build and watch the accepted job
   await page.getByRole("button", { name: /^build$/i }).click();

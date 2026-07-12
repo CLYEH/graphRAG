@@ -34,11 +34,11 @@ function renderImport(route: string) {
 describe("Import", () => {
   it("registers a text source with NO idempotency key and clears the form on success", async () => {
     stubSources([]);
-    const post = stubPost(source({ uri: "file:///data/corpus.txt", kind: "text" }));
+    const post = stubPost(source({ uri: "file:///data/corpus/", kind: "text" }));
     renderImport(projectRoute("acme", "import"));
 
     const uri = screen.getByLabelText("uri");
-    fireEvent.change(uri, { target: { value: "file:///data/corpus.txt" } });
+    fireEvent.change(uri, { target: { value: "file:///data/corpus/" } });
     fireEvent.click(screen.getByRole("button", { name: /add source/i }));
 
     await waitFor(() => expect(post).toHaveBeenCalled());
@@ -52,7 +52,7 @@ describe("Import", () => {
     // kind defaults to text (the wired kind), sent so the build doesn't fail on a
     // missing/unsupported kind.
     expect(path).toBe("/projects/{project}/sources");
-    expect(init.body).toEqual({ uri: "file:///data/corpus.txt", kind: "text" });
+    expect(init.body).toEqual({ uri: "file:///data/corpus/", kind: "text" });
     expect(init.params.header).toBeUndefined();
     // the form clears so the next source starts fresh
     await waitFor(() => expect(uri).toHaveValue(""));
@@ -80,6 +80,19 @@ describe("Import", () => {
       kind: "structured",
       metadata: { table: "documents", pk_column: "id" },
     });
+  });
+
+  it("blocks a non-file:// uri before POSTing", async () => {
+    stubSources([]);
+    const post = stubPost(source());
+    renderImport(projectRoute("acme", "import"));
+
+    // the only wired resolver is file://; an https:// (or bare-path) source would
+    // pass registration but its every build fails loud — refuse it at the source
+    fireEvent.change(screen.getByLabelText("uri"), { target: { value: "https://x/doc" } });
+    expect(screen.getByText(/only wired connector scheme/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /add source/i })).toBeDisabled();
+    expect(post).not.toHaveBeenCalled();
   });
 
   it("renders a registered source as inert text, never a live link", async () => {
