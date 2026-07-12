@@ -25,9 +25,10 @@ loop back to step 3.
    local stack, checks the browser console for errors, and captures screenshots/
    GIF evidence that goes into the PR body. Findings → back to step 3. This is a
    supplementary verification step (agent-session only, not CI-runnable), so it
-   does not replace the Playwright gate; it is mechanically enforced by the
-   browser-QA receipt hook (H10) — no receipt for the current tree on a `task/FE*`
-   branch ⇒ push/PR blocked.
+   does not replace the Playwright gate. It is an **honest-agent step** — the
+   pass runs and its screenshots / console evidence go into the PR body, where
+   the owner and Codex audit it — **not** a push-gate hook (mechanical
+   enforcement was attempted as H10 and dropped; see TASKS.md H10 for why).
 5. **Agent review (local gate)** — run the `code-reviewer` subagent on the diff
    (`doc-reviewer` for doc-only changes taking the fast lane).
    **VERDICT: FAIL → back to step 3** (fix, then re-verify + re-review).
@@ -83,6 +84,19 @@ loop back to step 3.
      of review quota (its only fresh response is the usage-limits message) — stop waiting
      and re-poke after the quota window resets instead of polling for nothing. Don't
      hand-roll one-off watchers.
+
+     **Never poke while `eyes` is showing (owner mandate).** `eyes` means Codex is
+     actively reviewing; an `@codex review` then only burns its quota and produces a
+     duplicate pass. So before *any* poke — including on a watcher `20`=timeout —
+     re-query the reactions and unresolved threads, and poke **only** when there is
+     genuinely no `eyes`, no `+1`, and no Codex thread/comment/review that landed after
+     your last push. A push **auto-triggers** a Codex re-review, so **never poke right
+     after pushing**: wait for `eyes` to appear, then wait for the verdict. Two watcher
+     failure modes that have caused false pokes, both to guard against: (1) a `20`=timeout
+     can be a *stale-review bootstrap* re-flagging an already-triaged response — confirm
+     the flagged response is genuinely new (submitted after your last push) before acting;
+     (2) never compare timestamps across mixed offsets (a `…Z` UTC time vs a `…+08:00`
+     local time) — normalize to one zone or the lexical compare silently mis-orders them.
    - **Conversations resolved** — GitHub blocks merge (`required_conversation_resolution`)
      until every Codex thread is addressed and resolved (PR UI, or
      `gh api graphql` → `resolveReviewThread`).
