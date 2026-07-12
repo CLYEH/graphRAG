@@ -1,0 +1,43 @@
+/* Shared form styling for NewProjectForm and reused by the Import page's source
+   form (both render structured field rows with a submit + fail-loud line). */
+.npf__form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  text-align: left;
+}
+
+.npf__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.npf__field--wide {
+  flex: 1 1 260px;
+}
+
+.npf__field input,
+.npf__field select {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+  font-size: 13px;
+}
+
+.npf__error {
+  flex-basis: 100%;
+  color: #c0392b;
+  font-size: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .npf__error {
+    color: #f87171;
+  }
+}

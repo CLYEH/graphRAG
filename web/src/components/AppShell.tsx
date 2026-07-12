@@ -3,10 +3,11 @@ import { NavLink, Outlet } from "react-router-dom";
 import { ProjectSwitcher } from "./ProjectSwitcher";
 import "./AppShell.css";
 
-// Console v1 areas (DESIGN §10.2 note): health / jobs / review / playground.
-// Import, clean, inspect and graph-explorer are v2 and get no nav yet.
+// Console areas (DESIGN §10.2 note): health / import / jobs / review / playground.
+// Clean, inspect and graph-explorer are the remaining v2 pages and get no nav yet.
 const NAV = [
   { to: "health", label: "Health" },
+  { to: "import", label: "Import" },
   { to: "jobs", label: "Jobs" },
   { to: "review", label: "Review" },
   { to: "playground", label: "Playground" },

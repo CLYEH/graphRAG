@@ -225,3 +225,100 @@ test("console shows an empty state when there are no projects", async ({ page })
 
   await expect(page.getByText(/no projects yet/i)).toBeVisible();
 });
+
+function sourceResponse() {
+  return {
+    status: 201,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: {
+        id: "50000000-0000-0000-0000-000000000000",
+        kind: "text",
+        uri: "file:///data/corpus/",
+        metadata: {},
+        added_at: "2026-07-01T00:00:00Z",
+      },
+      meta: META,
+    }),
+  };
+}
+
+function jobAcceptedResponse() {
+  return {
+    status: 202,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: { job_id: "0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f", status: "queued" },
+      meta: META,
+    }),
+  };
+}
+
+function jobResponse() {
+  return {
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: {
+        job_id: "0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f",
+        status: "running",
+        kind: "build",
+        project: "acme",
+        build_id: null,
+        step: "graph",
+        progress: 0.5,
+        message: null,
+        error: null,
+        created_at: "2026-07-01T00:00:00Z",
+        finished_at: null,
+      },
+      meta: META,
+    }),
+  };
+}
+
+test("the import section registers a source and triggers a build", async ({ page }) => {
+  await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  let sourceBody = "";
+  await page.route("**/projects/*/sources*", (route) => {
+    if (route.request().method() === "POST") {
+      sourceBody = route.request().postData() ?? "";
+      return route.fulfill(sourceResponse());
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: [], meta: META }),
+    });
+  });
+  let buildPath = "";
+  let buildBody: string | null = "unset";
+  await page.route("**/projects/*/build", (route) => {
+    buildPath = new URL(route.request().url()).pathname;
+    buildBody = route.request().postData();
+    return route.fulfill(jobAcceptedResponse());
+  });
+  await page.route("**/jobs/*/events", (route) =>
+    route.fulfill({ status: 200, contentType: "text/event-stream", body: "" }),
+  );
+  await page.route("**/jobs/*", (route) => route.fulfill(jobResponse()));
+  await page.goto("/");
+
+  await page.getByRole("link", { name: "Import" }).click();
+  await expect(page.getByRole("heading", { name: /^import$/i })).toBeVisible();
+
+  // register a text source by file:// uri (no byte upload — the contract models a
+  // uri reference, and text is the ingest-wired default kind)
+  await page.getByLabel("uri").fill("file:///data/corpus/");
+  await page.getByRole("button", { name: /add source/i }).click();
+  await expect.poll(() => sourceBody).toContain("file:///data/corpus/");
+
+  // trigger a full build and watch the accepted job
+  await page.getByRole("button", { name: /^build$/i }).click();
+  await expect(page.getByText(/accepted job/i)).toBeVisible();
+  // the build trigger hits its own path with an EMPTY body — source_ids/reason are
+  // 400-rejected by presence, so nothing may ride along (BA2e-1)
+  await expect.poll(() => buildPath).toMatch(/\/build$/);
+  expect(buildBody).toBeNull();
+});

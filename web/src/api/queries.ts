@@ -6,8 +6,10 @@ import { isPathAddressable } from "../project/projectRoute";
 import type { components } from "./schema";
 
 export type Project = components["schemas"]["Project"];
+export type Source = components["schemas"]["Source"];
 export type HealthReport = components["schemas"]["HealthReport"];
 export type Build = components["schemas"]["Build"];
+export type JobAccepted = components["schemas"]["JobAccepted"];
 export type Job = components["schemas"]["Job"];
 export type MergeCandidate = components["schemas"]["MergeCandidate"];
 export type MergeCandidateStatus = components["schemas"]["MergeCandidateStatus"];
@@ -258,6 +260,121 @@ export function useRunQuery(project: string) {
               : form.mode === "graph"
                 ? await api.POST("/projects/{project}/query/graph", { params, body })
                 : await api.POST("/projects/{project}/query/hybrid", { params, body });
+      if (res.error) throw new Error(res.error.error.message);
+      return res.data.data;
+    },
+  });
+}
+
+// ─── FE1 Import (DESIGN §5/§15, BA1b projects/sources + BA2e triggers) ───
+
+// A project's registered sources, newest first. Same path-addressability gate as
+// the other project reads; pages through next_cursor so every source is reachable,
+// and fails loud so a store outage surfaces rather than an empty list that would
+// read as "no sources yet".
+export function useSources(project: string | undefined) {
+  return useQuery({
+    queryKey: ["sources", project],
+    enabled: project !== undefined && isPathAddressable(project),
+    queryFn: async () => {
+      const all: Source[] = [];
+      let cursor: string | undefined;
+      do {
+        const { data, error } = await api.GET("/projects/{project}/sources", {
+          params: { path: { project: project as string }, query: { limit: 200, cursor } },
+        });
+        if (error) throw new Error(error.error.message);
+        all.push(...data.data);
+        cursor = data.meta.next_cursor ?? undefined;
+      } while (cursor);
+      return all;
+    },
+  });
+}
+
+export interface NewProject {
+  name: string;
+  displayName: string;
+  description: string;
+}
+
+// Creates a project. No client Idempotency-Key: `name` is the projects primary
+// key, so a duplicate — including a lost-201 retry — 409s "already exists" and
+// fails loud (the operator sees the project in the switcher and moves on). A
+// name-derived header key was rejected on purpose: `ProjectCreate.name` allows any
+// non-empty string (unicode, or >255 chars), which is not a valid HTTP header
+// value, so keying on it would break creating exactly the names the contract
+// permits (Codex #70); and a stable name key would additionally replay a stale 201
+// across a delete-then-recreate of the same name within the key TTL. Optional text
+// fields are omitted when blank. Invalidates the project list so the switcher and
+// root redirect pick the new project up.
+export function useCreateProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: NewProject) => {
+      const body: components["schemas"]["ProjectCreate"] = { name: input.name };
+      if (input.displayName.trim() !== "") body.display_name = input.displayName.trim();
+      if (input.description.trim() !== "") body.description = input.description.trim();
+      const { data, error } = await api.POST("/projects", { body });
+      if (error) throw new Error(error.error.message);
+      return data.data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["projects"] }),
+  });
+}
+
+// Registers a source under a project. `kind` is one of the ingest-wired kinds
+// (text/structured); `metadata` carries a structured source's table + pk_column
+// (read_csv_rows requires them). `idempotencyKey` is a per-logical-attempt random
+// key (NOT uri-derived — `uri` isn't unique server-side and a stable natural key
+// would suppress an intentional re-registration): a retry after a lost 201 replays
+// the stored response instead of minting a duplicate row, while a NEW attempt (the
+// form contents changed) carries a fresh key so deliberate duplicates stay
+// possible. Invalidates the source list so the new row appears.
+export function useAddSource(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: {
+      uri: string;
+      kind: string;
+      metadata?: Record<string, string>;
+      idempotencyKey: string;
+    }) => {
+      const body: components["schemas"]["SourceCreate"] = { uri: input.uri, kind: input.kind };
+      if (input.metadata) body.metadata = input.metadata;
+      const { data, error } = await api.POST("/projects/{project}/sources", {
+        params: {
+          path: { project },
+          header: { "Idempotency-Key": input.idempotencyKey },
+        },
+        body,
+      });
+      if (error) throw new Error(error.error.message);
+      return data.data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["sources", project] }),
+  });
+}
+
+export type TriggerKind = "ingest" | "build";
+
+// Triggers a pipeline run (both kinds run the full pipeline; the kind rides the
+// URL, switched to keep the typed path a codegen literal). The body is sent EMPTY:
+// IngestRequest.source_ids and BuildRequest.reason are 400-rejected by presence
+// until the pipeline honors them (BA2e-1). `idempotencyKey` is a per-logical-
+// attempt random key: create_job_exclusive only dedups while the first job is
+// non-terminal, so a retry after a LOST 202 would otherwise either 409 with no job
+// id to watch (job still running) or double-trigger a second full pipeline (job
+// finished) — with the key, the retry replays the stored 202 and hands back the
+// ORIGINAL job id. Returns the accepted job so the caller can watch it live.
+export function useTrigger(project: string) {
+  return useMutation({
+    mutationFn: async ({ kind, idempotencyKey }: { kind: TriggerKind; idempotencyKey: string }) => {
+      const params = { path: { project }, header: { "Idempotency-Key": idempotencyKey } };
+      const res =
+        kind === "ingest"
+          ? await api.POST("/projects/{project}/ingest", { params })
+          : await api.POST("/projects/{project}/build", { params });
       if (res.error) throw new Error(res.error.error.message);
       return res.data.data;
     },

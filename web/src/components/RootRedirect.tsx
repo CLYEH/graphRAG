@@ -1,10 +1,13 @@
 import { Navigate } from "react-router-dom";
 
 import { useProjects } from "../api/queries";
+import { NewProjectForm } from "./NewProjectForm";
 import { encodeProjectSegment } from "../project/projectRoute";
 
-// Landing route: send the user into the first project's health page, or show
-// an empty state when none exist (project-creation UI lands in a later task).
+// Landing route: send the user into the first project's health page, or — when
+// none exist — show the create form here (the Import page lives under /p/:project
+// and is unreachable with zero projects, so bootstrapping the first one must
+// happen at the root).
 export function RootRedirect() {
   const { data: projects, isPending, isError } = useProjects();
 
@@ -16,7 +19,8 @@ export function RootRedirect() {
   return (
     <section className="root-status">
       <h1>graphRAG Console</h1>
-      <p>No projects yet. Create one via the API — project management UI lands later.</p>
+      <p>No projects yet. Create your first project to get started.</p>
+      <NewProjectForm />
     </section>
   );
 }

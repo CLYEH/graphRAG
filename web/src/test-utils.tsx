@@ -7,7 +7,15 @@ import { api } from "./api/client";
 import { encodeProjectSegment } from "./project/projectRoute";
 
 import type { ReactElement } from "react";
-import type { Build, HealthReport, Job, MergeCandidate, Project, QueryResult } from "./api/queries";
+import type {
+  Build,
+  HealthReport,
+  Job,
+  MergeCandidate,
+  Project,
+  QueryResult,
+  Source,
+} from "./api/queries";
 
 type RetrievalResult = QueryResult["results"][number];
 
@@ -233,6 +241,41 @@ export function stubQuery(result: QueryResult) {
   return vi
     .spyOn(api, "POST")
     .mockResolvedValue({ data: { data: result, meta: META }, error: undefined } as never);
+}
+
+export function source(overrides: Partial<Source> = {}): Source {
+  return {
+    id: "50000000-0000-0000-0000-000000000000",
+    kind: "file",
+    uri: "file:///data/corpus",
+    metadata: {},
+    added_at: "2026-07-01T00:00:00Z",
+    ...overrides,
+  };
+}
+
+export function stubSources(sources: Source[]) {
+  return vi
+    .spyOn(api, "GET")
+    .mockResolvedValue({ data: { data: sources, meta: META }, error: undefined } as never);
+}
+
+// Generic POST-success stub (create project / add source / trigger) — wraps the
+// given payload in the response envelope. Tests read the returned spy to assert
+// the path, body, and idempotency header the call sent.
+export function stubPost(payload: unknown) {
+  return vi
+    .spyOn(api, "POST")
+    .mockResolvedValue({ data: { data: payload, meta: META }, error: undefined } as never);
+}
+
+// POST-error stub for the fail-loud paths (create 409 name-taken, trigger 409
+// JOB_CONFLICT, add-source outage). The message surfaces in the UI verbatim.
+export function stubPostError(code: string, message: string) {
+  return vi.spyOn(api, "POST").mockResolvedValue({
+    data: undefined,
+    error: { error: { code, message, details: null, request_id: META.request_id } },
+  } as never);
 }
 
 // A streaming fetch Response carrying the given SSE text chunks — mock global
