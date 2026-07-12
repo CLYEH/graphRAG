@@ -48,7 +48,9 @@ const SOURCE_KINDS = ["text", "structured"] as const;
 type SourceKind = (typeof SOURCE_KINDS)[number];
 
 // Whether a uri is a canonical file:/// path — the exact form the backend reads.
-// _local_path uses urlparse(uri).path only (core/builds/sources.py:50-57), so a
+// _local_path (core/builds/sources.py) reads urlparse(uri).path — and since BA9
+// it RAISES on every non-canonical form below, so this gate is the pre-submit UX
+// mirror of the SoR rule, not the only defense. Historically: a
 // host-bearing "file://nas/corpus" silently drops the host and reads /corpus, an
 // empty-path "file:" / "file://" resolves to the WORKER's cwd, and a query/hash
 // suffix ("file:///data?old") is silently stripped — the worker reads a different
@@ -78,6 +80,19 @@ function isFileUri(raw: string): boolean {
   // literal filename bytes read verbatim — consistent with the display — so only
   // raw controls are display≠read fuel.
   if (/[\u0000-\u001f]/.test(raw)) return false;
+  // Encoded separators hide the segment boundary from the display: no filesystem
+  // permits "/" in a filename, so %2F can only be a disguised separator - one
+  // canonical shape, separators are literal. A decoded backslash is a SEPARATOR
+  // on a Windows worker (url2pathname), so it rejects below too. Both mirror the
+  // SoR rule _local_path now enforces (BA9) - this gate is the pre-submit UX;
+  // the backend refuses the same forms at build time for CLI/API/MCP callers.
+  if (/%2f/i.test(raw)) return false;
+  // Same reason for the drive separator: url2pathname detects the drive from a LITERAL
+  // ":" in the still-ENCODED path, while the segment checks below run on the decoded
+  // one — so "file:///C%3A/corpus" would pass them and yet read "\C:\corpus" (no
+  // drive) instead of "C:\corpus". Every structural character the gate accepts must be
+  // literal, or the check and the read disagree.
+  if (/%3a/i.test(raw)) return false;
   // Validate the BACKEND-derived path, not the browser-normalized url.pathname:
   // WHATWG normalizes dot segments (raw ".." AND encoded "%2e%2e") away at parse
   // time, so checks on url.pathname never see them — but the backend keeps them
@@ -91,24 +106,61 @@ function isFileUri(raw: string): boolean {
   try {
     decoded = decodeURIComponent(raw.slice("file://".length).split(/[?#]/)[0]);
   } catch {
-    return false; // malformed escape: the backend would read it literally — refuse
+    // A malformed escape ("/data/100%") throws here but is LITERAL to Python's unquote,
+    // which never raises — so the SoR refuses this shape explicitly (BA9) rather than
+    // letting the two gates disagree. The canonical "%25" spelling decodes fine and
+    // stays registerable on both sides.
+    return false;
   }
   // An embedded NUL (file:///data/%00corpus) can't name a real file on any
   // supported OS — the connector's read is guaranteed to fail.
   if (decoded.includes("\0")) return false;
+  // a decoded backslash (%5C or literal) is a path SEPARATOR on a Windows worker
+  if (decoded.includes("\\")) return false;
+  // ...and so is a pipe: url2pathname's first act is replace(":", "|"), so the pipe IS
+  // the Windows DRIVE separator ("file:///a|/corpus" reads A:\corpus). Windows reserves
+  // "|" in filenames outright, so refusing it everywhere costs nothing.
+  if (decoded.includes("|")) return false;
   if (decoded.length <= 1) return false;
   // Every segment of the path the WORKER will read must be non-empty (an empty
   // segment means a "//" — UNC/root reinterpretation) and not "." / ".." (the
   // filesystem would resolve them away from the displayed path). One trailing
-  // slash is allowed — the idiomatic directory form.
+  // slash is allowed — the idiomatic directory form. A colon is legal only in the
+  // leading DRIVE segment ("file:///C:/data", the canonical Windows form): elsewhere
+  // url2pathname reads it as the drive separator and silently re-roots the path
+  // ("/data/foo:bar" opens "O:bar"). WHATWG rewrites "a|" → "a:" in url.pathname, so
+  // only this raw-derived path — the substring the backend's urlparse returns — sees
+  // these at all. Mirrors the SoR rule _local_path enforces (BA9).
   const path = decoded.endsWith("/") ? decoded.slice(0, -1) : decoded;
   const segments = path.split("/").slice(1);
-  return segments.length > 0 && segments.every((s) => s !== "" && s !== "." && s !== "..");
+  if (segments.length === 0) return false;
+  // A bare drive with no trailing slash ("file:///C:") is DRIVE-RELATIVE: url2pathname
+  // yields Path("C:"), the worker's current directory on that drive, not the drive root
+  // — the Windows spelling of the cwd hazard. "file:///C:/" is the root and is fine.
+  if (segments.length === 1 && /^[A-Za-z]:$/.test(segments[0]) && !decoded.endsWith("/"))
+    return false;
+  return segments.every(
+    (s, i) =>
+      s !== "" &&
+      s !== "." &&
+      s !== ".." &&
+      (!s.includes(":") || (i === 0 && /^[A-Za-z]:$/.test(s))),
+  );
+}
+
+// The Console's half of the canonical-uri contract, as one named rule: the uri EXACTLY
+// as stored (never a trimmed view — Python's urlparse keeps a trailing space in the
+// path, while new URL()/trim() normalize it away, so edge whitespace is itself a
+// display≠read divergence) must be a canonical file:/// uri. This must accept exactly
+// the set core.builds.sources._local_path accepts; tests/fixtures/canonical_file_uri.json
+// is the shared corpus that enforces that parity from both suites (BA9).
+export function isCanonicalFileUri(uri: string): boolean {
+  return uri === uri.trim() && isFileUri(uri);
 }
 
 // Whether the pipeline can resolve an already-registered source to the path the
 // operator registered. Two failure families, both blocking (Codex #70): (1)
-// resolve_source RAISES (core/builds/sources.py:71-90) on a kind outside the wired
+// resolve_source RAISES (core/builds/sources.py) on a kind outside the wired
 // set or a structured source missing non-empty table/pk_column (_required_meta) —
 // a loud guaranteed failure; (2) a non-canonical file uri (host/query/hash-bearing,
 // e.g. file://nas/corpus or file:///data?old) doesn't raise but is silently
@@ -121,12 +173,9 @@ function isFileUri(raw: string): boolean {
 // loaded list.
 function isResolvableSource(s: Source): boolean {
   if (s.kind !== "text" && s.kind !== "structured") return false;
-  // The worker reads the STORED uri verbatim — Python's urlparse keeps a trailing
-  // space in the path (verified live), while new URL()/trim() normalize it away.
-  // So edge whitespace is itself a display/read divergence: check exactly as
-  // stored, never a trimmed view. (The add form trims before POST, so only
-  // sources registered outside the form can carry it.)
-  if (s.uri !== s.uri.trim() || !isFileUri(s.uri)) return false;
+  // (The add form trims before POST, so only sources registered outside the form can
+  // carry edge whitespace — but they can, so the stored uri is checked as stored.)
+  if (!isCanonicalFileUri(s.uri)) return false;
   if (s.kind === "structured") {
     const table = s.metadata?.table;
     const pk = s.metadata?.pk_column;

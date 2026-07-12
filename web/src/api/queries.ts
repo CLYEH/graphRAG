@@ -100,14 +100,20 @@ export function useJob(jobId: string | null) {
   });
 }
 
-// Requests cancellation of a job (DESIGN §22). On success the job snapshot is
-// refetched so the status reflects the request even if the stream has closed.
+// Requests cancellation of a job (DESIGN §22). `idempotencyKey` is a per-logical-
+// attempt random key (same lost-2xx class as the triggers): a retry after a lost
+// response replays the stored cancellation instead of re-posting against a job
+// whose state has moved on. On success the job snapshot is refetched so the
+// status reflects the request even if the stream has closed.
 export function useCancelJob(jobId: string | null) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async () => {
+    mutationFn: async (idempotencyKey: string) => {
       const { data, error } = await api.POST("/jobs/{job_id}/cancel", {
-        params: { path: { job_id: jobId as string } },
+        params: {
+          path: { job_id: jobId as string },
+          header: { "Idempotency-Key": idempotencyKey },
+        },
       });
       if (error) throw new Error(error.error.message);
       return data.data;
