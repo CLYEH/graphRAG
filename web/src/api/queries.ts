@@ -125,11 +125,21 @@ export function useMergeCandidates(project: string | undefined) {
     queryFn: async () => {
       const all: MergeCandidate[] = [];
       let cursor: string | undefined;
+      // The endpoint re-resolves the active build per request, so a build
+      // activated mid-pagination would splice page 1 (old build) with later
+      // pages (new build) — a mixed queue whose stale rows then 404 on decide.
+      // Pin the first page's build_id and fail loud on a swap; a retry pulls a
+      // clean single-build snapshot. (`undefined` = not yet seen; build_id itself
+      // is string | null.)
+      let buildId: string | null | undefined;
       do {
         const { data, error } = await api.GET("/projects/{project}/merge-candidates", {
           params: { path: { project: project as string }, query: { limit: 200, cursor } },
         });
         if (error) throw new Error(error.error.message);
+        if (buildId === undefined) buildId = data.meta.build_id;
+        else if (data.meta.build_id !== buildId)
+          throw new Error("The active build changed while loading the review queue — retry.");
         all.push(...data.data);
         cursor = data.meta.next_cursor ?? undefined;
       } while (cursor);

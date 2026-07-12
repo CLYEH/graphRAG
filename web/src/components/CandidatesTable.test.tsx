@@ -2,6 +2,7 @@ import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CandidatesTable } from "./CandidatesTable";
+import { api } from "../api/client";
 import {
   mergeCandidate,
   renderWithProviders,
@@ -37,6 +38,31 @@ describe("CandidatesTable", () => {
     renderWithProviders(<CandidatesTable project="acme" />);
 
     expect(await screen.findByText(/could not load review queue/i)).toBeInTheDocument();
+  });
+
+  it("fails loud when the active build swaps mid-pagination (Codex #68)", async () => {
+    // page 1 is served by the old active build, page 2 by a newly-activated one;
+    // concatenating them would show a mixed queue whose stale rows 404 on decide
+    const meta = (build_id: string, next_cursor: string | null) => ({
+      request_id: "00000000-0000-0000-0000-000000000000",
+      build_id,
+      elapsed_ms: 1,
+      next_cursor,
+    });
+    let call = 0;
+    vi.spyOn(api, "GET").mockImplementation((() => {
+      const first = call++ === 0;
+      return Promise.resolve({
+        data: {
+          data: [mergeCandidate({ id: first ? CID : "c2222222-2222-2222-2222-222222222222" })],
+          meta: first ? meta("b-old", "cursor-2") : meta("b-new", null),
+        },
+        error: undefined,
+      });
+    }) as never);
+    renderWithProviders(<CandidatesTable project="acme" />);
+
+    expect(await screen.findByText(/active build changed/i)).toBeInTheDocument();
   });
 
   it("offers every action for a pending candidate", async () => {
