@@ -202,17 +202,29 @@ def test_gate_corpus_rejects(case: dict[str, str]) -> None:
 @pytest.mark.parametrize("case", _GATE_CORPUS["accept"], ids=lambda c: c["uri"])
 def test_gate_corpus_accepts(case: dict[str, str]) -> None:
     # The accept side is what keeps the deny-rules honest (class-9 dual): every canonical
-    # form — directory, drive, drive root, a literal "%" or space, canonically encoded —
-    # must survive BOTH gates. resolve_source is lazy (the connector reads on iteration),
+    # form — directory, drive, drive root, a literal "%" or space, a café, canonically
+    # encoded — must survive. resolve_source is lazy (the connector reads on iteration),
     # so this exercises _local_path without needing the path to exist.
+    if case.get("worker") == "posix" and os.name == "nt":
+        # ...except a DRIVELESS path on a Windows worker, which url2pathname roots on
+        # whichever drive the process is currently using ("\data\corpus") — so the tree it
+        # reads depends on the cwd. The SoR validates the RESOLVED path and refuses it;
+        # the Console can't know the worker's OS and accepts it. Pin BOTH halves of that
+        # asymmetry, so neither side can drift into silence: the SoR must fail LOUD here.
+        with pytest.raises(SourceResolutionError, match="not absolute on this worker"):
+            resolve_source(_source(case["uri"], kind="text"))
+        return
     resolve_source(_source(case["uri"], kind="text"))
 
 
 def test_percent_encoded_literal_percent_is_accepted() -> None:
     # class-9 dual for the malformed-escape reject: a directory legitimately named
     # "100%" must stay registerable in its CANONICAL spelling — which is what
-    # Path.as_uri() emits ("%25"). Only the malformed spelling is refused.
-    assert str(_local_path(_source("file:///data/100%25", kind="text"))).endswith("100%")
+    # Path.as_uri() emits ("%25"). Only the malformed spelling is refused. The uri names a
+    # drive on a Windows worker because a driveless path is drive-RELATIVE there (the
+    # absoluteness rule refuses it) — orthogonal to the decoding this pins.
+    uri = "file:///C:/data/100%25" if os.name == "nt" else "file:///data/100%25"
+    assert str(_local_path(_source(uri, kind="text"))).endswith("100%")
 
 
 def test_drive_root_uri_is_accepted() -> None:

@@ -216,8 +216,27 @@ def _local_path(source: Source) -> Path:
             "gate refuses this shape, so a build over it is runnable from the CLI and "
             "never from the UI; register the triple-slash form"
         )
-    # url2pathname handles the leading slash and Windows drive letters.
-    return Path(url2pathname(parsed.path))
+    # Everything above validates the uri's SHAPE. This last check validates the actual
+    # RESULT, and it is the only rule here that depends on the worker's own OS: on a
+    # Windows worker "/data/corpus" resolves to "\data\corpus" — rooted, but on whatever
+    # drive the process currently happens to be using, so one stored uri reads a
+    # different tree depending on the worker's cwd. Same current-directory dependence as
+    # the bare drive above, in the shape that otherwise looks canonical. On a POSIX
+    # worker (the deployment) every accepted form is already absolute, so this never
+    # fires there and changes nothing.
+    #
+    # The Console cannot mirror this one — a browser cannot know the worker's OS — so it
+    # is the single place the two accept sets legitimately differ. It differs in the SAFE
+    # direction: a loud build failure naming the uri, never a silent read of the wrong
+    # tree. (tests/fixtures/canonical_file_uri.json marks which accepts are POSIX-only.)
+    resolved = Path(url2pathname(parsed.path))
+    if not resolved.is_absolute():
+        raise _reject(
+            f"resolves to {str(resolved)!r}, which is not absolute on this worker — it "
+            "is rooted on whichever drive the process is currently using, so the tree it "
+            "reads depends on the worker's cwd; name the drive (file:///C:/data/corpus)"
+        )
+    return resolved
 
 
 def _required_meta(source: Source, key: str) -> str:

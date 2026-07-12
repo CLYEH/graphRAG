@@ -24,6 +24,13 @@ describe("canonical file uri gate (shared corpus with the SoR)", () => {
     expect(isCanonicalFileUri(uri)).toBe(false);
   });
 
+  // Every accept case, INCLUDING the ones the fixture marks "worker": "posix". A browser
+  // cannot know the worker's OS, so the Console accepts driveless paths everywhere while
+  // the SoR — which resolves the path and sees it is drive-relative — refuses them on a
+  // Windows worker. That is the one legitimate asymmetry between the two gates, and it
+  // fails in the safe direction (a loud build error, never a silent read of the wrong
+  // tree). Asserting the full accept set here is what keeps the Console from silently
+  // narrowing to some OS it guessed at.
   it.each(fixture.accept)("accepts $uri — $why", ({ uri }) => {
     expect(isCanonicalFileUri(uri)).toBe(true);
   });

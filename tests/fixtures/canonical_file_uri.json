@@ -12,7 +12,15 @@
     "web/src/pages/fileUriGate.test.ts (vitest) — so parity is mechanically enforced rather",
     "than asserted in a comment. A pure differential cannot catch a defect the two gates",
     "SHARE (file:///C: read the worker's cwd on both), so each side also keeps its own",
-    "display==read oracle; this fixture is the parity half."
+    "display==read oracle; this fixture is the parity half.",
+    "",
+    "ONE accept case is worker-OS-dependent, and it is marked \"worker\": \"posix\": a",
+    "driveless path like /data/corpus is absolute on a POSIX worker (the deployment) but",
+    "resolves to \\data\\corpus on a Windows one — rooted on whatever drive the process is",
+    "currently using. The SoR validates the RESOLVED path and so rejects those on a Windows",
+    "worker; the Console cannot (a browser cannot know the worker's OS) and accepts them",
+    "everywhere. That is the single legitimate asymmetry, and it fails in the SAFE",
+    "direction — a loud build error naming the uri, never a silent read of the wrong tree."
   ],
   "reject": [
     { "uri": "https://example.com/data.csv", "why": "not a file:// uri" },
@@ -40,14 +48,14 @@
     { "uri": "file:///data/%ED%A0%80", "why": "a surrogate half, likewise" }
   ],
   "accept": [
-    { "uri": "file:///data/corpus", "why": "the canonical form" },
-    { "uri": "file:///data/corpus/", "why": "the idiomatic directory form" },
-    { "uri": "file:///C:/corpus", "why": "the canonical Windows drive form (Path.as_uri())" },
+    { "uri": "file:///data/corpus", "why": "the canonical form", "worker": "posix" },
+    { "uri": "file:///data/corpus/", "why": "the idiomatic directory form", "worker": "posix" },
+    { "uri": "file:///C:/corpus", "why": "the canonical Windows drive form (Path.as_uri()) — absolute on BOTH (a POSIX worker reads a directory literally named 'C:')" },
     { "uri": "file:///C:/", "why": "the drive ROOT resolves absolute (unlike a bare C:)" },
-    { "uri": "file:///data/100%25", "why": "a directory really named 100%, canonically spelled" },
-    { "uri": "file:///data/my%20corpus", "why": "a space, canonically encoded" },
-    { "uri": "file:///data/caf%C3%A9", "why": "a VALID multi-byte UTF-8 escape — the dual of the invalid-UTF-8 reject; non-ASCII filenames must stay registerable" },
-    { "uri": "FILE:///data/corpus", "why": "an uppercase scheme is accepted by both gates (uri.lower() / the /i flag) — pinned so neither drops it" },
-    { "uri": "file:///data/corpus;v=1", "why": "a literal ';' survives ONLY because 'file' is absent from urllib.parse.uses_params — load-bearing and non-obvious, so pinned" }
+    { "uri": "file:///data/100%25", "why": "a directory really named 100%, canonically spelled", "worker": "posix" },
+    { "uri": "file:///data/my%20corpus", "why": "a space, canonically encoded", "worker": "posix" },
+    { "uri": "file:///data/caf%C3%A9", "why": "a VALID multi-byte UTF-8 escape — the dual of the invalid-UTF-8 reject; non-ASCII filenames must stay registerable", "worker": "posix" },
+    { "uri": "FILE:///data/corpus", "why": "an uppercase scheme is accepted by both gates (uri.lower() / the /i flag) — pinned so neither drops it", "worker": "posix" },
+    { "uri": "file:///data/corpus;v=1", "why": "a literal ';' survives ONLY because 'file' is absent from urllib.parse.uses_params — load-bearing and non-obvious, so pinned", "worker": "posix" }
   ]
 }
