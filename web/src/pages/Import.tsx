@@ -52,17 +52,22 @@ function isFileUri(raw: string): boolean {
   );
 }
 
-// Whether the pipeline can resolve an already-registered source — the mirror of
-// resolve_source's RAISE conditions (core/builds/sources.py:71-90): a kind outside
-// the wired set, a uri whose scheme isn't file (only the scheme raises — a
-// host-bearing file uri misreads but doesn't raise, so it can't justify blocking a
-// run), or a structured source missing non-empty table/pk_column metadata
-// (_required_meta). Sources created outside this form (CLI/API) can carry any of
-// these; one unresolvable source fails EVERY build at ingest, regardless of
-// ontology, so the run gate checks the whole loaded list (Codex #70).
+// Whether the pipeline can resolve an already-registered source to the path the
+// operator registered. Two failure families, both blocking (Codex #70): (1)
+// resolve_source RAISES (core/builds/sources.py:71-90) on a kind outside the wired
+// set or a structured source missing non-empty table/pk_column (_required_meta) —
+// a loud guaranteed failure; (2) a non-canonical file uri (host/query/hash-bearing,
+// e.g. file://nas/corpus or file:///data?old) doesn't raise but is silently
+// REINTERPRETED — _local_path reads only urlparse(uri).path, so the build ingests
+// /corpus or /data instead of the registered target: wrong data, which this
+// platform treats as strictly worse than a loud failure. So loaded sources must
+// pass the same canonical file:/// validation the add form enforces. Sources
+// created outside this form (CLI/API) can carry any of these; one bad source
+// breaks EVERY build, regardless of ontology, so the run gate checks the whole
+// loaded list.
 function isResolvableSource(s: Source): boolean {
   if (s.kind !== "text" && s.kind !== "structured") return false;
-  if (!/^file:/i.test(s.uri.trim())) return false;
+  if (!isFileUri(s.uri.trim())) return false;
   if (s.kind === "structured") {
     const table = s.metadata?.table;
     const pk = s.metadata?.pk_column;
@@ -306,9 +311,9 @@ function RunPipeline({
       {unresolvable.length > 0 && (
         <p className="npf__error">
           {unresolvable.length} source{unresolvable.length > 1 ? "s" : ""} can&apos;t be resolved by
-          the pipeline (unwired kind, non-<code>file://</code> uri, or missing structured
-          table/pk_column) — every run fails at ingest until they&apos;re fixed or removed via the
-          API/CLI.
+          the pipeline (unwired kind, non-canonical <code>file:///</code> uri, or missing structured
+          table/pk_column) — a run would fail at ingest or silently read a reinterpreted path, until
+          they&apos;re fixed or removed via the API/CLI.
         </p>
       )}
       <div className="import__actions">

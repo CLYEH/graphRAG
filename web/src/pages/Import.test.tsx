@@ -289,6 +289,19 @@ describe("Import", () => {
     expect(screen.getByRole("button", { name: /^ingest$/i })).toBeDisabled();
   });
 
+  it("blocks runs when an existing file uri would be silently reinterpreted", async () => {
+    // a host-bearing (or query/hash-bearing) file uri doesn't raise — _local_path
+    // reads only urlparse(uri).path, so the build would silently ingest /corpus
+    // instead of the registered NAS target: wrong data, worse than a loud failure
+    stubImportGets({ ...project("acme"), config: { ontology: { entity_types: ["P"] } } }, [
+      source({ kind: "text", uri: "file://nas/corpus" }),
+    ]);
+    renderImport(projectRoute("acme", "import"));
+
+    expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+  });
+
   it("blocks runs when a structured source lacks its table/pk_column metadata", async () => {
     // _required_meta raises for a structured source without non-empty table +
     // pk_column, so it is unresolvable even though its kind and scheme are wired
