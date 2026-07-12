@@ -7,6 +7,7 @@ These hermetic tests pin the dispatch and its fail-loud edges over tmp files.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from datetime import datetime
@@ -113,6 +114,20 @@ def test_non_file_uri_is_rejected() -> None:
         # drive from a literal ":"), while the segment checks run on the decoded one —
         # so an encoded drive colon passes them and yet reads "\\C:\\corpus" (no drive)
         ("file:///C%3A/corpus", "encodes the drive separator"),
+        # single-slash: reads the SAME path as the triple-slash form, but the Console
+        # gate refuses the shape — so a source registered this way via API/CLI would be
+        # buildable from the CLI and never from the UI. One canonical shape, one accept
+        # set on both sides of the API.
+        ("file:/data/corpus", "triple-slash"),
+        ("file:/C:/corpus", "triple-slash"),
+        # a malformed escape is LITERAL to unquote (which never raises) but THROWS in
+        # the Console's decodeURIComponent — same split enforcement, and it aliases:
+        # "/data/100%" and the canonical "/data/100%25" read the same path
+        ("file:///data/100%", "malformed percent-escape"),
+        ("file:///data/%zz", "malformed percent-escape"),
+        # a bare drive is DRIVE-RELATIVE — Path("C:") is the worker's current directory
+        # on that drive, not the drive root (the Windows spelling of the cwd hazard)
+        ("file:///C:", "bare drive"),
         # an empty path resolves to the worker's cwd; bare "/" is the root
         ("file:", "names no path"),
         ("file://", "names no path"),
@@ -137,10 +152,13 @@ def test_non_file_uri_is_rejected() -> None:
     ],
 )
 def test_non_canonical_file_uri_is_rejected(uri: str, why: str) -> None:
-    # the displayed path must be exactly what the worker reads (display==read):
-    # a build over a reinterpreted uri ingests the WRONG tree — silent wrong data,
-    # strictly worse than this loud failure. CLI/API/MCP-triggered builds have no
-    # Console gate in front of them, so the source of truth enforces it.
+    # Two invariants, both enforced HERE because CLI/API/MCP-triggered builds have no
+    # Console gate in front of them:
+    #   1. display == read — a build over a reinterpreted uri ingests the WRONG tree
+    #      (silent wrong data, strictly worse than this loud failure). Most cases below.
+    #   2. one canonical shape — the last cases read exactly what they display, but the
+    #      Console refuses their shape, so accepting them here would split enforcement:
+    #      a source buildable from the CLI and never from the UI.
     with pytest.raises(SourceResolutionError, match=why):
         list(resolve_source(_source(uri, kind="text")))
 
@@ -162,6 +180,48 @@ def test_windows_drive_uri_is_accepted() -> None:
     else:
         # POSIX url2pathname is literally unquote(): the read IS the displayed path
         assert str(resolved) == "/C:/corpus"
+
+
+_GATE_CORPUS = json.loads(
+    (Path(__file__).parent / "fixtures" / "canonical_file_uri.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("case", _GATE_CORPUS["reject"], ids=lambda c: c["uri"])
+def test_gate_corpus_rejects(case: dict[str, str]) -> None:
+    # Parity half: this corpus is asserted against the CONSOLE gate too
+    # (web/src/pages/fileUriGate.test.ts). The two gates must accept exactly the same
+    # set — when they drift, a source is buildable from one side and permanently
+    # unrunnable from the other, which is what two of the six Codex findings on PR #71
+    # were. Per-side tests cannot see that: each gate was self-consistent and they
+    # disagreed. A shared corpus can.
+    with pytest.raises(SourceResolutionError):
+        list(resolve_source(_source(case["uri"], kind="text")))
+
+
+@pytest.mark.parametrize("case", _GATE_CORPUS["accept"], ids=lambda c: c["uri"])
+def test_gate_corpus_accepts(case: dict[str, str]) -> None:
+    # The accept side is what keeps the deny-rules honest (class-9 dual): every canonical
+    # form — directory, drive, drive root, a literal "%" or space, canonically encoded —
+    # must survive BOTH gates. resolve_source is lazy (the connector reads on iteration),
+    # so this exercises _local_path without needing the path to exist.
+    resolve_source(_source(case["uri"], kind="text"))
+
+
+def test_percent_encoded_literal_percent_is_accepted() -> None:
+    # class-9 dual for the malformed-escape reject: a directory legitimately named
+    # "100%" must stay registerable in its CANONICAL spelling — which is what
+    # Path.as_uri() emits ("%25"). Only the malformed spelling is refused.
+    assert str(_local_path(_source("file:///data/100%25", kind="text"))).endswith("100%")
+
+
+def test_drive_root_uri_is_accepted() -> None:
+    # class-9 dual for the bare-drive reject: only the DRIVE-RELATIVE "file:///C:" is
+    # refused. The drive root resolves absolute and must stay registerable — the
+    # distinction the reject rests on is exactly is_absolute().
+    resolved = _local_path(_source("file:///C:/", kind="text"))
+    if os.name == "nt":
+        assert resolved.is_absolute() and resolved.drive == "C:"
 
 
 def test_trailing_slash_directory_uri_is_accepted(tmp_path: Path) -> None:

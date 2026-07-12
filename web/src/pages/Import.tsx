@@ -106,7 +106,11 @@ function isFileUri(raw: string): boolean {
   try {
     decoded = decodeURIComponent(raw.slice("file://".length).split(/[?#]/)[0]);
   } catch {
-    return false; // malformed escape: the backend would read it literally — refuse
+    // A malformed escape ("/data/100%") throws here but is LITERAL to Python's unquote,
+    // which never raises — so the SoR refuses this shape explicitly (BA9) rather than
+    // letting the two gates disagree. The canonical "%25" spelling decodes fine and
+    // stays registerable on both sides.
+    return false;
   }
   // An embedded NUL (file:///data/%00corpus) can't name a real file on any
   // supported OS — the connector's read is guaranteed to fail.
@@ -130,6 +134,11 @@ function isFileUri(raw: string): boolean {
   const path = decoded.endsWith("/") ? decoded.slice(0, -1) : decoded;
   const segments = path.split("/").slice(1);
   if (segments.length === 0) return false;
+  // A bare drive with no trailing slash ("file:///C:") is DRIVE-RELATIVE: url2pathname
+  // yields Path("C:"), the worker's current directory on that drive, not the drive root
+  // — the Windows spelling of the cwd hazard. "file:///C:/" is the root and is fine.
+  if (segments.length === 1 && /^[A-Za-z]:$/.test(segments[0]) && !decoded.endsWith("/"))
+    return false;
   return segments.every(
     (s, i) =>
       s !== "" &&
@@ -137,6 +146,16 @@ function isFileUri(raw: string): boolean {
       s !== ".." &&
       (!s.includes(":") || (i === 0 && /^[A-Za-z]:$/.test(s))),
   );
+}
+
+// The Console's half of the canonical-uri contract, as one named rule: the uri EXACTLY
+// as stored (never a trimmed view — Python's urlparse keeps a trailing space in the
+// path, while new URL()/trim() normalize it away, so edge whitespace is itself a
+// display≠read divergence) must be a canonical file:/// uri. This must accept exactly
+// the set core.builds.sources._local_path accepts; tests/fixtures/canonical_file_uri.json
+// is the shared corpus that enforces that parity from both suites (BA9).
+export function isCanonicalFileUri(uri: string): boolean {
+  return uri === uri.trim() && isFileUri(uri);
 }
 
 // Whether the pipeline can resolve an already-registered source to the path the
@@ -154,12 +173,9 @@ function isFileUri(raw: string): boolean {
 // loaded list.
 function isResolvableSource(s: Source): boolean {
   if (s.kind !== "text" && s.kind !== "structured") return false;
-  // The worker reads the STORED uri verbatim — Python's urlparse keeps a trailing
-  // space in the path (verified live), while new URL()/trim() normalize it away.
-  // So edge whitespace is itself a display/read divergence: check exactly as
-  // stored, never a trimmed view. (The add form trims before POST, so only
-  // sources registered outside the form can carry it.)
-  if (s.uri !== s.uri.trim() || !isFileUri(s.uri)) return false;
+  // (The add form trims before POST, so only sources registered outside the form can
+  // carry edge whitespace — but they can, so the stored uri is checked as stored.)
+  if (!isCanonicalFileUri(s.uri)) return false;
   if (s.kind === "structured") {
     const table = s.metadata?.table;
     const pk = s.metadata?.pk_column;

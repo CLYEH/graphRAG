@@ -1,0 +1,53 @@
+{
+  "why": [
+    "The SoR (core.builds.sources._local_path) and the Console (isCanonicalFileUri in",
+    "web/src/pages/Import.tsx) must accept EXACTLY the same set of source uris. When they",
+    "drift, a source registered via API/CLI is buildable from one side and permanently",
+    "unrunnable from the other — the Console marks it unresolvable and blocks every build",
+    "for the project. Two of the six Codex findings on PR #71 were that drift (a malformed",
+    "escape, which Python's unquote leaves literal but decodeURIComponent throws on; and a",
+    "single-slash file:/x, which urlparse accepts and the Console's ^file:/// refuses).",
+    "",
+    "This corpus is read by BOTH suites — tests/test_builds_sources.py (pytest) and",
+    "web/src/pages/fileUriGate.test.ts (vitest) — so parity is mechanically enforced rather",
+    "than asserted in a comment. A pure differential cannot catch a defect the two gates",
+    "SHARE (file:///C: read the worker's cwd on both), so each side also keeps its own",
+    "display==read oracle; this fixture is the parity half."
+  ],
+  "reject": [
+    { "uri": "https://example.com/data.csv", "why": "not a file:// uri" },
+    { "uri": "file:///data/corpus ", "why": "trailing whitespace (urlsplit strips it)" },
+    { "uri": "file:///tmp/\t../etc", "why": "control chars (urlsplit strips tab anywhere)" },
+    { "uri": "file://nas/corpus", "why": "host (url2pathname drops it)" },
+    { "uri": "file:///data/corpus?old", "why": "query stripped from the read path" },
+    { "uri": "file:///data/corpus#frag", "why": "fragment stripped from the read path" },
+    { "uri": "file:///data/%00corpus", "why": "NUL names no file on any filesystem" },
+    { "uri": "file:///data/a%5Cb", "why": "backslash is a Windows separator" },
+    { "uri": "file:///", "why": "filesystem root" },
+    { "uri": "file:////nas/corpus", "why": "//-leading reads as a UNC root" },
+    { "uri": "file:///tmp/corpus%2Fprivate", "why": "encoded separator hides the boundary" },
+    { "uri": "file:///data/../etc", "why": "dot segments resolve away from the display" },
+    { "uri": "file:///data/%2e%2e/etc", "why": "encoded dot segments, likewise" },
+    { "uri": "file:///a|/corpus", "why": "pipe IS the Windows drive separator" },
+    { "uri": "file:///data/foo:bar", "why": "colon outside the drive position re-roots" },
+    { "uri": "file:///C%3A/corpus", "why": "encoded drive separator (structure is read pre-decode)" },
+    { "uri": "file:///C:", "why": "bare drive is DRIVE-RELATIVE (the worker's cwd on C)" },
+    { "uri": "file:/data/corpus", "why": "single-slash: reads the same, splits enforcement" },
+    { "uri": "file:///data/100%", "why": "malformed escape: literal to unquote, throws in the Console" },
+    { "uri": "file:///data/%zz", "why": "malformed escape, likewise" },
+    { "uri": "file:///data/%FF", "why": "hex-valid but invalid UTF-8: unquote yields U+FFFD (mangled read), the Console throws" },
+    { "uri": "file:///data/%C3", "why": "truncated multi-byte sequence, likewise" },
+    { "uri": "file:///data/%ED%A0%80", "why": "a surrogate half, likewise" }
+  ],
+  "accept": [
+    { "uri": "file:///data/corpus", "why": "the canonical form" },
+    { "uri": "file:///data/corpus/", "why": "the idiomatic directory form" },
+    { "uri": "file:///C:/corpus", "why": "the canonical Windows drive form (Path.as_uri())" },
+    { "uri": "file:///C:/", "why": "the drive ROOT resolves absolute (unlike a bare C:)" },
+    { "uri": "file:///data/100%25", "why": "a directory really named 100%, canonically spelled" },
+    { "uri": "file:///data/my%20corpus", "why": "a space, canonically encoded" },
+    { "uri": "file:///data/caf%C3%A9", "why": "a VALID multi-byte UTF-8 escape — the dual of the invalid-UTF-8 reject; non-ASCII filenames must stay registerable" },
+    { "uri": "FILE:///data/corpus", "why": "an uppercase scheme is accepted by both gates (uri.lower() / the /i flag) — pinned so neither drops it" },
+    { "uri": "file:///data/corpus;v=1", "why": "a literal ';' survives ONLY because 'file' is absent from urllib.parse.uses_params — load-bearing and non-obvious, so pinned" }
+  ]
+}

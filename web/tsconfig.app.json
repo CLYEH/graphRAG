@@ -6,6 +6,10 @@
     "module": "esnext",
     "types": ["vite/client"],
     "allowArbitraryExtensions": true,
+    /* The canonical-uri parity corpus (tests/fixtures/canonical_file_uri.json) is
+       imported by fileUriGate.test.ts — the SAME file the backend suite reads, so the
+       two gates cannot drift. */
+    "resolveJsonModule": true,
     "skipLibCheck": true,
 
     /* Bundler mode */

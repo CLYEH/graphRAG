@@ -177,6 +177,13 @@ describe("Import", () => {
       // the still-encoded path, so "%3A" passes a decoded segment check but reads
       // "\C:\corpus" (no drive at all)
       "file:///C%3A/corpus",
+      // a bare drive is DRIVE-RELATIVE ("C:" = the worker's cwd on that drive, not the
+      // root) — the Windows spelling of the cwd hazard; "file:///C:/" is the root
+      "file:///C:",
+      // a malformed escape throws in decodeURIComponent but is LITERAL to Python's
+      // unquote — the SoR refuses it too, so both gates accept exactly the same set
+      "file:///data/100%",
+      "file:///data/%zz",
     ]) {
       fireEvent.change(uri, { target: { value: bad } });
       expect(screen.getByText(/canonical/i)).toBeInTheDocument();
@@ -185,7 +192,14 @@ describe("Import", () => {
     // the canonical triple-slash form is accepted — including the Windows drive form,
     // which the colon rule above must not over-block (it IS what Path.as_uri() emits
     // on a Windows worker, and url2pathname resolves it to exactly what it displays)
-    for (const good of ["file:///data/corpus/", "file:///C:/corpus"]) {
+    // ...the drive ROOT (only the drive-relative "file:///C:" is refused), and a
+    // directory legitimately named "100%" in its canonical "%25" spelling
+    for (const good of [
+      "file:///data/corpus/",
+      "file:///C:/corpus",
+      "file:///C:/",
+      "file:///data/100%25",
+    ]) {
       fireEvent.change(uri, { target: { value: good } });
       expect(screen.queryByText(/canonical/i)).not.toBeInTheDocument();
     }
