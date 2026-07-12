@@ -8,3 +8,4 @@
 - [BA 階段真實 LLM 測試](graphrag-ba-real-llm.md) — .env 有真 key,BA 可用真實 API call;harness 兩 lane(快速 hermetic vs 真實 LLM 在 integration/e2e,本地 pre-push,CI fail-loud);只在動到 model 的任務花呼叫
 - [初期落地場景:博物館導覽](graphrag-goal-museum-guide.md) — 外部 no-code agent 平台經 MCP(HTTP)接本平台當場所知識服務;C8b=整合縫;raw data 待 owner 提供;硬約束=不失一般性
 - [FE 瀏覽器操作測試](graphrag-fe-browser-qa.md) — FE 任務 e2e 綠後、開 PR 前,用 Claude in Chrome 真瀏覽器走 UI 流程(console/截圖證據附 PR);補充驗證步非機械 gate(owner 2026-07-11 定案)
+- [v2 前端開放](graphrag-v2-frontend-scope.md) — v1 全綠後 owner 2026-07-12 開放 v2 FE(FE1-4);FE1/FE3 建於既有端點、FE2 卡 BA4(契約無端點→DR-002 先問 owner)、FE4 部分;改凍結契約=DR-002 gate 停下問
