@@ -84,6 +84,12 @@ def _local_path(source: Source) -> Path:
         raise _reject(f"names a host {parsed.netloc!r} that url2pathname drops")
     if parsed.query or parsed.fragment:
         raise _reject("carries a query/fragment that urlparse strips from the path")
+    if "%2f" in parsed.path.lower():
+        # No filesystem permits "/" in a filename, so an encoded %2F can only be
+        # an alternative spelling of a separator — one that hides the segment
+        # boundary from the displayed uri. One canonical shape: separators are
+        # literal "/".
+        raise _reject("encodes the path separator (%2F) — separators must be literal")
     decoded = unquote(parsed.path)
     if "\x00" in decoded:
         raise _reject("decodes to a path containing NUL, which no filesystem accepts")

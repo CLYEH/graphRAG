@@ -103,14 +103,19 @@ def test_non_file_uri_is_rejected() -> None:
         # names (and would slip past a leading-slash-assuming segment split)
         ("file:../corpus", "relative path"),
         ("file:relative/corpus", "relative path"),
-        # //-leading (raw four-slash or decoded %2F) is reinterpreted as UNC root
+        # //-leading (raw four-slash) is reinterpreted as UNC root
         ("file:////nas/corpus", "//-leading"),
-        ("file:///%2Fdata", "//-leading"),
+        # encoded separators hide the segment boundary from the display — no
+        # filesystem permits "/" in a filename, so %2F can only be a disguised
+        # separator (whether it springs "//", "../", or plain segments)
+        ("file:///%2Fdata", "encodes the path separator"),
+        ("file:///safe/%2F..%2F..%2Fetc", "encodes the path separator"),
+        ("file:///tmp/corpus%2Fprivate", "encodes the path separator"),
+        ("file:///a%2fb", "encodes the path separator"),
         # dot segments — raw or percent-encoded — get resolved by the filesystem
-        # to a different tree than the display names (%2F..%2F springs "../")
+        # to a different tree than the display names
         ("file:///data/../etc", "dot path segments"),
         ("file:///data/%2e%2e/etc", "dot path segments"),
-        ("file:///safe/%2F..%2F..%2Fetc", "dot path segments"),
     ],
 )
 def test_non_canonical_file_uri_is_rejected(uri: str, why: str) -> None:

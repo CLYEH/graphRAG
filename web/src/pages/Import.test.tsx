@@ -159,6 +159,10 @@ describe("Import", () => {
       // them — but stored uris carrying them hit the same shared gate)
       "file:///tmp/\t../etc",
       "file:///data\tcorpus",
+      // encoded separators hide the segment boundary from the display (no
+      // filesystem permits "/" in a filename); %5C springs a Windows separator
+      "file:///tmp/corpus%2Fprivate",
+      "file:///data/a%5Cb",
     ]) {
       fireEvent.change(uri, { target: { value: bad } });
       expect(screen.getByText(/canonical/i)).toBeInTheDocument();
