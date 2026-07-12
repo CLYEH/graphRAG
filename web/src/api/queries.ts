@@ -325,20 +325,28 @@ export function useCreateProject() {
 
 // Registers a source under a project. `kind` is one of the ingest-wired kinds
 // (text/structured); `metadata` carries a structured source's table + pk_column
-// (read_csv_rows requires them). No Idempotency-Key by design: `uri` is not unique
-// server-side (each add mints a fresh id, duplicate uris are permitted), so there
-// is no natural key, and a uri-derived one would wrongly suppress an intentional
-// re-registration. The submit button is disabled while the request is in flight,
-// which covers the rapid double-submit. Invalidates the source list so the new row
-// appears.
+// (read_csv_rows requires them). `idempotencyKey` is a per-logical-attempt random
+// key (NOT uri-derived — `uri` isn't unique server-side and a stable natural key
+// would suppress an intentional re-registration): a retry after a lost 201 replays
+// the stored response instead of minting a duplicate row, while a NEW attempt (the
+// form contents changed) carries a fresh key so deliberate duplicates stay
+// possible. Invalidates the source list so the new row appears.
 export function useAddSource(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (input: { uri: string; kind: string; metadata?: Record<string, string> }) => {
+    mutationFn: async (input: {
+      uri: string;
+      kind: string;
+      metadata?: Record<string, string>;
+      idempotencyKey: string;
+    }) => {
       const body: components["schemas"]["SourceCreate"] = { uri: input.uri, kind: input.kind };
       if (input.metadata) body.metadata = input.metadata;
       const { data, error } = await api.POST("/projects/{project}/sources", {
-        params: { path: { project } },
+        params: {
+          path: { project },
+          header: { "Idempotency-Key": input.idempotencyKey },
+        },
         body,
       });
       if (error) throw new Error(error.error.message);
@@ -350,18 +358,19 @@ export function useAddSource(project: string) {
 
 export type TriggerKind = "ingest" | "build";
 
-// Triggers a pipeline run (ingest = stage 1, build = the full pipeline). The body
-// is sent EMPTY: IngestRequest.source_ids and BuildRequest.reason are 400-rejected
-// by presence until the pipeline honors them (BA2e-1), so no field may ride along
-// — the kind rides the URL, switched to keep the typed path a codegen literal. No
-// Idempotency-Key: create_job_exclusive serializes on the projects row and 409s a
-// second concurrent trigger (JOB_CONFLICT "overlapping job"), which is the
-// server-side dedup; the buttons are disabled while pending. Returns the accepted
-// job so the caller can watch it live.
+// Triggers a pipeline run (both kinds run the full pipeline; the kind rides the
+// URL, switched to keep the typed path a codegen literal). The body is sent EMPTY:
+// IngestRequest.source_ids and BuildRequest.reason are 400-rejected by presence
+// until the pipeline honors them (BA2e-1). `idempotencyKey` is a per-logical-
+// attempt random key: create_job_exclusive only dedups while the first job is
+// non-terminal, so a retry after a LOST 202 would otherwise either 409 with no job
+// id to watch (job still running) or double-trigger a second full pipeline (job
+// finished) — with the key, the retry replays the stored 202 and hands back the
+// ORIGINAL job id. Returns the accepted job so the caller can watch it live.
 export function useTrigger(project: string) {
   return useMutation({
-    mutationFn: async (kind: TriggerKind) => {
-      const params = { path: { project } };
+    mutationFn: async ({ kind, idempotencyKey }: { kind: TriggerKind; idempotencyKey: string }) => {
+      const params = { path: { project }, header: { "Idempotency-Key": idempotencyKey } };
       const res =
         kind === "ingest"
           ? await api.POST("/projects/{project}/ingest", { params })

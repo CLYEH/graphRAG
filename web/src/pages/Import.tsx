@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { useAddSource, useProjects, useSources, useTrigger } from "../api/queries";
 import { isPathAddressable, useActiveProject } from "../project/projectRoute";
@@ -180,6 +180,15 @@ function Sources({ project }: { project: string }) {
   const sources = useSources(project);
   const add = useAddSource(project);
 
+  // One Idempotency-Key per LOGICAL attempt: retrying the same form contents after
+  // a lost 201 replays the original row instead of duplicating it, while any edit
+  // (including the post-success clear) mints a fresh key so a deliberately
+  // re-typed duplicate registration still goes through.
+  const attemptKey = useRef(crypto.randomUUID());
+  useEffect(() => {
+    attemptKey.current = crypto.randomUUID();
+  }, [uri, kind, table, pkColumn]);
+
   // A structured source needs table + pk_column or resolve_source fails the build,
   // so gate the submit on them exactly as read_csv_rows requires.
   const structured = kind === "structured";
@@ -195,6 +204,7 @@ function Sources({ project }: { project: string }) {
         uri: uri.trim(),
         kind,
         metadata: structured ? { table: table.trim(), pk_column: pkColumn.trim() } : undefined,
+        idempotencyKey: attemptKey.current,
       },
       {
         onSuccess: () => {
@@ -338,8 +348,23 @@ function RunPipeline({
   const ready =
     gatesLoaded && sources.data !== undefined && !sources.isFetching && !sources.isError;
 
+  // One Idempotency-Key per logical trigger attempt, per kind: a retry after a
+  // lost 202 replays the stored response and hands back the ORIGINAL job id
+  // (create_job_exclusive only dedups while that job is non-terminal — without the
+  // key a late retry double-runs the full pipeline); a trigger that SUCCEEDED
+  // clears the key so the next click is a deliberate new run.
+  const attemptKeys = useRef<Partial<Record<TriggerKind, string>>>({});
   function run(kind: TriggerKind) {
-    trigger.mutate(kind, { onSuccess: (job) => setAccepted(job) });
+    const key = (attemptKeys.current[kind] ??= crypto.randomUUID());
+    trigger.mutate(
+      { kind, idempotencyKey: key },
+      {
+        onSuccess: (job) => {
+          delete attemptKeys.current[kind];
+          setAccepted(job);
+        },
+      },
+    );
   }
 
   return (

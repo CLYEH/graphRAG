@@ -49,29 +49,42 @@ function stubImportGets(proj: Project, srcs: Source[]) {
 }
 
 describe("Import", () => {
-  it("registers a text source with NO idempotency key and clears the form on success", async () => {
+  it("registers a text source with a per-attempt idempotency key and clears the form", async () => {
     stubSources([]);
-    const post = stubPost(source({ uri: "file:///data/corpus/", kind: "text" }));
+    // first attempt fails (a lost 201 looks the same client-side), the retry
+    // succeeds — the key must be IDENTICAL across the two calls so the server
+    // replays the committed row instead of duplicating it; it must NOT be
+    // uri-derived (uri isn't unique server-side; a stable natural key would
+    // suppress an intentional re-registration — edits mint a fresh key instead)
+    const post = vi
+      .spyOn(api, "POST")
+      .mockResolvedValueOnce({
+        data: undefined,
+        error: { error: { code: "STORE_UNAVAILABLE", message: "down", details: null } },
+      } as never)
+      .mockResolvedValue({
+        data: { data: source({ uri: "file:///data/corpus/", kind: "text" }), meta: META },
+        error: undefined,
+      } as never);
     renderImport(projectRoute("acme", "import"));
 
     const uri = screen.getByLabelText("uri");
     fireEvent.change(uri, { target: { value: "file:///data/corpus/" } });
     fireEvent.click(screen.getByRole("button", { name: /add source/i }));
+    await screen.findByText(/add failed/i);
+    fireEvent.click(screen.getByRole("button", { name: /add source/i }));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
 
-    await waitFor(() => expect(post).toHaveBeenCalled());
-    const [path, init] = post.mock.calls[0] as [
-      string,
-      { params: { header?: unknown }; body: unknown },
-    ];
-    // uri is not unique server-side (each add mints a fresh id, duplicate uris are
-    // permitted), so there is no natural key — a uri-derived one would wrongly
-    // suppress an intentional re-registration, so the add sends no Idempotency-Key.
-    // kind defaults to text (the wired kind), sent so the build doesn't fail on a
-    // missing/unsupported kind.
+    type Call = [string, { params: { header: { "Idempotency-Key": string } }; body: unknown }];
+    const [path, first] = post.mock.calls[0] as Call;
+    const [, second] = post.mock.calls[1] as Call;
     expect(path).toBe("/projects/{project}/sources");
-    expect(init.body).toEqual({ uri: "file:///data/corpus/", kind: "text" });
-    expect(init.params.header).toBeUndefined();
-    // the form clears so the next source starts fresh
+    expect(first.body).toEqual({ uri: "file:///data/corpus/", kind: "text" });
+    const key = first.params.header["Idempotency-Key"];
+    expect(key).toBeTruthy();
+    expect(key).not.toContain("corpus"); // random per attempt, not uri-derived
+    expect(second.params.header["Idempotency-Key"]).toBe(key);
+    // the form clears so the next source starts fresh (and with it, a fresh key)
     await waitFor(() => expect(uri).toHaveValue(""));
   });
 
@@ -354,6 +367,41 @@ describe("Import", () => {
 
     expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+  });
+
+  it("retries a trigger with the SAME idempotency key, then mints a new one after success", async () => {
+    // create_job_exclusive only dedups while the first job is non-terminal, so a
+    // retry after a lost 202 must replay the stored response (same key → original
+    // job id) instead of double-running the full pipeline; a trigger that
+    // SUCCEEDED clears the key so the next click is a deliberate new run
+    stubSources([]);
+    const post = vi
+      .spyOn(api, "POST")
+      .mockResolvedValueOnce({
+        data: undefined,
+        error: { error: { code: "STORE_UNAVAILABLE", message: "down", details: null } },
+      } as never)
+      .mockResolvedValue({
+        data: { data: { job_id: JOB_ID, status: "queued" }, meta: META },
+        error: undefined,
+      } as never);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(sseResponse([])));
+    renderImport(projectRoute("acme", "import"));
+
+    const build = await screen.findByRole("button", { name: /^build$/i });
+    await waitFor(() => expect(build).toBeEnabled());
+    fireEvent.click(build);
+    await screen.findByText(/trigger failed/i);
+    fireEvent.click(build);
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+    fireEvent.click(build); // after success: a deliberate new run
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(3));
+
+    type Call = [string, { params: { header: { "Idempotency-Key": string } } }];
+    const keys = post.mock.calls.map((c) => (c as Call)[1].params.header["Idempotency-Key"]);
+    expect(keys[0]).toBeTruthy();
+    expect(keys[1]).toBe(keys[0]); // retry replays the same attempt
+    expect(keys[2]).not.toBe(keys[0]); // post-success click is a new attempt
   });
 
   it("keeps the run gate closed after a failed sources refetch", async () => {
