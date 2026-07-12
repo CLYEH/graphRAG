@@ -8,10 +8,17 @@ import "./Import.css";
 
 import type { JobAccepted, TriggerKind } from "../api/queries";
 
-// Connector kinds the frozen contract's Source.kind documents (file/directory/url/
-// database); blank lets the backend infer. Not an enum in the contract, so this is
-// a convenience list, not a validation gate.
-const SOURCE_KINDS = ["file", "directory", "url", "database"];
+// The source kinds the ingest pipeline actually wires (core/builds/sources.py
+// SUPPORTED_SOURCE_KINDS): "text" reads a file:// text file/dir; "structured"
+// reads a file:// CSV and requires table + pk_column in metadata. The store/API
+// accept any kind string, but resolve_source fails the build loud for any other
+// kind (or a blank one), so the UI offers only these two, collects the structured
+// metadata, and points the uri at a file:// path (the only wired scheme) — never
+// letting the operator register a source whose build is guaranteed to fail. The
+// contract's Source.kind doc lists file/directory/url/database as illustrative
+// connector kinds, but those have no C2 connector yet (Codex #70).
+const SOURCE_KINDS = ["text", "structured"] as const;
+type SourceKind = (typeof SOURCE_KINDS)[number];
 
 // FE1 Import (DESIGN §5/§15): register sources into the active project by URI/
 // connector, then trigger ingest (stage 1) or a full build and watch the job live.
@@ -48,25 +55,37 @@ export function Import() {
   );
 }
 
-// Register a source (uri + optional kind) and list what's registered. The uri and
-// kind render as inert text/<code> — never an href/src — so a hostile source
-// string can't become a live link (a class-14 sink); the uri is shown verbatim so
-// the operator sees exactly what was stored.
+// Register a source (file:// uri + a wired kind, plus table/pk_column for
+// structured) and list what's registered. The uri and kind render as inert
+// text/<code> — never an href/src — so a hostile source string can't become a live
+// link (a class-14 sink); the uri is shown verbatim so the operator sees exactly
+// what was stored.
 function Sources({ project }: { project: string }) {
   const [uri, setUri] = useState("");
-  const [kind, setKind] = useState("");
+  const [kind, setKind] = useState<SourceKind>("text");
+  const [table, setTable] = useState("");
+  const [pkColumn, setPkColumn] = useState("");
   const sources = useSources(project);
   const add = useAddSource(project);
 
-  const canAdd = uri.trim() !== "" && !add.isPending;
+  // A structured source needs table + pk_column or resolve_source fails the build,
+  // so gate the submit on them exactly as read_csv_rows requires.
+  const structured = kind === "structured";
+  const metaReady = !structured || (table.trim() !== "" && pkColumn.trim() !== "");
+  const canAdd = uri.trim() !== "" && metaReady && !add.isPending;
 
   function submit() {
     add.mutate(
-      { uri: uri.trim(), kind },
+      {
+        uri: uri.trim(),
+        kind,
+        metadata: structured ? { table: table.trim(), pk_column: pkColumn.trim() } : undefined,
+      },
       {
         onSuccess: () => {
           setUri("");
-          setKind("");
+          setTable("");
+          setPkColumn("");
         },
       },
     );
@@ -75,6 +94,10 @@ function Sources({ project }: { project: string }) {
   return (
     <section className="import__section">
       <h2>Sources</h2>
+      <p className="runs__muted">
+        Sources are read from a local <code>file://</code> path — a text file or folder (text), or a
+        CSV (structured).
+      </p>
       <form
         className="npf__form"
         onSubmit={(e) => {
@@ -87,13 +110,12 @@ function Sources({ project }: { project: string }) {
           <input
             value={uri}
             onChange={(e) => setUri(e.target.value)}
-            placeholder="file:///data/corpus · https://… · postgres://…"
+            placeholder="file:///data/corpus.txt"
           />
         </label>
         <label className="npf__field">
           kind
-          <select value={kind} onChange={(e) => setKind(e.target.value)}>
-            <option value="">(infer)</option>
+          <select value={kind} onChange={(e) => setKind(e.target.value as SourceKind)}>
             {SOURCE_KINDS.map((k) => (
               <option key={k} value={k}>
                 {k}
@@ -101,6 +123,26 @@ function Sources({ project }: { project: string }) {
             ))}
           </select>
         </label>
+        {structured && (
+          <>
+            <label className="npf__field">
+              table
+              <input
+                value={table}
+                onChange={(e) => setTable(e.target.value)}
+                placeholder="documents"
+              />
+            </label>
+            <label className="npf__field">
+              pk_column
+              <input
+                value={pkColumn}
+                onChange={(e) => setPkColumn(e.target.value)}
+                placeholder="id"
+              />
+            </label>
+          </>
+        )}
         <button type="submit" disabled={!canAdd}>
           {add.isPending ? "Adding…" : "Add source"}
         </button>

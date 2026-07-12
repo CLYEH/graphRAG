@@ -32,13 +32,13 @@ function renderImport(route: string) {
 }
 
 describe("Import", () => {
-  it("registers a source with NO idempotency key and clears the form on success", async () => {
+  it("registers a text source with NO idempotency key and clears the form on success", async () => {
     stubSources([]);
-    const post = stubPost(source({ uri: "https://x/doc" }));
+    const post = stubPost(source({ uri: "file:///data/corpus.txt", kind: "text" }));
     renderImport(projectRoute("acme", "import"));
 
     const uri = screen.getByLabelText("uri");
-    fireEvent.change(uri, { target: { value: "https://x/doc" } });
+    fireEvent.change(uri, { target: { value: "file:///data/corpus.txt" } });
     fireEvent.click(screen.getByRole("button", { name: /add source/i }));
 
     await waitFor(() => expect(post).toHaveBeenCalled());
@@ -48,12 +48,38 @@ describe("Import", () => {
     ];
     // uri is not unique server-side (each add mints a fresh id, duplicate uris are
     // permitted), so there is no natural key — a uri-derived one would wrongly
-    // suppress an intentional re-registration, so the add sends no Idempotency-Key
+    // suppress an intentional re-registration, so the add sends no Idempotency-Key.
+    // kind defaults to text (the wired kind), sent so the build doesn't fail on a
+    // missing/unsupported kind.
     expect(path).toBe("/projects/{project}/sources");
-    expect(init.body).toEqual({ uri: "https://x/doc" });
+    expect(init.body).toEqual({ uri: "file:///data/corpus.txt", kind: "text" });
     expect(init.params.header).toBeUndefined();
     // the form clears so the next source starts fresh
     await waitFor(() => expect(uri).toHaveValue(""));
+  });
+
+  it("requires table + pk_column for a structured source and sends them as metadata", async () => {
+    stubSources([]);
+    const post = stubPost(source({ uri: "file:///data/rows.csv", kind: "structured" }));
+    renderImport(projectRoute("acme", "import"));
+
+    fireEvent.change(screen.getByLabelText("uri"), { target: { value: "file:///data/rows.csv" } });
+    fireEvent.change(screen.getByLabelText("kind"), { target: { value: "structured" } });
+
+    // read_csv_rows needs table + pk_column, so the submit must stay blocked until
+    // they're supplied — else the build fails on missing structured metadata
+    expect(screen.getByRole("button", { name: /add source/i })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("table"), { target: { value: "documents" } });
+    fireEvent.change(screen.getByLabelText("pk_column"), { target: { value: "id" } });
+    fireEvent.click(screen.getByRole("button", { name: /add source/i }));
+
+    await waitFor(() => expect(post).toHaveBeenCalled());
+    const [, init] = post.mock.calls[0] as [string, { body: unknown }];
+    expect(init.body).toEqual({
+      uri: "file:///data/rows.csv",
+      kind: "structured",
+      metadata: { table: "documents", pk_column: "id" },
+    });
   });
 
   it("renders a registered source as inert text, never a live link", async () => {

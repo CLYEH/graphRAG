@@ -233,8 +233,8 @@ function sourceResponse() {
     body: JSON.stringify({
       data: {
         id: "50000000-0000-0000-0000-000000000000",
-        kind: "url",
-        uri: "https://example.com/doc",
+        kind: "text",
+        uri: "file:///data/corpus.txt",
         metadata: {},
         added_at: "2026-07-01T00:00:00Z",
       },
@@ -308,10 +308,11 @@ test("the import section registers a source and triggers a build", async ({ page
   await page.getByRole("link", { name: "Import" }).click();
   await expect(page.getByRole("heading", { name: /^import$/i })).toBeVisible();
 
-  // register a source by uri (no byte upload — the contract models a uri reference)
-  await page.getByLabel("uri").fill("https://example.com/doc");
+  // register a text source by file:// uri (no byte upload — the contract models a
+  // uri reference, and text is the ingest-wired default kind)
+  await page.getByLabel("uri").fill("file:///data/corpus.txt");
   await page.getByRole("button", { name: /add source/i }).click();
-  await expect.poll(() => sourceBody).toContain("https://example.com/doc");
+  await expect.poll(() => sourceBody).toContain("file:///data/corpus.txt");
 
   // trigger a full build and watch the accepted job
   await page.getByRole("button", { name: /^build$/i }).click();

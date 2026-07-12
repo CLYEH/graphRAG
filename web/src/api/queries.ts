@@ -323,18 +323,20 @@ export function useCreateProject() {
   });
 }
 
-// Registers a source under a project. No Idempotency-Key by design: `uri` is not
-// unique server-side (each add mints a fresh id, duplicate uris are permitted), so
-// there is no natural key, and a uri-derived one would wrongly suppress an
-// intentional re-registration. The submit button is disabled while the request is
-// in flight, which covers the rapid double-submit. Invalidates the source list so
-// the new row appears.
+// Registers a source under a project. `kind` is one of the ingest-wired kinds
+// (text/structured); `metadata` carries a structured source's table + pk_column
+// (read_csv_rows requires them). No Idempotency-Key by design: `uri` is not unique
+// server-side (each add mints a fresh id, duplicate uris are permitted), so there
+// is no natural key, and a uri-derived one would wrongly suppress an intentional
+// re-registration. The submit button is disabled while the request is in flight,
+// which covers the rapid double-submit. Invalidates the source list so the new row
+// appears.
 export function useAddSource(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (input: { uri: string; kind: string }) => {
-      const body: components["schemas"]["SourceCreate"] = { uri: input.uri };
-      if (input.kind.trim() !== "") body.kind = input.kind.trim();
+    mutationFn: async (input: { uri: string; kind: string; metadata?: Record<string, string> }) => {
+      const body: components["schemas"]["SourceCreate"] = { uri: input.uri, kind: input.kind };
+      if (input.metadata) body.metadata = input.metadata;
       const { data, error } = await api.POST("/projects/{project}/sources", {
         params: { path: { project } },
         body,
