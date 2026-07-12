@@ -9,6 +9,8 @@ export type Project = components["schemas"]["Project"];
 export type HealthReport = components["schemas"]["HealthReport"];
 export type Build = components["schemas"]["Build"];
 export type Job = components["schemas"]["Job"];
+export type MergeCandidate = components["schemas"]["MergeCandidate"];
+export type MergeCandidateStatus = components["schemas"]["MergeCandidateStatus"];
 
 // Lists every project for the switcher. The switcher must reach any project,
 // so page through meta.next_cursor to exhaustion rather than showing only the
@@ -107,5 +109,93 @@ export function useCancelJob(jobId: string | null) {
       return data.data;
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["job", jobId] }),
+  });
+}
+
+// Merge candidates awaiting entity-resolution review (DESIGN §17). Active-build
+// scoped like the other project reads; pages through next_cursor so the whole
+// queue is reachable, and fails loud so a store outage / no-active-build surfaces
+// (with the API's message) rather than an empty queue that reads as "nothing to
+// review". All statuses are returned — decided rows stay visible as an audit
+// trail, their actions disabled by the §17 gate below.
+export function useMergeCandidates(project: string | undefined) {
+  return useQuery({
+    queryKey: ["merge-candidates", project],
+    enabled: project !== undefined && isPathAddressable(project),
+    queryFn: async () => {
+      const all: MergeCandidate[] = [];
+      let cursor: string | undefined;
+      // The endpoint re-resolves the active build per request, so a build
+      // activated mid-pagination would splice page 1 (old build) with later
+      // pages (new build) — a mixed queue whose stale rows then 404 on decide.
+      // Pin the first page's build_id and fail loud on a swap; a retry pulls a
+      // clean single-build snapshot. (`undefined` = not yet seen; build_id itself
+      // is string | null.)
+      let buildId: string | null | undefined;
+      do {
+        const { data, error } = await api.GET("/projects/{project}/merge-candidates", {
+          params: { path: { project: project as string }, query: { limit: 200, cursor } },
+        });
+        if (error) throw new Error(error.error.message);
+        if (buildId === undefined) buildId = data.meta.build_id;
+        else if (data.meta.build_id !== buildId)
+          throw new Error("The active build changed while loading the review queue — retry.");
+        all.push(...data.data);
+        cursor = data.meta.next_cursor ?? undefined;
+      } while (cursor);
+      return all;
+    },
+  });
+}
+
+export type ReviewVerb = "approve" | "reject" | "defer";
+
+// Records a curator decision on a merge candidate (DESIGN §17). The verb rides
+// the URL (three frozen paths), not a body field, so switch on it to keep the
+// typed path a literal — an accept-and-ignore body verb would defeat the codegen.
+// On success the queue is invalidated so the row reflects the new status (and a
+// terminal status disables further actions). `reason` is optional.
+export function useDecideMergeCandidate(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      candidateId,
+      verb,
+      reason,
+    }: {
+      candidateId: string;
+      verb: ReviewVerb;
+      reason: string | null;
+    }) => {
+      // A deterministic key per (candidate, verb): if a response is lost after the
+      // server commits the decision, the curator's retry replays the stored 200
+      // instead of hitting an illegal-transition 400 on the now-decided candidate
+      // (which would misreport a successful review as failed). The transition model
+      // makes each (candidate, verb) a once-only operation, so this natural key is
+      // stable across retries without extra state; the endpoints dedupe on it.
+      const params = {
+        path: { project, candidate_id: candidateId },
+        header: { "Idempotency-Key": `${candidateId}:${verb}` },
+      };
+      const body = { reason };
+      const res =
+        verb === "approve"
+          ? await api.POST("/projects/{project}/merge-candidates/{candidate_id}/approve", {
+              params,
+              body,
+            })
+          : verb === "reject"
+            ? await api.POST("/projects/{project}/merge-candidates/{candidate_id}/reject", {
+                params,
+                body,
+              })
+            : await api.POST("/projects/{project}/merge-candidates/{candidate_id}/defer", {
+                params,
+                body,
+              });
+      if (res.error) throw new Error(res.error.error.message);
+      return res.data.data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["merge-candidates", project] }),
   });
 }

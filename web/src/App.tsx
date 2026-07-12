@@ -6,6 +6,7 @@ import { JobsDashboard } from "./pages/JobsDashboard";
 import { NotFound } from "./pages/NotFound";
 import { Placeholder } from "./pages/Placeholder";
 import { ProjectHealth } from "./pages/ProjectHealth";
+import { ReviewQueue } from "./pages/ReviewQueue";
 
 export default function App() {
   return (
@@ -15,7 +16,7 @@ export default function App() {
         <Route index element={<Navigate to="health" replace />} />
         <Route path="health" element={<ProjectHealth />} />
         <Route path="jobs" element={<JobsDashboard />} />
-        <Route path="review" element={<Placeholder title="Entity Review" task="FE5" />} />
+        <Route path="review" element={<ReviewQueue />} />
         <Route path="playground" element={<Placeholder title="Query Playground" task="FE6" />} />
         <Route path="*" element={<NotFound />} />
       </Route>
