@@ -36,10 +36,12 @@ type SourceKind = (typeof SOURCE_KINDS)[number];
 // host-bearing "file://nas/corpus" silently drops the host and reads /corpus, an
 // empty-path "file:" / "file://" resolves to the WORKER's cwd, and a query/hash
 // suffix ("file:///data?old") is silently stripped — the worker reads a different
-// path than the stored uri displays (Codex #70). Requiring the triple-slash form
-// with a non-root path and no search/hash (parse-validated, so a bare local path
-// is rejected too) makes the browser's accept set exactly what the backend will
-// read. Dir-vs-file (text) stays placeholder guidance — a page can't stat.
+// path than the stored uri displays; and a four-slash "file:////nas/x" parses to a
+// "//"-leading path that url2pathname reinterprets as a UNC authority instead of
+// the displayed path (Codex #70). Requiring the triple-slash form with a non-root,
+// single-leading-slash path and no search/hash (parse-validated, so a bare local
+// path is rejected too) makes the browser's accept set exactly what the backend
+// will read. Dir-vs-file (text) stays placeholder guidance — a page can't stat.
 function isFileUri(raw: string): boolean {
   let url: URL;
   try {
@@ -48,7 +50,11 @@ function isFileUri(raw: string): boolean {
     return false;
   }
   return (
-    /^file:\/\/\//i.test(raw) && url.search === "" && url.hash === "" && url.pathname.length > 1
+    /^file:\/\/\//i.test(raw) &&
+    url.search === "" &&
+    url.hash === "" &&
+    url.pathname.length > 1 &&
+    !url.pathname.startsWith("//")
   );
 }
 

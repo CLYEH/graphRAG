@@ -118,6 +118,9 @@ describe("Import", () => {
       "file:///?x",
       "file:///data/corpus?old",
       "file:///a#frag",
+      // four slashes parse to a "//"-leading path that url2pathname reinterprets
+      // as a UNC authority — the worker can't read the displayed path
+      "file:////nas/corpus",
     ]) {
       fireEvent.change(uri, { target: { value: bad } });
       expect(screen.getByText(/canonical/i)).toBeInTheDocument();
