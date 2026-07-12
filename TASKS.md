@@ -92,6 +92,6 @@ Keep items small enough to finish in one loop.
 - [x] FE0 app shell + OpenAPI codegen client + project switcher
 - [x] FE7 Project Health home
 - [x] FE8 Pipeline/jobs dashboard
-- [ ] FE5 Entity-resolution review UI
+- [x] FE5 Entity-resolution review UI
 - [ ] FE6 Query playground UI
 - [ ] FE1 Import · [ ] FE2 Clean · [ ] FE3 Inspect · [ ] FE4 Graph explorer  *(v2)*

@@ -7,7 +7,7 @@ import { api } from "./api/client";
 import { encodeProjectSegment } from "./project/projectRoute";
 
 import type { ReactElement } from "react";
-import type { Build, HealthReport, Job, Project } from "./api/queries";
+import type { Build, HealthReport, Job, MergeCandidate, Project } from "./api/queries";
 
 // Builds the encoded route for a project key, so tests exercise the real
 // encode/decode path rather than hardcoding a raw `/p/<key>` segment.
@@ -166,6 +166,39 @@ export function stubJob(j: Job) {
   return vi
     .spyOn(api, "GET")
     .mockResolvedValue({ data: { data: j, meta: META }, error: undefined } as never);
+}
+
+export function mergeCandidate(overrides: Partial<MergeCandidate> = {}): MergeCandidate {
+  return {
+    id: "c0000000-0000-0000-0000-000000000000",
+    project: "acme",
+    build_id: "b0000000-0000-0000-0000-000000000000",
+    left_entity_id: "e1000000-0000-0000-0000-000000000000",
+    right_entity_id: "e2000000-0000-0000-0000-000000000000",
+    score: 0.9,
+    status: "pending",
+    decision: null,
+    decided_by: null,
+    decided_at: null,
+    reason: null,
+    impact: null,
+    left_snapshot: null,
+    right_snapshot: null,
+    ...overrides,
+  };
+}
+
+export function stubMergeCandidates(candidates: MergeCandidate[]) {
+  return vi
+    .spyOn(api, "GET")
+    .mockResolvedValue({ data: { data: candidates, meta: META }, error: undefined } as never);
+}
+
+// POST stub for the decision endpoints — resolves with the updated candidate.
+export function stubDecision(updated: MergeCandidate) {
+  return vi
+    .spyOn(api, "POST")
+    .mockResolvedValue({ data: { data: updated, meta: META }, error: undefined } as never);
 }
 
 // A streaming fetch Response carrying the given SSE text chunks — mock global
