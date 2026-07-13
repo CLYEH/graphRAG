@@ -79,7 +79,7 @@ test("console shell loads with the project switcher and section nav", async ({ p
   await expect(page.getByRole("status")).toHaveText("Healthy");
   await expect(page.getByText("chunks")).toBeVisible();
   await expect(page.getByRole("combobox", { name: /project/i })).toHaveValue("acme");
-  for (const label of ["Health", "Import", "Inspect", "Jobs", "Review", "Playground"]) {
+  for (const label of ["Health", "Import", "Clean", "Inspect", "Jobs", "Review", "Playground"]) {
     await expect(page.getByRole("link", { name: label })).toBeVisible();
   }
 });
@@ -399,4 +399,74 @@ test("inspect browses the active build's documents and opens a detail-only field
 
   await page.getByRole("button", { name: "file:///data/corpus/a.txt" }).click();
   await expect(page.getByText("Ada Lovelace worked at the Analytical Engine.")).toBeVisible();
+});
+
+test("clean previews pasted text and saves chunking by spreading the config", async ({ page }) => {
+  // The two FE2 invariants, end-to-end in a real browser: the preview call names
+  // exactly one source with omitted knobs left OUT of the body, and the save PATCH
+  // carries the project's OTHER config blocks (the column is replaced server-side —
+  // a naive {config:{chunking}} would wipe ontology).
+  let previewBody = "";
+  let patchBody = "";
+  // NB: playwright's `*` does not cross `/` — the preview path needs its own route
+  await page.route("**/projects/*/clean/preview", (route, request) => {
+    previewBody = request.postData() ?? "";
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          chunks: [
+            { ordinal: 0, text: "alpha beta", start_offset: 0, end_offset: 10, token_count: 2 },
+          ],
+        },
+        meta: {
+          request_id: "00000000-0000-0000-0000-000000000000",
+          build_id: null,
+          elapsed_ms: 1,
+        },
+      }),
+    });
+  });
+  await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  await page.route("**/projects/acme", (route, request) => {
+    if (request.method() === "PATCH") {
+      patchBody = request.postData() ?? "";
+    }
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          name: "acme",
+          display_name: null,
+          description: null,
+          config: {
+            ontology: { entity_types: ["PERSON"] },
+            chunking: { max_chars: 500, overlap: 50 },
+          },
+          created_at: "2026-07-01T00:00:00Z",
+        },
+        meta: {
+          request_id: "00000000-0000-0000-0000-000000000000",
+          build_id: null,
+          elapsed_ms: 1,
+        },
+      }),
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "Clean" }).click();
+  await expect(page.getByRole("heading", { name: /^clean$/i })).toBeVisible();
+
+  await page.locator("textarea").fill("alpha beta gamma delta");
+  await page.getByRole("button", { name: /^preview$/i }).click();
+  await expect(page.getByText("alpha beta", { exact: true })).toBeVisible();
+  expect(JSON.parse(previewBody)).toEqual({ text: "alpha beta gamma delta" });
+
+  await page.getByRole("button", { name: /save 500\/50 to config/i }).click();
+  await expect(page.getByText(/saved 500\/50 — the next build/i)).toBeVisible();
+  const patched = JSON.parse(patchBody);
+  expect(patched.config.ontology).toEqual({ entity_types: ["PERSON"] });
+  expect(patched.config.chunking).toEqual({ max_chars: 500, overlap: 50 });
 });

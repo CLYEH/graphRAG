@@ -1,0 +1,131 @@
+.clean {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.clean__title {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.clean__subtitle {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.clean__hint,
+.clean__line,
+.clean__muted {
+  margin: 0;
+  color: var(--muted, #666);
+  font-size: 0.9rem;
+}
+
+.clean__line--error {
+  color: var(--bad, #b00020);
+}
+
+.clean__form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  max-width: 44rem;
+}
+
+.clean__source {
+  display: flex;
+  gap: 1rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 4px;
+}
+
+.clean__source label {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+}
+
+.clean__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--muted, #666);
+}
+
+.clean__field textarea,
+.clean__field input,
+.clean__field select {
+  font: inherit;
+  color: inherit;
+  padding: 0.3rem 0.4rem;
+}
+
+.clean__knobs {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.clean__knobs .clean__field input {
+  width: 7rem;
+}
+
+.clean__knobs .clean__muted {
+  flex-basis: 100%;
+}
+
+.clean__actions {
+  display: flex;
+  gap: 0.6rem;
+}
+
+.clean__actions button,
+.clean__more {
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+  font: inherit;
+}
+
+.clean__more {
+  align-self: flex-start;
+  margin-top: 0.25rem;
+}
+
+.clean__result {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.clean__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.clean__table th,
+.clean__table td {
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border, #eee);
+  text-align: left;
+  vertical-align: top;
+}
+
+/* Headers are short known words; chunk text is arbitrary corpus — same split as
+   the Inspect table (never break headers mid-word; wrap values anywhere). */
+.clean__table th {
+  white-space: nowrap;
+}
+
+.clean__table td {
+  overflow-wrap: anywhere;
+}
+
+.clean__chunk {
+  white-space: pre-wrap;
+}

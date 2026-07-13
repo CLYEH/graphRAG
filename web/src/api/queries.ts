@@ -548,3 +548,124 @@ export function useChunk(project: string | undefined, id: string | undefined) {
     },
   });
 }
+
+// ---- FE2 清洗 (DESIGN §10.2, contract v1.1 DR-009) --------------------------------
+//
+// Two facts drive the shapes here (read from api/routers/projects.py and
+// core/registry/store.py, not assumed):
+// 1. PATCH /projects/{project} REPLACES the whole config column — there is no
+//    server-side deep merge. Writing chunking params must therefore spread the
+//    project's CURRENT config and override only the chunking block; PATCHing
+//    {config: {chunking}} alone would silently WIPE ontology and every other
+//    block, and the wreck would surface only at the next build.
+// 2. The preview is a pure RPC (nothing persisted, no Idempotency-Key), so it
+//    is a mutation, not a query: no cache entry means no stale-while-revalidate
+//    window for class 17 to bite — the page owns "these chunks answer THESE
+//    parameters" staleness explicitly instead.
+
+export type CleanPreviewRequest = components["schemas"]["CleanPreviewRequest"];
+export type CleanPreviewChunk = components["schemas"]["CleanPreviewChunk"];
+export type CleanPreviewResult = { chunks: CleanPreviewChunk[]; buildId: string | null };
+
+/** Engine chunking defaults — DISPLAY mirror of core/clean/chunking.py's
+ *  DEFAULT_MAX_CHARS/DEFAULT_OVERLAP. Only placeholders and the save button's
+ *  label read these; every REAL fallback happens server-side (the preview and
+ *  the build walk the same config→default chain), so a drift here mislabels a
+ *  placeholder but cannot change what runs. */
+export const DEFAULT_CHUNKING = { max_chars: 1200, overlap: 200 } as const;
+
+/** The project's configured chunking values with engine-default fallback —
+ *  same per-field, bool-excluded read the preview endpoint does server-side
+ *  (bool is an int subtype in Python AND accepted by JS typeof checks nowhere,
+ *  but a config written by hand can hold anything). */
+export function chunkingFromConfig(config: Record<string, unknown>): {
+  max_chars: number;
+  overlap: number;
+} {
+  const block = config["chunking"];
+  const pick = (key: string, fallback: number): number => {
+    if (block && typeof block === "object" && !Array.isArray(block)) {
+      const v = (block as Record<string, unknown>)[key];
+      if (typeof v === "number" && Number.isInteger(v)) return v;
+    }
+    return fallback;
+  };
+  return {
+    max_chars: pick("max_chars", DEFAULT_CHUNKING.max_chars),
+    overlap: pick("overlap", DEFAULT_CHUNKING.overlap),
+  };
+}
+
+/** The single project — FE2 needs the full config object to spread on save. */
+export function useProject(project: string | undefined) {
+  return useQuery({
+    queryKey: ["project", project],
+    enabled: project !== undefined && isPathAddressable(project),
+    queryFn: async () => {
+      const { data, error } = await api.GET("/projects/{project}", {
+        params: { path: { project: project as string } },
+      });
+      if (error) throw new Error(error.error.message);
+      return data.data;
+    },
+  });
+}
+
+/** Preview chunking (POST clean/preview). meta.build_id names the active build
+ *  the document was read from; null for the text source. */
+export function usePreviewClean(project: string) {
+  return useMutation({
+    mutationFn: async (body: CleanPreviewRequest): Promise<CleanPreviewResult> => {
+      const { data, error } = await api.POST("/projects/{project}/clean/preview", {
+        params: { path: { project } },
+        body,
+      });
+      if (error) throw new Error(error.error.message);
+      return { chunks: data.data.chunks, buildId: data.meta.build_id };
+    },
+  });
+}
+
+/** Write the chunking block into project config — spreading a FRESH read
+ *  (fact 1 above). The mutation re-GETs the project INSIDE itself rather than
+ *  spreading the page's cached copy: a config changed elsewhere since the page
+ *  loaded (another tab, a CLI PATCH) would otherwise be resurrected wholesale
+ *  by the column-replacing PATCH (Codex, #74). The refetch shrinks that window
+ *  from page-age to one round trip; the residual concurrent-write race is real
+ *  (a recheck is not a lock — class 10) but closing it needs a version token
+ *  in the frozen contract, a DR-002 round this task cannot open. */
+export function useSaveChunking(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (args: { max_chars?: number; overlap?: number }) => {
+      const fresh = await api.GET("/projects/{project}", {
+        params: { path: { project } },
+      });
+      if (fresh.error) throw new Error(fresh.error.error.message);
+      const current = (fresh.data.data.config ?? {}) as Record<string, unknown>;
+      // Omissions resolve against the FRESH chunking block, not the page's cached
+      // one (Codex, #74 round 2): resolving before the re-read preserved sibling
+      // blocks but silently reverted a knob someone else had just changed. And the
+      // combined pair must re-validate HERE — fresh fallbacks can make a typed knob
+      // illegal, and PATCH does not validate chunking (it would fail at the next
+      // build's config load instead).
+      const freshPair = chunkingFromConfig(current);
+      const pair = {
+        max_chars: args.max_chars ?? freshPair.max_chars,
+        overlap: args.overlap ?? freshPair.overlap,
+      };
+      if (!(0 <= pair.overlap && pair.overlap < pair.max_chars))
+        throw new Error(
+          `overlap must satisfy 0 <= overlap < max_chars (got ${pair.overlap} / ${pair.max_chars} ` +
+            "after resolving against the project's current config — it changed since this page loaded)",
+        );
+      const { data, error } = await api.PATCH("/projects/{project}", {
+        params: { path: { project } },
+        body: { config: { ...current, chunking: pair } },
+      });
+      if (error) throw new Error(error.error.message);
+      return { project: data.data, pair };
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["project", project] }),
+  });
+}
