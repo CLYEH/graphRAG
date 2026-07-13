@@ -43,6 +43,7 @@ from api.deps import lifespan
 from api.envelope import error_body, error_body_from
 from api.errors import ApiError, ErrorCode, code_for_framework_status, http_status_for
 from api.routers import builds as builds_router
+from api.routers import clean as clean_router
 from api.routers import health as health_router
 from api.routers import inspect as inspect_router
 from api.routers import jobs as jobs_router
@@ -184,6 +185,7 @@ def create_app() -> FastAPI:
     app.include_router(triggers_router.router)
     app.include_router(jobs_router.router)
     app.include_router(inspect_router.router)
+    app.include_router(clean_router.router)
     app.include_router(review_router.router)
     app.include_router(query_router.router)
     app.include_router(health_router.router)

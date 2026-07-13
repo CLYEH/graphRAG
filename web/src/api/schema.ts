@@ -330,6 +330,36 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/projects/{project}/clean/preview": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Preview chunking (§10.2 抽樣預覽) — a pure function; nothing is persisted
+     * @description Chunk ONE source with the given parameters and return the chunks that a build
+     *     WOULD produce, without writing anything. The source is exactly one of
+     *     `document_id` (that document's raw text, read from the ACTIVE build) or `text`
+     *     (chunk the given text — usable before any build exists). Omitted `max_chars` /
+     *     `overlap` fall back to the project's configured chunking values, then to the
+     *     engine defaults, so the no-parameter preview shows what a build would actually do.
+     *     The pair must satisfy `0 <= overlap < max_chars` — a relation two independent
+     *     numeric bounds cannot express in JSON Schema, so it is enforced at runtime
+     *     (violations answer 400 VALIDATION_ERROR).
+     */
+    post: operations["previewClean"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/projects/{project}/entities": {
     parameters: {
       query?: never;
@@ -903,6 +933,56 @@ export interface components {
         [key: string]: unknown;
       };
       status?: string;
+    };
+    /** @description Chunk a document's raw text, read from the ACTIVE build. */
+    CleanPreviewByDocument: {
+      /** @description Window size; omitted → project config, then engine default. */
+      max_chars?: number;
+      /** @description Window overlap; omitted → project config, then engine default. */
+      overlap?: number;
+      /** Format: uuid */
+      document_id: string;
+      text?: never;
+    };
+    /** @description Chunk the given text directly — works before any build exists. */
+    CleanPreviewByText: {
+      /** @description Window size; omitted → project config, then engine default. */
+      max_chars?: number;
+      /** @description Window overlap; omitted → project config, then engine default. */
+      overlap?: number;
+      text: string;
+      document_id?: never;
+    };
+    /**
+     * @description Exactly ONE source: document_id or text. The two variants are concrete
+     *     object schemas (each closed with additionalProperties: false), and each
+     *     declares the OTHER source with the `false` schema — so codegen emits it
+     *     as `?: never` and the union is EXACT, not merely structural: a payload
+     *     naming both sources fails to type even when built in a variable (excess-
+     *     property checks only cover literals). Both sources, or neither, is 400
+     *     at the API either way.
+     */
+    CleanPreviewRequest:
+      components["schemas"]["CleanPreviewByDocument"] | components["schemas"]["CleanPreviewByText"];
+    /**
+     * @description One previewed chunk. Computed on the fly and never stored, so it carries no
+     *     id/document_id/build_id — offsets satisfy raw[start_offset:end_offset] == text
+     *     exactly (the same invariant stored chunks freeze for §27.4 evidence spans).
+     */
+    CleanPreviewChunk: {
+      ordinal: number;
+      text: string;
+      start_offset: number;
+      /** @description Exclusive end, per Python slice semantics. */
+      end_offset: number;
+      token_count: number;
+    };
+    CleanPreviewResult: {
+      chunks: components["schemas"]["CleanPreviewChunk"][];
+    };
+    CleanPreviewResponse: {
+      data: components["schemas"]["CleanPreviewResult"];
+      meta: components["schemas"]["Meta"];
     };
     /**
      * @description Entity/relation lifecycle (DESIGN §4/§17).
@@ -1926,6 +2006,37 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["ChunkResponse"];
+        };
+      };
+      default: components["responses"]["Error"];
+    };
+  };
+  previewClean: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["CleanPreviewRequest"];
+      };
+    };
+    responses: {
+      /**
+       * @description The chunks these parameters would produce. meta.build_id names the active
+       *     build the document was read from; null for the `text` source (no build
+       *     involved).
+       */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["CleanPreviewResponse"];
         };
       };
       default: components["responses"]["Error"];
