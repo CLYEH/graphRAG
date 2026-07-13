@@ -79,7 +79,16 @@ test("console shell loads with the project switcher and section nav", async ({ p
   await expect(page.getByRole("status")).toHaveText("Healthy");
   await expect(page.getByText("chunks")).toBeVisible();
   await expect(page.getByRole("combobox", { name: /project/i })).toHaveValue("acme");
-  for (const label of ["Health", "Import", "Clean", "Inspect", "Jobs", "Review", "Playground"]) {
+  for (const label of [
+    "Health",
+    "Import",
+    "Clean",
+    "Inspect",
+    "Graph",
+    "Jobs",
+    "Review",
+    "Playground",
+  ]) {
     await expect(page.getByRole("link", { name: label })).toBeVisible();
   }
 });
@@ -469,4 +478,110 @@ test("clean previews pasted text and saves chunking by spreading the config", as
   const patched = JSON.parse(patchBody);
   expect(patched.config.ontology).toEqual({ entity_types: ["PERSON"] });
   expect(patched.config.chunking).toEqual({ max_chars: 500, overlap: 50 });
+});
+
+test("graph explorer walks a neighborhood and opens an edge's evidence", async ({ page }) => {
+  // The §10.2 edge fields (type/confidence/evidence/來源/review_status) come from
+  // the relation DETAIL fetch — the list frames omit evidence, so the click must
+  // travel to the server and back in a real browser too.
+  const E1 = "e1000000-0000-4000-8000-000000000001";
+  const E2 = "e2000000-0000-4000-8000-000000000002";
+  const R1 = "r1000000-0000-4000-8000-000000000001";
+  const meta = {
+    request_id: "00000000-0000-0000-0000-000000000000",
+    build_id: "b1",
+    elapsed_ms: 1,
+    next_cursor: null,
+  };
+  await page.route("**/projects/*/graph/subgraph*", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          nodes: [
+            { id: E1, type: "PERSON", label: "Ada Lovelace", properties: {} },
+            { id: E2, type: "PERSON", label: "Charles Babbage", properties: {} },
+          ],
+          edges: [{ id: R1, src: E1, dst: E2, type: "WORKS_WITH", properties: {} }],
+        },
+        meta,
+      }),
+    }),
+  );
+  await page.route("**/projects/*/entities*", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: [
+          {
+            id: E1,
+            build_id: "b1",
+            type: "PERSON",
+            canonical_name: "Ada Lovelace",
+            entity_key: "person:ada",
+            status: "resolved",
+            attributes: {},
+          },
+        ],
+        meta,
+      }),
+    }),
+  );
+  await page.route("**/projects/*/entities/*", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          id: E1,
+          build_id: "b1",
+          type: "PERSON",
+          canonical_name: "Ada Lovelace",
+          entity_key: "person:ada",
+          status: "resolved",
+          attributes: {},
+        },
+        meta,
+      }),
+    }),
+  );
+  await page.route("**/projects/*/relations/*", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          id: R1,
+          build_id: "b1",
+          src_entity_id: E1,
+          dst_entity_id: E2,
+          type: "WORKS_WITH",
+          status: "resolved",
+          review_status: "approved",
+          created_by: "pipeline",
+          confidence: 0.87,
+          evidence: [
+            {
+              id: "ev000000-0000-4000-8000-000000000001",
+              evidence_type: "chunk",
+              quote: "Ada worked with Charles on the Engine.",
+              source_uri: "file:///corpus/ada.txt",
+            },
+          ],
+        },
+        meta,
+      }),
+    }),
+  );
+  await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "Graph" }).click();
+  await expect(page.getByRole("heading", { name: /^graph$/i })).toBeVisible();
+
+  await page.getByRole("button", { name: /ada lovelace/i }).click();
+  await expect(page.getByText("WORKS_WITH")).toBeVisible();
+
+  await page.getByText("WORKS_WITH").click();
+  await expect(page.getByText(/ada worked with charles/i)).toBeVisible();
+  await expect(page.getByText("file:///corpus/ada.txt")).toBeVisible();
 });

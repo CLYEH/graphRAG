@@ -669,3 +669,92 @@ export function useSaveChunking(project: string) {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["project", project] }),
   });
 }
+
+// ---- FE4 圖譜互動探索 (DESIGN §10.2) ------------------------------------------
+//
+// Facts read from api/routers/inspect.py (not assumed):
+// * The subgraph endpoint REQUIRES a query_policy block in project config —
+//   missing → 400 with details.query_policy="missing" (a condition the page
+//   must name, not blur into a generic failure); hops beyond max_graph_hops
+//   are REJECTED, not clamped.
+// * Entity lists support NO server-side search (reject_unsupported_query) —
+//   any left-column filter is a client-side filter over LOADED pages and must
+//   say so (the FE3 false-affordance lesson).
+// * Relation.evidence[] rides ONLY the detail GET — clicking an edge is a
+//   real fetch, exactly like Document.raw in FE3.
+
+export type Entity = components["schemas"]["Entity"];
+export type Relation = components["schemas"]["Relation"];
+export type GraphContext = components["schemas"]["GraphContext"];
+
+async function fetchEntities(project: string, cursor?: string): Promise<InspectPage<Entity>> {
+  const { data, error } = await api.GET("/projects/{project}/entities", {
+    params: { path: { project }, query: { limit: INSPECT_PAGE, cursor } },
+  });
+  if (error) throw apiError(error);
+  return { rows: data.data, buildId: data.meta.build_id, next: data.meta.next_cursor ?? undefined };
+}
+
+export const useEntities = (project: string | undefined) =>
+  useInspectList("entities", project, fetchEntities);
+
+export function useEntity(project: string | undefined, id: string | undefined) {
+  return useQuery({
+    queryKey: ["entity", project, id],
+    enabled: project !== undefined && isPathAddressable(project) && id !== undefined,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/projects/{project}/entities/{entity_id}", {
+        params: { path: { project: project as string, entity_id: id as string } },
+      });
+      if (error) throw detailError(response.status, error.error.message);
+      return data.data;
+    },
+  });
+}
+
+export function useRelation(project: string | undefined, id: string | undefined) {
+  return useQuery({
+    queryKey: ["relation", project, id],
+    enabled: project !== undefined && isPathAddressable(project) && id !== undefined,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET(
+        "/projects/{project}/relations/{relation_id}",
+        { params: { path: { project: project as string, relation_id: id as string } } },
+      );
+      if (error) throw detailError(response.status, error.error.message);
+      return data.data;
+    },
+  });
+}
+
+/** The distinguished "this project has no query_policy configured" condition —
+ *  the subgraph endpoint 400s it with a machine-readable detail, and the page
+ *  offers configuration guidance instead of a generic failure line. */
+export class PolicyMissingError extends Error {}
+
+export type SubgraphResult = { graph: GraphContext; buildId: string | null };
+
+export function useSubgraph(
+  project: string | undefined,
+  entityId: string | undefined,
+  hops: number,
+) {
+  return useQuery({
+    queryKey: ["subgraph", project, entityId, hops],
+    enabled: project !== undefined && isPathAddressable(project) && entityId !== undefined,
+    queryFn: async (): Promise<SubgraphResult> => {
+      const { data, error } = await api.GET("/projects/{project}/graph/subgraph", {
+        params: {
+          path: { project: project as string },
+          query: { entity_id: entityId as string, hops },
+        },
+      });
+      if (error) {
+        const details = (error.error as { details?: { query_policy?: string } }).details;
+        if (details?.query_policy === "missing") throw new PolicyMissingError(error.error.message);
+        throw new Error(error.error.message);
+      }
+      return { graph: data.data, buildId: data.meta.build_id };
+    },
+  });
+}
