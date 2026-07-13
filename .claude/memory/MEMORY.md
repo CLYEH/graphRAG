@@ -9,7 +9,7 @@
 - [初期落地場景:博物館導覽](graphrag-goal-museum-guide.md) — 外部 no-code agent 平台經 MCP(HTTP)接本平台當場所知識服務;C8b=整合縫;raw data 已到位(海科館 xlsx,v2 後再動);硬約束=不失一般性
 - [FE 瀏覽器操作測試](graphrag-fe-browser-qa.md) — FE 任務 e2e 綠後、開 PR 前,用 Claude in Chrome 真瀏覽器走 UI 流程(console/截圖證據附 PR);補充驗證步非機械 gate(owner 2026-07-11 定案)
 - [v2 前端開放](graphrag-v2-frontend-scope.md) — v1 全綠後 owner 2026-07-12 開放 v2 FE(FE1-4);FE1/FE3 建於既有端點、FE2 卡 BA4(契約無端點→DR-002 先問 owner)、FE4 部分;改凍結契約=DR-002 gate 停下問
-- [海科館真實資料](graphrag-sample-data-hakeguan.md) — owner 已提供 .discuss/sample_data (5 份 xlsx)；**v2 完成後**才動手跑通、找缺口；已知缺 xlsx connector
+- [海科館真實資料](graphrag-sample-data-hakeguan.md) — 偵察完成:2 類結構(FAQ=問答列;導覽內容=標題/詳情/位置/分類);缺 xlsx connector,建議先前處理腳本→text connector 驗抽取品質,再決定原生 connector;ontology 草案已擬
 - [教學先於海科館](graphrag-tutorial-before-hakeguan.md) — ✅ 完成(.discuss/tutorial/,owner 指定 gitignored 位置);全產品首次端到端實證;**遺留:museum 專案在 dev 庫會踩 H11 全表計數測試**;下一站海科館
 - [DR-002 清洗回合](graphrag-dr002-cleaning-round.md) — owner 2026-07-13 核准為 cleaning 加端點；只缺「預覽」(POST clean/preview，document_id|text 擇一、一次一份)，rules 用既有 PATCH /projects/{project}；FE4 不需契約變更
 - [FE1 PR#70 教訓](graphrag-fe1-pr70-codex-quota.md) — Codex quota 有限(長 finding-chain 耗盡,恢復後 @codex review 手動觸發);FE 鏡射後端實際行為非契約示意;gate fail-closed(isFetching);後端 _local_path 硬化已完成(BA9/#71);ontology UI follow-up 仍待 owner
