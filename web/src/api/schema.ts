@@ -942,6 +942,7 @@ export interface components {
       overlap?: number;
       /** Format: uuid */
       document_id: string;
+      text?: never;
     };
     /** @description Chunk the given text directly — works before any build exists. */
     CleanPreviewByText: {
@@ -950,13 +951,16 @@ export interface components {
       /** @description Window overlap; omitted → project config, then engine default. */
       overlap?: number;
       text: string;
+      document_id?: never;
     };
     /**
      * @description Exactly ONE source: document_id or text. The two variants are concrete
-     *     object schemas (each closed with additionalProperties: false) rather than
-     *     bare required/not combinators, so the generated client type is a real
-     *     discriminated union — naming both sources, or neither, fails to satisfy
-     *     either variant at compile time as well as at the API (400).
+     *     object schemas (each closed with additionalProperties: false), and each
+     *     declares the OTHER source with the `false` schema — so codegen emits it
+     *     as `?: never` and the union is EXACT, not merely structural: a payload
+     *     naming both sources fails to type even when built in a variable (excess-
+     *     property checks only cover literals). Both sources, or neither, is 400
+     *     at the API either way.
      */
     CleanPreviewRequest:
       components["schemas"]["CleanPreviewByDocument"] | components["schemas"]["CleanPreviewByText"];
