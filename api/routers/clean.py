@@ -31,7 +31,7 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 from fastapi.routing import APIRouter
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from api.deps import Conn, response_meta
 from api.envelope import success
@@ -60,6 +60,21 @@ class CleanPreviewRequest(BaseModel):
     overlap: int | None = Field(default=None, ge=0, strict=True)
     document_id: uuid.UUID | None = None
     text: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_explicit_nulls(cls, data: Any) -> Any:
+        # Every property in the frozen schema is optional but NON-null (JSON
+        # Schema `required` checks key presence; a present null still fails
+        # `type`). The `| None` annotations exist to model OMISSION — without
+        # this guard an explicit `"document_id": null` parses to None, the
+        # exactly-one check reads it as absent, and a request the contract
+        # rejects gets a 200 that chunks the other field (Codex, #73).
+        if isinstance(data, dict):
+            for key in ("max_chars", "overlap", "document_id", "text"):
+                if key in data and data[key] is None:
+                    raise ValueError(f"{key} must not be null — omit the key instead")
+        return data
 
 
 def _reject(message: str) -> ApiError:

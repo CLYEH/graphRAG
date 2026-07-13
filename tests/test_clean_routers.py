@@ -111,6 +111,29 @@ def test_unknown_keys_are_rejected_not_defaulted(
     assert r.status_code == 400
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"text": "abc", "document_id": None},  # Codex's repro: null source key
+        {"document_id": str(_DOC), "text": None},  # the inverse
+        {"text": "abc", "max_chars": None},  # null knobs are type-violations too
+        {"text": "abc", "overlap": None},
+    ],
+)
+def test_explicit_null_fields_are_rejected_not_read_as_omitted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
+) -> None:
+    # Every property in the frozen schema is optional but NON-null: `required`
+    # only checks key presence, and a present null fails `type`. The model's
+    # `| None` exists to represent OMISSION — treating an explicit null as
+    # omitted would 200 a request the contract rejects (each case here chunks
+    # happily if the guard is dropped, so the pin discriminates).
+    _project(monkeypatch)
+    _active(monkeypatch)
+    r = _preview(client, body)
+    assert r.status_code == 400
+
+
 # ---- the text source ---------------------------------------------------------
 
 
