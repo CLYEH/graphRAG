@@ -934,24 +934,32 @@ export interface components {
       };
       status?: string;
     };
-    /**
-     * @description Exactly ONE source: document_id or text. Both present or both absent is
-     *     rejected. Unknown keys are rejected (a misspelled parameter silently falling
-     *     back to defaults would preview the wrong chunking).
-     */
-    CleanPreviewRequest: {
+    /** @description Chunk a document's raw text, read from the ACTIVE build. */
+    CleanPreviewByDocument: {
       /** @description Window size; omitted → project config, then engine default. */
       max_chars?: number;
       /** @description Window overlap; omitted → project config, then engine default. */
       overlap?: number;
-      /**
-       * Format: uuid
-       * @description Chunk this document's raw text (read from the ACTIVE build).
-       */
-      document_id?: string;
-      /** @description Chunk this text directly (works before any build exists). */
-      text?: string;
-    } & (unknown | unknown);
+      /** Format: uuid */
+      document_id: string;
+    };
+    /** @description Chunk the given text directly — works before any build exists. */
+    CleanPreviewByText: {
+      /** @description Window size; omitted → project config, then engine default. */
+      max_chars?: number;
+      /** @description Window overlap; omitted → project config, then engine default. */
+      overlap?: number;
+      text: string;
+    };
+    /**
+     * @description Exactly ONE source: document_id or text. The two variants are concrete
+     *     object schemas (each closed with additionalProperties: false) rather than
+     *     bare required/not combinators, so the generated client type is a real
+     *     discriminated union — naming both sources, or neither, fails to satisfy
+     *     either variant at compile time as well as at the API (400).
+     */
+    CleanPreviewRequest:
+      components["schemas"]["CleanPreviewByDocument"] | components["schemas"]["CleanPreviewByText"];
     /**
      * @description One previewed chunk. Computed on the fly and never stored, so it carries no
      *     id/document_id/build_id — offsets satisfy raw[start_offset:end_offset] == text

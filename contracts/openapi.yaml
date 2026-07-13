@@ -1457,13 +1457,11 @@ components:
         status:
           type: string
 
-    CleanPreviewRequest:
+    CleanPreviewByDocument:
       type: object
-      description: |
-        Exactly ONE source: document_id or text. Both present or both absent is
-        rejected. Unknown keys are rejected (a misspelled parameter silently falling
-        back to defaults would preview the wrong chunking).
+      description: Chunk a document's raw text, read from the ACTIVE build.
       additionalProperties: false
+      required: [document_id]
       properties:
         max_chars:
           description: Window size; omitted → project config, then engine default.
@@ -1474,20 +1472,37 @@ components:
           type: integer
           minimum: 0
         document_id:
-          description: Chunk this document's raw text (read from the ACTIVE build).
           type: string
           format: uuid
+
+    CleanPreviewByText:
+      type: object
+      description: Chunk the given text directly — works before any build exists.
+      additionalProperties: false
+      required: [text]
+      properties:
+        max_chars:
+          description: Window size; omitted → project config, then engine default.
+          type: integer
+          minimum: 1
+        overlap:
+          description: Window overlap; omitted → project config, then engine default.
+          type: integer
+          minimum: 0
         text:
-          description: Chunk this text directly (works before any build exists).
           type: string
           minLength: 1
+
+    CleanPreviewRequest:
+      description: |
+        Exactly ONE source: document_id or text. The two variants are concrete
+        object schemas (each closed with additionalProperties: false) rather than
+        bare required/not combinators, so the generated client type is a real
+        discriminated union — naming both sources, or neither, fails to satisfy
+        either variant at compile time as well as at the API (400).
       oneOf:
-        - required: [document_id]
-          not:
-            required: [text]
-        - required: [text]
-          not:
-            required: [document_id]
+        - $ref: "#/components/schemas/CleanPreviewByDocument"
+        - $ref: "#/components/schemas/CleanPreviewByText"
 
     CleanPreviewChunk:
       type: object
