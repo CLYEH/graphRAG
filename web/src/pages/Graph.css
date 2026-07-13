@@ -1,0 +1,229 @@
+.graph {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.graph__title {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.graph__subtitle {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.graph__hint,
+.graph__line,
+.graph__muted {
+  margin: 0;
+  color: var(--muted, #666);
+  font-size: 0.9rem;
+}
+
+.graph__line--error {
+  color: var(--bad, #b00020);
+}
+
+.graph__columns {
+  display: grid;
+  grid-template-columns: 16rem minmax(0, 1fr) 20rem;
+  gap: 1rem;
+  align-items: start;
+}
+
+.graph__col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.6rem;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
+.graph__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--muted, #666);
+}
+
+.graph__field input {
+  font: inherit;
+  color: inherit;
+  padding: 0.3rem 0.4rem;
+}
+
+.graph__hops input {
+  width: 5rem;
+}
+
+.graph__entities {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 26rem;
+  overflow-y: auto;
+}
+
+.graph__entity {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.3rem 0.4rem;
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.graph__entity:hover {
+  background: var(--surface-2, #f5f5f5);
+}
+
+.graph__entity--center {
+  background: var(--surface-2, #f5f5f5);
+  font-weight: 600;
+}
+
+.graph__entity-name {
+  overflow-wrap: anywhere;
+}
+
+.graph__entity-type {
+  color: var(--muted, #666);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.graph__more {
+  align-self: flex-start;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+  font: inherit;
+}
+
+.graph__svg {
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border, #eee);
+  border-radius: 4px;
+  background: var(--surface, #fff);
+}
+
+.graph__edge {
+  stroke: var(--muted, #999);
+  stroke-width: 1.5;
+  cursor: pointer;
+}
+
+.graph__edge--selected {
+  stroke: var(--accent, #6b4fd8);
+  stroke-width: 3;
+}
+
+.graph__edge-label {
+  font-size: 10px;
+  fill: var(--muted, #888);
+  text-anchor: middle;
+  cursor: pointer;
+  user-select: none;
+}
+
+.graph__node {
+  cursor: pointer;
+}
+
+.graph__dot {
+  fill: var(--surface-2, #dcd3f5);
+  stroke: var(--accent, #6b4fd8);
+  stroke-width: 1.5;
+}
+
+.graph__dot--selected {
+  stroke-width: 3;
+}
+
+.graph__dot--center {
+  fill: var(--accent, #6b4fd8);
+}
+
+.graph__node-label {
+  font-size: 11px;
+  fill: var(--fg, #333);
+  text-anchor: middle;
+  user-select: none;
+}
+
+.graph__fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin: 0;
+}
+
+.graph__fieldrow {
+  display: grid;
+  grid-template-columns: 7rem 1fr;
+  gap: 0.5rem;
+}
+
+.graph__fieldrow dt {
+  color: var(--muted, #666);
+  font-size: 0.85rem;
+}
+
+.graph__fieldrow dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.graph__pre {
+  max-height: 12rem;
+  margin: 0;
+  overflow: auto;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+}
+
+.graph__evidence {
+  margin: 0;
+  padding-left: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.graph__evidence-type {
+  color: var(--muted, #666);
+  font-size: 0.8rem;
+}
+
+.graph__quote {
+  margin: 0.15rem 0;
+  padding-left: 0.5rem;
+  border-left: 2px solid var(--border, #ddd);
+  font-size: 0.85rem;
+}
+
+.graph__evidence-src {
+  display: block;
+  color: var(--muted, #666);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.graph__policy {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}

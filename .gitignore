@@ -38,3 +38,8 @@ web/coverage/
 Thumbs.db
 .idea/
 .vscode/
+
+# Playwright artifacts when invoked from the repo root (web/.gitignore only covers web/)
+test-results/
+playwright-report/
+blob-report/
