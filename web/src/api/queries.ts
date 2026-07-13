@@ -510,12 +510,25 @@ export const useChunks = (project: string | undefined) =>
 // A 404 here means "no such row IN THE ACTIVE BUILD" — ids are minted per build, so a
 // row id from a superseded build cannot resolve in the current one. Say that, rather
 // than echoing the generic VALIDATION_ERROR message every 4xx carries.
-function detailError(status: number, message: string): Error {
-  return new Error(
-    status === 404
-      ? "Not found in the active build — it may belong to an older build, or the active build changed. Reload the list."
-      : message,
-  );
+/** A detail read's 404 PROVES the world moved: the inspect detail endpoints
+ *  return rows regardless of lifecycle status, so the only 404 is
+ *  id-absent-from-build — a build swap (or a deleted project). Typed so pages
+ *  that must fail closed page-wide on scope loss (Graph) can classify it;
+ *  Inspect renders the message locally, which is also honest for its layout. */
+export class DetailScopeGoneError extends Error {}
+
+function detailError(status: number, message: string, code?: string): Error {
+  if (status === 404)
+    return new DetailScopeGoneError(
+      "Not found in the active build — it may belong to an older build, or the active build changed. Reload the list.",
+    );
+  // the deliberate scope codes are the same proof at a different status (the
+  // round-6 code-vs-status lesson applied to the detail path too): the server's
+  // own message survives, only the CLASS is sharpened — behavior-neutral for
+  // Inspect, which renders message(error) with no type branch
+  if (code === "NO_ACTIVE_BUILD" || code === "PROJECT_NOT_FOUND")
+    return new DetailScopeGoneError(message);
+  return new Error(message);
 }
 
 // Detail reads. `Document.raw` is returned ONLY here — the list omits the key entirely
@@ -529,7 +542,7 @@ export function useDocument(project: string | undefined, id: string | undefined)
         "/projects/{project}/documents/{document_id}",
         { params: { path: { project: project as string, document_id: id as string } } },
       );
-      if (error) throw detailError(response.status, error.error.message);
+      if (error) throw detailError(response.status, error.error.message, error.error.code);
       return data.data;
     },
   });
@@ -543,7 +556,7 @@ export function useChunk(project: string | undefined, id: string | undefined) {
       const { data, error, response } = await api.GET("/projects/{project}/chunks/{chunk_id}", {
         params: { path: { project: project as string, chunk_id: id as string } },
       });
-      if (error) throw detailError(response.status, error.error.message);
+      if (error) throw detailError(response.status, error.error.message, error.error.code);
       return data.data;
     },
   });
@@ -706,7 +719,7 @@ export function useEntity(project: string | undefined, id: string | undefined) {
       const { data, error, response } = await api.GET("/projects/{project}/entities/{entity_id}", {
         params: { path: { project: project as string, entity_id: id as string } },
       });
-      if (error) throw detailError(response.status, error.error.message);
+      if (error) throw detailError(response.status, error.error.message, error.error.code);
       return data.data;
     },
   });
@@ -721,7 +734,7 @@ export function useRelation(project: string | undefined, id: string | undefined)
         "/projects/{project}/relations/{relation_id}",
         { params: { path: { project: project as string, relation_id: id as string } } },
       );
-      if (error) throw detailError(response.status, error.error.message);
+      if (error) throw detailError(response.status, error.error.message, error.error.code);
       return data.data;
     },
   });
@@ -731,6 +744,16 @@ export function useRelation(project: string | undefined, id: string | undefined)
  *  the subgraph endpoint 400s it with a machine-readable detail, and the page
  *  offers configuration guidance instead of a generic failure line. */
 export class PolicyMissingError extends Error {}
+
+/** A subgraph failure that PROVES the page's world moved: the active build is
+ *  gone/changed (NO_ACTIVE_BUILD, PROJECT_NOT_FOUND) or the seed no longer
+ *  resolves in the current build (404 — either a build swap or the entity's
+ *  status drifted off active; both mean the listed rows are stale). Classified
+ *  AT THROW TIME because the code alone is ambiguous: a seed miss carries the
+ *  coarse VALIDATION_ERROR that a hops rejection (a plain user-input 400 that
+ *  must stay LOCAL) also carries — the STATUS is what separates them (the FE3
+ *  lesson). */
+export class SubgraphScopeError extends Error {}
 
 export type SubgraphResult = { graph: GraphContext; buildId: string | null };
 
@@ -743,7 +766,7 @@ export function useSubgraph(
     queryKey: ["subgraph", project, entityId, hops],
     enabled: project !== undefined && isPathAddressable(project) && entityId !== undefined,
     queryFn: async (): Promise<SubgraphResult> => {
-      const { data, error } = await api.GET("/projects/{project}/graph/subgraph", {
+      const { data, error, response } = await api.GET("/projects/{project}/graph/subgraph", {
         params: {
           path: { project: project as string },
           query: { entity_id: entityId as string, hops },
@@ -752,6 +775,9 @@ export function useSubgraph(
       if (error) {
         const details = (error.error as { details?: { query_policy?: string } }).details;
         if (details?.query_policy === "missing") throw new PolicyMissingError(error.error.message);
+        const code = error.error.code;
+        if (code === "NO_ACTIVE_BUILD" || code === "PROJECT_NOT_FOUND" || response.status === 404)
+          throw new SubgraphScopeError(error.error.message);
         throw new Error(error.error.message);
       }
       return { graph: data.data, buildId: data.meta.build_id };

@@ -1,7 +1,9 @@
 import { useMemo, useState } from "react";
 
 import {
+  DetailScopeGoneError,
   PolicyMissingError,
+  SubgraphScopeError,
   isScopeNeutral,
   useEntities,
   useEntity,
@@ -61,6 +63,8 @@ function GraphBody({ project }: { project: string }) {
   const [selected, setSelected] = useState<Selection | null>(null);
   const list = useEntities(project);
   const sub = useSubgraph(project, centerId, hops);
+  const entityDetail = useEntity(project, selected?.kind === "node" ? selected.id : undefined);
+  const relationDetail = useRelation(project, selected?.kind === "edge" ? selected.id : undefined);
 
   // Page-wide scope death (Codex, #75): a scope-gone answer on the ENTITY list
   // means the whole page's world is dead — leaving the middle/right columns
@@ -74,6 +78,29 @@ function GraphBody({ project }: { project: string }) {
         <h1 className="graph__title">Graph</h1>
         <p className="graph__line graph__line--error">
           Could not load entities: {message(list.error)}
+        </p>
+      </section>
+    );
+  // A subgraph failure that PROVES scope loss is page-wide too (Codex, #75
+  // round 6): a click on a build-A row after build B activates answers
+  // NO_ACTIVE_BUILD or a seed 404 — proof the listed rows are stale, which must
+  // not render as a local viz error beside a still-clickable stale list. A hops
+  // rejection or a store outage stays LOCAL (user input / scope-neutral).
+  // A DETAIL 404 is the same proof one request later (reviewer sweep, round 6):
+  // the detail endpoints return rows regardless of lifecycle status, so the only
+  // 404 is id-absent-from-build — and a node/edge click does NOT refetch the
+  // subgraph, so this is reachable without the subgraph verdict ever firing.
+  if (
+    entityDetail.error instanceof DetailScopeGoneError ||
+    relationDetail.error instanceof DetailScopeGoneError ||
+    sub.error instanceof SubgraphScopeError
+  )
+    return (
+      <section className="graph">
+        <h1 className="graph__title">Graph</h1>
+        <p className="graph__line graph__line--error">
+          This page&apos;s content could not be read from the active build — the build likely
+          changed under it. Reload to see the current build.
         </p>
       </section>
     );
@@ -137,7 +164,7 @@ function GraphBody({ project }: { project: string }) {
           onSelect={setSelected}
           onCenter={setCenterId}
         />
-        <DetailColumn project={project} selected={visibleSelection} />
+        <DetailColumn entity={entityDetail} relation={relationDetail} selected={visibleSelection} />
       </div>
     </section>
   );
@@ -429,10 +456,15 @@ function VizColumn({
 
 // ---- right: node / edge detail ------------------------------------------------
 
-function DetailColumn({ project, selected }: { project: string; selected: Selection | null }) {
-  const entity = useEntity(project, selected?.kind === "node" ? selected.id : undefined);
-  const relation = useRelation(project, selected?.kind === "edge" ? selected.id : undefined);
-
+function DetailColumn({
+  entity,
+  relation,
+  selected,
+}: {
+  entity: ReturnType<typeof useEntity>;
+  relation: ReturnType<typeof useRelation>;
+  selected: Selection | null;
+}) {
   if (!selected)
     return <div className="graph__col graph__muted">Click a node or an edge for detail.</div>;
 

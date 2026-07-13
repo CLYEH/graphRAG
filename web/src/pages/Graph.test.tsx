@@ -135,6 +135,7 @@ describe("Graph", () => {
             details: { query_policy: "missing" },
           },
         },
+        response: { status: 400 },
       },
     });
     renderGraph();
@@ -159,6 +160,7 @@ describe("Graph", () => {
             details: null,
           },
         },
+        response: { status: 400 },
       },
     });
     renderGraph();
@@ -167,6 +169,9 @@ describe("Graph", () => {
 
     expect(await screen.findByText(/hops=9 is outside the policy ceiling/i)).toBeInTheDocument();
     expect(screen.queryByText(/PATCH \/projects\//i)).not.toBeInTheDocument();
+    // the over-block dual of the page-wide scope teardown: a user-input 400 is
+    // LOCAL — the entity list must survive it
+    expect(screen.getByRole("button", { name: /ada lovelace/i })).toBeInTheDocument();
   });
 
   it("renders the subgraph and fetches an edge's detail on click — evidence rides ONLY the detail GET", async () => {
@@ -385,6 +390,80 @@ describe("Graph", () => {
 
     await waitFor(() =>
       expect(screen.queryByText(/ada worked with charles/i)).not.toBeInTheDocument(),
+    );
+  });
+
+  it("tears the page down when the SUBGRAPH proves the scope is gone", async () => {
+    // Clicking a build-A row after build B activates answers NO_ACTIVE_BUILD (or
+    // a seed 404) from the subgraph — proof the listed rows are stale. That must
+    // not render as a local viz error beside a still-clickable stale list
+    // (Codex, #75 round 6); the classification is at throw time, by CODE for the
+    // deliberate scope codes and by STATUS for the coarse seed 404.
+    stubApi({
+      subgraph: {
+        data: undefined,
+        error: { error: { code: "NO_ACTIVE_BUILD", message: "no active build", details: null } },
+        response: { status: 409 },
+      },
+    });
+    renderGraph();
+
+    fireEvent.click(await screen.findByRole("button", { name: /ada lovelace/i }));
+
+    expect(await screen.findByText(/build likely changed under it/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /ada lovelace/i })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("tears the page down when a DETAIL read 404s — the proof arrives one request later", async () => {
+    // A node/edge click does NOT refetch the subgraph, so a build swap can first
+    // surface as the detail's 404 (the detail endpoints return rows regardless of
+    // lifecycle status — the only 404 is id-absent-from-build). Local rendering
+    // would leave a stale, clickable list beside an honest-sounding panel note.
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path.endsWith("/graph/subgraph"))
+        return Promise.resolve({ data: { data: subgraph(), meta: META }, error: undefined });
+      if (path.includes("{entity_id}"))
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "VALIDATION_ERROR", message: "entity not found" } },
+          response: { status: 404 },
+        });
+      return Promise.resolve({ data: { data: [entity()], meta: META }, error: undefined });
+    }) as never);
+    renderGraph();
+
+    fireEvent.click(await screen.findByRole("button", { name: /ada lovelace/i }));
+
+    expect(await screen.findByText(/build likely changed under it/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /ada lovelace/i })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("tears the page down when a DETAIL read answers NO_ACTIVE_BUILD", async () => {
+    // The 409 sibling of the detail-404 proof (the code-vs-status pair, both
+    // directions now covered on the detail path): deactivate-to-nothing plus a
+    // click before any refetch lands here first.
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path.endsWith("/graph/subgraph"))
+        return Promise.resolve({ data: { data: subgraph(), meta: META }, error: undefined });
+      if (path.includes("{entity_id}"))
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "NO_ACTIVE_BUILD", message: "no active build" } },
+          response: { status: 409 },
+        });
+      return Promise.resolve({ data: { data: [entity()], meta: META }, error: undefined });
+    }) as never);
+    renderGraph();
+
+    fireEvent.click(await screen.findByRole("button", { name: /ada lovelace/i }));
+
+    expect(await screen.findByText(/build likely changed under it/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /ada lovelace/i })).not.toBeInTheDocument(),
     );
   });
 
