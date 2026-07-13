@@ -637,23 +637,34 @@ export function usePreviewClean(project: string) {
 export function useSaveChunking(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (args: { max_chars: number; overlap: number }) => {
+    mutationFn: async (args: { max_chars?: number; overlap?: number }) => {
       const fresh = await api.GET("/projects/{project}", {
         params: { path: { project } },
       });
       if (fresh.error) throw new Error(fresh.error.error.message);
       const current = (fresh.data.data.config ?? {}) as Record<string, unknown>;
+      // Omissions resolve against the FRESH chunking block, not the page's cached
+      // one (Codex, #74 round 2): resolving before the re-read preserved sibling
+      // blocks but silently reverted a knob someone else had just changed. And the
+      // combined pair must re-validate HERE — fresh fallbacks can make a typed knob
+      // illegal, and PATCH does not validate chunking (it would fail at the next
+      // build's config load instead).
+      const freshPair = chunkingFromConfig(current);
+      const pair = {
+        max_chars: args.max_chars ?? freshPair.max_chars,
+        overlap: args.overlap ?? freshPair.overlap,
+      };
+      if (!(0 <= pair.overlap && pair.overlap < pair.max_chars))
+        throw new Error(
+          `overlap must satisfy 0 <= overlap < max_chars (got ${pair.overlap} / ${pair.max_chars} ` +
+            "after resolving against the project's current config — it changed since this page loaded)",
+        );
       const { data, error } = await api.PATCH("/projects/{project}", {
         params: { path: { project } },
-        body: {
-          config: {
-            ...current,
-            chunking: { max_chars: args.max_chars, overlap: args.overlap },
-          },
-        },
+        body: { config: { ...current, chunking: pair } },
       });
       if (error) throw new Error(error.error.message);
-      return data.data;
+      return { project: data.data, pair };
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["project", project] }),
   });

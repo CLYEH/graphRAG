@@ -134,11 +134,11 @@ function CleanBody({ project }: { project: string }) {
   }
 
   function runSave() {
-    const pair = { max: effectiveMax, overlap: effectiveOverlap };
-    save.mutate(
-      { max_chars: pair.max, overlap: pair.overlap },
-      { onSuccess: () => setSavedPair(pair) },
-    );
+    // raw optional knobs — the mutation resolves omissions against the FRESH
+    // config and returns the pair it actually wrote (the banner's truth)
+    save.mutate(knobs(), {
+      onSuccess: (r) => setSavedPair({ max: r.pair.max_chars, overlap: r.pair.overlap }),
+    });
   }
 
   return (

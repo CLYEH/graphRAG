@@ -81,6 +81,58 @@ describe("Clean", () => {
     expect(body.config["chunking"]).toEqual({ max_chars: 500, overlap: 50 });
   });
 
+  it("resolves EMPTY knobs against the FRESH config, not the page's cached fallbacks", async () => {
+    // Codex's second config-spread finding: the fresh re-read preserved sibling
+    // BLOCKS but the page had already baked its cached fallbacks into concrete
+    // numbers. Page loads {500,50}; another operator sets overlap=80; the user
+    // types ONLY max_chars=1000 — the save must write {1000, 80}, not {1000, 50}
+    // (a silent revert of the other operator's change).
+    let gets = 0;
+    vi.spyOn(api, "GET").mockImplementation((() =>
+      Promise.resolve(
+        ++gets === 1
+          ? projectBody({ chunking: { max_chars: 500, overlap: 50 } })
+          : projectBody({
+              chunking: { max_chars: 500, overlap: 80 },
+              ontology: { entity_types: ["ORG"] },
+            }),
+      )) as never);
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderClean();
+
+    fireEvent.change(await screen.findByLabelText(/max_chars/i), { target: { value: "1000" } });
+    fireEvent.click(screen.getByRole("button", { name: /save 1000\/50 to config/i }));
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    const body = (patch.mock.calls[0] as unknown as [string, { body: unknown }])[1].body as {
+      config: Record<string, unknown>;
+    };
+    expect(body.config["chunking"]).toEqual({ max_chars: 1000, overlap: 80 }); // fresh fallback
+    expect(body.config["ontology"]).toEqual({ entity_types: ["ORG"] }); // blocks still spread
+  });
+
+  it("fails the save loud when fresh fallbacks make the typed knob an illegal pair", async () => {
+    // The composed pair is only validated client-side against CACHED fallbacks; a
+    // fresh overlap can make a typed max_chars illegal, PATCH does not validate
+    // chunking, and the wreck would surface at the next build's config load.
+    // The mutation re-validates after resolving and aborts — PATCH never fires.
+    let gets = 0;
+    vi.spyOn(api, "GET").mockImplementation((() =>
+      Promise.resolve(
+        ++gets === 1
+          ? projectBody({ chunking: { max_chars: 500, overlap: 50 } })
+          : projectBody({ chunking: { max_chars: 500, overlap: 200 } }),
+      )) as never);
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderClean();
+
+    fireEvent.change(await screen.findByLabelText(/max_chars/i), { target: { value: "100" } });
+    fireEvent.click(screen.getByRole("button", { name: /save 100\/50 to config/i }));
+
+    expect(await screen.findByText(/save failed: overlap must satisfy/i)).toBeInTheDocument();
+    expect(patch).not.toHaveBeenCalled();
+  });
+
   it("aborts the save loud when the fresh re-read fails — never PATCHes a fallback", async () => {
     // The fresh-GET error branch is the fix's load-bearing invariant: "cannot read
     // fresh" must abort the save, not fall back to a cached/empty spread — a
