@@ -3,7 +3,7 @@
 openapi: 3.1.0
 info:
   title: graphRAG Console API
-  version: "1.0"
+  version: "1.1"
   description: |
     Frozen OpenAPI contract for the graphRAG Console backend (DESIGN §15, DR-002).
     `core`/`api`/`web` all build against this document; the FastAPI app (BA0) must
@@ -40,6 +40,7 @@ tags:
   - name: builds
   - name: jobs
   - name: inspect
+  - name: clean
   - name: review
   - name: query
   - name: health
@@ -481,6 +482,42 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ChunkResponse"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /projects/{project}/clean/preview:
+    parameters:
+      - $ref: "#/components/parameters/ProjectPath"
+    post:
+      operationId: previewClean
+      tags: [clean]
+      summary: Preview chunking (§10.2 抽樣預覽) — a pure function; nothing is persisted
+      description: |
+        Chunk ONE source with the given parameters and return the chunks that a build
+        WOULD produce, without writing anything. The source is exactly one of
+        `document_id` (that document's raw text, read from the ACTIVE build) or `text`
+        (chunk the given text — usable before any build exists). Omitted `max_chars` /
+        `overlap` fall back to the project's configured chunking values, then to the
+        engine defaults, so the no-parameter preview shows what a build would actually do.
+        The pair must satisfy `0 <= overlap < max_chars` — a relation two independent
+        numeric bounds cannot express in JSON Schema, so it is enforced at runtime
+        (violations answer 400 VALIDATION_ERROR).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CleanPreviewRequest"
+      responses:
+        "200":
+          description: |
+            The chunks these parameters would produce. meta.build_id names the active
+            build the document was read from; null for the `text` source (no build
+            involved).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CleanPreviewResponse"
         default:
           $ref: "#/components/responses/Error"
 
@@ -1419,6 +1456,81 @@ components:
           additionalProperties: true
         status:
           type: string
+
+    CleanPreviewRequest:
+      type: object
+      description: |
+        Exactly ONE source: document_id or text. Both present or both absent is
+        rejected. Unknown keys are rejected (a misspelled parameter silently falling
+        back to defaults would preview the wrong chunking).
+      additionalProperties: false
+      properties:
+        max_chars:
+          description: Window size; omitted → project config, then engine default.
+          type: integer
+          minimum: 1
+        overlap:
+          description: Window overlap; omitted → project config, then engine default.
+          type: integer
+          minimum: 0
+        document_id:
+          description: Chunk this document's raw text (read from the ACTIVE build).
+          type: string
+          format: uuid
+        text:
+          description: Chunk this text directly (works before any build exists).
+          type: string
+          minLength: 1
+      oneOf:
+        - required: [document_id]
+          not:
+            required: [text]
+        - required: [text]
+          not:
+            required: [document_id]
+
+    CleanPreviewChunk:
+      type: object
+      description: |
+        One previewed chunk. Computed on the fly and never stored, so it carries no
+        id/document_id/build_id — offsets satisfy raw[start_offset:end_offset] == text
+        exactly (the same invariant stored chunks freeze for §27.4 evidence spans).
+      required: [ordinal, text, start_offset, end_offset, token_count]
+      properties:
+        ordinal:
+          type: integer
+          minimum: 0
+        text:
+          type: string
+          minLength: 1
+        start_offset:
+          type: integer
+          minimum: 0
+        end_offset:
+          description: Exclusive end, per Python slice semantics.
+          type: integer
+          minimum: 1
+        token_count:
+          type: integer
+          minimum: 1
+
+    CleanPreviewResult:
+      type: object
+      required: [chunks]
+      properties:
+        chunks:
+          type: array
+          items:
+            $ref: "#/components/schemas/CleanPreviewChunk"
+
+    CleanPreviewResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          $ref: "#/components/schemas/CleanPreviewResult"
+        meta:
+          $ref: "#/components/schemas/Meta"
 
     LifecycleStatus:
       type: string

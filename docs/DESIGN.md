@@ -197,7 +197,7 @@ graphRAG/
 - **Job**：長操作 `202 {data:{job_id,status}}`；`GET /jobs/{id}/events`(SSE) 事件 `{status, progress, step, message, ts}`。
 - **Idempotency**：寫入端點吃 `Idempotency-Key` header，避免重試重複觸發 build/ingest。
 - **Auth 佔位**：所有端點 `Depends(auth)`（§23）。
-**端點（節錄）**：`/projects[/{p}]` CRUD · `/projects/{p}/sources|ingest|build` · `/projects/{p}/builds[/{b}/activate|rollback]` · `/jobs/{id}[/cancel|/events]` · `/projects/{p}/{documents|chunks|entities|relations|graph/subgraph}` · `/projects/{p}/merge-candidates[/{id}/approve|reject|defer]` · `/projects/{p}/query/{semantic|graph|sql|global|hybrid}` · `/projects/{p}/{health|metrics|eval}`。
+**端點（節錄）**：`/projects[/{p}]` CRUD · `/projects/{p}/sources|ingest|build` · `/projects/{p}/builds[/{b}/activate|rollback]` · `/jobs/{id}[/cancel|/events]` · `/projects/{p}/{documents|chunks|entities|relations|graph/subgraph}` · `/projects/{p}/clean/preview` · `/projects/{p}/merge-candidates[/{id}/approve|reject|defer]` · `/projects/{p}/query/{semantic|graph|sql|global|hybrid}` · `/projects/{p}/{health|metrics|eval}`。
 
 ## 16. MCP Response Contract（凍結交付物，DR-002）
 `contracts/mcp_response.schema.json`，所有 retrieval 工具共用：
@@ -266,6 +266,7 @@ graphRAG/
 **DR-005 佇列 arq**：採 arq + Redis（async-native），非 Celery。
 **DR-006 Active Build 強制注入**：唯一 active build 以 Postgres partial unique index 保證；所有 store 存取一律經 build-scoped repository 層自動注入 `build_id`，query/MCP 層不得直接拿裸 client → 結構上杜絕「忘了帶 build_id 混到舊版」。
 **DR-007 Fingerprint 版本化**：review ledger 的 entity_key/relation_signature/merge_key 帶 `fingerprint_version`；正規化或 ontology 規則變更即升版，升版觸發 migration 或標記重審，不得靜默誤套。
+**DR-009 契約 v1.1 — cleaning 抽樣預覽端點（2026-07-13，owner 核准的首個 DR-002 回合）**：`openapi.yaml` `info.version` 1.0→1.1，新增 `POST /projects/{project}/clean/preview`（§10.2「清洗(含抽樣預覽)」缺的那一塊；寫入 chunking 參數沿用既有 `PATCH /projects/{project}`，不加端點）。body=`{max_chars?, overlap?, document_id | text}` 兩種來源**擇一**、一次一份；參數省略→專案 config→引擎預設（preview 不重驗 config——build loader 會拒絕的 chunking 值在此靜默退回引擎預設；驗證仍是 build-load 的職責）。純函式（`core.clean.chunking.chunk_text`）、不落地、不呼叫 LLM、**read-only RPC 不吃 Idempotency-Key**（同 query 類——鑰匙會謊稱寫入語意）；`meta.build_id` 僅 document_id 來源有值（讀 active build 的 raw），text 來源為 null（build 前即可試切）。其他三份契約 schema 未動。
 **DR-008 Migration 工具 = Alembic + SQLAlchemy (core)**：Postgres schema 變更一律以 Alembic 管理（表以 SQLAlchemy core 定義、autogenerate 產生 migration、asyncpg 相容）；migration scripts 為版本化交付物，自 P2（`builds` 表 + partial unique index）起隨各任務落地。
 
 ---

@@ -74,6 +74,7 @@ _FROZEN_PATHS = frozenset(
         "/projects/{project}/documents/{document_id}",
         "/projects/{project}/chunks",
         "/projects/{project}/chunks/{chunk_id}",
+        "/projects/{project}/clean/preview",
         "/projects/{project}/entities",
         "/projects/{project}/entities/{entity_id}",
         "/projects/{project}/relations",
@@ -526,8 +527,12 @@ def test_openapi_document_is_valid(spec: dict[str, Any]) -> None:
 
 
 def test_contract_is_versioned(spec: dict[str, Any]) -> None:
-    """DR-002: the contract is a versioned deliverable; breaking changes bump it."""
-    assert spec["info"]["version"] == "1.0"
+    """DR-002: the contract is a versioned deliverable; changes bump it.
+
+    1.0 → 1.1 (2026-07-13, DESIGN §26 DR-009): added POST
+    /projects/{project}/clean/preview — the §10.2 抽樣預覽 endpoint.
+    """
+    assert spec["info"]["version"] == "1.1"
 
 
 def test_frozen_endpoint_surface(spec: dict[str, Any]) -> None:
@@ -616,11 +621,15 @@ def test_write_endpoints_accept_idempotency_key(spec: dict[str, Any]) -> None:
     POST takes Idempotency-Key and documents 409 IDEMPOTENCY_CONFLICT. Query
     endpoints are read-only RPC and take no key."""
     writes: set[str] = set()
+    # Read-only RPC over POST: no side effects, so nothing to replay — a key here
+    # would falsely signal write semantics. Queries (§15) and the v1.1 clean
+    # preview (DR-009: a pure function, nothing persisted) are this category.
+    read_rpc = ("/query/", "/clean/preview")
     for path, method, op in _operations(spec):
         if method != "post":
             continue
         refs = _param_refs(op)
-        if "/query/" in path:
+        if any(marker in path for marker in read_rpc):
             assert "IdempotencyKey" not in refs, path
             continue
         writes.add(path)
