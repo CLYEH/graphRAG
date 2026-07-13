@@ -153,6 +153,78 @@ describe("Inspect", () => {
     expect(screen.getByText("file:///data/corpus/a.txt")).toBeInTheDocument();
   });
 
+  it.each([
+    ["the active build was deactivated", 409, "NO_ACTIVE_BUILD", "no active build for project"],
+    ["the project was deleted", 404, "PROJECT_NOT_FOUND", "project 'acme' not found"],
+  ])(
+    "drops the rows when LOAD MORE reports the scope is gone (%s), even though it is a next-page failure",
+    async (_why, status, code, msg) => {
+      // These are the WHOLE reject surface of the endpoint's scope resolution: inspect.py::_bind
+      // fails in exactly two ways, and BOTH prove the rows on screen came from a build that no
+      // longer exists. (PROJECT_NOT_FOUND implies it too: delete_project refuses while any build
+      // exists, so the project being gone means its builds are gone.) Each arrives as a
+      // next-page failure, so keying on isFetchNextPageError alone leaves a vanished corpus on
+      // display — the same defect in two spellings, which is why the guard now allowlists the
+      // failures that CANNOT invalidate the binding rather than blocklisting the ones that can.
+      const get = vi.spyOn(api, "GET");
+      get.mockResolvedValueOnce(ok([doc()], { next_cursor: "c2" }) as never);
+      get.mockResolvedValueOnce(fail(status as number, code as string, msg as string) as never);
+      renderInspect();
+
+      fireEvent.click(await screen.findByRole("button", { name: /load more documents/i }));
+
+      expect(await screen.findByText(new RegExp(msg as string, "i"))).toBeInTheDocument();
+      await waitFor(() =>
+        expect(screen.queryByText("file:///data/corpus/a.txt")).not.toBeInTheDocument(),
+      );
+      // and it is NOT reported as a mere pagination hiccup
+      expect(screen.queryByText(/could not load more/i)).not.toBeInTheDocument();
+    },
+  );
+
+  it("keeps the rows when LOAD MORE hits a scope-NEUTRAL failure the server named", async () => {
+    // The acceptance side, and it must be pinned through the ApiError path — not just the
+    // transport path above — or the fail-closed default could quietly widen until a store blip
+    // blanks a perfectly valid table. STORE_UNAVAILABLE says the store was down, which says
+    // nothing about which build is active: the rows survive, the page failure is reported.
+    const get = vi.spyOn(api, "GET");
+    get.mockResolvedValueOnce(ok([doc()], { next_cursor: "c2" }) as never);
+    get.mockResolvedValueOnce(fail(503, "STORE_UNAVAILABLE", "qdrant is unreachable") as never);
+    renderInspect();
+
+    fireEvent.click(await screen.findByRole("button", { name: /load more documents/i }));
+
+    expect(await screen.findByText(/could not load more documents/i)).toBeInTheDocument();
+    expect(screen.getByText("file:///data/corpus/a.txt")).toBeInTheDocument();
+  });
+
+  it("drops the rows when a load-more failure has no readable code, and says so in words", async () => {
+    // A body that is NOT our envelope — a proxy's HTML 502, which never reached the app. There
+    // is no code to read, so nothing has told us the build survived, and the allowlist's rule is
+    // that only a code we RECOGNISE earns the rows back. Two failures are pinned here at once:
+    //   * the rows must go (an unreadable answer is not a scope-neutral one), and
+    //   * reading the envelope unguarded would throw a TypeError — which is NOT an ApiError, so
+    //     it would land in the TRANSPORT branch and silently KEEP the rows, with every other
+    //     test still green. That false-green is exactly why this branch needs its own pin.
+    const get = vi.spyOn(api, "GET");
+    get.mockResolvedValueOnce(ok([doc()], { next_cursor: "c2" }) as never);
+    get.mockResolvedValueOnce({
+      data: undefined,
+      error: "<html>502 Bad Gateway</html>",
+      response: { status: 502 },
+    } as never);
+    renderInspect();
+
+    fireEvent.click(await screen.findByRole("button", { name: /load more documents/i }));
+
+    expect(await screen.findByText(/the request failed/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText("file:///data/corpus/a.txt")).not.toBeInTheDocument(),
+    );
+    // the user is told what happened — not handed a JS crash escaping our own error path
+    expect(screen.queryByText(/cannot read properties/i)).not.toBeInTheDocument();
+  });
+
   it("hides the stale table when a REFETCH fails, instead of calling it a load-more failure", async () => {
     // The two cached-data errors are NOT alike. A failed refetch (focus/reconnect, or the
     // active build being removed → 409) also raises isError while react-query keeps the

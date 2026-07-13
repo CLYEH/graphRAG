@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { useChunk, useChunks, useDocument, useDocuments } from "../api/queries";
+import { isScopeNeutral, useChunk, useChunks, useDocument, useDocuments } from "../api/queries";
 import { isPathAddressable, useActiveProject } from "../project/projectRoute";
 import "./Inspect.css";
 
@@ -138,16 +138,23 @@ function PagedList<T extends { id: string }>({
   } = query;
 
   if (isPending) return <p className="inspect__muted">Loading {label}…</p>;
-  // TWO different failures both raise isError while react-query KEEPS the cached pages,
-  // and they must not be treated alike:
-  //   * a failed "load more" — the rows already on screen are still valid; discarding a
-  //     good table over one bad page would be a worse failure than the one reported.
-  //   * a failed REFETCH (focus/reconnect, or the active build being removed → 409/503)
-  //     — here the cached rows are STALE: they describe a build the server will no longer
-  //     serve. Rendering them is showing a corpus that no longer exists, which is exactly
-  //     the stale-data-during-refetch trap the run gates were hardened against (#70).
-  // So keep the table ONLY for the pagination failure; every other error fails closed.
-  if (isError && !isFetchNextPageError)
+
+  // react-query KEEPS the cached pages on any failed fetch, so `isError` beside a populated
+  // cache is not one situation. The rows stay showable under exactly ONE condition: the build
+  // that served them is still the active build. So THAT — not "which request failed" — decides.
+  //   * a failed REFETCH (focus/reconnect) — the cached rows are unverified against the
+  //     server's current answer; fail closed (the stale-data-during-refetch trap of #70).
+  //   * a failed "load more" — keep the rows ONLY when the failure says nothing about the
+  //     binding (transport, or a scope-neutral code: store down, throttled, 500, timeout).
+  //     Discarding a good table over one flaky page would be a worse failure than the one
+  //     reported. But a load-more can ALSO return NO_ACTIVE_BUILD or PROJECT_NOT_FOUND, and
+  //     those prove every row on screen belongs to a build that no longer exists — keeping
+  //     them because "it was only a load-more" would leave a vanished corpus on display.
+  // Note the symmetry this restores: the list already fails closed when a swap makes page 2
+  // arrive from a DIFFERENT build. A swap that leaves NO active build (or takes the project
+  // with it) is the same event, and must not land on the opposite branch.
+  const keepsRows = isFetchNextPageError && isScopeNeutral(error);
+  if (isError && !keepsRows)
     return (
       <p className="inspect__muted inspect__muted--error">
         Could not load {label}: {message(error)}
@@ -209,9 +216,9 @@ function PagedList<T extends { id: string }>({
         </tbody>
       </table>
 
-      {/* the ONLY error that reaches here is a load-more failure (everything else failed
-          closed above): the rows on screen are still valid, so keep them and say so */}
-      {isFetchNextPageError && (
+      {/* the SAME predicate that let the rows survive the guard above — reusing it (rather
+          than restating the condition) is what keeps the two from ever disagreeing */}
+      {keepsRows && (
         <p className="inspect__muted inspect__muted--error">
           Could not load more {label}: {message(error)}
         </p>

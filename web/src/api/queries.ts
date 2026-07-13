@@ -418,6 +418,60 @@ const INSPECT_PAGE = 50;
  *  cursor to the next page (absent = last page). */
 export type InspectPage<T> = { rows: T[]; buildId: string | null; next?: string };
 
+/** An API failure that keeps the frozen error CODE. The list pages are only valid while
+ *  the build that served them is still active, and the code is what says whether it is. */
+type ErrorCode = components["schemas"]["ErrorCode"];
+
+class ApiError extends Error {
+  readonly code: ErrorCode | "";
+
+  constructor(code: ErrorCode | "", message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/** Codes that say NOTHING about the build that served the pages already on screen: the store
+ *  was down, we were throttled, the server faulted, it timed out. The corpus is untouched, so
+ *  a load-more that hits one of these may keep the loaded rows.
+ *
+ *  This is an ALLOWLIST, and the direction is the point. Both of `inspect.py::_bind`'s failure
+ *  exits prove the scope that served those rows is gone — NO_ACTIVE_BUILD (409, the build was
+ *  deactivated) and PROJECT_NOT_FOUND (404: `delete_project` refuses while any build exists, so
+ *  the project being gone means its builds are too). Listing the REJECTS instead would close
+ *  today's two spellings and leave the branch open for the next: §27.2's ErrorCode vocabulary is
+ *  additive-only, and a code added later must not silently inherit the branch that keeps a
+ *  possibly-vanished corpus on screen. Fail closed by default; earn the rows back explicitly. */
+const SCOPE_NEUTRAL = new Set<ErrorCode>([
+  "STORE_UNAVAILABLE",
+  "RATE_LIMITED",
+  "INTERNAL",
+  "QUERY_TIMEOUT",
+]);
+
+/** Builds the thrown error from the API's error envelope. The `??`s are not defensive noise:
+ *  a body that is NOT our envelope (a proxy's HTML 502, say) has no `error.code` to read, and
+ *  the empty code deliberately falls OUTSIDE the allowlist below — an unparseable failure tells
+ *  us nothing about the binding, and "nothing" fails closed here. Reading it unguarded would
+ *  instead throw a TypeError and show the user "Cannot read properties of undefined". */
+function apiError(body: { error?: { code?: ErrorCode; message?: string } }): ApiError {
+  return new ApiError(body.error?.code ?? "", body.error?.message ?? "the request failed");
+}
+
+/** True when the failure CANNOT have invalidated the build that served the loaded pages —
+ *  either the server never answered at all (a transport error, so it said nothing about the
+ *  binding) or it answered with a scope-neutral code above.
+ *
+ *  Note this keys on the CODE while the detail read below keys on the STATUS. The asymmetry is
+ *  real: these codes are raised deliberately by the API, whereas a detail 404's code is the
+ *  COARSE fallback `code_for_status` stamps on every framework-raised 4xx (VALIDATION_ERROR),
+ *  which identifies nothing. And status alone would be a spelling here — 409 is shared by
+ *  BUILD_NOT_READY and JOB_CONFLICT; the code names the condition itself. */
+export function isScopeNeutral(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return true; // the server never answered — it said nothing
+  return error.code !== "" && SCOPE_NEUTRAL.has(error.code); // unparseable body ⇒ fail closed
+}
+
 function useInspectList<T>(
   key: string,
   project: string | undefined,
@@ -436,7 +490,7 @@ async function fetchDocuments(project: string, cursor?: string): Promise<Inspect
   const { data, error } = await api.GET("/projects/{project}/documents", {
     params: { path: { project }, query: { limit: INSPECT_PAGE, cursor } },
   });
-  if (error) throw new Error(error.error.message);
+  if (error) throw apiError(error);
   return { rows: data.data, buildId: data.meta.build_id, next: data.meta.next_cursor ?? undefined };
 }
 
@@ -444,7 +498,7 @@ async function fetchChunks(project: string, cursor?: string): Promise<InspectPag
   const { data, error } = await api.GET("/projects/{project}/chunks", {
     params: { path: { project }, query: { limit: INSPECT_PAGE, cursor } },
   });
-  if (error) throw new Error(error.error.message);
+  if (error) throw apiError(error);
   return { rows: data.data, buildId: data.meta.build_id, next: data.meta.next_cursor ?? undefined };
 }
 
