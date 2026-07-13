@@ -24,7 +24,7 @@ function entity(overrides: Record<string, unknown> = {}) {
     type: "PERSON",
     canonical_name: "Ada Lovelace",
     entity_key: "person:ada",
-    status: "resolved",
+    status: "active",
     review_status: "unreviewed",
     created_by: "pipeline",
     attributes: {},
@@ -39,7 +39,7 @@ function relationDetail() {
     src_entity_id: E1,
     dst_entity_id: E2,
     type: "WORKS_WITH",
-    status: "resolved",
+    status: "active",
     review_status: "approved",
     created_by: "pipeline",
     confidence: 0.87,
@@ -201,7 +201,7 @@ describe("Graph", () => {
     // picking from the left selects the node too; the detail column shows the
     // entity's identity fields from the settled detail read
     expect(await screen.findByText("person:ada")).toBeInTheDocument(); // entity_key
-    expect(screen.getByText("resolved")).toBeInTheDocument();
+    expect(screen.getByText("active", { selector: "dd" })).toBeInTheDocument();
   });
 
   it("labels the left filter as covering LOADED entities only, and filters client-side", async () => {
@@ -252,7 +252,7 @@ describe("Graph", () => {
     expect(await screen.findByText(/could not load more entities/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /ada lovelace/i })).toBeInTheDocument(); // kept
 
-    // the scope-gone direction
+    // the scope-gone direction: the WHOLE page fails closed, not just the column
     view1.unmount();
     get.mockReset();
     get.mockResolvedValueOnce({
@@ -270,6 +270,67 @@ describe("Graph", () => {
       await screen.findByText(/could not load entities: no active build/i),
     ).toBeInTheDocument();
     expect(col.querySelectorAll(".graph__entity").length).toBe(0); // dropped
+  });
+
+  it("tears down the CACHED subgraph and detail when the entity list loses the scope", async () => {
+    // The page-level half of the scope-gone rule (Codex, #75): the viz and
+    // detail columns hold their own cached queries, which an entity-list error
+    // does not invalidate — without the page-wide verdict the screen would say
+    // "no active build" beside the OLD build's rendered graph.
+    const get = stubApi();
+    // entities page 1 with a cursor so load-more exists
+    get.mockImplementation(((path: string) => {
+      if (path.endsWith("/graph/subgraph"))
+        return Promise.resolve({ data: { data: subgraph(), meta: META }, error: undefined });
+      if (path.includes("{entity_id}"))
+        return Promise.resolve({ data: { data: entity(), meta: META }, error: undefined });
+      if (path.includes("{relation_id}"))
+        return Promise.resolve({ data: { data: relationDetail(), meta: META }, error: undefined });
+      return Promise.resolve({
+        data: { data: [entity()], meta: { ...META, next_cursor: "c2" } },
+        error: undefined,
+      });
+    }) as never);
+    renderGraph();
+    fireEvent.click(await screen.findByRole("button", { name: /ada lovelace/i }));
+    expect(await screen.findByText("WORKS_WITH")).toBeInTheDocument(); // graph up
+
+    get.mockImplementation(((path: string) => {
+      if (path.endsWith("/entities"))
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "NO_ACTIVE_BUILD", message: "no active build" } },
+        });
+      return new Promise(() => {}); // nothing else answers
+    }) as never);
+    fireEvent.click(screen.getByRole("button", { name: /load more entities/i }));
+
+    expect(
+      await screen.findByText(/could not load entities: no active build/i),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText("WORKS_WITH")).not.toBeInTheDocument());
+    expect(screen.queryByText("person:ada")).not.toBeInTheDocument(); // detail gone too
+  });
+
+  it("disables non-active entities as seeds and says why", async () => {
+    // The list returns EVERY status in the build (the router has no predicate)
+    // but the subgraph endpoint only accepts ACTIVE seeds — a merged row that
+    // looks clickable can only 404. It stays LISTED (real build content) but
+    // disabled, with the status visible.
+    vi.spyOn(api, "GET").mockImplementation((() =>
+      Promise.resolve({
+        data: {
+          data: [entity(), entity({ id: E2, canonical_name: "Old Merged", status: "merged" })],
+          meta: META,
+        },
+        error: undefined,
+      })) as never);
+    renderGraph();
+
+    const merged = await screen.findByRole("button", { name: /old merged/i });
+    expect(merged).toBeDisabled();
+    expect(merged).toHaveTextContent("merged");
+    expect(screen.getByRole("button", { name: /ada lovelace/i })).toBeEnabled();
   });
 
   it("hides a stale subgraph while a refetch re-verifies the active build", async () => {

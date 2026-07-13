@@ -59,6 +59,23 @@ function GraphBody({ project }: { project: string }) {
   const [centerId, setCenterId] = useState<string | undefined>(undefined);
   const [hops, setHops] = useState(1);
   const [selected, setSelected] = useState<Selection | null>(null);
+  const list = useEntities(project);
+
+  // Page-wide scope death (Codex, #75): a scope-gone answer on the ENTITY list
+  // means the whole page's world is dead — leaving the middle/right columns
+  // rendering their cached subgraph/detail would show the old build's graph
+  // beside a line saying there is no active build. One predicate, one verdict,
+  // all three columns (the class-17 rule applied at page scope, not per column).
+  const keepsRows = list.isFetchNextPageError && isScopeNeutral(list.error);
+  if (list.isError && !keepsRows)
+    return (
+      <section className="graph">
+        <h1 className="graph__title">Graph</h1>
+        <p className="graph__line graph__line--error">
+          Could not load entities: {message(list.error)}
+        </p>
+      </section>
+    );
 
   return (
     <section className="graph">
@@ -69,7 +86,8 @@ function GraphBody({ project }: { project: string }) {
       </p>
       <div className="graph__columns">
         <EntityColumn
-          project={project}
+          list={list}
+          keepsRows={keepsRows}
           centerId={centerId}
           onCenter={(id) => {
             setCenterId(id);
@@ -94,35 +112,25 @@ function GraphBody({ project }: { project: string }) {
 // ---- left: entity list + honest client-side filter ---------------------------
 
 function EntityColumn({
-  project,
+  list,
+  keepsRows,
   centerId,
   onCenter,
 }: {
-  project: string;
+  list: ReturnType<typeof useEntities>;
+  keepsRows: boolean;
   centerId: string | undefined;
   onCenter: (id: string) => void;
 }) {
-  const list = useEntities(project);
   const [filter, setFilter] = useState("");
 
   if (list.isPending) return <div className="graph__col">Loading entities…</div>;
   // Same cached-rows discipline as the FE3 lists: a refetch re-verifies the
   // active build, so until it answers the rows are unverified; a next-page
-  // fetch extends the pinned build and keeps the list.
+  // fetch extends the pinned build and keeps the list. (The scope-gone isError
+  // case never reaches here — GraphBody fails the WHOLE page closed on it.)
   if (list.isFetching && !list.isFetchingNextPage)
     return <div className="graph__col">Loading entities…</div>;
-  // FE3's keep-rows rule, not a restatement of half of it (Codex, #75): the
-  // loaded rows survive a load-more failure ONLY when the failure cannot have
-  // invalidated the build binding (transport / scope-neutral code) — a
-  // scope-gone answer on ANY request means every row on screen belongs to a
-  // build that no longer exists.
-  const keepsRows = list.isFetchNextPageError && isScopeNeutral(list.error);
-  if (list.isError && !keepsRows)
-    return (
-      <div className="graph__col graph__line--error">
-        Could not load entities: {message(list.error)}
-      </div>
-    );
 
   const pages = list.data?.pages ?? [];
   const builds = new Set(pages.map((p) => p.buildId));
@@ -163,13 +171,24 @@ function EntityColumn({
       <ul className="graph__entities">
         {shown.map((e) => (
           <li key={e.id}>
+            {/* the subgraph endpoint only accepts ACTIVE seeds (repo.active_entity_ids
+                — Codex, #75): a merged/rejected row is still real build content worth
+                LISTING, but clicking it could only 404, so it is disabled and says why */}
             <button
               type="button"
               className={`graph__entity${e.id === centerId ? " graph__entity--center" : ""}`}
+              disabled={e.status !== "active"}
+              title={
+                e.status !== "active"
+                  ? `status ${e.status} — only active entities can seed a subgraph`
+                  : undefined
+              }
               onClick={() => onCenter(e.id)}
             >
               <span className="graph__entity-name">{e.canonical_name}</span>
-              <span className="graph__entity-type">{e.type}</span>
+              <span className="graph__entity-type">
+                {e.status !== "active" ? `${e.type} · ${e.status}` : e.type}
+              </span>
             </button>
           </li>
         ))}
