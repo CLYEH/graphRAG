@@ -60,6 +60,7 @@ function GraphBody({ project }: { project: string }) {
   const [hops, setHops] = useState(1);
   const [selected, setSelected] = useState<Selection | null>(null);
   const list = useEntities(project);
+  const sub = useSubgraph(project, centerId, hops);
 
   // Page-wide scope death (Codex, #75): a scope-gone answer on the ENTITY list
   // means the whole page's world is dead — leaving the middle/right columns
@@ -92,6 +93,23 @@ function GraphBody({ project }: { project: string }) {
       </section>
     );
 
+  // Selection is reconciled against the CURRENT subgraph by comparison, not by
+  // clearing on events (Codex, #75; the FE2 lesson): shrinking hops, recentering
+  // or a refetch can all leave `selected` pointing at a node/edge the displayed
+  // graph no longer contains — the right column must not render detail for
+  // something that is not on screen, whatever path removed it.
+  const graph = sub.data?.graph;
+  const visibleSelection =
+    selected === null || graph === undefined
+      ? null
+      : selected.kind === "node"
+        ? graph.nodes.some((n) => n.id === selected.id)
+          ? selected
+          : null
+        : graph.edges.some((e) => e.id === selected.id)
+          ? selected
+          : null;
+
   return (
     <section className="graph">
       <h1 className="graph__title">Graph</h1>
@@ -111,14 +129,15 @@ function GraphBody({ project }: { project: string }) {
         />
         <VizColumn
           project={project}
+          sub={sub}
           centerId={centerId}
           hops={hops}
           onHops={setHops}
-          selected={selected}
+          selected={visibleSelection}
           onSelect={setSelected}
           onCenter={setCenterId}
         />
-        <DetailColumn project={project} selected={selected} />
+        <DetailColumn project={project} selected={visibleSelection} />
       </div>
     </section>
   );
@@ -279,6 +298,7 @@ export function radialLayout(graph: GraphContext, centerId: string): Positioned[
 
 function VizColumn({
   project,
+  sub,
   centerId,
   hops,
   onHops,
@@ -287,6 +307,7 @@ function VizColumn({
   onCenter,
 }: {
   project: string;
+  sub: ReturnType<typeof useSubgraph>;
   centerId: string | undefined;
   hops: number;
   onHops: (h: number) => void;
@@ -294,7 +315,6 @@ function VizColumn({
   onSelect: (s: Selection) => void;
   onCenter: (id: string) => void;
 }) {
-  const sub = useSubgraph(project, centerId, hops);
   const positioned = useMemo(
     () => (sub.data && centerId ? radialLayout(sub.data.graph, centerId) : []),
     [sub.data, centerId],

@@ -349,6 +349,45 @@ describe("Graph", () => {
     await waitFor(() => expect(screen.queryByText("WORKS_WITH")).not.toBeInTheDocument());
   });
 
+  it("drops a selection the new neighborhood no longer contains — detail must not outlive the view", async () => {
+    // Reconciliation is a COMPARISON against the returned graph (the FE2 lesson),
+    // so hops shrink, recenter and refetch are all one predicate: select the edge
+    // at hops=1, then shrink the neighborhood to the bare center — the evidence
+    // panel must leave with the edge, not keep describing something off-screen.
+    let bare = false;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path.endsWith("/graph/subgraph"))
+        return Promise.resolve({
+          data: {
+            data: bare
+              ? {
+                  nodes: [{ id: E1, type: "PERSON", label: "Ada Lovelace", properties: {} }],
+                  edges: [],
+                }
+              : subgraph(),
+            meta: META,
+          },
+          error: undefined,
+        });
+      if (path.includes("{relation_id}"))
+        return Promise.resolve({ data: { data: relationDetail(), meta: META }, error: undefined });
+      if (path.includes("{entity_id}"))
+        return Promise.resolve({ data: { data: entity(), meta: META }, error: undefined });
+      return Promise.resolve({ data: { data: [entity()], meta: META }, error: undefined });
+    }) as never);
+    renderGraph();
+    fireEvent.click(await screen.findByRole("button", { name: /ada lovelace/i }));
+    fireEvent.click(await screen.findByText("WORKS_WITH"));
+    expect(await screen.findByText(/ada worked with charles/i)).toBeInTheDocument();
+
+    bare = true; // the next neighborhood no longer contains the selected edge
+    fireEvent.change(screen.getByLabelText(/hops/i), { target: { value: "3" } });
+
+    await waitFor(() =>
+      expect(screen.queryByText(/ada worked with charles/i)).not.toBeInTheDocument(),
+    );
+  });
+
   it("disables non-active entities as seeds and says why", async () => {
     // The list returns EVERY status in the build (the router has no predicate)
     // but the subgraph endpoint only accepts ACTIVE seeds — a merged row that
