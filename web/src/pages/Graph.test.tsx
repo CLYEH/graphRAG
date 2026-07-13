@@ -312,6 +312,43 @@ describe("Graph", () => {
     expect(screen.queryByText("person:ada")).not.toBeInTheDocument(); // detail gone too
   });
 
+  it("tears the whole page down when a load-more SUCCEEDS from a different build", async () => {
+    // The splice sibling of the scope-gone teardown (Codex, #75 round 3): a page-2
+    // success served by a NEW build proves the world changed under the page — the
+    // cached subgraph/detail describe the old build exactly as much as a spliced
+    // list would. One verdict, all three columns.
+    const get = stubApi();
+    get.mockImplementation(((path: string) => {
+      if (path.endsWith("/graph/subgraph"))
+        return Promise.resolve({ data: { data: subgraph(), meta: META }, error: undefined });
+      if (path.includes("_id}"))
+        return Promise.resolve({ data: { data: entity(), meta: META }, error: undefined });
+      return Promise.resolve({
+        data: { data: [entity()], meta: { ...META, next_cursor: "c2" } },
+        error: undefined,
+      });
+    }) as never);
+    renderGraph();
+    fireEvent.click(await screen.findByRole("button", { name: /ada lovelace/i }));
+    expect(await screen.findByText("WORKS_WITH")).toBeInTheDocument();
+
+    get.mockImplementation(((path: string) => {
+      if (path.endsWith("/entities"))
+        return Promise.resolve({
+          data: {
+            data: [entity({ id: E2, canonical_name: "New Build Row" })],
+            meta: { ...META, build_id: "b2", next_cursor: null },
+          },
+          error: undefined,
+        });
+      return new Promise(() => {});
+    }) as never);
+    fireEvent.click(screen.getByRole("button", { name: /load more entities/i }));
+
+    expect(await screen.findByText(/would mix two builds/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText("WORKS_WITH")).not.toBeInTheDocument());
+  });
+
   it("disables non-active entities as seeds and says why", async () => {
     // The list returns EVERY status in the build (the router has no predicate)
     // but the subgraph endpoint only accepts ACTIVE seeds — a merged row that

@@ -76,6 +76,21 @@ function GraphBody({ project }: { project: string }) {
         </p>
       </section>
     );
+  // The build-SPLICE verdict is page-wide for the same reason (Codex, #75): a
+  // load-more that SUCCEEDS from a different build proves the world changed
+  // under the page — the cached subgraph/detail describe the old build just as
+  // much as the spliced list would.
+  const pages = list.data?.pages ?? [];
+  if (new Set(pages.map((p) => p.buildId)).size > 1)
+    return (
+      <section className="graph">
+        <h1 className="graph__title">Graph</h1>
+        <p className="graph__line graph__line--error">
+          The active build changed while loading entities — the page would mix two builds. Reload to
+          see a single build.
+        </p>
+      </section>
+    );
 
   return (
     <section className="graph">
@@ -132,16 +147,8 @@ function EntityColumn({
   if (list.isFetching && !list.isFetchingNextPage)
     return <div className="graph__col">Loading entities…</div>;
 
-  const pages = list.data?.pages ?? [];
-  const builds = new Set(pages.map((p) => p.buildId));
-  if (builds.size > 1)
-    return (
-      <div className="graph__col graph__line--error">
-        The active build changed while loading entities — reload to see a single build.
-      </div>
-    );
-
-  const rows = pages.flatMap((p) => p.rows);
+  // (the build-splice case never reaches here — GraphBody fails the page closed)
+  const rows = (list.data?.pages ?? []).flatMap((p) => p.rows);
   if (rows.length === 0) return <div className="graph__col">No entities in the active build.</div>;
 
   const needle = filter.trim().toLowerCase();
