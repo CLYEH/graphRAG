@@ -465,7 +465,7 @@ test("clean previews pasted text and saves chunking by spreading the config", as
   expect(JSON.parse(previewBody)).toEqual({ text: "alpha beta gamma delta" });
 
   await page.getByRole("button", { name: /save 500\/50 to config/i }).click();
-  await expect(page.getByText(/saved — the next build/i)).toBeVisible();
+  await expect(page.getByText(/saved 500\/50 — the next build/i)).toBeVisible();
   const patched = JSON.parse(patchBody);
   expect(patched.config.ontology).toEqual({ entity_types: ["PERSON"] });
   expect(patched.config.chunking).toEqual({ max_chars: 500, overlap: 50 });

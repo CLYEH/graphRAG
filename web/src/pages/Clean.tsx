@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 
 import {
   DEFAULT_CHUNKING,
@@ -57,13 +57,21 @@ function CleanBody({ project }: { project: string }) {
   const [documentId, setDocumentId] = useState("");
   const [maxCharsText, setMaxCharsText] = useState("");
   const [overlapText, setOverlapText] = useState("");
-  // the result answers the INPUTS it was made with — edits after a preview make it
-  // stale, and a stale preview must say so rather than impersonate the new inputs.
-  // The version counter closes the in-flight window: an edit DURING a pending
-  // preview must leave the settled result flagged, so success only clears the
-  // flag when no input moved since the mutate captured its body.
-  const [stale, setStale] = useState(false);
-  const inputVersion = useRef(0);
+  // Staleness is a COMPARISON, not an event trail (Codex, #74): the preview
+  // answers the EFFECTIVE tuple it was made with (source content + the pair the
+  // server would resolve), so the page snapshots that tuple at mutate time and
+  // recomputes "stale" every render. Anything that moves the current tuple —
+  // typed edits, a source switch, or a useProject refetch changing the CONFIG
+  // fallbacks with no input event at all — flags the old result automatically,
+  // including edits that land while the request is on the wire. Same shape for
+  // the save confirmation: it names the pair it saved and only stands while the
+  // effective pair still matches.
+  const [previewedWith, setPreviewedWith] = useState<{
+    sourceKey: string;
+    max: number;
+    overlap: number;
+  } | null>(null);
+  const [savedPair, setSavedPair] = useState<{ max: number; overlap: number } | null>(null);
 
   // Loading / failed project reads fail CLOSED: the save path spreads the loaded
   // config, so rendering the form without it risks saving a wipe (see queries.ts).
@@ -108,18 +116,29 @@ function CleanBody({ project }: { project: string }) {
     };
   }
 
+  const currentSourceKey = source === "text" ? `t:${text}` : `d:${documentId}`;
+  const stale =
+    preview.data !== undefined &&
+    previewedWith !== null &&
+    (previewedWith.sourceKey !== currentSourceKey ||
+      previewedWith.max !== effectiveMax ||
+      previewedWith.overlap !== effectiveOverlap);
+  const savedStands =
+    savedPair !== null && savedPair.max === effectiveMax && savedPair.overlap === effectiveOverlap;
+
   function runPreview() {
     const body: CleanPreviewRequest =
       source === "text" ? { text, ...knobs() } : { document_id: documentId, ...knobs() };
-    const version = inputVersion.current;
-    preview.mutate(body, {
-      onSuccess: () => setStale(inputVersion.current !== version),
-    });
+    setPreviewedWith({ sourceKey: currentSourceKey, max: effectiveMax, overlap: effectiveOverlap });
+    preview.mutate(body);
   }
 
-  function markStale() {
-    inputVersion.current += 1;
-    if (preview.data) setStale(true);
+  function runSave() {
+    const pair = { max: effectiveMax, overlap: effectiveOverlap };
+    save.mutate(
+      { max_chars: pair.max, overlap: pair.overlap },
+      { onSuccess: () => setSavedPair(pair) },
+    );
   }
 
   return (
@@ -138,10 +157,7 @@ function CleanBody({ project }: { project: string }) {
               type="radio"
               name="source"
               checked={source === "text"}
-              onChange={() => {
-                setSource("text");
-                markStale();
-              }}
+              onChange={() => setSource("text")}
             />
             Paste text
           </label>
@@ -150,10 +166,7 @@ function CleanBody({ project }: { project: string }) {
               type="radio"
               name="source"
               checked={source === "document"}
-              onChange={() => {
-                setSource("document");
-                markStale();
-              }}
+              onChange={() => setSource("document")}
             />
             Ingested document (active build)
           </label>
@@ -166,20 +179,14 @@ function CleanBody({ project }: { project: string }) {
               value={text}
               maxLength={MAX_TEXT}
               rows={6}
-              onChange={(e) => {
-                setText(e.target.value);
-                markStale();
-              }}
+              onChange={(e) => setText(e.target.value)}
             />
           </label>
         ) : (
           <DocumentPicker
             project={project}
             value={documentId}
-            onChange={(id) => {
-              setDocumentId(id);
-              markStale();
-            }}
+            onChange={(id) => setDocumentId(id)}
           />
         )}
 
@@ -191,10 +198,7 @@ function CleanBody({ project }: { project: string }) {
               min={1}
               placeholder={String(configured.max_chars)}
               value={maxCharsText}
-              onChange={(e) => {
-                setMaxCharsText(e.target.value);
-                markStale();
-              }}
+              onChange={(e) => setMaxCharsText(e.target.value)}
             />
           </label>
           <label className="clean__field">
@@ -204,10 +208,7 @@ function CleanBody({ project }: { project: string }) {
               min={0}
               placeholder={String(configured.overlap)}
               value={overlapText}
-              onChange={(e) => {
-                setOverlapText(e.target.value);
-                markStale();
-              }}
+              onChange={(e) => setOverlapText(e.target.value)}
             />
           </label>
           <p className="clean__muted">
@@ -227,11 +228,7 @@ function CleanBody({ project }: { project: string }) {
           >
             {preview.isPending ? "Previewing…" : "Preview"}
           </button>
-          <button
-            type="button"
-            disabled={pairError !== null || save.isPending}
-            onClick={() => save.mutate({ max_chars: effectiveMax, overlap: effectiveOverlap })}
-          >
+          <button type="button" disabled={pairError !== null || save.isPending} onClick={runSave}>
             {save.isPending ? "Saving…" : `Save ${effectiveMax}/${effectiveOverlap} to config`}
           </button>
         </div>
@@ -239,8 +236,11 @@ function CleanBody({ project }: { project: string }) {
         {save.isError && (
           <p className="clean__line clean__line--error">Save failed: {message(save.error)}</p>
         )}
-        {save.isSuccess && !save.isPending && (
-          <p className="clean__line">Saved — the next build will chunk with these values.</p>
+        {save.isSuccess && !save.isPending && savedStands && (
+          <p className="clean__line">
+            Saved {savedPair?.max}/{savedPair?.overlap} — the next build will chunk with these
+            values.
+          </p>
         )}
       </div>
 

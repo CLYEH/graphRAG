@@ -1,4 +1,5 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { focusManager } from "@tanstack/react-query";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -227,6 +228,57 @@ describe("Clean", () => {
 
     expect(await screen.findByText("alpha beta")).toBeInTheDocument();
     expect(await screen.findByText(/changed since this preview/i)).toBeInTheDocument();
+  });
+
+  it("marks the preview stale when a CONFIG refetch moves the fallback pair — no input event at all", async () => {
+    // The event-trail hole Codex named (#74): with empty knobs the effective pair
+    // comes from project config, and a focus refetch can change that config with no
+    // input handler running. Staleness is a comparison against the snapshot the
+    // preview captured, so the moved fallback must flag the table by itself.
+    let gets = 0;
+    vi.spyOn(api, "GET").mockImplementation((() =>
+      Promise.resolve(
+        ++gets === 1
+          ? projectBody({ chunking: { max_chars: 100, overlap: 10 } })
+          : projectBody({ chunking: { max_chars: 300, overlap: 30 } }),
+      )) as never);
+    vi.spyOn(api, "POST").mockResolvedValue(previewBody([CHUNK]) as never);
+    renderClean();
+
+    fireEvent.change(await screen.findByLabelText(/text/i, { selector: "textarea" }), {
+      target: { value: "abc def" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^preview$/i }));
+    expect(await screen.findByText("alpha beta")).toBeInTheDocument();
+    expect(screen.queryByText(/changed since this preview/i)).not.toBeInTheDocument();
+
+    // another tab / CLI PATCHed the config; the window-focus refetch picks it up
+    act(() => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+
+    expect(await screen.findByText(/changed since this preview/i)).toBeInTheDocument();
+  });
+
+  it("withdraws the save confirmation when the effective pair moves past what was saved", async () => {
+    // "Saved — the next build will chunk with these values" beside freshly edited,
+    // UNSAVED values is a false receipt (Codex, #74): the banner names the pair it
+    // saved and stands only while the effective pair still matches it.
+    vi.spyOn(api, "GET").mockResolvedValue(
+      projectBody({ chunking: { max_chars: 100, overlap: 10 } }) as never,
+    );
+    vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderClean();
+
+    fireEvent.click(await screen.findByRole("button", { name: /save 100\/10 to config/i }));
+    expect(await screen.findByText(/saved 100\/10 — the next build/i)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(/max_chars/i), { target: { value: "800" } });
+
+    await waitFor(() =>
+      expect(screen.queryByText(/saved 100\/10 — the next build/i)).not.toBeInTheDocument(),
+    );
   });
 
   it("surfaces a preview rejection loud, with the server's own message", async () => {
