@@ -510,6 +510,50 @@ describe("Graph", () => {
     expect(screen.getAllByText(/loading/i).length).toBeGreaterThan(0);
   });
 
+  it("hides the DETAIL when the subgraph fails scope-neutrally while the detail itself succeeds", async () => {
+    // The discriminating shape of Codex's round-7 finding: a focus refetch where
+    // the SUBGRAPH hits STORE_UNAVAILABLE (settled error — react-query keeps its
+    // previous data, the viz shows a local error) while the DETAIL refetch
+    // SUCCEEDS. If visibleSelection were derived from the cached graph, the
+    // right column would keep showing evidence for an item that is no longer
+    // verifiably on screen. The graph must count as ABSENT unless the subgraph
+    // query is settled-successful — the detail's own gates cannot catch this
+    // case (its read is green), which is why the earlier hung-everything version
+    // of this pin was NOT discriminating.
+    const { focusManager } = await import("@tanstack/react-query");
+    const { act } = await import("@testing-library/react");
+    const get = stubApi();
+    renderGraph();
+    fireEvent.click(await screen.findByRole("button", { name: /ada lovelace/i }));
+    fireEvent.click(await screen.findByText("WORKS_WITH"));
+    expect(await screen.findByText(/ada worked with charles/i)).toBeInTheDocument();
+
+    get.mockImplementation(((path: string) => {
+      if (path.endsWith("/graph/subgraph"))
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "STORE_UNAVAILABLE", message: "neo4j down" } },
+          response: { status: 503 },
+        });
+      if (path.includes("{relation_id}"))
+        return Promise.resolve({ data: { data: relationDetail(), meta: META }, error: undefined });
+      if (path.includes("{entity_id}"))
+        return Promise.resolve({ data: { data: entity(), meta: META }, error: undefined });
+      return Promise.resolve({ data: { data: [entity()], meta: META }, error: undefined });
+    }) as never);
+    act(() => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+
+    expect(await screen.findByText(/could not load the subgraph: neo4j down/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText(/ada worked with charles/i)).not.toBeInTheDocument(),
+    );
+    // and the page did NOT tear down — a 503 is scope-neutral, the list survives
+    expect(screen.getByRole("button", { name: /ada lovelace/i })).toBeInTheDocument();
+  });
+
   it("sends only entity_id and hops to the subgraph endpoint — never sort or filter", async () => {
     // reject_unsupported_query 400s stray params on the inspect surface; the
     // invariant lives in the fetcher's own query object (the FE3 false-green

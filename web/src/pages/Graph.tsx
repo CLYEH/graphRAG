@@ -125,7 +125,12 @@ function GraphBody({ project }: { project: string }) {
   // or a refetch can all leave `selected` pointing at a node/edge the displayed
   // graph no longer contains — the right column must not render detail for
   // something that is not on screen, whatever path removed it.
-  const graph = sub.data?.graph;
+  // The graph "exists" only while the subgraph query is SETTLED-SUCCESSFUL
+  // (Codex, #75 round 7 — the class-17 predicate applied to this derivation):
+  // react-query keeps the previous data during a refetch and after a
+  // scope-neutral failure, and a selection validated against that STALE graph
+  // would keep the detail on screen while the viz itself shows loading/error.
+  const graph = sub.isSuccess && !sub.isFetching ? sub.data.graph : undefined;
   const visibleSelection =
     selected === null || graph === undefined
       ? null
