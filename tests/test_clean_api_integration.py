@@ -113,7 +113,6 @@ async def _chunk_rows(conn: AsyncConnection) -> int:
     return int(count)
 
 
-@pytest.mark.anyio
 async def test_document_preview_reads_the_active_build_and_persists_nothing(api: Api) -> None:
     client, conn = api
     project = await _make_project(client)
@@ -139,7 +138,6 @@ async def test_document_preview_reads_the_active_build_and_persists_nothing(api:
     assert await _chunk_rows(conn) == before
 
 
-@pytest.mark.anyio
 async def test_document_in_a_non_active_build_is_invisible(api: Api) -> None:
     # The row exists — in a build that is not active. DR-006 means the preview
     # must not be able to see it: previewing against superseded corpus would
@@ -155,7 +153,6 @@ async def test_document_in_a_non_active_build_is_invisible(api: Api) -> None:
     assert r.status_code == 404
 
 
-@pytest.mark.anyio
 async def test_text_preview_uses_the_project_config_from_the_registry(api: Api) -> None:
     # End-to-end fallback proof: the config travels client → registry →
     # preview. 30-char windows must split this text; the engine default (1200)
