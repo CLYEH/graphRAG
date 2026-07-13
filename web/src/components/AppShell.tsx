@@ -8,6 +8,7 @@ import "./AppShell.css";
 const NAV = [
   { to: "health", label: "Health" },
   { to: "import", label: "Import" },
+  { to: "inspect", label: "Inspect" },
   { to: "jobs", label: "Jobs" },
   { to: "review", label: "Review" },
   { to: "playground", label: "Playground" },

@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api } from "./client";
 import { isPathAddressable } from "../project/projectRoute";
@@ -13,6 +13,8 @@ export type JobAccepted = components["schemas"]["JobAccepted"];
 export type Job = components["schemas"]["Job"];
 export type MergeCandidate = components["schemas"]["MergeCandidate"];
 export type MergeCandidateStatus = components["schemas"]["MergeCandidateStatus"];
+export type Document = components["schemas"]["Document"];
+export type Chunk = components["schemas"]["Chunk"];
 export type QueryMode = components["schemas"]["QueryMode"];
 export type QueryResult = components["schemas"]["QueryResult"];
 
@@ -383,6 +385,166 @@ export function useTrigger(project: string) {
           : await api.POST("/projects/{project}/build", { params });
       if (res.error) throw new Error(res.error.error.message);
       return res.data.data;
+    },
+  });
+}
+
+// ---- FE3 Inspect (BA3 reads) ------------------------------------------------
+//
+// DESIGN §10.2 names this page 檢視(文件/chunks) — the ingested documents and the
+// chunks they were split into. Entity/relation detail with evidence is the spec'd
+// content of a DIFFERENT page (圖譜互動探索 / FE4: "點邊顯示 type/confidence/
+// evidence/來源"), so the entity/relation reads are FE4's, not this task's.
+//
+// Three things the frozen contract makes non-negotiable here:
+//
+// 1. NEVER send `sort` or `filter[...]`. The op params still expose them, but
+//    `reject_unsupported_query` (api/routers/_query.py) 400s any `filter[...]` and
+//    any sort other than the list's own default — and for CHUNKS, whose default
+//    order is the compound (document_id, ordinal), it rejects EVERY explicit sort
+//    (`sort_field=None`). Verified live: `?sort=id:desc` on chunks → HTTP 400.
+// 2. Each request re-resolves the ACTIVE build, so a build activated mid-pagination
+//    would splice page 1 (old build) with page 2 (new) — a silently mixed corpus.
+//    Every page carries `meta.build_id`; the page pins it and fails loud on a swap.
+//    (No active build at all is a 409 NO_ACTIVE_BUILD, verified live — never a 200
+//    with an empty list, so an empty table really does mean an empty build.)
+// 3. A missing row answers 404 with `error.code = "VALIDATION_ERROR"` — `code_for_status`
+//    maps EVERY 4xx to that code, so it cannot distinguish "gone" from "bad request".
+//    Branch on the HTTP STATUS.
+
+const INSPECT_PAGE = 50;
+
+/** One page of a build-scoped list: its rows, the build that served them, and the
+ *  cursor to the next page (absent = last page). */
+export type InspectPage<T> = { rows: T[]; buildId: string | null; next?: string };
+
+/** An API failure that keeps the frozen error CODE. The list pages are only valid while
+ *  the build that served them is still active, and the code is what says whether it is. */
+type ErrorCode = components["schemas"]["ErrorCode"];
+
+class ApiError extends Error {
+  readonly code: ErrorCode | "";
+
+  constructor(code: ErrorCode | "", message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/** Codes that say NOTHING about the build that served the pages already on screen: the store
+ *  was down, we were throttled, the server faulted, it timed out. The corpus is untouched, so
+ *  a load-more that hits one of these may keep the loaded rows.
+ *
+ *  This is an ALLOWLIST, and the direction is the point. Both of `inspect.py::_bind`'s failure
+ *  exits prove the scope that served those rows is gone — NO_ACTIVE_BUILD (409, the build was
+ *  deactivated) and PROJECT_NOT_FOUND (404: `delete_project` refuses while any build exists, so
+ *  the project being gone means its builds are too). Listing the REJECTS instead would close
+ *  today's two spellings and leave the branch open for the next: §27.2's ErrorCode vocabulary is
+ *  additive-only, and a code added later must not silently inherit the branch that keeps a
+ *  possibly-vanished corpus on screen. Fail closed by default; earn the rows back explicitly. */
+const SCOPE_NEUTRAL = new Set<ErrorCode>([
+  "STORE_UNAVAILABLE",
+  "RATE_LIMITED",
+  "INTERNAL",
+  "QUERY_TIMEOUT",
+]);
+
+/** Builds the thrown error from the API's error envelope. The `??`s are not defensive noise:
+ *  a body that is NOT our envelope (a proxy's HTML 502, say) has no `error.code` to read, and
+ *  the empty code deliberately falls OUTSIDE the allowlist below — an unparseable failure tells
+ *  us nothing about the binding, and "nothing" fails closed here. Reading it unguarded would
+ *  instead throw a TypeError and show the user "Cannot read properties of undefined". */
+function apiError(body: { error?: { code?: ErrorCode; message?: string } }): ApiError {
+  return new ApiError(body.error?.code ?? "", body.error?.message ?? "the request failed");
+}
+
+/** True when the failure CANNOT have invalidated the build that served the loaded pages —
+ *  either the server never answered at all (a transport error, so it said nothing about the
+ *  binding) or it answered with a scope-neutral code above.
+ *
+ *  Note this keys on the CODE while the detail read below keys on the STATUS. The asymmetry is
+ *  real: these codes are raised deliberately by the API, whereas a detail 404's code is the
+ *  COARSE fallback `code_for_status` stamps on every framework-raised 4xx (VALIDATION_ERROR),
+ *  which identifies nothing. And status alone would be a spelling here — 409 is shared by
+ *  BUILD_NOT_READY and JOB_CONFLICT; the code names the condition itself. */
+export function isScopeNeutral(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return true; // the server never answered — it said nothing
+  return error.code !== "" && SCOPE_NEUTRAL.has(error.code); // unparseable body ⇒ fail closed
+}
+
+function useInspectList<T>(
+  key: string,
+  project: string | undefined,
+  fetchPage: (project: string, cursor?: string) => Promise<InspectPage<T>>,
+) {
+  return useInfiniteQuery({
+    queryKey: [key, project],
+    enabled: project !== undefined && isPathAddressable(project),
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) => fetchPage(project as string, pageParam),
+    getNextPageParam: (last: InspectPage<T>) => last.next,
+  });
+}
+
+async function fetchDocuments(project: string, cursor?: string): Promise<InspectPage<Document>> {
+  const { data, error } = await api.GET("/projects/{project}/documents", {
+    params: { path: { project }, query: { limit: INSPECT_PAGE, cursor } },
+  });
+  if (error) throw apiError(error);
+  return { rows: data.data, buildId: data.meta.build_id, next: data.meta.next_cursor ?? undefined };
+}
+
+async function fetchChunks(project: string, cursor?: string): Promise<InspectPage<Chunk>> {
+  const { data, error } = await api.GET("/projects/{project}/chunks", {
+    params: { path: { project }, query: { limit: INSPECT_PAGE, cursor } },
+  });
+  if (error) throw apiError(error);
+  return { rows: data.data, buildId: data.meta.build_id, next: data.meta.next_cursor ?? undefined };
+}
+
+export const useDocuments = (project: string | undefined) =>
+  useInspectList("documents", project, fetchDocuments);
+export const useChunks = (project: string | undefined) =>
+  useInspectList("chunks", project, fetchChunks);
+
+// A 404 here means "no such row IN THE ACTIVE BUILD" — ids are minted per build, so a
+// row id from a superseded build cannot resolve in the current one. Say that, rather
+// than echoing the generic VALIDATION_ERROR message every 4xx carries.
+function detailError(status: number, message: string): Error {
+  return new Error(
+    status === 404
+      ? "Not found in the active build — it may belong to an older build, or the active build changed. Reload the list."
+      : message,
+  );
+}
+
+// Detail reads. `Document.raw` is returned ONLY here — the list omits the key entirely
+// (verified against a real build), which is what a row click is for.
+export function useDocument(project: string | undefined, id: string | undefined) {
+  return useQuery({
+    queryKey: ["document", project, id],
+    enabled: project !== undefined && isPathAddressable(project) && id !== undefined,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET(
+        "/projects/{project}/documents/{document_id}",
+        { params: { path: { project: project as string, document_id: id as string } } },
+      );
+      if (error) throw detailError(response.status, error.error.message);
+      return data.data;
+    },
+  });
+}
+
+export function useChunk(project: string | undefined, id: string | undefined) {
+  return useQuery({
+    queryKey: ["chunk", project, id],
+    enabled: project !== undefined && isPathAddressable(project) && id !== undefined,
+    queryFn: async () => {
+      const { data, error, response } = await api.GET("/projects/{project}/chunks/{chunk_id}", {
+        params: { path: { project: project as string, chunk_id: id as string } },
+      });
+      if (error) throw detailError(response.status, error.error.message);
+      return data.data;
     },
   });
 }
