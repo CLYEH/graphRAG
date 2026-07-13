@@ -1,4 +1,5 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { focusManager } from "@tanstack/react-query";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -152,6 +153,33 @@ describe("Inspect", () => {
     expect(screen.getByText("file:///data/corpus/a.txt")).toBeInTheDocument();
   });
 
+  it("hides the stale table when a REFETCH fails, instead of calling it a load-more failure", async () => {
+    // The two cached-data errors are NOT alike. A failed refetch (focus/reconnect, or the
+    // active build being removed → 409) also raises isError while react-query keeps the
+    // previous pages — but those rows describe a build the server will no longer serve.
+    // Rendering them is showing a corpus that no longer exists: the stale-data-during-
+    // refetch trap the FE1 run gates were hardened against. Only a load-more failure may
+    // keep its rows; everything else fails closed.
+    const get = vi.spyOn(api, "GET");
+    get.mockResolvedValueOnce(ok([doc()]) as never);
+    renderInspect();
+    expect(await screen.findByText("file:///data/corpus/a.txt")).toBeInTheDocument();
+
+    // the refocus refetch finds the build gone
+    get.mockResolvedValue(fail(409, "NO_ACTIVE_BUILD", "no active build for project") as never);
+    act(() => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+
+    expect(await screen.findByText(/no active build for project/i)).toBeInTheDocument();
+    // the stale rows are GONE, and this was never labelled a pagination problem
+    await waitFor(() =>
+      expect(screen.queryByText("file:///data/corpus/a.txt")).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/could not load more/i)).not.toBeInTheDocument();
+  });
+
   it("fetches the detail-only field a row click exists for", async () => {
     // Document.raw comes back on the detail GET only — the list omits the key entirely
     // (verified against a real build). If the panel rendered from the list row, raw would
@@ -167,6 +195,49 @@ describe("Inspect", () => {
     fireEvent.click(await screen.findByRole("button", { name: "file:///data/corpus/a.txt" }));
 
     expect(await screen.findByText("the full document text")).toBeInTheDocument();
+  });
+
+  it("drops the stale detail fields when the detail refetch fails, rather than showing a vanished build's document under the error", async () => {
+    // The same cached-data-beside-isError trap as the list, one component over — and here
+    // the list CANNOT catch it: on a build swap the list refetch succeeds (one build in the
+    // pages, so the splice guard passes and the new table renders) while the detail refetch
+    // 404s. react-query keeps the previous document as `data`, so rendering the fields
+    // beside the error would print the OLD build's id/source_uri/raw underneath a line
+    // saying the row is gone from the active build. Error and fields are exclusive.
+    let swapped = false;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path.includes("_id}"))
+        return Promise.resolve(
+          swapped
+            ? fail(404, "VALIDATION_ERROR", "not found")
+            : {
+                data: { data: doc({ raw: "the full document text" }), meta: META },
+                error: undefined,
+              },
+        );
+      return Promise.resolve(
+        swapped
+          ? ok([doc({ id: "d2", source_uri: "file:///b.txt" })], { build_id: "b2" })
+          : ok([doc()]),
+      );
+    }) as never);
+    renderInspect();
+
+    fireEvent.click(await screen.findByRole("button", { name: "file:///data/corpus/a.txt" }));
+    expect(await screen.findByText("the full document text")).toBeInTheDocument();
+
+    swapped = true; // a build is activated that does not contain d1
+    act(() => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+
+    expect(await screen.findByText(/not found in the active build/i)).toBeInTheDocument();
+    expect(await screen.findByText("file:///b.txt")).toBeInTheDocument(); // list is fine
+    // …but the panel must not still be describing the build that no longer exists
+    await waitFor(() =>
+      expect(screen.queryByText("the full document text")).not.toBeInTheDocument(),
+    );
   });
 
   it("branches on the HTTP status, not the error code, to explain a missing row", async () => {

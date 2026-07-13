@@ -103,6 +103,7 @@ type ListProps<T> = {
     data?: { pages: InspectPage<T>[] };
     isPending: boolean;
     isError: boolean;
+    isFetchNextPageError: boolean;
     error: unknown;
     hasNextPage: boolean;
     isFetchingNextPage: boolean;
@@ -125,13 +126,28 @@ function PagedList<T extends { id: string }>({
   onSelect,
   detail,
 }: ListProps<T>) {
-  const { data, isPending, isError, error, hasNextPage, isFetchingNextPage, fetchNextPage } = query;
+  const {
+    data,
+    isPending,
+    isError,
+    isFetchNextPageError,
+    error,
+    hasNextPage,
+    isFetchingNextPage,
+    fetchNextPage,
+  } = query;
 
   if (isPending) return <p className="inspect__muted">Loading {label}…</p>;
-  // A FAILED "load more" also sets isError while `data` still holds the pages that DID
-  // load, so returning early on isError alone would throw away a good table over one bad
-  // page. Fail loud either way — but only replace the table when there is nothing to show.
-  if (isError && !data)
+  // TWO different failures both raise isError while react-query KEEPS the cached pages,
+  // and they must not be treated alike:
+  //   * a failed "load more" — the rows already on screen are still valid; discarding a
+  //     good table over one bad page would be a worse failure than the one reported.
+  //   * a failed REFETCH (focus/reconnect, or the active build being removed → 409/503)
+  //     — here the cached rows are STALE: they describe a build the server will no longer
+  //     serve. Rendering them is showing a corpus that no longer exists, which is exactly
+  //     the stale-data-during-refetch trap the run gates were hardened against (#70).
+  // So keep the table ONLY for the pagination failure; every other error fails closed.
+  if (isError && !isFetchNextPageError)
     return (
       <p className="inspect__muted inspect__muted--error">
         Could not load {label}: {message(error)}
@@ -193,8 +209,9 @@ function PagedList<T extends { id: string }>({
         </tbody>
       </table>
 
-      {/* a page that failed while a good table is on screen: say so, keep the rows */}
-      {isError && (
+      {/* the ONLY error that reaches here is a load-more failure (everything else failed
+          closed above): the rows on screen are still valid, so keep them and say so */}
+      {isFetchNextPageError && (
         <p className="inspect__muted inspect__muted--error">
           Could not load more {label}: {message(error)}
         </p>
@@ -237,16 +254,24 @@ function Detail({
     <aside className="inspect__detail" aria-label={`${title} detail`}>
       <h2 className="inspect__detail-title">{title}</h2>
       {isPending && <p className="inspect__muted">Loading…</p>}
-      {isError && <p className="inspect__muted inspect__muted--error">{message(error)}</p>}
-      {fields && (
-        <dl className="inspect__fields">
-          {fields.map(([label, value]) => (
-            <div key={label} className="inspect__field">
-              <dt>{label}</dt>
-              <dd>{value}</dd>
-            </div>
-          ))}
-        </dl>
+      {/* Same trap as the list, one component over: a failed REFETCH raises isError while
+          react-query keeps the previous `data`, so rendering the fields beside the error
+          would print the OLD build's id/source_uri/raw underneath a line saying the row is
+          gone from the active build. Error and fields are mutually exclusive — fail closed
+          here rather than in each tab, so a tab added later cannot re-open it. */}
+      {isError ? (
+        <p className="inspect__muted inspect__muted--error">{message(error)}</p>
+      ) : (
+        fields && (
+          <dl className="inspect__fields">
+            {fields.map(([label, value]) => (
+              <div key={label} className="inspect__field">
+                <dt>{label}</dt>
+                <dd>{value}</dd>
+              </div>
+            ))}
+          </dl>
+        )
       )}
     </aside>
   );
