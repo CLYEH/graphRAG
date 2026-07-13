@@ -163,6 +163,29 @@ def test_omitted_parameters_use_the_project_config_not_engine_defaults(
     assert len(r.json()["data"]["chunks"]) > 1
 
 
+@pytest.mark.parametrize(
+    "knobs",
+    [
+        {"max_chars": True, "overlap": 0},  # Codex's repro: coerces to max_chars=1
+        {"overlap": False},  # coerces to overlap=0 under the default max_chars
+        {"max_chars": "100", "overlap": 10},  # lax str->int would accept "100"
+    ],
+)
+def test_request_knobs_are_strict_integers(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, knobs: dict[str, Any]
+) -> None:
+    # The contract says `type: integer`, and JSON Schema's integer excludes
+    # booleans (and numeric strings). Pydantic's lax mode would coerce each of
+    # these into a VALID pair and answer 200 with numbers the operator would
+    # trust (true -> one-character chunks). Each case pairs its knob with an
+    # overlap that keeps the coerced pair legal — otherwise the pair-relation
+    # check rejects it by accident and the test can't tell strictness from
+    # luck (the first version of this test did exactly that).
+    _project(monkeypatch)
+    r = _preview(client, {"text": "hello world", **knobs})
+    assert r.status_code == 400
+
+
 def test_bool_config_values_fall_back_rather_than_coerce(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

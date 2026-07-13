@@ -53,8 +53,11 @@ class CleanPreviewRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    max_chars: int | None = Field(default=None, ge=1)
-    overlap: int | None = Field(default=None, ge=0)
+    # strict: the contract says `type: integer`, and JSON Schema's integer
+    # excludes booleans — without it Pydantic coerces `max_chars: true` to 1
+    # and previews one-character chunks instead of answering 400 (Codex, #73).
+    max_chars: int | None = Field(default=None, ge=1, strict=True)
+    overlap: int | None = Field(default=None, ge=0, strict=True)
     document_id: uuid.UUID | None = None
     text: str | None = Field(default=None, min_length=1)
 
