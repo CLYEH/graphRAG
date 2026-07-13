@@ -102,6 +102,7 @@ type ListProps<T> = {
   query: {
     data?: { pages: InspectPage<T>[] };
     isPending: boolean;
+    isFetching: boolean;
     isError: boolean;
     isFetchNextPageError: boolean;
     error: unknown;
@@ -129,6 +130,7 @@ function PagedList<T extends { id: string }>({
   const {
     data,
     isPending,
+    isFetching,
     isError,
     isFetchNextPageError,
     error,
@@ -138,6 +140,16 @@ function PagedList<T extends { id: string }>({
   } = query;
 
   if (isPending) return <p className="inspect__muted">Loading {label}…</p>;
+
+  // A background REFETCH (focus/reconnect) exists to re-ask which build is active — so until
+  // it answers, the cached pages are exactly the thing being verified. react-query serves
+  // them anyway (stale-while-revalidate) with isError false, which would show build A's rows,
+  // still clickable, after build B was activated in another tab — until the refetch settles,
+  // or indefinitely on a hung request (Codex, #72). Same fail-closed rule as everywhere else
+  // on this page: unverified rows don't render. A next-page fetch is the one fetch that does
+  // NOT re-open the question for the rows already on screen — it extends the pinned build,
+  // and the splice/scope guards below judge its answer — so it must not blank the table.
+  if (isFetching && !isFetchingNextPage) return <p className="inspect__muted">Loading {label}…</p>;
 
   // react-query KEEPS the cached pages on any failed fetch, so `isError` beside a populated
   // cache is not one situation. The rows stay showable under exactly ONE condition: the build
@@ -247,26 +259,31 @@ function PagedList<T extends { id: string }>({
 function Detail({
   title,
   fields,
-  isPending,
+  isFetching,
   isError,
   error,
 }: {
   title: string;
   fields?: [string, ReactNode][];
-  isPending: boolean;
+  isFetching: boolean;
   isError: boolean;
   error: unknown;
 }) {
   return (
     <aside className="inspect__detail" aria-label={`${title} detail`}>
       <h2 className="inspect__detail-title">{title}</h2>
-      {isPending && <p className="inspect__muted">Loading…</p>}
-      {/* Same trap as the list, one component over: a failed REFETCH raises isError while
-          react-query keeps the previous `data`, so rendering the fields beside the error
-          would print the OLD build's id/source_uri/raw underneath a line saying the row is
-          gone from the active build. Error and fields are mutually exclusive — fail closed
-          here rather than in each tab, so a tab added later cannot re-open it. */}
-      {isError ? (
+      {/* Same trap as the list, one component over, in both of its states. A failed REFETCH
+          raises isError while react-query keeps the previous `data` — and while a refetch is
+          still IN FLIGHT it serves that `data` with isError false, so either way the OLD
+          build's id/source_uri/raw would render as if current (under the error line, or while
+          the 404 that will disown it is still on the wire — a hung request shows it forever).
+          Loading, error, and fields are mutually exclusive: fields render only from a settled,
+          successful answer. Fail closed here rather than in each tab, so a tab added later
+          cannot re-open it. (isFetching covers the initial load too — the query only runs
+          with a selected id, so pending means fetching.) */}
+      {isFetching ? (
+        <p className="inspect__muted">Loading…</p>
+      ) : isError ? (
         <p className="inspect__muted inspect__muted--error">{message(error)}</p>
       ) : (
         fields && (
@@ -326,7 +343,7 @@ function DocumentsTab({ project, selected, onSelect }: TabProps) {
         id && (
           <Detail
             title="Document"
-            isPending={detail.isPending}
+            isFetching={detail.isFetching}
             isError={detail.isError}
             error={detail.error}
             fields={
@@ -374,7 +391,7 @@ function ChunksTab({ project, selected, onSelect }: TabProps) {
         id && (
           <Detail
             title="Chunk"
-            isPending={detail.isPending}
+            isFetching={detail.isFetching}
             isError={detail.isError}
             error={detail.error}
             fields={

@@ -225,6 +225,46 @@ describe("Inspect", () => {
     expect(screen.queryByText(/cannot read properties/i)).not.toBeInTheDocument();
   });
 
+  it("hides the rows WHILE a refetch is re-verifying the active build, not only after it settles", async () => {
+    // The in-flight state, which the settled-state guards cannot cover: a refocus refetch
+    // exists to re-ask which build is active, so until it answers, the cached rows are exactly
+    // the thing being verified. react-query serves them anyway (stale-while-revalidate) with
+    // isError still false — build A's rows, still clickable, after build B was activated in
+    // another tab. A HUNG request makes that window unbounded, which is why this test never
+    // resolves the refetch at all: the rows must leave the screen without any settle.
+    const get = vi.spyOn(api, "GET");
+    get.mockResolvedValueOnce(ok([doc()]) as never);
+    renderInspect();
+    expect(await screen.findByText("file:///data/corpus/a.txt")).toBeInTheDocument();
+
+    get.mockImplementation((() => new Promise(() => {})) as never); // the refetch hangs
+    act(() => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByText("file:///data/corpus/a.txt")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText(/loading documents/i)).toBeInTheDocument();
+  });
+
+  it("keeps the verified rows on screen while the NEXT page is on the wire", async () => {
+    // The over-block dual of the test above. A next-page fetch is the one fetch that does NOT
+    // re-open the question for the rows already on screen — it extends the pinned build, and
+    // the splice/scope guards judge its answer when it lands. If the in-flight gate were keyed
+    // on isFetching alone, every "load more" would blank a table whose rows are verified.
+    const get = vi.spyOn(api, "GET");
+    get.mockResolvedValueOnce(ok([doc()], { next_cursor: "c2" }) as never);
+    get.mockImplementationOnce((() => new Promise(() => {})) as never); // page 2 hangs
+    renderInspect();
+
+    fireEvent.click(await screen.findByRole("button", { name: /load more documents/i }));
+
+    expect(await screen.findByRole("button", { name: /loading/i })).toBeDisabled();
+    expect(screen.getByText("file:///data/corpus/a.txt")).toBeInTheDocument();
+  });
+
   it("hides the stale table when a REFETCH fails, instead of calling it a load-more failure", async () => {
     // The two cached-data errors are NOT alike. A failed refetch (focus/reconnect, or the
     // active build being removed → 409) also raises isError while react-query keeps the
@@ -267,6 +307,41 @@ describe("Inspect", () => {
     fireEvent.click(await screen.findByRole("button", { name: "file:///data/corpus/a.txt" }));
 
     expect(await screen.findByText("the full document text")).toBeInTheDocument();
+  });
+
+  it("hides the stale detail fields WHILE their refetch is on the wire, not only after the 404 lands", async () => {
+    // The panel's own in-flight window, and the list's gate cannot cover it: the LIST refetch
+    // here settles (same build, so the table re-renders) while only the DETAIL refetch hangs —
+    // if the fields rendered from the cached document during that window, the old build's raw
+    // text would sit on screen until the 404 that disowns it arrives, or forever on a hung
+    // request. Fields render only from a settled, successful answer.
+    let hang = false;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path.includes("_id}"))
+        return hang
+          ? new Promise(() => {})
+          : Promise.resolve({
+              data: { data: doc({ raw: "the full document text" }), meta: META },
+              error: undefined,
+            });
+      return Promise.resolve(ok([doc()]));
+    }) as never);
+    renderInspect();
+
+    fireEvent.click(await screen.findByRole("button", { name: "file:///data/corpus/a.txt" }));
+    expect(await screen.findByText("the full document text")).toBeInTheDocument();
+
+    hang = true; // a build swap elsewhere; the panel's refetch never comes back
+    act(() => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByText("the full document text")).not.toBeInTheDocument(),
+    );
+    // the LIST is untouched by the hung detail — its rows settled and render
+    expect(screen.getByText("file:///data/corpus/a.txt")).toBeInTheDocument();
   });
 
   it("drops the stale detail fields when the detail refetch fails, rather than showing a vanished build's document under the error", async () => {
