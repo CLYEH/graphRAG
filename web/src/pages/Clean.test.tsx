@@ -42,18 +42,30 @@ afterEach(() => {
 });
 
 describe("Clean", () => {
-  it("saves chunking by SPREADING the current config — never wiping sibling blocks", async () => {
-    // THE load-bearing behavior of the save path: PATCH /projects/{project} REPLACES
+  it("saves chunking by SPREADING a FRESH config read — never wiping or resurrecting sibling blocks", async () => {
+    // TWO load-bearing behaviors in one pin. (1) PATCH /projects/{project} REPLACES
     // the whole config column server-side (no deep merge — read from
-    // core/registry/store.py). A save that sent {config: {chunking}} alone would
-    // silently destroy the ontology every build needs and the wreck would surface
-    // only at the next build. The ontology block in the PATCH body is the pin.
-    vi.spyOn(api, "GET").mockResolvedValue(
-      projectBody({
-        ontology: { entity_types: ["PERSON"] },
-        chunking: { max_chars: 500, overlap: 50 },
-      }) as never,
-    );
+    // core/registry/store.py): {config:{chunking}} alone would silently destroy the
+    // ontology every build needs. (2) The spread must come from a FRESH read inside
+    // the mutation, not the page's cached copy — a config changed elsewhere since
+    // page load would otherwise be resurrected wholesale (Codex, #74). The mock
+    // serves DIFFERENT configs per GET: the page loaded with PERSON-ontology, but
+    // by save time the server holds ORG-ontology plus a query_policy block — the
+    // PATCH body must carry the LATER config, proving the mutation re-read it.
+    let gets = 0;
+    vi.spyOn(api, "GET").mockImplementation((() =>
+      Promise.resolve(
+        ++gets === 1
+          ? projectBody({
+              ontology: { entity_types: ["PERSON"] },
+              chunking: { max_chars: 500, overlap: 50 },
+            })
+          : projectBody({
+              ontology: { entity_types: ["ORG"] },
+              query_policy: { deny: ["drop"] },
+              chunking: { max_chars: 500, overlap: 50 },
+            }),
+      )) as never);
     const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
     renderClean();
 
@@ -63,8 +75,33 @@ describe("Clean", () => {
     const body = (patch.mock.calls[0] as unknown as [string, { body: unknown }])[1].body as {
       config: Record<string, unknown>;
     };
-    expect(body.config["ontology"]).toEqual({ entity_types: ["PERSON"] }); // survived
+    expect(body.config["ontology"]).toEqual({ entity_types: ["ORG"] }); // the FRESH read
+    expect(body.config["query_policy"]).toEqual({ deny: ["drop"] }); // survived, not wiped
     expect(body.config["chunking"]).toEqual({ max_chars: 500, overlap: 50 });
+  });
+
+  it("aborts the save loud when the fresh re-read fails — never PATCHes a fallback", async () => {
+    // The fresh-GET error branch is the fix's load-bearing invariant: "cannot read
+    // fresh" must abort the save, not fall back to a cached/empty spread — a
+    // fallback would quietly reintroduce the resurrection/wipe the re-read exists
+    // to prevent. Both halves pinned: the failure surfaces, and PATCH never fires.
+    let gets = 0;
+    vi.spyOn(api, "GET").mockImplementation((() =>
+      Promise.resolve(
+        ++gets === 1
+          ? projectBody({ ontology: { entity_types: ["PERSON"] } })
+          : {
+              data: undefined,
+              error: { error: { code: "STORE_UNAVAILABLE", message: "pg gone" } },
+            },
+      )) as never);
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderClean();
+
+    fireEvent.click(await screen.findByRole("button", { name: /save .* to config/i }));
+
+    expect(await screen.findByText(/save failed: pg gone/i)).toBeInTheDocument();
+    expect(patch).not.toHaveBeenCalled();
   });
 
   it("fails closed while the config is loading or failed — a form without the real config saves a wipe", async () => {

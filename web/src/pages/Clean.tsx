@@ -230,9 +230,7 @@ function CleanBody({ project }: { project: string }) {
           <button
             type="button"
             disabled={pairError !== null || save.isPending}
-            onClick={() =>
-              save.mutate({ config, max_chars: effectiveMax, overlap: effectiveOverlap })
-            }
+            onClick={() => save.mutate({ max_chars: effectiveMax, overlap: effectiveOverlap })}
           >
             {save.isPending ? "Saving…" : `Save ${effectiveMax}/${effectiveOverlap} to config`}
           </button>

@@ -626,23 +626,28 @@ export function usePreviewClean(project: string) {
   });
 }
 
-/** Write the chunking block into project config — spreading the CURRENT config
- *  (fact 1 above). The caller passes the config it read; sending a stale spread
- *  would resurrect deleted blocks, so the page keeps the project query fresh and
- *  invalidates it on success. */
+/** Write the chunking block into project config — spreading a FRESH read
+ *  (fact 1 above). The mutation re-GETs the project INSIDE itself rather than
+ *  spreading the page's cached copy: a config changed elsewhere since the page
+ *  loaded (another tab, a CLI PATCH) would otherwise be resurrected wholesale
+ *  by the column-replacing PATCH (Codex, #74). The refetch shrinks that window
+ *  from page-age to one round trip; the residual concurrent-write race is real
+ *  (a recheck is not a lock — class 10) but closing it needs a version token
+ *  in the frozen contract, a DR-002 round this task cannot open. */
 export function useSaveChunking(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (args: {
-      config: Record<string, unknown>;
-      max_chars: number;
-      overlap: number;
-    }) => {
+    mutationFn: async (args: { max_chars: number; overlap: number }) => {
+      const fresh = await api.GET("/projects/{project}", {
+        params: { path: { project } },
+      });
+      if (fresh.error) throw new Error(fresh.error.error.message);
+      const current = (fresh.data.data.config ?? {}) as Record<string, unknown>;
       const { data, error } = await api.PATCH("/projects/{project}", {
         params: { path: { project } },
         body: {
           config: {
-            ...args.config,
+            ...current,
             chunking: { max_chars: args.max_chars, overlap: args.overlap },
           },
         },
