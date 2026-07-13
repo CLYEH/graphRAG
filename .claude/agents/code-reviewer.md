@@ -594,6 +594,38 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      exactly when the client most needs it (BA2e-1 round 2). Peek
      replay/conflict first (non-reserving); precheck only fresh requests.
 
+8. **Contract projection stack** (when the diff adds or changes a
+   `contracts/` schema — BA4/#73 burned 5 Codex rounds, one per projection
+   face of a SINGLE request object): a contract object exists in FIVE
+   projections, and "the contract says X" must hold — and be pinned — in
+   EACH one independently. Fixing the face a finding names leaves the next
+   face as next round.
+   - **Schema text** (class-1 value constraints: no-op values, cross-field
+     pairs, additionalProperties).
+   - **Runtime validator equivalence**: Pydantic's LAX defaults diverge from
+     JSON Schema in at least three places — bool passes `int` (coerces to
+     1/0; `strict=True`), numeric strings pass `int` (`strict=True`), and
+     explicit `null` passes `X | None` as if OMITTED while `required`-but-
+     non-null schemas reject a present null (mode="before" null guard).
+     Write the acceptance-matrix test: {absent, explicit-null, wrong-type
+     (bool AND numeric string), unknown-key, each combinator branch} — and
+     make each case DISCRIMINATING (BA4: a coerced max_chars=1 collided with
+     the default overlap and 400'd by ACCIDENT; pair every case with values
+     that keep the coerced result otherwise legal).
+   - **Generated client type**: bare `required`/`not` combinators codegen to
+     `unknown | unknown` — variants must be CONCRETE closed schemas; and a
+     structural union is not an EXACT one (excess-property checks cover
+     literals only) — declare the opposite variant's keys with the `false`
+     schema so codegen emits `?: never` (OpenAPI 3.1).
+   - **Compiler flags that make the type real**: without `strict`
+     (strictNullChecks), every null-guarantee in the generated type is
+     hollow. Pin with a `*.typetest.ts` of `@ts-expect-error` assertions —
+     which doubles as the tripwire (removing strict turns the pins into
+     TS2578 failures).
+   - **Probe the probe**: a mutation-based revert-probe proves nothing
+     unless the mutation is ASSERTED to have landed (BA4: a strict-removal
+     replace silently no-opped and reported a false-negative 0).
+
 ## Output (exactly this shape)
 ```
 VERDICT: PASS | FAIL
