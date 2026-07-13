@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 
 import {
   PolicyMissingError,
+  isScopeNeutral,
   useEntities,
   useEntity,
   useRelation,
@@ -110,7 +111,13 @@ function EntityColumn({
   // fetch extends the pinned build and keeps the list.
   if (list.isFetching && !list.isFetchingNextPage)
     return <div className="graph__col">Loading entities…</div>;
-  if (list.isError)
+  // FE3's keep-rows rule, not a restatement of half of it (Codex, #75): the
+  // loaded rows survive a load-more failure ONLY when the failure cannot have
+  // invalidated the build binding (transport / scope-neutral code) — a
+  // scope-gone answer on ANY request means every row on screen belongs to a
+  // build that no longer exists.
+  const keepsRows = list.isFetchNextPageError && isScopeNeutral(list.error);
+  if (list.isError && !keepsRows)
     return (
       <div className="graph__col graph__line--error">
         Could not load entities: {message(list.error)}
@@ -168,6 +175,9 @@ function EntityColumn({
         ))}
         {shown.length === 0 && <li className="graph__muted">No loaded entity matches.</li>}
       </ul>
+      {keepsRows && (
+        <p className="graph__line--error">Could not load more entities: {message(list.error)}</p>
+      )}
       {list.hasNextPage && (
         <button
           type="button"

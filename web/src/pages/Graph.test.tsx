@@ -231,6 +231,47 @@ describe("Graph", () => {
     expect(screen.queryByRole("button", { name: /ada lovelace/i })).not.toBeInTheDocument();
   });
 
+  it("keeps the loaded entities when a load-more fails scope-neutrally, drops them when the scope is GONE", async () => {
+    // FE3's keep-rows rule applies to this list too (Codex, #75 — the guard was
+    // restated here with half missing): a 503 on page 2 says nothing about the
+    // build, so discarding a usable column over one flaky page is worse than the
+    // failure reported; a NO_ACTIVE_BUILD on page 2 proves every loaded row's
+    // build is gone. Both directions in one test so the predicate can't drift.
+    const get = vi.spyOn(api, "GET");
+    get.mockResolvedValueOnce({
+      data: { data: [entity()], meta: { ...META, next_cursor: "c2" } },
+      error: undefined,
+    } as never);
+    get.mockResolvedValueOnce({
+      data: undefined,
+      error: { error: { code: "STORE_UNAVAILABLE", message: "qdrant down" } },
+    } as never);
+    const view1 = renderGraph();
+
+    fireEvent.click(await screen.findByRole("button", { name: /load more entities/i }));
+    expect(await screen.findByText(/could not load more entities/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /ada lovelace/i })).toBeInTheDocument(); // kept
+
+    // the scope-gone direction
+    view1.unmount();
+    get.mockReset();
+    get.mockResolvedValueOnce({
+      data: { data: [entity()], meta: { ...META, next_cursor: "c2" } },
+      error: undefined,
+    } as never);
+    get.mockResolvedValueOnce({
+      data: undefined,
+      error: { error: { code: "NO_ACTIVE_BUILD", message: "no active build" } },
+    } as never);
+    const view2 = renderGraph();
+    const col = view2.container;
+    fireEvent.click(await screen.findByRole("button", { name: /load more entities/i }));
+    expect(
+      await screen.findByText(/could not load entities: no active build/i),
+    ).toBeInTheDocument();
+    expect(col.querySelectorAll(".graph__entity").length).toBe(0); // dropped
+  });
+
   it("hides a stale subgraph while a refetch re-verifies the active build", async () => {
     // The FE3/class-17 rule applied to the viz: the subgraph belongs to the
     // active build, a refocus refetch re-asks which build that is, and until it
