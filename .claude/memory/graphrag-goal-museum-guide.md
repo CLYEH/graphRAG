@@ -1,6 +1,6 @@
 ---
 name: graphrag-goal-museum-guide
-description: 初期落地場景——博物館導覽 agent:外部 no-code agent 平台經 MCP(HTTP)接本平台當場所知識服務;raw data 待 owner 提供;硬約束=不失一般性
+description: 初期落地場景——博物館導覽 agent:外部 no-code agent 平台經 MCP(HTTP)接本平台當場所知識服務;raw data 已到位(海科館 xlsx);硬約束=不失一般性
 metadata: 
   node_type: memory
   type: project
@@ -10,7 +10,7 @@ metadata:
 owner 2026-07-10 闡述初期目標:
 - owner 有一個 agent no-code 平台,可接外部 MCP(**HTTP**);平台上調教的 agent 可輸出成 API 嵌進應用程式,成為對話應用。
 - 正在幫**博物館**建置導覽 agent:本 graphRAG 專案=場所知識的 serving 服務,經 **MCP over HTTP** 接給該 agent 使用 → **C8b(MCP HTTP transport)是主要使用場景的整合縫**,不只是 nice-to-have(owner 已定案排在 BA3c 之後)。
-- owner 之後會提供實際知識 raw data 樣本,屆時針對資料形態評估要強化的部分(connector/ontology/檢索調優)。**待輸入:raw data 樣本。**
+- **raw data 已到位(owner 2026-07-13)**:海科館 5 份 xlsx 在 `.discuss/sample_data`,見 [[graphrag-sample-data-hakeguan]]。動手時機=**v2 完成後**(owner 明說不用現在做);第一眼已知缺口=沒有 xlsx connector(只 wire 了 text/structured)。
 - **硬約束:不失一般性**——平台未來要支援更多不同性質的專案;針對博物館資料的強化一律走 per-project config(§6 ontology/mapping)與可插拔 connector(C2),不寫死領域邏輯。
 - 衍生注意:MCP HTTP 對外曝露後,§23 auth placeholder 會變成真需求(外部平台呼叫的認證);凍結 enum 無 auth 錯誤碼,屆時是 DR-002 相關的 owner 決策。
 
