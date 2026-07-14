@@ -201,16 +201,53 @@ describe("ReviewCases", () => {
     expect(await screen.findAllByText("「位於基隆八斗子」")).not.toHaveLength(0);
   });
 
-  it("a context failure says so but never blocks the decision", async () => {
+  it("a scope-NEUTRAL context failure says so but never blocks the decision", async () => {
     // the context is the decision AID; the graph store being down must not
-    // freeze the review queue — but it must say so, not render an empty box
-    stubReviewWorld({ candidates: [namedCandidate()], failSubgraph: true });
+    // freeze the review queue — but it must say so, not render an empty box.
+    // (the over-blocking dual of the scope-proof tests below: neutral outages
+    // must NOT trip the scope gate)
+    stubReviewWorld({ candidates: [namedCandidate()], failSubgraph: "neutral" });
     renderWithProviders(<ReviewCases project="acme" />);
 
     // both panels, not just the first to settle — findAll returns on ≥1 match,
     // so the two-sided assert needs waitFor
     await waitFor(() => expect(screen.getAllByText(/上下文載入失敗/)).toHaveLength(2));
     expect(screen.getByRole("button", { name: "是,合併" })).toBeEnabled();
+  });
+
+  it("a scope-PROOF context failure blocks deciding and refetches the queue (Codex #76 R2)", async () => {
+    // SubgraphScopeError proves the active build moved on: the whole queue was
+    // read from a dead build and a decide would 404 against the rebound build
+    // (review.py re-resolves per request) — so the verbs lock and the queue
+    // refetches, instead of a "仍可作決定" line inviting a doomed POST
+    const get = stubReviewWorld({ candidates: [namedCandidate()], failSubgraph: "scope" });
+    renderWithProviders(<ReviewCases project="acme" />);
+
+    await waitFor(() => expect(screen.getAllByText(/知識庫版本已切換,此案已過期/)).toHaveLength(2));
+    expect(screen.getByText(/正在重新載入最新佇列/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "是,合併" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "不是,分開" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "跳過,下次再問" })).toBeDisabled();
+    // the invalidation refetched the queue (initial load + ≥1 refetch)
+    await waitFor(() => {
+      const queueCalls = get.mock.calls.filter(
+        (c) => c[0] === "/projects/{project}/merge-candidates",
+      );
+      expect(queueCalls.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  it("a context read stamped with a DIFFERENT build proves the same scope loss", async () => {
+    // even a SUCCESSFUL subgraph read betrays the swap when its meta names a
+    // build other than the candidate's — same verdict as the error path
+    stubReviewWorld({
+      candidates: [namedCandidate()],
+      subgraphBuildId: "b9999999-9999-9999-9999-999999999999",
+    });
+    renderWithProviders(<ReviewCases project="acme" />);
+
+    await waitFor(() => expect(screen.getAllByText(/知識庫版本已切換,此案已過期/)).toHaveLength(2));
+    expect(screen.getByRole("button", { name: "是,合併" })).toBeDisabled();
   });
 
   it("an entity with no evidenced edges gets an honest empty-context line", async () => {

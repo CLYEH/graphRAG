@@ -1,6 +1,9 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 
 import {
+  PolicyMissingError,
+  SubgraphScopeError,
   useDecideMergeCandidate,
   useMergeCandidates,
   useRelation,
@@ -100,6 +103,19 @@ function CaseCard({
     null,
   );
   const decide = useDecideMergeCandidate(project);
+  // Scope loss (class 19): a context read can PROVE the active build moved on
+  // (SubgraphScopeError, or a success stamped with a different build) — then
+  // this whole queue is stale and a decide would 404 against the rebound build
+  // (review.py re-resolves the active build). Proof blocks the verbs and
+  // refetches the queue; a scope-NEUTRAL context failure stays local and never
+  // blocks deciding (Codex #76 round 2).
+  const queryClient = useQueryClient();
+  const [scopeLost, setScopeLost] = useState(false);
+  const onScopeLoss = useCallback(() => {
+    setScopeLost(true);
+    void queryClient.invalidateQueries({ queryKey: ["merge-candidates", project] });
+  }, [queryClient, project]);
+  const blocked = decide.isPending || scopeLost;
 
   const submit = (verb: ReviewVerb) => {
     decide.mutate(
@@ -134,16 +150,25 @@ function CaseCard({
           project={project}
           entityId={candidate.left_entity_id}
           snapshot={candidate.left_snapshot}
+          expectedBuildId={candidate.build_id}
+          onScopeLoss={onScopeLoss}
         />
         <EntityPanel
           project={project}
           entityId={candidate.right_entity_id}
           snapshot={candidate.right_snapshot}
+          expectedBuildId={candidate.build_id}
+          onScopeLoss={onScopeLoss}
         />
       </div>
       <p className="review__score">{scoreWords(candidate.score)}</p>
       {candidate.status === "deferred" && (
         <p className="review__note">這一筆先前已跳過;這次只能選「合併」或「分開」。</p>
+      )}
+      {scopeLost && (
+        <p className="review__error">
+          知識庫版本已切換,這批審核清單已過期——正在重新載入最新佇列,此案暫停決定。
+        </p>
       )}
       <input
         className="review__reason"
@@ -154,18 +179,14 @@ function CaseCard({
       />
       {confirming === null ? (
         <div className="review__actions">
-          <button
-            type="button"
-            onClick={() => setConfirming("approve")}
-            disabled={decide.isPending}
-          >
+          <button type="button" onClick={() => setConfirming("approve")} disabled={blocked}>
             是,合併
           </button>
-          <button type="button" onClick={() => setConfirming("reject")} disabled={decide.isPending}>
+          <button type="button" onClick={() => setConfirming("reject")} disabled={blocked}>
             不是,分開
           </button>
           {canDefer && (
-            <button type="button" onClick={() => submit("defer")} disabled={decide.isPending}>
+            <button type="button" onClick={() => submit("defer")} disabled={blocked}>
               跳過,下次再問
             </button>
           )}
@@ -176,10 +197,10 @@ function CaseCard({
             {confirming === "approve" ? "合併" : "分開"}
             送出後<strong>無法更改</strong>。確定嗎?
           </p>
-          <button type="button" onClick={() => submit(confirming)} disabled={decide.isPending}>
+          <button type="button" onClick={() => submit(confirming)} disabled={blocked}>
             {confirming === "approve" ? "確定合併" : "確定分開"}
           </button>
-          <button type="button" onClick={() => setConfirming(null)} disabled={decide.isPending}>
+          <button type="button" onClick={() => setConfirming(null)} disabled={blocked}>
             取消
           </button>
         </div>
@@ -230,10 +251,14 @@ function EntityPanel({
   project,
   entityId,
   snapshot,
+  expectedBuildId,
+  onScopeLoss,
 }: {
   project: string;
   entityId: string;
   snapshot: MergeCandidate["left_snapshot"];
+  expectedBuildId: string;
+  onScopeLoss: () => void;
 }) {
   const name = snapshotText(snapshot, "name");
   const type = snapshotText(snapshot, "type");
@@ -242,7 +267,12 @@ function EntityPanel({
     <div className="review__panel">
       <p className="review__name">{name ?? "(名稱快照缺失)"}</p>
       {type && <span className="review__chip">{type}</span>}
-      <EntityContext project={project} entityId={entityId} />
+      <EntityContext
+        project={project}
+        entityId={entityId}
+        expectedBuildId={expectedBuildId}
+        onScopeLoss={onScopeLoss}
+      />
     </div>
   );
 }
@@ -250,20 +280,46 @@ function EntityPanel({
 // One evidenced relation as the case's context sentence. Evidence rides ONLY
 // the relation detail GET (FE4's rule), so this is subgraph(hops=1) → first
 // edge → detail; both fetches are per-CURRENT-case (lazy via the case key) and
-// cached by react-query. A context failure never blocks the decision — the
-// operator may know the names cold — but it must say so instead of rendering
-// an empty box that reads as "no context exists".
-function EntityContext({ project, entityId }: { project: string; entityId: string }) {
+// cached by react-query. Failure semantics follow class 19's verdict placement:
+// a scope-NEUTRAL failure (store down, plain errors) stays local and never
+// blocks the decision — the operator may know the names cold — but a failure
+// that PROVES the world moved (SubgraphScopeError: build gone/changed, seed no
+// longer active) or a success stamped with a DIFFERENT build than the
+// candidate's escalates via onScopeLoss: the queue itself is stale and any
+// decide would 404 (review.py rebinds the active build per request).
+function EntityContext({
+  project,
+  entityId,
+  expectedBuildId,
+  onScopeLoss,
+}: {
+  project: string;
+  entityId: string;
+  expectedBuildId: string;
+  onScopeLoss: () => void;
+}) {
   const sub = useSubgraph(project, entityId, 1);
   const edge = sub.data?.graph.edges.find((e) => e.src === entityId || e.dst === entityId);
   const rel = useRelation(project, edge ? edge.id : undefined);
 
+  // buildId null = the meta didn't name a build — not proof of anything;
+  // only a NAMED, DIFFERENT build proves the swap.
+  const scopeLost =
+    (sub.isError && sub.error instanceof SubgraphScopeError) ||
+    (sub.isSuccess && sub.data.buildId !== null && sub.data.buildId !== expectedBuildId);
+  useEffect(() => {
+    if (scopeLost) onScopeLoss();
+  }, [scopeLost, onScopeLoss]);
+
+  if (scopeLost)
+    return <p className="review__context review__context--muted">知識庫版本已切換,此案已過期。</p>;
   if (sub.isPending) return <p className="review__context">載入上下文…</p>;
   if (sub.isError)
     return (
       <p className="review__context review__context--muted">
-        上下文載入失敗:{sub.error instanceof Error ? sub.error.message : "unknown error"}
-        (仍可作決定)
+        {sub.error instanceof PolicyMissingError
+          ? "此專案尚未設定查詢政策,無法載入上下文(仍可作決定)。"
+          : `上下文載入失敗:${sub.error instanceof Error ? sub.error.message : "unknown error"}(仍可作決定)`}
       </p>
     );
   if (!edge)

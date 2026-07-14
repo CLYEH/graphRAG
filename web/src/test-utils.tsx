@@ -219,23 +219,37 @@ export function stubReviewWorld({
   subgraph = { nodes: [], edges: [] },
   relation,
   failSubgraph = false,
+  subgraphBuildId = null,
 }: {
   candidates: MergeCandidate[];
   subgraph?: SubgraphStub;
   relation?: { id: string; evidence?: { id: string; evidence_type: string; quote?: string }[] };
-  failSubgraph?: boolean;
+  /** false = succeed; "neutral" = 503 store outage (scope-neutral);
+   *  "scope" = 404 (SubgraphScopeError: build swap / seed gone). */
+  failSubgraph?: false | "neutral" | "scope";
+  /** meta.build_id stamped on the subgraph response; null = unnamed (no proof). */
+  subgraphBuildId?: string | null;
 }) {
   return vi.spyOn(api, "GET").mockImplementation(((path: string) => {
     if (path === "/projects/{project}/merge-candidates")
       return Promise.resolve({ data: { data: candidates, meta: META }, error: undefined });
     if (path === "/projects/{project}/graph/subgraph") {
-      if (failSubgraph)
+      if (failSubgraph === "neutral")
         return Promise.resolve({
           data: undefined,
           error: { error: { code: "STORE_UNAVAILABLE", message: "graph store down" } },
           response: { status: 503 },
         });
-      return Promise.resolve({ data: { data: subgraph, meta: META }, error: undefined });
+      if (failSubgraph === "scope")
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "VALIDATION_ERROR", message: "entity not in active build" } },
+          response: { status: 404 },
+        });
+      return Promise.resolve({
+        data: { data: subgraph, meta: { ...META, build_id: subgraphBuildId } },
+        error: undefined,
+      });
     }
     if (path === "/projects/{project}/relations/{relation_id}")
       return Promise.resolve({ data: { data: relation, meta: META }, error: undefined });
