@@ -1,0 +1,28 @@
+---
+name: graphrag-ux-redesign
+description: "owner 2026-07-14 核准開工:Track 4(UXA1-3/UXB1/UXC1-2)已排入 TASKS.md;Phase C 的 DR-002 契約 bump(eval+upload 端點)同日核准;提案=.discuss/ux-redesign/PROPOSAL.md"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: a5de076e-8823-47d9-a44a-b3fd7b14df4e
+---
+
+**Owner 兩個急件(2026-07-14)**:(1) 前端要能走完完整流程;(2) UX designer 視角
+全面重審前端——「目前的前端畫面太過技術了,非技術人員無法操作」。
+確認痛點原話:「各式名詞太艱深、沒有足夠上下文讓人判斷、過多對人沒有意義的 id、
+操作上需要一些說明」。
+
+**已交付**:`.discuss/ux-redesign/PROPOSAL.md` — 完整 UX 審查(12 張真實資料截圖,
+`.discuss/ux-redesign/ux-audit-screens.spec.ts` 可重跑——需先複製到 web/e2e/ 執行)+ 翻新設計 + 路線圖。
+鐵證:Review 頁 Candidate 欄顯示 UUID 截斷碼(連名字都沒有);Playground 結果頁
+高 17,450px(裸 UUID 溯源牆);Health 數字爆版。
+
+**核心診斷**:工程師的資料庫檢視器 vs 館方知識管理員的工作台——翻譯層缺失
+(UUID 永不見人/欄名變人話/狀態變下一步/JSON 摘要化)。
+
+**路線圖(owner 2026-07-14 全數核准,Track 4 已排入 TASKS.md)**:
+Phase A=純 FE(UXA1 Review 重設計、UXA2 總覽落地頁+activate 按鈕、UXA3 全站翻譯層);
+Phase B=UXB1 設定頁表單(既有 PATCH);Phase C=UXC1 契約 v1.2(**eval+upload 端點,
+DR-002 bump 已核准**,§26 記錄隨 UXC1 PR 落地)+UXC2 評測頁/上傳 UI。
+主線斷頭現況:config=curl、eval=CLI(無端點)、activate=curl(見 [[graphrag-sample-data-hakeguan]]
+的 G5 與 .discuss/hakeguan/GAPS.md)——A2/B1/C 依序補齊。

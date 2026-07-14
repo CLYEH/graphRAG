@@ -1,6 +1,6 @@
 ---
 name: graphrag-sample-data-hakeguan
-description: owner 2026-07-13 提供海科館真實知識資料(.discuss/sample_data，5 份 xlsx)；v2 完成後才動手：拿真實資料跑通全流程、找出缺的功能
+description: 海科館適配進行中(nmmst 專案)；pilot 30 列全綠、缺口帳本在 .discuss/hakeguan/GAPS.md(G1-G4)；owner 定案=缺口先累積、夠量才開 task
 metadata: 
   node_type: memory
   type: project
@@ -44,3 +44,27 @@ metadata:
 - ontology 草案:EXHIBIT/LOCATION/SPECIES/ETHNIC_GROUP/EVENT/FACILITY;LOCATED_IN/BELONGS_TO/
   PRACTICED_BY/EXHIBITS。FAQ 類(2-1/iMuseum)更適合純 semantic 檢索,圖譜價值在 2-2 導覽內容。
 - 教學的 museum 專案(.discuss/tutorial)就是這個場景的迷你彩排——同一套流程直接放大。
+
+**適配實跑(2026-07-13~14,pilot 完成)**:
+- 專案 `nmmst`(display 海科館導覽);前處理=`.discuss/hakeguan/preprocess.py`
+  (xlsx→每列一 .txt,`--pilot N` 取每檔前 N 列;防禦模板千空列/壞 dimension/float 編號)。
+- **Pilot 30 列全綠**:build ~5min → 124 實體/98 關係(0 缺證據)/15 社群報告;
+  golden eval 4/4(`projects/nmmst/eval/golden.yaml`);已 activate。
+  Review 流程首次真實觸發:3 合併候選=2 併(全名簡稱/館廳混用)+1 駁(生物區vs人文區),
+  決策入 review_ledger——全量 build 要驗 DR-003 自動套用。
+- **缺口帳本=`.discuss/hakeguan/GAPS.md`**(G1 xlsx connector/G2 source 生命週期 API/
+  G3 上游截斷/G4 抽取雜訊 + 觀察 O1-O3)。**owner 2026-07-14 定案:缺口的來龍去脈
+  記在 .discuss 累積,「還有很多需要討論的」,等累積夠了再開 TASKS 任務——別急著開 task。**
+- `projects/nmmst/`(config.yaml/eval/golden.yaml/mcp_entrypoint.py)與 museum 同樣 untracked,
+  doc-lane commit 時別被 `git add -A` 掃進去。
+- 工具教訓:`GET /jobs/{id}` 終態字彙是 **done**(非 succeeded);entities 列表欄位是
+  `canonical_name`、merge-candidate 快照欄位是 `name`;jobs 端點在頂層(非 project-scoped);
+  merge-candidates 是 active-build-scoped(build ready 時查=0)且固定只回 pending+deferred
+  (Filter 參數契約有、實作延後,帶了會被靜默忽略)。
+- **全量 425 列完成(2026-07-14)**:410 文件(15 份=上游重複列,去重正確)→ 1409 實體/
+  1158 關係/93 報告,eval 4/4,已 activate;55 個 pending 候選**留給 owner 審**。
+  **DR-003 驗證 2/3**:approve 吸收+reject 抑制都成立;`區域探索館↔廳` 因 LLM 型別漂移
+  (EXHIBIT→FACILITY/LOCATION)fingerprint 對不上而重浮——規模化主病根=型別不穩定
+  (同名實體劈成 3-4 型別、EVENT 12→264 不成比例),已記入 GAPS.md G4。
+- **G5(owner 2026-07-14 回饋)**:web「光看了不會操作」——主線有三個 UI 洞
+  (config=curl、eval=CLI 無端點、activate=無按鈕),詳 GAPS.md G5。
