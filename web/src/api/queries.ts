@@ -128,8 +128,9 @@ export function useCancelJob(jobId: string | null) {
 // scoped like the other project reads; pages through next_cursor so the whole
 // queue is reachable, and fails loud so a store outage / no-active-build surfaces
 // (with the API's message) rather than an empty queue that reads as "nothing to
-// review". All statuses are returned — decided rows stay visible as an audit
-// trail, their actions disabled by the §17 gate below.
+// review". The server returns only still-reviewable rows (pending + deferred —
+// api/routers/review.py keeps the list identical to §19's pending_review gauge;
+// decided rows stay in the SoR for audit but never ride this endpoint).
 export function useMergeCandidates(project: string | undefined) {
   return useQuery({
     queryKey: ["merge-candidates", project],
@@ -537,6 +538,8 @@ export function useDocument(project: string | undefined, id: string | undefined)
   return useQuery({
     queryKey: ["document", project, id],
     enabled: project !== undefined && isPathAddressable(project) && id !== undefined,
+    // same rule as useRelation: a detail 404 is deterministic, don't retry it
+    retry: (failureCount, error) => !(error instanceof DetailScopeGoneError) && failureCount < 3,
     queryFn: async () => {
       const { data, error, response } = await api.GET(
         "/projects/{project}/documents/{document_id}",
@@ -552,6 +555,8 @@ export function useChunk(project: string | undefined, id: string | undefined) {
   return useQuery({
     queryKey: ["chunk", project, id],
     enabled: project !== undefined && isPathAddressable(project) && id !== undefined,
+    // same rule as useRelation: a detail 404 is deterministic, don't retry it
+    retry: (failureCount, error) => !(error instanceof DetailScopeGoneError) && failureCount < 3,
     queryFn: async () => {
       const { data, error, response } = await api.GET("/projects/{project}/chunks/{chunk_id}", {
         params: { path: { project: project as string, chunk_id: id as string } },
@@ -715,6 +720,8 @@ export function useEntity(project: string | undefined, id: string | undefined) {
   return useQuery({
     queryKey: ["entity", project, id],
     enabled: project !== undefined && isPathAddressable(project) && id !== undefined,
+    // same rule as useRelation: a detail 404 is deterministic, don't retry it
+    retry: (failureCount, error) => !(error instanceof DetailScopeGoneError) && failureCount < 3,
     queryFn: async () => {
       const { data, error, response } = await api.GET("/projects/{project}/entities/{entity_id}", {
         params: { path: { project: project as string, entity_id: id as string } },
@@ -729,6 +736,9 @@ export function useRelation(project: string | undefined, id: string | undefined)
   return useQuery({
     queryKey: ["relation", project, id],
     enabled: project !== undefined && isPathAddressable(project) && id !== undefined,
+    // DetailScopeGoneError is deterministic (id absent from the active build)
+    // — retrying delays the scope verdict (Codex #76 R6)
+    retry: (failureCount, error) => !(error instanceof DetailScopeGoneError) && failureCount < 3,
     queryFn: async () => {
       const { data, error, response } = await api.GET(
         "/projects/{project}/relations/{relation_id}",
@@ -765,6 +775,13 @@ export function useSubgraph(
   return useQuery({
     queryKey: ["subgraph", project, entityId, hops],
     enabled: project !== undefined && isPathAddressable(project) && entityId !== undefined,
+    // Scope-proof and policy-missing errors are deterministic contract states,
+    // not transient faults — retrying only delays the verdict consumers must
+    // act on (the review queue uses it as a WRITE lock: Codex #76 R6). Neutral
+    // failures keep the default three attempts.
+    retry: (failureCount, error) =>
+      !(error instanceof SubgraphScopeError || error instanceof PolicyMissingError) &&
+      failureCount < 3,
     queryFn: async (): Promise<SubgraphResult> => {
       const { data, error, response } = await api.GET("/projects/{project}/graph/subgraph", {
         params: {

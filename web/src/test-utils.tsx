@@ -26,7 +26,13 @@ export function projectRoute(key: string, section = "health") {
 }
 
 export function renderWithProviders(ui: ReactElement, { route = "/" }: { route?: string } = {}) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  // retry: false covers hooks without a per-query retry; the scope-aware hooks
+  // (useSubgraph/useRelation/useEntity) OVERRIDE it with their own retry fn
+  // (Codex #76 R6), so retryDelay: 0 keeps their neutral-error retries instant
+  // in tests instead of walking real backoff.
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+  });
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[route]}>{ui}</MemoryRouter>
@@ -202,6 +208,75 @@ export function stubMergeCandidates(candidates: MergeCandidate[]) {
   return vi
     .spyOn(api, "GET")
     .mockResolvedValue({ data: { data: candidates, meta: META }, error: undefined } as never);
+}
+
+export type SubgraphStub = {
+  nodes: { id: string; label?: string | null }[];
+  edges: { id: string; src: string; dst: string; type: string }[];
+};
+
+// Route-aware GET stub for the UXA1 review flow: the case card fans out to
+// three endpoints (queue, subgraph-per-entity, relation detail), so a single
+// mockResolvedValue would feed queue-shaped data to the context fetches — the
+// contract marks GraphContext.edges required, and the component rightly
+// trusts that instead of null-guarding an impossible shape.
+export function stubReviewWorld({
+  candidates,
+  subgraph = { nodes: [], edges: [] },
+  relation,
+  failSubgraph = false,
+  subgraphBuildId = null,
+  failRelation = false,
+}: {
+  candidates: MergeCandidate[];
+  subgraph?: SubgraphStub;
+  relation?: { id: string; evidence?: { id: string; evidence_type: string; quote?: string }[] };
+  /** false = succeed; "neutral" = 503 store outage (scope-neutral);
+   *  "scope" = 404 (SubgraphScopeError: build swap / seed gone). */
+  failSubgraph?: false | "neutral" | "scope";
+  /** meta.build_id stamped on the subgraph response; null = unnamed (no proof). */
+  subgraphBuildId?: string | null;
+  /** false = succeed; "neutral" = 503 outage; "scope" = 404 (DetailScopeGoneError). */
+  failRelation?: false | "neutral" | "scope";
+}) {
+  return vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+    if (path === "/projects/{project}/merge-candidates")
+      return Promise.resolve({ data: { data: candidates, meta: META }, error: undefined });
+    if (path === "/projects/{project}/graph/subgraph") {
+      if (failSubgraph === "neutral")
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "STORE_UNAVAILABLE", message: "graph store down" } },
+          response: { status: 503 },
+        });
+      if (failSubgraph === "scope")
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "VALIDATION_ERROR", message: "entity not in active build" } },
+          response: { status: 404 },
+        });
+      return Promise.resolve({
+        data: { data: subgraph, meta: { ...META, build_id: subgraphBuildId } },
+        error: undefined,
+      });
+    }
+    if (path === "/projects/{project}/relations/{relation_id}") {
+      if (failRelation === "neutral")
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "STORE_UNAVAILABLE", message: "graph store down" } },
+          response: { status: 503 },
+        });
+      if (failRelation === "scope")
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "VALIDATION_ERROR", message: "relation not found" } },
+          response: { status: 404 },
+        });
+      return Promise.resolve({ data: { data: relation, meta: META }, error: undefined });
+    }
+    throw new Error(`unstubbed GET ${path}`);
+  }) as never);
 }
 
 // POST stub for the decision endpoints — resolves with the updated candidate.
