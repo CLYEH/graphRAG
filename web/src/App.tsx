@@ -7,6 +7,7 @@ import { Inspect } from "./pages/Inspect";
 import { Clean } from "./pages/Clean";
 import { Graph } from "./pages/Graph";
 import { JobsDashboard } from "./pages/JobsDashboard";
+import { Overview } from "./pages/Overview";
 import { NotFound } from "./pages/NotFound";
 import { Playground } from "./pages/Playground";
 import { ProjectHealth } from "./pages/ProjectHealth";
@@ -17,7 +18,10 @@ export default function App() {
     <Routes>
       <Route path="/" element={<RootRedirect />} />
       <Route path="/p/:project" element={<AppShell />}>
-        <Route index element={<Navigate to="health" replace />} />
+        {/* UXA2: land on 總覽 — the page that says what to do next; Health
+            stays the diagnostics page */}
+        <Route index element={<Navigate to="overview" replace />} />
+        <Route path="overview" element={<Overview />} />
         <Route path="health" element={<ProjectHealth />} />
         <Route path="import" element={<Import />} />
         <Route path="inspect" element={<Inspect />} />

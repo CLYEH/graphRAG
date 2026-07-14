@@ -6,6 +6,7 @@ import "./AppShell.css";
 // Console areas (DESIGN §10.2): health / import / clean / inspect / graph / jobs /
 // review / playground — the full v1+v2 surface.
 const NAV = [
+  { to: "overview", label: "總覽" },
   { to: "health", label: "Health" },
   { to: "import", label: "Import" },
   { to: "clean", label: "Clean" },

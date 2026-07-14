@@ -1,0 +1,250 @@
+import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { Route, Routes } from "react-router-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { Overview } from "./Overview";
+import { api } from "../api/client";
+import { build, healthReport, projectRoute, renderWithProviders } from "../test-utils";
+
+import type { Build, HealthReport, Source } from "../api/queries";
+
+const META = {
+  request_id: "00000000-0000-0000-0000-000000000000",
+  build_id: null,
+  elapsed_ms: 1,
+  next_cursor: null,
+};
+
+const READY_ID = "b1111111-1111-1111-1111-111111111111";
+
+function source(): Source {
+  return {
+    id: "s0000000-0000-0000-0000-000000000000",
+    project: "acme",
+    kind: "text",
+    uri: "file:///data/corpus",
+    metadata: {},
+    created_at: "2026-07-01T00:00:00Z",
+  } as Source;
+}
+
+// Route-aware stub for the Overview's three reads (+ the activate POST spy is
+// separate): a single mockResolvedValue would feed health-shaped data to the
+// sources/builds reads and scramble every checklist assertion.
+function stubOverview({
+  health = healthReport(),
+  sources = [],
+  builds = [],
+}: {
+  health?: HealthReport;
+  sources?: Source[];
+  builds?: Build[];
+}) {
+  return vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+    if (path === "/projects/{project}/health")
+      return Promise.resolve({ data: { data: health, meta: META }, error: undefined });
+    if (path === "/projects/{project}/sources")
+      return Promise.resolve({ data: { data: sources, meta: META }, error: undefined });
+    if (path === "/projects/{project}/builds")
+      return Promise.resolve({ data: { data: builds, meta: META }, error: undefined });
+    throw new Error(`unstubbed GET ${path}`);
+  }) as never);
+}
+
+function renderOverview() {
+  return renderWithProviders(
+    <Routes>
+      <Route path="/p/:project/overview" element={<Overview />} />
+    </Routes>,
+    { route: projectRoute("acme", "overview") },
+  );
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("Overview", () => {
+  it("fresh project: nothing done, step ① is the active next step", async () => {
+    stubOverview({});
+    renderOverview();
+
+    expect(await screen.findByText(/尚未開始/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "去匯入" })).toBeInTheDocument();
+    // the later steps offer no actions yet
+    expect(screen.queryByRole("link", { name: "去建置" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
+  });
+
+  it("built but not evaluated: step ③ hands over the copyable CLI command", async () => {
+    // eval has no API endpoint until UXC1 — the checklist must hand the
+    // operator the exact terminal command instead of a dead end
+    stubOverview({
+      sources: [source()],
+      builds: [build({ id: READY_ID, status: "ready", eval: null })],
+    });
+    renderOverview();
+
+    expect(await screen.findByText(/已建置,尚未上線/)).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(`eval acme --build ${READY_ID}`))).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
+  });
+
+  it("ready to activate: the activate button posts with an Idempotency-Key after confirm", async () => {
+    stubOverview({
+      sources: [source()],
+      builds: [build({ id: READY_ID, status: "ready", eval: { score: 1 } })],
+    });
+    const post = vi.spyOn(api, "POST").mockResolvedValue({
+      data: { data: build({ id: READY_ID, status: "active" }), meta: META },
+      error: undefined,
+    } as never);
+    renderOverview();
+
+    fireEvent.click(await screen.findByRole("button", { name: "上線這個版本" }));
+    // activation swaps what every reader sees — never one click away
+    expect(post).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "確定上線" }));
+
+    await waitFor(() => {
+      expect(post).toHaveBeenCalledTimes(1);
+      const [path, opts] = post.mock.calls[0] as [string, Record<string, unknown>];
+      expect(path).toBe("/projects/{project}/builds/{build_id}/activate");
+      const params = (opts as { params: { path: unknown; header: Record<string, string> } }).params;
+      expect(params.path).toEqual({ project: "acme", build_id: READY_ID });
+      expect(params.header["Idempotency-Key"]).toMatch(/[0-9a-f-]{36}/);
+    });
+  });
+
+  it("取消 backs out of the confirm without posting", async () => {
+    stubOverview({
+      sources: [source()],
+      builds: [build({ id: READY_ID, status: "ready", eval: { score: 1 } })],
+    });
+    const post = vi.spyOn(api, "POST");
+    renderOverview();
+
+    fireEvent.click(await screen.findByRole("button", { name: "上線這個版本" }));
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+
+    expect(post).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "上線這個版本" })).toBeEnabled();
+  });
+
+  it("renders the server's §14 refusal verbatim, with the CLI hint when it names eval", async () => {
+    // the server owns §14 — the UI relays its message and turns it into
+    // guidance instead of a dead end
+    stubOverview({
+      sources: [source()],
+      builds: [build({ id: READY_ID, status: "ready", eval: { score: 1 } })],
+    });
+    vi.spyOn(api, "POST").mockResolvedValue({
+      data: undefined,
+      error: { error: { code: "VALIDATION_ERROR", message: "build has no eval scores (§14)" } },
+    } as never);
+    renderOverview();
+
+    fireEvent.click(await screen.findByRole("button", { name: "上線這個版本" }));
+    fireEvent.click(screen.getByRole("button", { name: "確定上線" }));
+
+    expect(await screen.findByText(/上線失敗:build has no eval scores/)).toBeInTheDocument();
+    expect(screen.getByText(/先在終端機執行/)).toBeInTheDocument();
+  });
+
+  it("active project: 服務中 status, scale strip, all steps done, review deep link", async () => {
+    const ACTIVE = "b2222222-2222-2222-2222-222222222222";
+    stubOverview({
+      health: healthReport({
+        status: "needs_review",
+        active_build_id: ACTIVE,
+        pending_review: 55,
+        counts: { documents: 410, entities: 1409, relations: 1158 },
+      }),
+      sources: [source()],
+      builds: [
+        build({
+          id: ACTIVE,
+          status: "active",
+          eval: { score: 1 },
+          activated_at: "2026-07-13T16:35:46Z",
+        }),
+      ],
+    });
+    renderOverview();
+
+    expect(await screen.findByText(/服務中/)).toBeInTheDocument();
+    expect(screen.getByText(/410 份文件 · 1409 個知識點 · 1158 條關聯/)).toBeInTheDocument();
+    const reviewLink = screen.getByRole("link", { name: /55 筆疑似重複/ });
+    expect(reviewLink).toHaveAttribute("href", expect.stringContaining("review"));
+    expect(screen.getAllByText("完成")).toHaveLength(4);
+    expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
+  });
+
+  it("locks the activate write while the builds read is refetching (fail-closed)", async () => {
+    // R5/R10 applied at birth: a (re)fetching builds list means the candidate
+    // row may be about to change — the write waits for the settled world.
+    // A hung second GET latches isFetching; the refetch is started directly on
+    // the query client, so no other gate can explain the disabled button.
+    let buildsCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/health")
+        return Promise.resolve({ data: { data: healthReport(), meta: META }, error: undefined });
+      if (path === "/projects/{project}/sources")
+        return Promise.resolve({ data: { data: [source()], meta: META }, error: undefined });
+      if (path === "/projects/{project}/builds") {
+        buildsCalls += 1;
+        if (buildsCalls > 1) return new Promise(() => {});
+        return Promise.resolve({
+          data: {
+            data: [build({ id: READY_ID, status: "ready", eval: { score: 1 } })],
+            meta: META,
+          },
+          error: undefined,
+        });
+      }
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    const { queryClient } = renderOverviewWithClient();
+
+    expect(await screen.findByRole("button", { name: "上線這個版本" })).toBeEnabled();
+    void queryClient.invalidateQueries({ queryKey: ["builds", "acme"] });
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "上線這個版本" })).toBeDisabled(),
+    );
+  });
+
+  it("fails loud when a status read fails — a status page must not guess", async () => {
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/health")
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "STORE_UNAVAILABLE", message: "postgres down" } },
+        });
+      return Promise.resolve({ data: { data: [], meta: META }, error: undefined });
+    }) as never);
+    renderOverview();
+
+    expect(await screen.findByText(/無法載入專案狀態:postgres down/)).toBeInTheDocument();
+  });
+});
+
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
+import { render } from "@testing-library/react";
+
+function renderOverviewWithClient() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+  });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[projectRoute("acme", "overview")]}>
+        <Routes>
+          <Route path="/p/:project/overview" element={<Overview />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  return { queryClient };
+}
