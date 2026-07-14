@@ -136,6 +136,7 @@ export function ReviewCases({ project }: { project: string }) {
         project={project}
         onSkipped={() => setIndex(index + 1)}
         scopeFrozen={scopeFrozen}
+        queueRefreshing={isFetching}
         onScopeLoss={onScopeLoss}
         onDecidingChange={setDeciding}
       />
@@ -148,6 +149,7 @@ function CaseCard({
   project,
   onSkipped,
   scopeFrozen,
+  queueRefreshing,
   onScopeLoss,
   onDecidingChange,
 }: {
@@ -155,6 +157,7 @@ function CaseCard({
   project: string;
   onSkipped: () => void;
   scopeFrozen: boolean;
+  queueRefreshing: boolean;
   onScopeLoss: () => void;
   onDecidingChange: (deciding: boolean) => void;
 }) {
@@ -167,8 +170,12 @@ function CaseCard({
   // active build moved on — the freeze lives in the PARENT (one proof freezes
   // the whole stale queue, navigation included); this card only reports proof
   // upward and obeys the frozen flag. A scope-NEUTRAL context failure stays
-  // local and never blocks deciding.
-  const blocked = decide.isPending || scopeFrozen;
+  // local and never blocks deciding. queueRefreshing is the FE1 fail-closed
+  // gate on the WRITE side: while the queue is being refreshed (refocus,
+  // invalidation) the rows on screen may be about to be replaced, and a decide
+  // against the old snapshot can 404 — verbs wait for the settled queue
+  // (Codex #76 R5).
+  const blocked = decide.isPending || scopeFrozen || queueRefreshing;
 
   const submit = (verb: ReviewVerb) => {
     onDecidingChange(true);

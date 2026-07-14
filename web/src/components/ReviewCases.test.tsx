@@ -1,4 +1,5 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ReviewCases } from "./ReviewCases";
@@ -176,6 +177,61 @@ describe("ReviewCases", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "下一筆" })).toBeDisabled());
     expect(screen.getByRole("button", { name: "上一筆" })).toBeDisabled();
+  });
+
+  it("locks the verbs while the queue itself is refetching (Codex #76 R5)", async () => {
+    // FE1's fail-closed gate on the write side: during a BACKGROUND refetch
+    // (refocus, external invalidation) the rows on screen may be about to be
+    // replaced, and a decide against the old snapshot can 404 — so the verbs
+    // wait for the settled queue. A hung second GET keeps isFetching latched;
+    // the refetch is started directly on the query client, with no mutation
+    // and no scope proof in play, so ONLY the new queueRefreshing gate can be
+    // what disables the verbs.
+    let queueCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/merge-candidates") {
+        queueCalls += 1;
+        if (queueCalls > 1) return new Promise(() => {});
+        return Promise.resolve({
+          data: {
+            data: [namedCandidate()],
+            meta: {
+              request_id: "00000000-0000-0000-0000-000000000000",
+              build_id: null,
+              elapsed_ms: 1,
+              next_cursor: null,
+            },
+          },
+          error: undefined,
+        });
+      }
+      if (path === "/projects/{project}/graph/subgraph")
+        return Promise.resolve({
+          data: {
+            data: { nodes: [], edges: [] },
+            meta: {
+              request_id: "00000000-0000-0000-0000-000000000000",
+              build_id: null,
+              elapsed_ms: 1,
+              next_cursor: null,
+            },
+          },
+          error: undefined,
+        });
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewCases project="acme" />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole("button", { name: "是,合併" })).toBeEnabled();
+    void client.invalidateQueries({ queryKey: ["merge-candidates", "acme"] });
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "是,合併" })).toBeDisabled());
+    expect(screen.getByRole("button", { name: "不是,分開" })).toBeDisabled();
   });
 
   it("one card's scope proof freezes the WHOLE queue, navigation included (Codex #76 R4)", async () => {
