@@ -282,6 +282,63 @@ describe("ReviewCases", () => {
     expect(screen.getByText("第 2 筆,共 2 筆")).toBeInTheDocument();
   });
 
+  it("a FAILED decision disarms the expected-shrink flag (Codex #76 R7)", async () => {
+    // the flag is armed BEFORE the mutate call (the invalidation refetch can
+    // unmount the card and skip every mutate-level callback), so a failed POST
+    // must disarm it in onError — otherwise the next EXTERNAL replacement
+    // would consume the stale flag and keep a position that belongs to a
+    // different queue
+    const second = namedCandidate({
+      id: "c2222222-2222-2222-2222-222222222222",
+      left_snapshot: { name: "區域探索館", type: "FACILITY" },
+      right_snapshot: { name: "區域探索廳", type: "FACILITY" },
+    });
+    const fresh = namedCandidate({
+      id: "c3333333-3333-3333-3333-333333333333",
+      left_snapshot: { name: "海祭", type: "EVENT" },
+      right_snapshot: { name: "海祭儀式", type: "EVENT" },
+    });
+    let phase = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/merge-candidates")
+        return Promise.resolve({
+          data: { data: phase === 0 ? [namedCandidate(), second] : [fresh], meta: META_NULL },
+          error: undefined,
+        });
+      if (path === "/projects/{project}/graph/subgraph")
+        return Promise.resolve({
+          data: { data: { nodes: [], edges: [] }, meta: META_NULL },
+          error: undefined,
+        });
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    vi.spyOn(api, "POST").mockResolvedValue({
+      data: undefined,
+      error: { error: { code: "INTERNAL", message: "decide blew up" } },
+    } as never);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewCases project="acme" />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "下一筆" }));
+    expect(await screen.findByText("區域探索館")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "是,合併" }));
+    fireEvent.click(screen.getByRole("button", { name: "確定合併" }));
+    expect(await screen.findByText(/決定送出失敗/)).toBeInTheDocument();
+
+    // external replacement AFTER the failed decision: the walk must reset —
+    // a stale armed flag would keep index 1 and bury the single fresh case
+    phase = 1;
+    void client.invalidateQueries({ queryKey: ["merge-candidates", "acme"] });
+    expect(await screen.findByText("海祭")).toBeInTheDocument();
+    expect(screen.getByText("第 1 筆,共 1 筆")).toBeInTheDocument();
+  });
+
   it("scope-proof context reads do not retry (Codex #76 R6)", async () => {
     // the production QueryClient retries failed queries by default; a
     // deterministic 404 that PROVES scope loss must not sit behind a retry

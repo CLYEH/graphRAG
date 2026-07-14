@@ -76,8 +76,8 @@ export function ReviewCases({ project }: { project: string }) {
   // the walk. Defer never changes the content by itself, so the tail-defer
   // end-panel state is untouched (queueKey identical → effect no-op).
   const expectedShrinkRef = useRef(false);
-  const onDecided = useCallback(() => {
-    expectedShrinkRef.current = true;
+  const setExpectedShrink = useCallback((v: boolean) => {
+    expectedShrinkRef.current = v;
   }, []);
   const prevQueueKeyRef = useRef(queueKey);
   useEffect(() => {
@@ -154,7 +154,7 @@ export function ReviewCases({ project }: { project: string }) {
         candidate={current}
         project={project}
         onSkipped={() => setIndex(index + 1)}
-        onDecided={onDecided}
+        setExpectedShrink={setExpectedShrink}
         scopeFrozen={scopeFrozen}
         queueRefreshing={isFetching}
         onScopeLoss={onScopeLoss}
@@ -168,7 +168,7 @@ function CaseCard({
   candidate,
   project,
   onSkipped,
-  onDecided,
+  setExpectedShrink,
   scopeFrozen,
   queueRefreshing,
   onScopeLoss,
@@ -177,7 +177,7 @@ function CaseCard({
   candidate: MergeCandidate;
   project: string;
   onSkipped: () => void;
-  onDecided: () => void;
+  setExpectedShrink: (v: boolean) => void;
   scopeFrozen: boolean;
   queueRefreshing: boolean;
   onScopeLoss: () => void;
@@ -201,6 +201,14 @@ function CaseCard({
 
   const submit = (verb: ReviewVerb) => {
     onDecidingChange(true);
+    // approve/reject will remove the row — the expected-shrink flag must be
+    // armed BEFORE the mutate call: the hook-level onSuccess invalidates and
+    // AWAITS the refetch first, and that refetch can unmount this keyed card,
+    // skipping every mutate-level callback (v5 gates them on hasListeners) —
+    // an onSuccess-armed flag then never rises and the parent misreads our
+    // own shrink as an external replacement (Codex #76 R7). A failed POST
+    // disarms in onError (no shrink is coming).
+    if (verb !== "defer") setExpectedShrink(true);
     decide.mutate(
       {
         candidateId: candidate.id,
@@ -214,10 +222,9 @@ function CaseCard({
         // same pair re-renders and「跳過,下次再問」skips nothing (Codex #76).
         onSuccess: () => {
           if (verb === "defer") onSkipped();
-          // approve/reject remove the row: flag the expected shrink so the
-          // parent keeps the walk position instead of treating the refetch as
-          // an external queue replacement (Codex #76 R6)
-          else onDecided();
+        },
+        onError: () => {
+          if (verb !== "defer") setExpectedShrink(false);
         },
         // best-effort: skipped if this card unmounted first (v5 gates mutate
         // callbacks on hasListeners) — the parent's currentId effect covers that
