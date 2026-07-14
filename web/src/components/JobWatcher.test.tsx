@@ -8,8 +8,8 @@ import { job, renderWithProviders, sseResponse, stubApiError, stubJob } from "..
 const JOB_ID = "0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f";
 
 function enter(id: string) {
-  fireEvent.change(screen.getByLabelText(/job id/i), { target: { value: id } });
-  fireEvent.click(screen.getByRole("button", { name: /watch/i }));
+  fireEvent.change(screen.getByLabelText("工作識別碼"), { target: { value: id } });
+  fireEvent.click(screen.getByRole("button", { name: "追蹤" }));
 }
 
 afterEach(() => {
@@ -19,7 +19,7 @@ afterEach(() => {
 describe("JobWatcher", () => {
   it("prompts for a job id before one is entered", () => {
     renderWithProviders(<JobWatcher />);
-    expect(screen.getByText(/paste a job id/i)).toBeInTheDocument();
+    expect(screen.getByText(/貼上工作識別碼/)).toBeInTheDocument();
   });
 
   it("overlays the live SSE event on the fetched job snapshot", async () => {

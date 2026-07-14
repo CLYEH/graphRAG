@@ -213,18 +213,17 @@ function EntityColumn({
   return (
     <div className="graph__col" aria-label="entities">
       <label className="graph__field">
-        filter
+        過濾
         <input
           type="search"
           value={filter}
-          placeholder="name or type…"
+          placeholder="名稱或型別…"
           onChange={(e) => setFilter(e.target.value)}
         />
       </label>
       {/* the API has no entity search — say exactly what this filter covers */}
       <p className="graph__muted">
-        Filters the {rows.length} loaded entit{rows.length === 1 ? "y" : "ies"} only — load more to
-        widen it.
+        只過濾已載入的 {rows.length} 個知識點——要擴大範圍先按「載入更多」。
       </p>
       <ul className="graph__entities">
         {shown.map((e) => (
@@ -250,11 +249,9 @@ function EntityColumn({
             </button>
           </li>
         ))}
-        {shown.length === 0 && <li className="graph__muted">No loaded entity matches.</li>}
+        {shown.length === 0 && <li className="graph__muted">已載入的知識點中沒有符合的。</li>}
       </ul>
-      {keepsRows && (
-        <p className="graph__line--error">Could not load more entities: {message(list.error)}</p>
-      )}
+      {keepsRows && <p className="graph__line--error">載入更多失敗:{message(list.error)}</p>}
       {list.hasNextPage && (
         <button
           type="button"
@@ -262,7 +259,7 @@ function EntityColumn({
           disabled={list.isFetchingNextPage}
           onClick={() => list.fetchNextPage()}
         >
-          {list.isFetchingNextPage ? "Loading…" : "Load more entities"}
+          {list.isFetchingNextPage ? "載入中…" : "載入更多"}
         </button>
       )}
     </div>
@@ -320,7 +317,7 @@ export function radialLayout(graph: GraphContext, centerId: string): Positioned[
         id,
         x: W / 2 + r * Math.cos(angle),
         y: H / 2 + r * Math.sin(angle),
-        label: n?.label ?? id.slice(0, 8),
+        label: n?.label ?? "(未命名)",
         type: n?.type ?? null,
       });
     });
@@ -391,7 +388,12 @@ function VizColumn({
         )
       ) : sub.data && positioned.length > 0 ? (
         <>
-          {sub.data.buildId && <p className="graph__muted">Active build {sub.data.buildId}</p>}
+          {sub.data.buildId && (
+            // provenance without chrome: words visible, uuid on hover (UXA3)
+            <p className="graph__muted" title={sub.data.buildId}>
+              顯示目前上線中的知識庫
+            </p>
+          )}
           <svg
             viewBox={`0 0 ${W} ${H}`}
             className="graph__svg"
@@ -508,15 +510,22 @@ function blob(value: unknown): string {
 function EntityFields({ e }: { e: Entity }) {
   return (
     <dl className="graph__fields">
-      <Field label="canonical_name">{e.canonical_name}</Field>
-      <Field label="type">{e.type}</Field>
-      <Field label="entity_key">{e.entity_key}</Field>
-      <Field label="status">{e.status}</Field>
-      <Field label="review_status">{e.review_status ?? "—"}</Field>
-      <Field label="created_by">{e.created_by ?? "—"}</Field>
-      <Field label="attributes">
-        <pre className="graph__pre">{blob(e.attributes)}</pre>
-      </Field>
+      <Field label="名稱">{e.canonical_name}</Field>
+      <Field label="型別">{e.type}</Field>
+      <Field label="狀態">{e.status}</Field>
+      <Field label="審核狀態">{e.review_status ?? "—"}</Field>
+      <Field label="來源">{e.created_by ?? "—"}</Field>
+      {/* raw identifiers live behind the 進階 fold (UXA3): the fingerprint is
+          an engineering key, not a fact about the entity */}
+      <details className="graph__advanced">
+        <summary>進階(原始資料)</summary>
+        <dl className="graph__fields">
+          <Field label="entity_key">{e.entity_key}</Field>
+          <Field label="attributes">
+            <pre className="graph__pre">{blob(e.attributes)}</pre>
+          </Field>
+        </dl>
+      </details>
     </dl>
   );
 }
@@ -527,12 +536,12 @@ function EntityFields({ e }: { e: Entity }) {
 function RelationFields({ r }: { r: Relation }) {
   return (
     <dl className="graph__fields">
-      <Field label="type">{r.type}</Field>
-      <Field label="confidence">{r.confidence ?? "—"}</Field>
-      <Field label="status">{r.status}</Field>
-      <Field label="review_status">{r.review_status ?? "—"}</Field>
-      <Field label="created_by">{r.created_by ?? "—"}</Field>
-      <Field label="evidence">
+      <Field label="關聯型別">{r.type}</Field>
+      <Field label="信心">{r.confidence ?? "—"}</Field>
+      <Field label="狀態">{r.status}</Field>
+      <Field label="審核狀態">{r.review_status ?? "—"}</Field>
+      <Field label="來源">{r.created_by ?? "—"}</Field>
+      <Field label="原文證據">
         {r.evidence && r.evidence.length > 0 ? (
           <ul className="graph__evidence">
             {r.evidence.map((ev) => (

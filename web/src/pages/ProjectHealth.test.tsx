@@ -39,9 +39,9 @@ describe("ProjectHealth", () => {
     );
     renderHealthAt(projectRoute("acme"));
 
-    expect(await screen.findByRole("status")).toHaveTextContent("Healthy");
+    expect(await screen.findByRole("status")).toHaveTextContent("健康");
     // counts render from the open map, so an operator sees corpus size at a glance
-    expect(screen.getByText("chunks")).toBeInTheDocument();
+    expect(screen.getByText("段落")).toBeInTheDocument();
     expect(screen.getByText("40")).toBeInTheDocument();
     expect(screen.getByText("3")).toBeInTheDocument(); // pending review
   });
@@ -50,10 +50,10 @@ describe("ProjectHealth", () => {
   // would hide exactly the conditions (failed build, drift, regression) it exists
   // to surface. Each enum value maps to its own human label.
   it.each([
-    ["needs_review", "Needs review"],
-    ["build_failed", "Build failed"],
-    ["index_drift", "Index drift"],
-    ["eval_regression", "Eval regression"],
+    ["needs_review", "有待審項目"],
+    ["build_failed", "建置失敗"],
+    ["index_drift", "索引漂移"],
+    ["eval_regression", "評測退步"],
   ] as [HealthReport["status"], string][])("labels the %s light as %j", async (status, label) => {
     stubHealth(healthReport({ status }));
     renderHealthAt(projectRoute("acme"));
@@ -70,7 +70,7 @@ describe("ProjectHealth", () => {
     );
     renderHealthAt(projectRoute("acme"));
 
-    expect(await screen.findByRole("status")).toHaveTextContent("Index drift");
+    expect(await screen.findByRole("status")).toHaveTextContent("索引漂移");
     expect(screen.getByText("qdrant")).toBeInTheDocument();
     expect(screen.getByText(/"actual":39/)).toBeInTheDocument();
   });
@@ -79,7 +79,7 @@ describe("ProjectHealth", () => {
     stubHealth(healthReport({ drift: null }));
     renderHealthAt(projectRoute("acme"));
 
-    expect(await screen.findByText(/no drift detected/i)).toBeInTheDocument();
+    expect(await screen.findByText(/沒有漂移/)).toBeInTheDocument();
   });
 
   it("surfaces store warnings from the report", async () => {
@@ -94,12 +94,12 @@ describe("ProjectHealth", () => {
     expect(screen.getByText("STORE_UNAVAILABLE")).toBeInTheDocument();
   });
 
-  it("renders an em dash when there is no active build", async () => {
+  it("says 無 (words, not a uuid) when there is no active build", async () => {
     stubHealth(healthReport({ active_build_id: null }));
     renderHealthAt(projectRoute("acme"));
 
     await screen.findByRole("status");
-    expect(screen.getByText("—")).toBeInTheDocument();
+    expect(screen.getByText("無")).toBeInTheDocument();
   });
 
   it("fails loud when the health endpoint errors instead of blanking", async () => {
@@ -107,7 +107,7 @@ describe("ProjectHealth", () => {
     stubHealthError();
     renderHealthAt(projectRoute("acme"));
 
-    expect(await screen.findByText(/could not load project health/i)).toBeInTheDocument();
+    expect(await screen.findByText(/無法載入專案健康狀態/)).toBeInTheDocument();
   });
 
   it("reports an unknown project for an undecodable route segment", async () => {

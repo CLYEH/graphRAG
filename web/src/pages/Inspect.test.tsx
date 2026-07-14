@@ -91,8 +91,8 @@ describe("Inspect", () => {
         Promise.resolve(path.endsWith("/chunks") ? ok([chunk()]) : ok([doc()]))) as never);
     renderInspect();
 
-    expect(await screen.findByText("file:///data/corpus/a.txt")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: "Chunks" }));
+    expect(await screen.findByText("a.txt")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "段落" }));
     expect(await screen.findByText(/Ada Lovelace worked with Charles Babbage/)).toBeInTheDocument();
 
     const listCalls = get.mock.calls.filter(
@@ -115,7 +115,7 @@ describe("Inspect", () => {
     get.mockResolvedValueOnce(ok([doc({ id: "d2" })], { build_id: "b2" }) as never);
     renderInspect();
 
-    fireEvent.click(await screen.findByRole("button", { name: /load more documents/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "載入更多" }));
 
     expect(await screen.findByText(/active build changed/i)).toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument(); // no spliced rows survive
@@ -129,10 +129,10 @@ describe("Inspect", () => {
     get.mockResolvedValueOnce(ok([doc({ id: "d2", source_uri: "file:///b.txt" })]) as never);
     renderInspect();
 
-    fireEvent.click(await screen.findByRole("button", { name: /load more documents/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "載入更多" }));
 
-    expect(await screen.findByText("file:///b.txt")).toBeInTheDocument();
-    expect(screen.getByText("file:///a.txt")).toBeInTheDocument();
+    expect(await screen.findByText("b.txt")).toBeInTheDocument();
+    expect(screen.getByText("a.txt", { selector: "span" })).toBeInTheDocument();
     // page 2 asks with the OPAQUE cursor page 1's meta handed back — never an offset the
     // client invents (the cursor is a keyset token bound to the server's own order)
     expect(requestQuery(get.mock.calls[1]).cursor).toBe("c2");
@@ -147,10 +147,10 @@ describe("Inspect", () => {
     get.mockRejectedValueOnce(new Error("network down"));
     renderInspect();
 
-    fireEvent.click(await screen.findByRole("button", { name: /load more documents/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "載入更多" }));
 
     expect(await screen.findByText(/could not load more documents/i)).toBeInTheDocument();
-    expect(screen.getByText("file:///data/corpus/a.txt")).toBeInTheDocument();
+    expect(screen.getByText("a.txt")).toBeInTheDocument();
   });
 
   it.each([
@@ -171,12 +171,10 @@ describe("Inspect", () => {
       get.mockResolvedValueOnce(fail(status as number, code as string, msg as string) as never);
       renderInspect();
 
-      fireEvent.click(await screen.findByRole("button", { name: /load more documents/i }));
+      fireEvent.click(await screen.findByRole("button", { name: "載入更多" }));
 
       expect(await screen.findByText(new RegExp(msg as string, "i"))).toBeInTheDocument();
-      await waitFor(() =>
-        expect(screen.queryByText("file:///data/corpus/a.txt")).not.toBeInTheDocument(),
-      );
+      await waitFor(() => expect(screen.queryByText("a.txt")).not.toBeInTheDocument());
       // and it is NOT reported as a mere pagination hiccup
       expect(screen.queryByText(/could not load more/i)).not.toBeInTheDocument();
     },
@@ -192,10 +190,10 @@ describe("Inspect", () => {
     get.mockResolvedValueOnce(fail(503, "STORE_UNAVAILABLE", "qdrant is unreachable") as never);
     renderInspect();
 
-    fireEvent.click(await screen.findByRole("button", { name: /load more documents/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "載入更多" }));
 
     expect(await screen.findByText(/could not load more documents/i)).toBeInTheDocument();
-    expect(screen.getByText("file:///data/corpus/a.txt")).toBeInTheDocument();
+    expect(screen.getByText("a.txt")).toBeInTheDocument();
   });
 
   it("drops the rows when a load-more failure has no readable code, and says so in words", async () => {
@@ -215,12 +213,10 @@ describe("Inspect", () => {
     } as never);
     renderInspect();
 
-    fireEvent.click(await screen.findByRole("button", { name: /load more documents/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "載入更多" }));
 
     expect(await screen.findByText(/the request failed/i)).toBeInTheDocument();
-    await waitFor(() =>
-      expect(screen.queryByText("file:///data/corpus/a.txt")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.queryByText("a.txt")).not.toBeInTheDocument());
     // the user is told what happened — not handed a JS crash escaping our own error path
     expect(screen.queryByText(/cannot read properties/i)).not.toBeInTheDocument();
   });
@@ -235,7 +231,7 @@ describe("Inspect", () => {
     const get = vi.spyOn(api, "GET");
     get.mockResolvedValueOnce(ok([doc()]) as never);
     renderInspect();
-    expect(await screen.findByText("file:///data/corpus/a.txt")).toBeInTheDocument();
+    expect(await screen.findByText("a.txt")).toBeInTheDocument();
 
     get.mockImplementation((() => new Promise(() => {})) as never); // the refetch hangs
     act(() => {
@@ -243,9 +239,7 @@ describe("Inspect", () => {
       focusManager.setFocused(true);
     });
 
-    await waitFor(() =>
-      expect(screen.queryByText("file:///data/corpus/a.txt")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.queryByText("a.txt")).not.toBeInTheDocument());
     expect(screen.getByText(/loading documents/i)).toBeInTheDocument();
   });
 
@@ -259,10 +253,10 @@ describe("Inspect", () => {
     get.mockImplementationOnce((() => new Promise(() => {})) as never); // page 2 hangs
     renderInspect();
 
-    fireEvent.click(await screen.findByRole("button", { name: /load more documents/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "載入更多" }));
 
-    expect(await screen.findByRole("button", { name: /loading/i })).toBeDisabled();
-    expect(screen.getByText("file:///data/corpus/a.txt")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "載入中…" })).toBeDisabled();
+    expect(screen.getByText("a.txt")).toBeInTheDocument();
   });
 
   it("hides the stale table when a REFETCH fails, instead of calling it a load-more failure", async () => {
@@ -275,7 +269,7 @@ describe("Inspect", () => {
     const get = vi.spyOn(api, "GET");
     get.mockResolvedValueOnce(ok([doc()]) as never);
     renderInspect();
-    expect(await screen.findByText("file:///data/corpus/a.txt")).toBeInTheDocument();
+    expect(await screen.findByText("a.txt")).toBeInTheDocument();
 
     // the refocus refetch finds the build gone
     get.mockResolvedValue(fail(409, "NO_ACTIVE_BUILD", "no active build for project") as never);
@@ -286,9 +280,7 @@ describe("Inspect", () => {
 
     expect(await screen.findByText(/no active build for project/i)).toBeInTheDocument();
     // the stale rows are GONE, and this was never labelled a pagination problem
-    await waitFor(() =>
-      expect(screen.queryByText("file:///data/corpus/a.txt")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.queryByText("a.txt")).not.toBeInTheDocument());
     expect(screen.queryByText(/could not load more/i)).not.toBeInTheDocument();
   });
 
@@ -304,7 +296,7 @@ describe("Inspect", () => {
     } as never);
     renderInspect();
 
-    fireEvent.click(await screen.findByRole("button", { name: "file:///data/corpus/a.txt" }));
+    fireEvent.click(await screen.findByRole("button", { name: /a\.txt/ }));
 
     expect(await screen.findByText("the full document text")).toBeInTheDocument();
   });
@@ -328,7 +320,7 @@ describe("Inspect", () => {
     }) as never);
     renderInspect();
 
-    fireEvent.click(await screen.findByRole("button", { name: "file:///data/corpus/a.txt" }));
+    fireEvent.click(await screen.findByRole("button", { name: /a\.txt/ }));
     expect(await screen.findByText("the full document text")).toBeInTheDocument();
 
     hang = true; // a build swap elsewhere; the panel's refetch never comes back
@@ -341,7 +333,7 @@ describe("Inspect", () => {
       expect(screen.queryByText("the full document text")).not.toBeInTheDocument(),
     );
     // the LIST is untouched by the hung detail — its rows settled and render
-    expect(screen.getByText("file:///data/corpus/a.txt")).toBeInTheDocument();
+    expect(screen.getByText("a.txt")).toBeInTheDocument();
   });
 
   it("drops the stale detail fields when the detail refetch fails, rather than showing a vanished build's document under the error", async () => {
@@ -370,7 +362,7 @@ describe("Inspect", () => {
     }) as never);
     renderInspect();
 
-    fireEvent.click(await screen.findByRole("button", { name: "file:///data/corpus/a.txt" }));
+    fireEvent.click(await screen.findByRole("button", { name: /a\.txt/ }));
     expect(await screen.findByText("the full document text")).toBeInTheDocument();
 
     swapped = true; // a build is activated that does not contain d1
@@ -380,7 +372,7 @@ describe("Inspect", () => {
     });
 
     expect(await screen.findByText(/not found in the active build/i)).toBeInTheDocument();
-    expect(await screen.findByText("file:///b.txt")).toBeInTheDocument(); // list is fine
+    expect(await screen.findByText("b.txt")).toBeInTheDocument(); // list is fine
     // …but the panel must not still be describing the build that no longer exists
     await waitFor(() =>
       expect(screen.queryByText("the full document text")).not.toBeInTheDocument(),
@@ -396,7 +388,7 @@ describe("Inspect", () => {
     get.mockResolvedValueOnce(fail(404, "VALIDATION_ERROR", "not found") as never);
     const view = renderInspect();
 
-    fireEvent.click(await screen.findByRole("button", { name: "file:///data/corpus/a.txt" }));
+    fireEvent.click(await screen.findByRole("button", { name: /a\.txt/ }));
     expect(await screen.findByText(/not found in the active build/i)).toBeInTheDocument();
     view.unmount();
 
@@ -409,7 +401,7 @@ describe("Inspect", () => {
     get.mockResolvedValue(fail(400, "VALIDATION_ERROR", "limit must be <= 500") as never);
     renderInspect();
 
-    fireEvent.click(await screen.findByRole("button", { name: "file:///data/corpus/a.txt" }));
+    fireEvent.click(await screen.findByRole("button", { name: /a\.txt/ }));
     expect(await screen.findByText(/limit must be <= 500/i)).toBeInTheDocument();
     await waitFor(() =>
       expect(screen.queryByText(/not found in the active build/i)).not.toBeInTheDocument(),

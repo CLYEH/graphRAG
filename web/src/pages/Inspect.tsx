@@ -23,8 +23,8 @@ import type { ReactNode } from "react";
 type Tab = "documents" | "chunks";
 
 const TABS: { id: Tab; label: string }[] = [
-  { id: "documents", label: "Documents" },
-  { id: "chunks", label: "Chunks" },
+  { id: "documents", label: "文件" },
+  { id: "chunks", label: "段落" },
 ];
 
 // A row's id is enough to fetch its detail; the LIST rows omit the heavy field
@@ -243,7 +243,7 @@ function PagedList<T extends { id: string }>({
           onClick={() => fetchNextPage()}
           disabled={isFetchingNextPage}
         >
-          {isFetchingNextPage ? "Loading…" : `Load more ${label}`}
+          {isFetchingNextPage ? "載入中…" : "載入更多"}
         </button>
       )}
 
@@ -309,6 +309,14 @@ function text(value: string | null | undefined): ReactNode {
   return value ? <pre className="inspect__pre">{value}</pre> : "—";
 }
 
+// The last path segment of a source uri — the human name of the file; the
+// full uri stays reachable (hover + detail) but stops being the row identity.
+function basename(uri: string): string {
+  const trimmed = uri.replace(/[/\\]+$/, "");
+  const seg = trimmed.split(/[/\\]/).pop();
+  return seg && seg !== "" ? seg : uri;
+}
+
 function fmt(ts: string | null | undefined): string {
   return ts ? ts.replace("T", " ").replace(/\..*$/, "").replace("Z", " UTC") : "—";
 }
@@ -331,10 +339,15 @@ function DocumentsTab({ project, selected, onSelect }: TabProps) {
     <PagedList<Document>
       label="documents"
       columns={[
-        { header: "Source", cell: (d) => d.source_uri },
-        { header: "MIME", cell: (d) => d.mime ?? "—" },
-        { header: "Status", cell: (d) => d.status ?? "—" },
-        { header: "Ingested", cell: (d) => fmt(d.ingested_at) },
+        {
+          header: "文件",
+          // the row leads with the file NAME — the full uri (a filesystem path
+          // in disguise) rides the hover title and the detail pane (UXA3)
+          cell: (d) => <span title={d.source_uri}>{basename(d.source_uri)}</span>,
+        },
+        { header: "類型", cell: (d) => d.mime ?? "—" },
+        { header: "狀態", cell: (d) => (d.status === "ingested" ? "已匯入" : (d.status ?? "—")) },
+        { header: "匯入時間", cell: (d) => fmt(d.ingested_at) },
       ]}
       query={list}
       selectedId={id}
@@ -379,10 +392,14 @@ function ChunksTab({ project, selected, onSelect }: TabProps) {
     <PagedList<Chunk>
       label="chunks"
       columns={[
-        { header: "Ordinal", cell: (c) => c.ordinal },
-        { header: "Document", cell: (c) => c.document_id },
-        { header: "Text", cell: (c) => c.text.slice(0, 80) },
-        { header: "Tokens", cell: (c) => c.token_count ?? "—" },
+        { header: "序號", cell: (c) => c.ordinal },
+        {
+          header: "所屬文件",
+          // an id is not a name — words on the surface, id on hover (UXA3)
+          cell: (c) => <span title={c.document_id}>(懸停看識別碼)</span>,
+        },
+        { header: "內容開頭", cell: (c) => c.text.slice(0, 80) },
+        { header: "字元數", cell: (c) => c.token_count ?? "—" },
       ]}
       query={list}
       selectedId={id}

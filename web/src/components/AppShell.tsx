@@ -3,18 +3,20 @@ import { NavLink, Outlet } from "react-router-dom";
 import { ProjectSwitcher } from "./ProjectSwitcher";
 import "./AppShell.css";
 
-// Console areas (DESIGN §10.2): health / import / clean / inspect / graph / jobs /
-// review / playground — the full v1+v2 surface.
+// Console areas (DESIGN §10.2), ordered by the operator's WORKFLOW (UXA3):
+// 總覽 → 匯入 → 建置 → 檢視 → 清洗 → 圖譜 → 審核 → 問答, with 診斷 (health)
+// last — diagnostics is where you go when something is wrong, not a stop on
+// the happy path. Labels are zh (the P4 fix); routes stay stable.
 const NAV = [
   { to: "overview", label: "總覽" },
-  { to: "health", label: "Health" },
-  { to: "import", label: "Import" },
-  { to: "clean", label: "Clean" },
-  { to: "inspect", label: "Inspect" },
-  { to: "graph", label: "Graph" },
-  { to: "jobs", label: "Jobs" },
-  { to: "review", label: "Review" },
-  { to: "playground", label: "Playground" },
+  { to: "import", label: "匯入" },
+  { to: "jobs", label: "建置" },
+  { to: "inspect", label: "檢視" },
+  { to: "clean", label: "清洗" },
+  { to: "graph", label: "圖譜" },
+  { to: "review", label: "審核" },
+  { to: "playground", label: "問答" },
+  { to: "health", label: "診斷" },
 ];
 
 export function AppShell() {

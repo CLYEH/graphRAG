@@ -120,3 +120,19 @@
     color: #f87171;
   }
 }
+
+/* UXA3: numbers must not wrap into vertical digit stacks (the audit's 149 →
+   1/4/9 bug) — give values room and keep them on one line */
+.health__grid dd,
+.health__facts dd {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.health__grid > div {
+  min-width: 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}

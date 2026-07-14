@@ -92,24 +92,14 @@ test("console shell loads with the project switcher and section nav", async ({ p
   await expect(page.getByRole("heading", { name: "總覽" })).toBeVisible();
   await expect(page.getByText(/尚未開始/)).toBeVisible();
   await expect(page.getByRole("combobox", { name: /project/i })).toHaveValue("acme");
-  for (const label of [
-    "總覽",
-    "Health",
-    "Import",
-    "Clean",
-    "Inspect",
-    "Graph",
-    "Jobs",
-    "Review",
-    "Playground",
-  ]) {
-    await expect(page.getByRole("link", { name: label })).toBeVisible();
+  for (const label of ["總覽", "匯入", "建置", "檢視", "清洗", "圖譜", "審核", "問答", "診斷"]) {
+    await expect(page.getByRole("link", { name: label, exact: true })).toBeVisible();
   }
 
   // Health stays the diagnostics page, one click away
-  await page.getByRole("link", { name: "Health" }).click();
-  await expect(page.getByRole("heading", { name: /project health/i })).toBeVisible();
-  await expect(page.getByRole("status")).toHaveText("Healthy");
+  await page.getByRole("link", { name: "診斷" }).click();
+  await expect(page.getByRole("heading", { name: "專案健康(診斷)" })).toBeVisible();
+  await expect(page.getByRole("status")).toHaveText("健康");
 });
 
 test("the overview walks the setup checklist and activates a build", async ({ page }) => {
@@ -209,10 +199,10 @@ test("the jobs section shows the pipeline runs table", async ({ page }) => {
   await page.route("**/projects/*/builds*", (route) => route.fulfill(buildsResponse()));
   await page.goto("/");
 
-  await page.getByRole("link", { name: "Jobs" }).click();
-  await expect(page.getByRole("heading", { name: /pipeline/i })).toBeVisible();
-  await expect(page.getByText(/watch a job/i)).toBeVisible();
-  await expect(page.getByText("active")).toBeVisible(); // a run row badge
+  await page.getByRole("link", { name: "建置" }).click();
+  await expect(page.getByRole("heading", { name: "建置與工作" })).toBeVisible();
+  await expect(page.getByText(/追蹤工作/)).toBeVisible();
+  await expect(page.getByText("上線中")).toBeVisible(); // a run row badge
 });
 
 test("the review section shows the queue and records a decision", async ({ page }) => {
@@ -260,7 +250,7 @@ test("the review section shows the queue and records a decision", async ({ page 
   );
 
   await page.goto("/");
-  await page.getByRole("link", { name: "Review" }).click();
+  await page.getByRole("link", { name: "審核" }).click();
 
   await expect(page.getByRole("heading", { name: "實體審核" })).toBeVisible();
   // the decision surface leads with the snapshot NAMES, never the id prefix (UXA1)
@@ -314,10 +304,10 @@ test("the playground runs a query and shows results", async ({ page }) => {
   });
   await page.goto("/");
 
-  await page.getByRole("link", { name: "Playground" }).click();
-  await expect(page.getByRole("heading", { name: /query playground/i })).toBeVisible();
+  await page.getByRole("link", { name: "問答" }).click();
+  await expect(page.getByRole("heading", { name: "問答測試" })).toBeVisible();
 
-  await page.getByLabel("query", { exact: true }).fill("what is the answer?");
+  await page.getByLabel("問題", { exact: true }).fill("what is the answer?");
   await page.getByRole("button", { name: /run query/i }).click();
 
   await expect(page.getByText("the answer is 42")).toBeVisible();
@@ -411,18 +401,18 @@ test("the import section registers a source and triggers a build", async ({ page
   await page.route("**/jobs/*", (route) => route.fulfill(jobResponse()));
   await page.goto("/");
 
-  await page.getByRole("link", { name: "Import" }).click();
-  await expect(page.getByRole("heading", { name: /^import$/i })).toBeVisible();
+  await page.getByRole("link", { name: "匯入", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "匯入資料" })).toBeVisible();
 
   // register a text source by file:// uri (no byte upload — the contract models a
   // uri reference, and text is the ingest-wired default kind)
   await page.getByLabel("uri").fill("file:///data/corpus/");
-  await page.getByRole("button", { name: /add source/i }).click();
+  await page.getByRole("button", { name: "登記來源" }).click();
   await expect.poll(() => sourceBody).toContain("file:///data/corpus/");
 
   // trigger a full build and watch the accepted job
-  await page.getByRole("button", { name: /^build$/i }).click();
-  await expect(page.getByText(/accepted job/i)).toBeVisible();
+  await page.getByRole("button", { name: "開始建置" }).click();
+  await expect(page.getByText(/建置已排入佇列/)).toBeVisible();
   // the build trigger hits its own path with an EMPTY body — source_ids/reason are
   // 400-rejected by presence, so nothing may ride along (BA2e-1)
   await expect.poll(() => buildPath).toMatch(/\/build$/);
@@ -495,15 +485,15 @@ test("inspect browses the active build's documents and opens a detail-only field
   );
 
   await page.goto("/");
-  await page.getByRole("link", { name: "Inspect" }).click();
+  await page.getByRole("link", { name: "檢視" }).click();
   await expect(page.getByRole("heading", { name: /^inspect$/i })).toBeVisible();
 
-  await expect(page.getByRole("button", { name: "file:///data/corpus/a.txt" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /a\.txt/ })).toBeVisible();
   await expect.poll(() => listUrl).toContain("/documents?");
   expect(listUrl).not.toContain("sort");
   expect(listUrl).not.toContain("filter");
 
-  await page.getByRole("button", { name: "file:///data/corpus/a.txt" }).click();
+  await page.getByRole("button", { name: /a\.txt/ }).click();
   await expect(page.getByText("Ada Lovelace worked at the Analytical Engine.")).toBeVisible();
 });
 
@@ -562,16 +552,16 @@ test("clean previews pasted text and saves chunking by spreading the config", as
   });
 
   await page.goto("/");
-  await page.getByRole("link", { name: "Clean" }).click();
-  await expect(page.getByRole("heading", { name: /^clean$/i })).toBeVisible();
+  await page.getByRole("link", { name: "清洗" }).click();
+  await expect(page.getByRole("heading", { name: "清洗(切塊預覽)" })).toBeVisible();
 
   await page.locator("textarea").fill("alpha beta gamma delta");
-  await page.getByRole("button", { name: /^preview$/i }).click();
+  await page.getByRole("button", { name: "預覽" }).click();
   await expect(page.getByText("alpha beta", { exact: true })).toBeVisible();
   expect(JSON.parse(previewBody)).toEqual({ text: "alpha beta gamma delta" });
 
-  await page.getByRole("button", { name: /save 500\/50 to config/i }).click();
-  await expect(page.getByText(/saved 500\/50 — the next build/i)).toBeVisible();
+  await page.getByRole("button", { name: "儲存 500/50 到專案設定" }).click();
+  await expect(page.getByText(/已儲存 500\/50/)).toBeVisible();
   const patched = JSON.parse(patchBody);
   expect(patched.config.ontology).toEqual({ entity_types: ["PERSON"] });
   expect(patched.config.chunking).toEqual({ max_chars: 500, overlap: 50 });
@@ -672,7 +662,7 @@ test("graph explorer walks a neighborhood and opens an edge's evidence", async (
   await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
 
   await page.goto("/");
-  await page.getByRole("link", { name: "Graph" }).click();
+  await page.getByRole("link", { name: "圖譜" }).click();
   await expect(page.getByRole("heading", { name: /^graph$/i })).toBeVisible();
 
   await page.getByRole("button", { name: /ada lovelace/i }).click();

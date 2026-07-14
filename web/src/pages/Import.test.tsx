@@ -70,9 +70,9 @@ describe("Import", () => {
 
     const uri = screen.getByLabelText("uri");
     fireEvent.change(uri, { target: { value: "file:///data/corpus/" } });
-    fireEvent.click(screen.getByRole("button", { name: /add source/i }));
-    await screen.findByText(/add failed/i);
-    fireEvent.click(screen.getByRole("button", { name: /add source/i }));
+    fireEvent.click(screen.getByRole("button", { name: "登記來源" }));
+    await screen.findByText(/登記失敗/);
+    fireEvent.click(screen.getByRole("button", { name: "登記來源" }));
     await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
 
     type Call = [string, { params: { header: { "Idempotency-Key": string } }; body: unknown }];
@@ -98,10 +98,10 @@ describe("Import", () => {
 
     // read_csv_rows needs table + pk_column, so the submit must stay blocked until
     // they're supplied — else the build fails on missing structured metadata
-    expect(screen.getByRole("button", { name: /add source/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "登記來源" })).toBeDisabled();
     fireEvent.change(screen.getByLabelText("table"), { target: { value: "documents" } });
     fireEvent.change(screen.getByLabelText("pk_column"), { target: { value: "id" } });
-    fireEvent.click(screen.getByRole("button", { name: /add source/i }));
+    fireEvent.click(screen.getByRole("button", { name: "登記來源" }));
 
     await waitFor(() => expect(post).toHaveBeenCalled());
     const [, init] = post.mock.calls[0] as [string, { body: unknown }];
@@ -118,7 +118,7 @@ describe("Import", () => {
     renderImport(projectRoute("acme", "import"));
 
     const uri = screen.getByLabelText("uri");
-    const add = () => screen.getByRole("button", { name: /add source/i });
+    const add = () => screen.getByRole("button", { name: "登記來源" });
     // _local_path reads only urlparse(uri).path, so each of these registers a
     // source the build then misreads or rejects — refuse them at the source:
     // a non-file scheme (unwired), a host-bearing file uri (host silently
@@ -233,11 +233,11 @@ describe("Import", () => {
     renderImport(projectRoute("acme", "import"));
 
     // the run buttons fail closed until the config/source gates load
-    const build = await screen.findByRole("button", { name: /^build$/i });
+    const build = await screen.findByRole("button", { name: "開始建置" });
     await waitFor(() => expect(build).toBeEnabled());
     fireEvent.click(build);
 
-    expect(await screen.findByText(/accepted job/i)).toBeInTheDocument();
+    expect(await screen.findByText(/建置已排入佇列/)).toBeInTheDocument();
     // the accepted job feeds the shared live watcher (its status badge appears)
     expect(await screen.findByRole("status")).toHaveTextContent("running");
     // BA2e-1: the trigger body must be EMPTY — IngestRequest.source_ids and
@@ -252,15 +252,13 @@ describe("Import", () => {
     stubPostError("JOB_CONFLICT", "a job is already running for this project");
     renderImport(projectRoute("acme", "import"));
 
-    const build = await screen.findByRole("button", { name: /^build$/i });
+    const build = await screen.findByRole("button", { name: "開始建置" });
     await waitFor(() => expect(build).toBeEnabled());
     fireEvent.click(build);
 
     // create_job_exclusive serializes one job per project; the 409 must surface
     // (§22) rather than the trigger appearing to succeed
-    expect(
-      await screen.findByText(/trigger failed: a job is already running/i),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/建置啟動失敗:a job is already running/)).toBeInTheDocument();
   });
 
   it("fails closed: run buttons stay disabled until the config/source gates load", async () => {
@@ -270,8 +268,8 @@ describe("Import", () => {
     vi.spyOn(api, "GET").mockImplementation((() => new Promise(() => {})) as never);
     renderImport(projectRoute("acme", "import"));
 
-    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /^ingest$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
   });
 
   it("keeps the run gate closed through the post-add refetch window", async () => {
@@ -292,12 +290,12 @@ describe("Import", () => {
     // initial source list: empty → no text source → runnable
     await waitFor(() => expect(sourceCalls).toHaveLength(1));
     sourceCalls[0]({ data: { data: [], meta: META }, error: undefined });
-    const build = await screen.findByRole("button", { name: /^build$/i });
+    const build = await screen.findByRole("button", { name: "開始建置" });
     await waitFor(() => expect(build).toBeEnabled());
 
     // add a text source → the refetch is in flight → the gate must fail closed
     fireEvent.change(screen.getByLabelText("uri"), { target: { value: "file:///data/corpus/" } });
-    fireEvent.click(screen.getByRole("button", { name: /add source/i }));
+    fireEvent.click(screen.getByRole("button", { name: "登記來源" }));
     await waitFor(() => expect(sourceCalls).toHaveLength(2));
     expect(build).toBeDisabled();
 
@@ -319,8 +317,8 @@ describe("Import", () => {
     // the graph stage with OntologyRequiredError — the run must be blocked, not
     // accepted as a job guaranteed to fail after spending work
     expect(await screen.findByText(/no valid ontology configured/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /^ingest$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
     expect(post).not.toHaveBeenCalled();
   });
 
@@ -336,7 +334,7 @@ describe("Import", () => {
 
     await screen.findByText("file:///data/corpus/"); // the source list resolved
     expect(screen.queryByText(/no valid ontology configured/i)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^build$/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeEnabled();
   });
 
   it("blocks a text build when the ontology is present but malformed", async () => {
@@ -350,7 +348,7 @@ describe("Import", () => {
     renderImport(projectRoute("acme", "import"));
 
     expect(await screen.findByText(/present but invalid/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
   });
 
   it("blocks ALL runs when the ontology is present but invalid — even structured-only", async () => {
@@ -368,7 +366,7 @@ describe("Import", () => {
     renderImport(projectRoute("acme", "import"));
 
     expect(await screen.findByText(/present but invalid/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
   });
 
   it("does not block a structured-only build without an ontology", async () => {
@@ -384,7 +382,7 @@ describe("Import", () => {
 
     await screen.findByText("file:///data/rows.csv");
     expect(screen.queryByText(/no valid ontology configured/i)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^build$/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeEnabled();
   });
 
   it("blocks runs when an existing source is one the pipeline can't resolve", async () => {
@@ -399,8 +397,8 @@ describe("Import", () => {
     renderImport(projectRoute("acme", "import"));
 
     expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /^ingest$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
   });
 
   it("blocks runs when an existing file uri would be silently reinterpreted", async () => {
@@ -414,7 +412,7 @@ describe("Import", () => {
     renderImport(projectRoute("acme", "import"));
 
     expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
   });
 
   it("blocks runs when a stored uri carries edge whitespace", async () => {
@@ -429,7 +427,7 @@ describe("Import", () => {
     renderImport(projectRoute("acme", "import"));
 
     expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
   });
 
   it("retries a trigger with the SAME idempotency key, then mints a new one after success", async () => {
@@ -451,10 +449,10 @@ describe("Import", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(sseResponse([])));
     renderImport(projectRoute("acme", "import"));
 
-    const build = await screen.findByRole("button", { name: /^build$/i });
+    const build = await screen.findByRole("button", { name: "開始建置" });
     await waitFor(() => expect(build).toBeEnabled());
     fireEvent.click(build);
-    await screen.findByText(/trigger failed/i);
+    await screen.findByText(/建置啟動失敗/);
     fireEvent.click(build);
     await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
     fireEvent.click(build); // after success: a deliberate new run
@@ -489,11 +487,11 @@ describe("Import", () => {
     stubPost(source({ kind: "text", uri: "file:///data/corpus/" }));
     renderImport(projectRoute("acme", "import"));
 
-    const build = await screen.findByRole("button", { name: /^build$/i });
+    const build = await screen.findByRole("button", { name: "開始建置" });
     await waitFor(() => expect(build).toBeEnabled());
 
     fireEvent.change(screen.getByLabelText("uri"), { target: { value: "file:///data/corpus/" } });
-    fireEvent.click(screen.getByRole("button", { name: /add source/i }));
+    fireEvent.click(screen.getByRole("button", { name: "登記來源" }));
 
     // the refetch failed loudly (the sources section shows it) — the gate stays shut
     expect(await screen.findByText(/could not load sources/i)).toBeInTheDocument();
@@ -518,7 +516,7 @@ describe("Import", () => {
       return Promise.resolve({ data: { data: [], meta: META }, error: undefined });
     }) as never);
     renderImport(projectRoute("acme", "import"));
-    const build = await screen.findByRole("button", { name: /^build$/i });
+    const build = await screen.findByRole("button", { name: "開始建置" });
     await waitFor(() => expect(build).toBeEnabled());
 
     act(() => {
@@ -545,7 +543,7 @@ describe("Import", () => {
       return Promise.resolve({ data: { data: [], meta: META }, error: undefined });
     }) as never);
     renderImport(projectRoute("acme", "import"));
-    const build = await screen.findByRole("button", { name: /^build$/i });
+    const build = await screen.findByRole("button", { name: "開始建置" });
     await waitFor(() => expect(build).toBeEnabled());
 
     act(() => {
@@ -566,7 +564,7 @@ describe("Import", () => {
     renderImport(projectRoute("acme", "import"));
 
     expect(await screen.findByText(/can't be resolved by the pipeline/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^build$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
   });
 
   it("reports an un-addressable project without firing a project-scoped call", async () => {

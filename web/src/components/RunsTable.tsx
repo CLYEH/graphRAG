@@ -13,6 +13,16 @@ const TONE: Record<Build["status"], string> = {
   archived: "muted",
 };
 
+// Build["status"] → operator words; keying on the contract enum makes a new
+// value a type error, not a silently-english badge (UXA3).
+const STATUS_LABEL: Record<Build["status"], string> = {
+  active: "上線中",
+  ready: "已就緒",
+  building: "建置中",
+  failed: "失敗",
+  archived: "已封存",
+};
+
 function fmt(ts: string | null | undefined): string {
   return ts ? ts.replace("T", " ").replace(/\..*$/, "").replace("Z", " UTC") : "—";
 }
@@ -34,10 +44,10 @@ export function RunsTable({ project }: { project: string }) {
     <table className="runs">
       <thead>
         <tr>
-          <th>Build</th>
-          <th>Status</th>
-          <th>Started</th>
-          <th>Finished</th>
+          <th>版本</th>
+          <th>狀態</th>
+          <th>開始</th>
+          <th>完成</th>
         </tr>
       </thead>
       <tbody>
@@ -66,9 +76,16 @@ function BuildRow({
   return (
     <>
       <tr className="runs__row" onClick={onToggle} aria-expanded={open}>
-        <td className="runs__id">{build.id.slice(0, 8)}</td>
+        {/* words on the surface, uuid on hover: the start time names the
+            version for humans; the full id survives in the title attribute and
+            the expanded detail (UXA3 translation layer) */}
+        <td className="runs__id" title={build.id}>
+          {fmt(build.started_at)} 版
+        </td>
         <td>
-          <span className={`runs__badge runs__badge--${TONE[build.status]}`}>{build.status}</span>
+          <span className={`runs__badge runs__badge--${TONE[build.status]}`}>
+            {STATUS_LABEL[build.status]}
+          </span>
         </td>
         <td>{fmt(build.started_at)}</td>
         <td>{fmt(build.finished_at)}</td>

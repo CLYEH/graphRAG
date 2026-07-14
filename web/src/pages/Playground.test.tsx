@@ -47,7 +47,7 @@ describe("Playground", () => {
     );
     renderAt("acme");
 
-    fireEvent.change(screen.getByLabelText("query"), { target: { value: "what?" } });
+    fireEvent.change(screen.getByLabelText("問題"), { target: { value: "what?" } });
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
 
     expect(await screen.findByText("the answer")).toBeInTheDocument();
@@ -64,19 +64,19 @@ describe("Playground", () => {
     stubQuery(queryResult());
     renderAt("acme");
 
-    fireEvent.change(screen.getByLabelText("mode"), { target: { value: "graph" } });
+    fireEvent.change(screen.getByLabelText("查詢模式"), { target: { value: "graph" } });
 
-    expect(screen.queryByLabelText("top_k")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("entity")).toBeInTheDocument();
+    expect(screen.queryByLabelText("結果數上限")).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/起點實體/)).toBeInTheDocument();
   });
 
   it("submits the graph mode with options and no top_k", async () => {
     const post = stubQuery(queryResult({ mode: "graph" }));
     renderAt("acme");
 
-    fireEvent.change(screen.getByLabelText("mode"), { target: { value: "graph" } });
-    fireEvent.change(screen.getByLabelText("query"), { target: { value: "who?" } });
-    fireEvent.change(screen.getByLabelText("entity"), { target: { value: "Ada" } });
+    fireEvent.change(screen.getByLabelText("查詢模式"), { target: { value: "graph" } });
+    fireEvent.change(screen.getByLabelText("問題"), { target: { value: "who?" } });
+    fireEvent.change(screen.getByLabelText(/起點實體/), { target: { value: "Ada" } });
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
 
     await waitFor(() =>
@@ -94,11 +94,11 @@ describe("Playground", () => {
     stubQuery(queryResult({ mode: "graph" }));
     renderAt("acme");
 
-    fireEvent.change(screen.getByLabelText("mode"), { target: { value: "graph" } });
-    fireEvent.change(screen.getByLabelText("query"), { target: { value: "who?" } });
+    fireEvent.change(screen.getByLabelText("查詢模式"), { target: { value: "graph" } });
+    fireEvent.change(screen.getByLabelText("問題"), { target: { value: "who?" } });
     expect(screen.getByRole("button", { name: /run query/i })).toBeDisabled();
 
-    fireEvent.change(screen.getByLabelText("entity"), { target: { value: "Ada" } });
+    fireEvent.change(screen.getByLabelText(/起點實體/), { target: { value: "Ada" } });
     expect(screen.getByRole("button", { name: /run query/i })).toBeEnabled();
   });
 
@@ -111,7 +111,7 @@ describe("Playground", () => {
     );
     renderAt("acme");
 
-    fireEvent.change(screen.getByLabelText("query"), { target: { value: "slow" } });
+    fireEvent.change(screen.getByLabelText("問題"), { target: { value: "slow" } });
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
 
     expect(await screen.findByText("PARTIAL_RESULTS")).toBeInTheDocument();
@@ -133,7 +133,7 @@ describe("Playground", () => {
     } as never);
     renderAt("acme");
 
-    fireEvent.change(screen.getByLabelText("query"), { target: { value: "hi" } });
+    fireEvent.change(screen.getByLabelText("問題"), { target: { value: "hi" } });
     fireEvent.click(screen.getByRole("button", { name: /run query/i }));
 
     expect(

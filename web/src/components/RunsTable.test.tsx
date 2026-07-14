@@ -16,9 +16,12 @@ describe("RunsTable", () => {
     ]);
     renderWithProviders(<RunsTable project="acme" />);
 
-    expect(await screen.findByText("b1111111")).toBeInTheDocument(); // short id
-    expect(screen.getByText("active")).toBeInTheDocument();
-    expect(screen.getByText("failed")).toBeInTheDocument();
+    // words on the surface: the start time names the version; the uuid rides
+    // the hover title only (UXA3) — its bare prefix must NOT be visible text
+    expect((await screen.findAllByText(/版$/)).length).toBeGreaterThan(0);
+    expect(screen.queryByText("b1111111")).not.toBeInTheDocument();
+    expect(screen.getByText("上線中")).toBeInTheDocument();
+    expect(screen.getByText("失敗")).toBeInTheDocument();
   });
 
   it("expands a run to drill into hashes and metrics", async () => {
@@ -32,7 +35,7 @@ describe("RunsTable", () => {
     ]);
     renderWithProviders(<RunsTable project="acme" />);
 
-    fireEvent.click(await screen.findByText("b1111111"));
+    fireEvent.click((await screen.findAllByText(/版$/))[0]);
     // the drill-down is what makes a failed run diagnosable from the dashboard
     expect(await screen.findByText("cfg-abc")).toBeInTheDocument();
     expect(screen.getByText(/"groundedness":0\.91/)).toBeInTheDocument();
