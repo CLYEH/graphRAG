@@ -200,16 +200,54 @@ function CaseCard({
     null,
   );
   const decide = useDecideMergeCandidate(project);
-  // Scope loss (class 19, Codex #76 R2/R4): a context read can PROVE the
-  // active build moved on — the freeze lives in the PARENT (one proof freezes
-  // the whole stale queue, navigation included); this card only reports proof
-  // upward and obeys the frozen flag. A scope-NEUTRAL context failure stays
-  // local and never blocks deciding. queueRefreshing is the FE1 fail-closed
-  // gate on the WRITE side: while the queue is being refreshed (refocus,
-  // invalidation) the rows on screen may be about to be replaced, and a decide
-  // against the old snapshot can 404 — verbs wait for the settled queue
-  // (Codex #76 R5).
-  const blocked = decide.isPending || scopeFrozen || queueRefreshing;
+
+  // The four context reads are SCOPE SENTINELS, owned here so proof and
+  // pendingness are computed in one place (Codex #76 R9): subgraph(hops=1)
+  // per side, then the first evidenced relation's detail (evidence rides ONLY
+  // the detail GET — FE4's rule). Failure semantics follow class 19's verdict
+  // placement: a scope-NEUTRAL failure (store down, plain errors, missing
+  // policy) stays a local context line and never blocks deciding, but a
+  // failure that PROVES the world moved (SubgraphScopeError; a success
+  // stamped with a different, non-null build; DetailScopeGoneError one hop
+  // later) escalates via onScopeLoss — the queue itself is stale and any
+  // decide would 404 (review.py rebinds the active build per request).
+  const subLeft = useSubgraph(project, candidate.left_entity_id, 1);
+  const subRight = useSubgraph(project, candidate.right_entity_id, 1);
+  const edgeLeft = subLeft.data?.graph.edges.find(
+    (e) => e.src === candidate.left_entity_id || e.dst === candidate.left_entity_id,
+  );
+  const edgeRight = subRight.data?.graph.edges.find(
+    (e) => e.src === candidate.right_entity_id || e.dst === candidate.right_entity_id,
+  );
+  const relLeft = useRelation(project, edgeLeft ? edgeLeft.id : undefined);
+  const relRight = useRelation(project, edgeRight ? edgeRight.id : undefined);
+
+  // buildId null = the meta didn't name a build — not proof of anything;
+  // only a NAMED, DIFFERENT build proves the swap.
+  const sideProof = (sub: SubResult, rel: RelResult): boolean =>
+    (sub.isError && sub.error instanceof SubgraphScopeError) ||
+    (sub.isSuccess && sub.data.buildId !== null && sub.data.buildId !== candidate.build_id) ||
+    (rel.isError && rel.error instanceof DetailScopeGoneError);
+  const scopeProof = sideProof(subLeft, relLeft) || sideProof(subRight, relRight);
+  useEffect(() => {
+    if (scopeProof) onScopeLoss();
+  }, [scopeProof, onScopeLoss]);
+
+  // A PENDING sentinel is an undetermined verdict: before the first
+  // subgraph/relation round trip settles, this candidate may already belong
+  // to a dead build — the verbs wait until every sentinel settles into a
+  // proof (freeze) or a neutral answer (Codex #76 R9). A disabled relation
+  // query (no edge yet / no edge at all) reports isPending forever in RQ v5,
+  // so it only counts while its edge actually exists.
+  const scopeChecking =
+    subLeft.isPending ||
+    subRight.isPending ||
+    (edgeLeft !== undefined && relLeft.isPending) ||
+    (edgeRight !== undefined && relRight.isPending);
+
+  // queueRefreshing is the FE1 fail-closed gate on the WRITE side (R5): while
+  // the queue refreshes, the rows on screen may be about to be replaced.
+  const blocked = decide.isPending || scopeFrozen || queueRefreshing || scopeChecking;
 
   const submit = (verb: ReviewVerb) => {
     onDecidingChange(true);
@@ -259,18 +297,18 @@ function CaseCard({
       <h2 className="review__question">這兩個是同一個東西嗎?</h2>
       <div className="review__panels">
         <EntityPanel
-          project={project}
-          entityId={candidate.left_entity_id}
           snapshot={candidate.left_snapshot}
-          expectedBuildId={candidate.build_id}
-          onScopeLoss={onScopeLoss}
+          sub={subLeft}
+          rel={relLeft}
+          edge={edgeLeft}
+          scopeLost={sideProof(subLeft, relLeft)}
         />
         <EntityPanel
-          project={project}
-          entityId={candidate.right_entity_id}
           snapshot={candidate.right_snapshot}
-          expectedBuildId={candidate.build_id}
-          onScopeLoss={onScopeLoss}
+          sub={subRight}
+          rel={relRight}
+          edge={edgeRight}
+          scopeLost={sideProof(subRight, relRight)}
         />
       </div>
       <p className="review__score">{scoreWords(candidate.score)}</p>
@@ -360,18 +398,22 @@ function CaseCard({
   );
 }
 
+type SubResult = ReturnType<typeof useSubgraph>;
+type RelResult = ReturnType<typeof useRelation>;
+type SubEdge = NonNullable<SubResult["data"]>["graph"]["edges"][number];
+
 function EntityPanel({
-  project,
-  entityId,
   snapshot,
-  expectedBuildId,
-  onScopeLoss,
+  sub,
+  rel,
+  edge,
+  scopeLost,
 }: {
-  project: string;
-  entityId: string;
   snapshot: MergeCandidate["left_snapshot"];
-  expectedBuildId: string;
-  onScopeLoss: () => void;
+  sub: SubResult;
+  rel: RelResult;
+  edge: SubEdge | undefined;
+  scopeLost: boolean;
 }) {
   const name = snapshotText(snapshot, "name");
   const type = snapshotText(snapshot, "type");
@@ -380,54 +422,25 @@ function EntityPanel({
     <div className="review__panel">
       <p className="review__name">{name ?? "(名稱快照缺失)"}</p>
       {type && <span className="review__chip">{type}</span>}
-      <EntityContext
-        project={project}
-        entityId={entityId}
-        expectedBuildId={expectedBuildId}
-        onScopeLoss={onScopeLoss}
-      />
+      <EntityContext sub={sub} rel={rel} edge={edge} scopeLost={scopeLost} />
     </div>
   );
 }
 
-// One evidenced relation as the case's context sentence. Evidence rides ONLY
-// the relation detail GET (FE4's rule), so this is subgraph(hops=1) → first
-// edge → detail; both fetches are per-CURRENT-case (lazy via the case key) and
-// cached by react-query. Failure semantics follow class 19's verdict placement:
-// a scope-NEUTRAL failure (store down, plain errors) stays local and never
-// blocks the decision — the operator may know the names cold — but a failure
-// that PROVES the world moved (SubgraphScopeError: build gone/changed, seed no
-// longer active) or a success stamped with a DIFFERENT build than the
-// candidate's escalates via onScopeLoss: the queue itself is stale and any
-// decide would 404 (review.py rebinds the active build per request).
+// Presentational: the sentinel queries live in CaseCard (R9); this renders
+// their settled shape — scope verdict, honest failure lines, or the evidenced
+// relation with its quote.
 function EntityContext({
-  project,
-  entityId,
-  expectedBuildId,
-  onScopeLoss,
+  sub,
+  rel,
+  edge,
+  scopeLost,
 }: {
-  project: string;
-  entityId: string;
-  expectedBuildId: string;
-  onScopeLoss: () => void;
+  sub: SubResult;
+  rel: RelResult;
+  edge: SubEdge | undefined;
+  scopeLost: boolean;
 }) {
-  const sub = useSubgraph(project, entityId, 1);
-  const edge = sub.data?.graph.edges.find((e) => e.src === entityId || e.dst === entityId);
-  const rel = useRelation(project, edge ? edge.id : undefined);
-
-  // buildId null = the meta didn't name a build — not proof of anything;
-  // only a NAMED, DIFFERENT build proves the swap. The relation-detail read is
-  // the same sentinel one hop later: its 404 (DetailScopeGoneError) means the
-  // edge id the subgraph JUST returned no longer resolves — the build swapped
-  // between the two reads (Codex #76 R3).
-  const scopeLost =
-    (sub.isError && sub.error instanceof SubgraphScopeError) ||
-    (sub.isSuccess && sub.data.buildId !== null && sub.data.buildId !== expectedBuildId) ||
-    (rel.isError && rel.error instanceof DetailScopeGoneError);
-  useEffect(() => {
-    if (scopeLost) onScopeLoss();
-  }, [scopeLost, onScopeLoss]);
-
   if (scopeLost)
     return <p className="review__context review__context--muted">知識庫版本已切換,此案已過期。</p>;
   if (sub.isPending) return <p className="review__context">載入上下文…</p>;
@@ -447,7 +460,7 @@ function EntityContext({
     );
 
   const nodeLabel = (id: string): string => {
-    const node = sub.data.graph.nodes.find((n) => n.id === id);
+    const node = sub.data?.graph.nodes.find((n) => n.id === id);
     return node?.label ?? "(未知)";
   };
   const quote = rel.data?.evidence?.find((ev) => ev.quote)?.quote;

@@ -43,6 +43,16 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+// The verbs are gated on settled scope sentinels (Codex #76 R9), so a click
+// must wait for enablement — clicking a still-disabled button is a no-op that
+// turns a real regression into a silent test pass.
+async function clickWhenEnabled(name: string) {
+  const btn = await screen.findByRole("button", { name });
+  await waitFor(() => expect(btn).toBeEnabled());
+  fireEvent.click(btn);
+  return btn;
+}
+
 describe("ReviewCases", () => {
   it("leads with the snapshot names — never the id prefix", async () => {
     stubReviewWorld({ candidates: [namedCandidate()] });
@@ -69,7 +79,7 @@ describe("ReviewCases", () => {
     const post = stubDecision(namedCandidate({ status: "approved" }));
     renderWithProviders(<ReviewCases project="acme" />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "是,合併" }));
+    await clickWhenEnabled("是,合併");
     expect(post).not.toHaveBeenCalled();
     expect(screen.getByRole("alertdialog", { name: "確認決定" })).toBeInTheDocument();
 
@@ -95,7 +105,7 @@ describe("ReviewCases", () => {
     const post = stubDecision(namedCandidate({ status: "rejected" }));
     renderWithProviders(<ReviewCases project="acme" />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "不是,分開" }));
+    await clickWhenEnabled("不是,分開");
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
 
     expect(post).not.toHaveBeenCalled();
@@ -112,7 +122,7 @@ describe("ReviewCases", () => {
     fireEvent.change(await screen.findByLabelText("決定理由"), {
       target: { value: "不同展區,字面相似而已" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "不是,分開" }));
+    await clickWhenEnabled("不是,分開");
     fireEvent.click(screen.getByRole("button", { name: "確定分開" }));
 
     await waitFor(() =>
@@ -134,7 +144,7 @@ describe("ReviewCases", () => {
     const post = stubDecision(namedCandidate({ status: "deferred" }));
     renderWithProviders(<ReviewCases project="acme" />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "跳過,下次再問" }));
+    await clickWhenEnabled("跳過,下次再問");
 
     await waitFor(() =>
       expect(post).toHaveBeenCalledWith(
@@ -158,7 +168,7 @@ describe("ReviewCases", () => {
     stubDecision(namedCandidate({ status: "deferred" }));
     renderWithProviders(<ReviewCases project="acme" />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "跳過,下次再問" }));
+    await clickWhenEnabled("跳過,下次再問");
 
     expect(await screen.findByText("區域探索館")).toBeInTheDocument();
     expect(screen.getByText("第 2 筆,共 2 筆")).toBeInTheDocument();
@@ -178,8 +188,8 @@ describe("ReviewCases", () => {
     vi.spyOn(api, "POST").mockImplementation((() => new Promise(() => {})) as never);
     renderWithProviders(<ReviewCases project="acme" />);
 
-    expect(await screen.findByRole("button", { name: "下一筆" })).toBeEnabled();
-    fireEvent.click(screen.getByRole("button", { name: "是,合併" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "下一筆" })).toBeEnabled());
+    await clickWhenEnabled("是,合併");
     fireEvent.click(screen.getByRole("button", { name: "確定合併" }));
 
     await waitFor(() => expect(screen.getByRole("button", { name: "下一筆" })).toBeDisabled());
@@ -274,7 +284,7 @@ describe("ReviewCases", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "下一筆" }));
     expect(await screen.findByText("區域探索館")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "是,合併" }));
+    await clickWhenEnabled("是,合併");
     fireEvent.click(screen.getByRole("button", { name: "確定合併" }));
 
     // case 3 slides into slot 2; a reset would show case 1 (台灣海洋科技館)
@@ -325,7 +335,7 @@ describe("ReviewCases", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "下一筆" }));
     expect(await screen.findByText("區域探索館")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "是,合併" }));
+    await clickWhenEnabled("是,合併");
     fireEvent.click(screen.getByRole("button", { name: "確定合併" }));
 
     phase = 1;
@@ -382,7 +392,7 @@ describe("ReviewCases", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "下一筆" }));
     expect(await screen.findByText("區域探索館")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "是,合併" }));
+    await clickWhenEnabled("是,合併");
     fireEvent.click(screen.getByRole("button", { name: "確定合併" }));
     expect(await screen.findByText(/決定送出失敗/)).toBeInTheDocument();
 
@@ -428,6 +438,34 @@ describe("ReviewCases", () => {
     // one call per entity, zero retries — with default retry the verdict would
     // wait out ~3 backoff rounds per side and this assert would see 4+
     expect(subgraphCalls).toBe(2);
+  });
+
+  it("locks the verbs while the scope sentinel is still PENDING (Codex #76 R9)", async () => {
+    // the pending cell of the sentinel state machine: no proof, no freeze, no
+    // decision, no refetch — ONLY the scopeChecking gate can be what disables
+    // the verbs. Deleting scopeChecking from `blocked` fails this test; the
+    // clickWhenEnabled sweeps alone cannot (they pass on an always-enabled UI).
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/merge-candidates")
+        return Promise.resolve({
+          data: { data: [namedCandidate()], meta: META_NULL },
+          error: undefined,
+        });
+      if (path === "/projects/{project}/graph/subgraph") return new Promise(() => {});
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewCases project="acme" />
+      </QueryClientProvider>,
+    );
+
+    // names render from the snapshot payload, not the hung sentinel
+    expect(await screen.findByText("台灣海洋科技館")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "是,合併" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "不是,分開" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "跳過,下次再問" })).toBeDisabled();
   });
 
   it("locks the verbs while the queue itself is refetching (Codex #76 R5)", async () => {
@@ -478,7 +516,7 @@ describe("ReviewCases", () => {
       </QueryClientProvider>,
     );
 
-    expect(await screen.findByRole("button", { name: "是,合併" })).toBeEnabled();
+    await waitFor(() => expect(screen.getByRole("button", { name: "是,合併" })).toBeEnabled());
     void client.invalidateQueries({ queryKey: ["merge-candidates", "acme"] });
 
     await waitFor(() => expect(screen.getByRole("button", { name: "是,合併" })).toBeDisabled());
@@ -496,17 +534,20 @@ describe("ReviewCases", () => {
     stubReviewWorld({ candidates: [namedCandidate(), second], failSubgraph: "scope" });
     renderWithProviders(<ReviewCases project="acme" />);
 
-    await waitFor(() => expect(screen.getByRole("button", { name: "是,合併" })).toBeDisabled());
+    // the verbs can momentarily disable via the PENDING sentinel gate (R9)
+    // before the proof lands — the freeze notice is the signal that the
+    // page-level lock (nav included) is in force
+    expect(await screen.findByText(/暫停所有決定/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "是,合併" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "下一筆" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "上一筆" })).toBeDisabled();
-    expect(screen.getByText(/暫停所有決定/)).toBeInTheDocument();
   });
 
   it("offers a deferred case no skip and says why (§17: never re-defer)", async () => {
     stubReviewWorld({ candidates: [namedCandidate({ status: "deferred" })] });
     renderWithProviders(<ReviewCases project="acme" />);
 
-    expect(await screen.findByRole("button", { name: "是,合併" })).toBeEnabled();
+    await waitFor(() => expect(screen.getByRole("button", { name: "是,合併" })).toBeEnabled());
     expect(screen.getByRole("button", { name: "不是,分開" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "跳過,下次再問" })).not.toBeInTheDocument();
     expect(screen.getByText(/先前已跳過/)).toBeInTheDocument();
@@ -672,7 +713,7 @@ describe("ReviewCases", () => {
     stubDecision(namedCandidate({ status: "deferred" }));
     renderWithProviders(<ReviewCases project="acme" />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "跳過,下次再問" }));
+    await clickWhenEnabled("跳過,下次再問");
 
     expect(await screen.findByText(/這一輪看到底了/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "是,合併" })).not.toBeInTheDocument();
