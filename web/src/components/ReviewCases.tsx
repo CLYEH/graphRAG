@@ -67,6 +67,25 @@ export function ReviewCases({ project }: { project: string }) {
   useEffect(() => {
     setDeciding(false);
   }, [currentId]);
+  // Queue REPLACEMENT vs queue SHRINK (Codex #76 R6): when our own decision
+  // removed a row, the walk keeps its position — the next case slides into the
+  // same slot, and deciding the tail lands on the end-of-pass panel (R3). But
+  // when the content changes WITHOUT a local decision (new active build,
+  // another tab, a project switch), the retained index would bury a shorter
+  // queue behind the end panel or start midway through a longer one — reset
+  // the walk. Defer never changes the content by itself, so the tail-defer
+  // end-panel state is untouched (queueKey identical → effect no-op).
+  const expectedShrinkRef = useRef(false);
+  const onDecided = useCallback(() => {
+    expectedShrinkRef.current = true;
+  }, []);
+  const prevQueueKeyRef = useRef(queueKey);
+  useEffect(() => {
+    if (prevQueueKeyRef.current === queueKey) return;
+    prevQueueKeyRef.current = queueKey;
+    if (expectedShrinkRef.current) expectedShrinkRef.current = false;
+    else setIndex(0);
+  }, [queueKey]);
 
   if (isPending) return <p className="runs__muted">載入審核佇列…</p>;
   if (isError)
@@ -135,6 +154,7 @@ export function ReviewCases({ project }: { project: string }) {
         candidate={current}
         project={project}
         onSkipped={() => setIndex(index + 1)}
+        onDecided={onDecided}
         scopeFrozen={scopeFrozen}
         queueRefreshing={isFetching}
         onScopeLoss={onScopeLoss}
@@ -148,6 +168,7 @@ function CaseCard({
   candidate,
   project,
   onSkipped,
+  onDecided,
   scopeFrozen,
   queueRefreshing,
   onScopeLoss,
@@ -156,6 +177,7 @@ function CaseCard({
   candidate: MergeCandidate;
   project: string;
   onSkipped: () => void;
+  onDecided: () => void;
   scopeFrozen: boolean;
   queueRefreshing: boolean;
   onScopeLoss: () => void;
@@ -192,6 +214,10 @@ function CaseCard({
         // same pair re-renders and「跳過,下次再問」skips nothing (Codex #76).
         onSuccess: () => {
           if (verb === "defer") onSkipped();
+          // approve/reject remove the row: flag the expected shrink so the
+          // parent keeps the walk position instead of treating the refetch as
+          // an external queue replacement (Codex #76 R6)
+          else onDecided();
         },
         // best-effort: skipped if this card unmounted first (v5 gates mutate
         // callbacks on hasListeners) — the parent's currentId effect covers that

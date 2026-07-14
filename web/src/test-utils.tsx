@@ -26,7 +26,13 @@ export function projectRoute(key: string, section = "health") {
 }
 
 export function renderWithProviders(ui: ReactElement, { route = "/" }: { route?: string } = {}) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  // retry: false covers hooks without a per-query retry; the scope-aware hooks
+  // (useSubgraph/useRelation/useEntity) OVERRIDE it with their own retry fn
+  // (Codex #76 R6), so retryDelay: 0 keeps their neutral-error retries instant
+  // in tests instead of walking real backoff.
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+  });
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[route]}>{ui}</MemoryRouter>

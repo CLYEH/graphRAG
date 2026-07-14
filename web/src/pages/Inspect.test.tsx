@@ -403,7 +403,10 @@ describe("Inspect", () => {
     // same code, different status: the server's own message must survive untouched
     get.mockReset();
     get.mockResolvedValueOnce(ok([doc()]) as never);
-    get.mockResolvedValueOnce(fail(400, "VALIDATION_ERROR", "limit must be <= 500") as never);
+    // not Once: a plain-Error 400 is retried by the detail hooks' retry fn
+    // (only DetailScopeGoneError skips retries — Codex #76 R6), so the mock
+    // must keep answering the retries with the same 400
+    get.mockResolvedValue(fail(400, "VALIDATION_ERROR", "limit must be <= 500") as never);
     renderInspect();
 
     fireEvent.click(await screen.findByRole("button", { name: "file:///data/corpus/a.txt" }));

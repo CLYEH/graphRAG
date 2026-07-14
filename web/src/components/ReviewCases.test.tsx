@@ -18,6 +18,13 @@ const CID = "c1111111-1111-1111-1111-111111111111";
 const LEFT = "e1000000-0000-0000-0000-000000000000";
 const RIGHT = "e2000000-0000-0000-0000-000000000000";
 
+const META_NULL = {
+  request_id: "00000000-0000-0000-0000-000000000000",
+  build_id: null,
+  elapsed_ms: 1,
+  next_cursor: null,
+};
+
 // A named case whose snapshot names deliberately differ from every id prefix —
 // the discriminating fixture for "names, never ids": a UI that renders
 // id.slice(0, 8) (the pre-UXA1 behavior) cannot pass by accident.
@@ -177,6 +184,138 @@ describe("ReviewCases", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "下一筆" })).toBeDisabled());
     expect(screen.getByRole("button", { name: "上一筆" })).toBeDisabled();
+  });
+
+  it("resets the walk when the queue is REPLACED externally (Codex #76 R6)", async () => {
+    // an external replacement (new active build, another tab) with a retained
+    // index would bury a shorter queue behind the end panel — the walk resets
+    const second = namedCandidate({
+      id: "c2222222-2222-2222-2222-222222222222",
+      left_snapshot: { name: "區域探索館", type: "FACILITY" },
+      right_snapshot: { name: "區域探索廳", type: "FACILITY" },
+    });
+    const fresh = namedCandidate({
+      id: "c3333333-3333-3333-3333-333333333333",
+      left_snapshot: { name: "海祭", type: "EVENT" },
+      right_snapshot: { name: "海祭儀式", type: "EVENT" },
+    });
+    let phase = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/merge-candidates")
+        return Promise.resolve({
+          data: {
+            data: phase === 0 ? [namedCandidate(), second] : [fresh],
+            meta: META_NULL,
+          },
+          error: undefined,
+        });
+      if (path === "/projects/{project}/graph/subgraph")
+        return Promise.resolve({
+          data: { data: { nodes: [], edges: [] }, meta: META_NULL },
+          error: undefined,
+        });
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewCases project="acme" />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "下一筆" }));
+    expect(await screen.findByText("區域探索館")).toBeInTheDocument();
+
+    phase = 1;
+    void client.invalidateQueries({ queryKey: ["merge-candidates", "acme"] });
+
+    // without the reset, index 1 >= length 1 would show the end panel and hide
+    // the fresh case entirely
+    expect(await screen.findByText("海祭")).toBeInTheDocument();
+    expect(screen.getByText("第 1 筆,共 1 筆")).toBeInTheDocument();
+  });
+
+  it("keeps the walk position when OUR decision shrank the queue (Codex #76 R6)", async () => {
+    // approving case 2 of 3: the next case slides into the same slot — a reset
+    // here would yank the curator back to case 1 after every decision
+    const a = namedCandidate();
+    const b = namedCandidate({
+      id: "c2222222-2222-2222-2222-222222222222",
+      left_snapshot: { name: "區域探索館", type: "FACILITY" },
+      right_snapshot: { name: "區域探索廳", type: "FACILITY" },
+    });
+    const c = namedCandidate({
+      id: "c3333333-3333-3333-3333-333333333333",
+      left_snapshot: { name: "海祭", type: "EVENT" },
+      right_snapshot: { name: "海祭儀式", type: "EVENT" },
+    });
+    let decided = false;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/merge-candidates")
+        return Promise.resolve({
+          data: { data: decided ? [a, c] : [a, b, c], meta: META_NULL },
+          error: undefined,
+        });
+      if (path === "/projects/{project}/graph/subgraph")
+        return Promise.resolve({
+          data: { data: { nodes: [], edges: [] }, meta: META_NULL },
+          error: undefined,
+        });
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    vi.spyOn(api, "POST").mockImplementation((() => {
+      decided = true;
+      return Promise.resolve({
+        data: { data: { ...b, status: "approved" }, meta: META_NULL },
+        error: undefined,
+      });
+    }) as never);
+    renderWithProviders(<ReviewCases project="acme" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "下一筆" }));
+    expect(await screen.findByText("區域探索館")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "是,合併" }));
+    fireEvent.click(screen.getByRole("button", { name: "確定合併" }));
+
+    // case 3 slides into slot 2; a reset would show case 1 (台灣海洋科技館)
+    expect(await screen.findByText("海祭")).toBeInTheDocument();
+    expect(screen.getByText("第 2 筆,共 2 筆")).toBeInTheDocument();
+  });
+
+  it("scope-proof context reads do not retry (Codex #76 R6)", async () => {
+    // the production QueryClient retries failed queries by default; a
+    // deterministic 404 that PROVES scope loss must not sit behind a retry
+    // backoff with the verbs still enabled — the hooks disable retry for the
+    // scope/policy error classes, so the verdict lands on the first failure
+    let subgraphCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/merge-candidates")
+        return Promise.resolve({
+          data: { data: [namedCandidate()], meta: META_NULL },
+          error: undefined,
+        });
+      if (path === "/projects/{project}/graph/subgraph") {
+        subgraphCalls += 1;
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "VALIDATION_ERROR", message: "entity not in active build" } },
+          response: { status: 404 },
+        });
+      }
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    // production-like client: retries NOT disabled
+    const client = new QueryClient();
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewCases project="acme" />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(screen.getAllByText(/知識庫版本已切換,此案已過期/)).toHaveLength(2));
+    // one call per entity, zero retries — with default retry the verdict would
+    // wait out ~3 backoff rounds per side and this assert would see 4+
+    expect(subgraphCalls).toBe(2);
   });
 
   it("locks the verbs while the queue itself is refetching (Codex #76 R5)", async () => {
