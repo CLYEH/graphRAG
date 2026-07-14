@@ -40,3 +40,11 @@ missing-score 專屬 CLI 提示(`eval --build <id> -- <project>`,shell 三層安
 3 輪 Codex/4 P2+2 reviewer blocker(教訓入 class 21:mock 對齊真實錯誤信封)。
 下一個:UXA3(全站翻譯層 sweep)。
 
+**UXA3 ✅ merged(PR #78,2026-07-15,c329850)——Phase A 完成**:全站翻譯層上線。
+9 頁 chrome 無裸 UUID/snake_case(chromeInvariant.test 機械 pin:TreeWalker 掃
+文字節點、排除 <details> 祖先);原始識別碼只住兩處=hover title 與「進階」folds;
+前綴洩漏(id.slice(0,8))由 per-component 測試另層 pin。3+1 輪 Codex/4 P2
+(詞元數、建立者、review link gate 可行動分量、drift 診斷剪裁)+本地 reviewer
+首輪 FAIL(oracle 未蓋的 3 頁全漏 UUID)——教訓入 [[graphrag-loop-paused-pr5]]
+class 22(翻譯即斷言/oracle 閉合路由表)。下一個:UXB1 設定頁表單。
+

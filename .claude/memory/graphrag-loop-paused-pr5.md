@@ -184,3 +184,23 @@ argparse 語意;(b) 帶反斜線的程式碼產出用 Write 工具寫檔,別過 
 (跳脫層層剝皮,`"\$1"` 變 no-op 咬過一次、heredoc 語法炸過三次),寫完驗證
 **檔案位元組**而非 shell 轉印;(c) UXA2 靠 class 20 的「先枚舉狀態機」把 12 輪
 壓到 3 輪——新有狀態面的前置設計成本完全值回。
+
+**Class 22 — 翻譯即斷言 × 不變量 oracle 閉合路由表(PR #78,3+1 輪 4 P2+reviewer 首輪 FAIL)**:
+全站翻譯層 sweep 的固有風險:譯錯標籤不是文案問題,是**語意錯誤**——R1a
+`token_count` 譯「字元數」(單位錯 ~4x);R1b `created_by` 譯「來源」,與 §10.2 的
+「來源」(evidence source_uri)撞名。判準:**譯每個欄位前讀 producer(server 端)
+確認語意與單位;譯詞對照既有 UI 詞彙表查撞名**(同詞異義=class-5 分岔的新軸)。
+子教訓:(a) **聚合 gauge≠可行動計數**(R2):health.pending_review 聚合 4 型,
+/review 只服務 merge candidates——導流連結/卡片要 gate 在可行動分量
+(pending_merge_candidates);同類掃除抓到 Overview 卡片連數字都是聚合值。
+(b) **共用 selector 的 presentation 修補要先枚舉全部消費者**(R3):治數字疊行的
+blanket nowrap/ellipsis 把同 class 的 drift 行 JSON 診斷剪掉——動共用 CSS 前列出
+每個消費者,例外走 scoped class(`health__grid--drift`)。(c) **不變量 oracle 要
+閉合整個路由表**:chromeInvariant 首版蓋 6 頁,reviewer FAIL 抓到的 3 個裸 UUID
+全在未蓋的頁(Clean/Graph/Import)——有界表面=路由表全枚舉,抽樣=假綠;
+且全 UUID regex 抓不到前綴洩漏(`id.slice(0,8)`),那層由 per-component 測試 pin
+(分層 oracle,各管一種洩漏)。(d) **會 crash 的檢查不是 gate**:merge 前
+fresh-state 腳本 IndexError 死掉,merge 指令卻因換行分隔照跑——precondition
+檢查與寫入必須 `&&`/`set -e` 同鏈 fail-closed,這次靠 PreToolUse hook 才守住。
+(e) Codex 會對新 head 原樣重貼已修 finding——checkable rationale resolve;
+push 後 ~35 分鐘無回應=fresh-state check 後 poke `@codex review`。
