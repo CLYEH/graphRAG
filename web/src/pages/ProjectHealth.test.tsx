@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -28,6 +28,35 @@ function renderHealthAt(route: string) {
 }
 
 describe("ProjectHealth", () => {
+  it("links 前往審核 only for a merge-candidate backlog (Codex #78)", async () => {
+    // the aggregate can be non-zero from ontology/entity/relation backlogs the
+    // /review page cannot show — no link for those, count still visible
+    stubHealth(
+      healthReport({
+        status: "needs_review",
+        pending_review: 4,
+        counts: { pending_ontology_proposals: 4 },
+      }),
+    );
+    renderHealthAt(projectRoute("acme"));
+    // both the aggregate fact and the count grid legitimately show the 4 —
+    // the pin is the ABSENT link
+    expect((await screen.findAllByText("4")).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("link", { name: "前往審核" })).not.toBeInTheDocument();
+
+    cleanup();
+    vi.restoreAllMocks();
+    stubHealth(
+      healthReport({
+        status: "needs_review",
+        pending_review: 3,
+        counts: { pending_merge_candidates: 3 },
+      }),
+    );
+    renderHealthAt(projectRoute("acme"));
+    expect(await screen.findByRole("link", { name: "前往審核" })).toBeInTheDocument();
+  });
+
   it("shows the status light, counts, and pending review for a healthy build", async () => {
     stubHealth(
       healthReport({

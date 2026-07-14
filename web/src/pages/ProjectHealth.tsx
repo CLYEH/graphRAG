@@ -74,6 +74,11 @@ function HealthView({ report }: { report: HealthReport }) {
   const warnings = report.warnings ?? [];
 
   const pending = report.pending_review ?? 0;
+  // pending_review AGGREGATES four §19 review types, but /review renders only
+  // the merge-candidate flow — deep-linking an ontology/entity/relation
+  // backlog there would land on an empty page (Codex #78). The link follows
+  // the one actionable count; the grid below breaks down the rest.
+  const mergePending = Number((report.counts ?? {}).pending_merge_candidates ?? 0);
 
   return (
     <section className="health">
@@ -94,7 +99,7 @@ function HealthView({ report }: { report: HealthReport }) {
           <dt>待審核</dt>
           <dd>
             {pending}
-            {pending > 0 && (
+            {mergePending > 0 && (
               <>
                 {" "}
                 <Link to="../review">前往審核</Link>

@@ -132,9 +132,14 @@ function OverviewBody({ project }: { project: string }) {
         <p className="overview__status">⚪ 尚未開始 — 照下面四步把知識庫建起來</p>
       )}
 
-      {(h.pending_review ?? 0) > 0 && (
+      {/* the card speaks merge-candidate language and links to the
+          merge-candidate flow, so it follows counts.pending_merge_candidates —
+          NOT the aggregate pending_review, which also counts ontology/entity/
+          relation backlogs the /review page cannot show (Codex #78) */}
+      {Number(counts.pending_merge_candidates ?? 0) > 0 && (
         <Link to="../review" className="overview__card overview__card--action">
-          ⚠ 有 {h.pending_review} 筆疑似重複的知識等你確認 <span aria-hidden>→</span> 前往審核
+          ⚠ 有 {counts.pending_merge_candidates} 筆疑似重複的知識等你確認 <span aria-hidden>→</span>{" "}
+          前往審核
         </Link>
       )}
 
