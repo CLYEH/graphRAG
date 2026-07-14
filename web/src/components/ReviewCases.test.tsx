@@ -250,6 +250,91 @@ describe("ReviewCases", () => {
     expect(screen.getByRole("button", { name: "是,合併" })).toBeDisabled();
   });
 
+  it("a relation-detail scope loss blocks deciding like the subgraph path (Codex #76 R3)", async () => {
+    // the second hop is the same sentinel: the subgraph SUCCEEDS, then the
+    // relation detail 404s because the build swapped between the two reads —
+    // DetailScopeGoneError proves the queue is stale exactly like
+    // SubgraphScopeError does
+    stubReviewWorld({
+      candidates: [namedCandidate()],
+      subgraph: {
+        nodes: [
+          { id: LEFT, label: "左" },
+          { id: RIGHT, label: "右" },
+          { id: "e3000000-0000-0000-0000-000000000000", label: "鄰居" },
+        ],
+        edges: [
+          {
+            id: "r1000000-0000-0000-0000-000000000000",
+            src: LEFT,
+            dst: "e3000000-0000-0000-0000-000000000000",
+            type: "LOCATED_IN",
+          },
+          {
+            id: "r2000000-0000-0000-0000-000000000000",
+            src: RIGHT,
+            dst: "e3000000-0000-0000-0000-000000000000",
+            type: "LOCATED_IN",
+          },
+        ],
+      },
+      failRelation: "scope",
+    });
+    renderWithProviders(<ReviewCases project="acme" />);
+
+    await waitFor(() => expect(screen.getAllByText(/知識庫版本已切換,此案已過期/)).toHaveLength(2));
+    expect(screen.getByRole("button", { name: "是,合併" })).toBeDisabled();
+  });
+
+  it("a scope-NEUTRAL relation failure stays local and never blocks (over-block dual)", async () => {
+    stubReviewWorld({
+      candidates: [namedCandidate()],
+      subgraph: {
+        nodes: [
+          { id: LEFT, label: "左" },
+          { id: RIGHT, label: "右" },
+          { id: "e3000000-0000-0000-0000-000000000000", label: "鄰居" },
+        ],
+        edges: [
+          {
+            id: "r1000000-0000-0000-0000-000000000000",
+            src: LEFT,
+            dst: "e3000000-0000-0000-0000-000000000000",
+            type: "LOCATED_IN",
+          },
+          {
+            id: "r2000000-0000-0000-0000-000000000000",
+            src: RIGHT,
+            dst: "e3000000-0000-0000-0000-000000000000",
+            type: "LOCATED_IN",
+          },
+        ],
+      },
+      failRelation: "neutral",
+    });
+    renderWithProviders(<ReviewCases project="acme" />);
+
+    await waitFor(() => expect(screen.getAllByText(/原文載入失敗/)).toHaveLength(2));
+    expect(screen.getByRole("button", { name: "是,合併" })).toBeEnabled();
+  });
+
+  it("deferring the tail case ends the pass instead of forcing a decision (Codex #76 R3)", async () => {
+    // a deferred row stays in the queue, so advancing past the LAST case used
+    // to clamp straight back onto it — now with the skip button gone, which
+    // FORCED a decision on the very pair the curator declined to decide
+    stubReviewWorld({ candidates: [namedCandidate()] });
+    stubDecision(namedCandidate({ status: "deferred" }));
+    renderWithProviders(<ReviewCases project="acme" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "跳過,下次再問" }));
+
+    expect(await screen.findByText(/這一輪看到底了/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "是,合併" })).not.toBeInTheDocument();
+    // the pass can restart deliberately — the case comes back by CHOICE
+    fireEvent.click(screen.getByRole("button", { name: "從頭再看一輪" }));
+    expect(await screen.findByText("台灣海洋科技館")).toBeInTheDocument();
+  });
+
   it("an entity with no evidenced edges gets an honest empty-context line", async () => {
     stubReviewWorld({ candidates: [namedCandidate()], subgraph: { nodes: [], edges: [] } });
     renderWithProviders(<ReviewCases project="acme" />);

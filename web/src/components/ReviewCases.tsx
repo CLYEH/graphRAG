@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import {
+  DetailScopeGoneError,
   PolicyMissingError,
   SubgraphScopeError,
   useDecideMergeCandidate,
@@ -56,24 +57,40 @@ export function ReviewCases({ project }: { project: string }) {
       </p>
     );
 
-  // A decision shrinks the queue on refetch — clamp instead of pointing past
-  // the end, so「決定 → 自動跳到下一筆」falls out of the invalidation.
-  const safe = Math.min(index, queue.length - 1);
-  const current = queue[safe];
+  // Walking past the end is a real state, not an index bug: deferring the LAST
+  // case advances past it (its row intentionally stays in the queue), and
+  // deciding the last case shrinks the queue underneath the index. Clamping
+  // back would re-present a case the curator just skipped — with the skip
+  // button gone, that FORCES a decision on the very pair they declined to
+  // decide (Codex #76 R3). End the pass instead.
+  if (index >= queue.length)
+    return (
+      <div className="review__flow">
+        <p className="runs__muted">這一輪看到底了。佇列還有 {queue.length} 筆未定案(含跳過的)。</p>
+        <button type="button" onClick={() => setIndex(0)}>
+          從頭再看一輪
+        </button>
+      </div>
+    );
+  const current = queue[index];
 
   return (
     <div className="review__flow">
       <div className="review__nav">
         <span className="review__progress">
-          第 {safe + 1} 筆,共 {queue.length} 筆
+          第 {index + 1} 筆,共 {queue.length} 筆
         </span>
-        <button type="button" onClick={() => setIndex(Math.max(0, safe - 1))} disabled={safe === 0}>
+        <button
+          type="button"
+          onClick={() => setIndex(Math.max(0, index - 1))}
+          disabled={index === 0}
+        >
           上一筆
         </button>
         <button
           type="button"
-          onClick={() => setIndex(Math.min(queue.length - 1, safe + 1))}
-          disabled={safe >= queue.length - 1}
+          onClick={() => setIndex(Math.min(queue.length - 1, index + 1))}
+          disabled={index >= queue.length - 1}
         >
           下一筆
         </button>
@@ -83,7 +100,7 @@ export function ReviewCases({ project }: { project: string }) {
         key={current.id}
         candidate={current}
         project={project}
-        onSkipped={() => setIndex(safe + 1)}
+        onSkipped={() => setIndex(index + 1)}
       />
     </div>
   );
@@ -303,10 +320,14 @@ function EntityContext({
   const rel = useRelation(project, edge ? edge.id : undefined);
 
   // buildId null = the meta didn't name a build — not proof of anything;
-  // only a NAMED, DIFFERENT build proves the swap.
+  // only a NAMED, DIFFERENT build proves the swap. The relation-detail read is
+  // the same sentinel one hop later: its 404 (DetailScopeGoneError) means the
+  // edge id the subgraph JUST returned no longer resolves — the build swapped
+  // between the two reads (Codex #76 R3).
   const scopeLost =
     (sub.isError && sub.error instanceof SubgraphScopeError) ||
-    (sub.isSuccess && sub.data.buildId !== null && sub.data.buildId !== expectedBuildId);
+    (sub.isSuccess && sub.data.buildId !== null && sub.data.buildId !== expectedBuildId) ||
+    (rel.isError && rel.error instanceof DetailScopeGoneError);
   useEffect(() => {
     if (scopeLost) onScopeLoss();
   }, [scopeLost, onScopeLoss]);

@@ -220,6 +220,7 @@ export function stubReviewWorld({
   relation,
   failSubgraph = false,
   subgraphBuildId = null,
+  failRelation = false,
 }: {
   candidates: MergeCandidate[];
   subgraph?: SubgraphStub;
@@ -229,6 +230,8 @@ export function stubReviewWorld({
   failSubgraph?: false | "neutral" | "scope";
   /** meta.build_id stamped on the subgraph response; null = unnamed (no proof). */
   subgraphBuildId?: string | null;
+  /** false = succeed; "neutral" = 503 outage; "scope" = 404 (DetailScopeGoneError). */
+  failRelation?: false | "neutral" | "scope";
 }) {
   return vi.spyOn(api, "GET").mockImplementation(((path: string) => {
     if (path === "/projects/{project}/merge-candidates")
@@ -251,8 +254,21 @@ export function stubReviewWorld({
         error: undefined,
       });
     }
-    if (path === "/projects/{project}/relations/{relation_id}")
+    if (path === "/projects/{project}/relations/{relation_id}") {
+      if (failRelation === "neutral")
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "STORE_UNAVAILABLE", message: "graph store down" } },
+          response: { status: 503 },
+        });
+      if (failRelation === "scope")
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "VALIDATION_ERROR", message: "relation not found" } },
+          response: { status: 404 },
+        });
       return Promise.resolve({ data: { data: relation, meta: META }, error: undefined });
+    }
     throw new Error(`unstubbed GET ${path}`);
   }) as never);
 }
