@@ -12,6 +12,7 @@ import { NotFound } from "./pages/NotFound";
 import { Playground } from "./pages/Playground";
 import { ProjectHealth } from "./pages/ProjectHealth";
 import { ReviewQueue } from "./pages/ReviewQueue";
+import { Settings } from "./pages/Settings";
 
 export default function App() {
   return (
@@ -30,6 +31,7 @@ export default function App() {
         <Route path="jobs" element={<JobsDashboard />} />
         <Route path="review" element={<ReviewQueue />} />
         <Route path="playground" element={<Playground />} />
+        <Route path="settings" element={<Settings />} />
         <Route path="*" element={<NotFound />} />
       </Route>
       <Route path="*" element={<NotFound />} />

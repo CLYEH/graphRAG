@@ -847,3 +847,234 @@ export function useSubgraph(
     },
   });
 }
+
+// ---- UXB1 設定頁 (DESIGN §6/§21) ---------------------------------------------
+//
+// Facts read from api/routers/projects.py, core/builds/config.py,
+// api/routers/query.py and contracts/query_policy.schema.json (not assumed):
+// * PATCH validates NOTHING about config block content. Each block fails at
+//   its own later moment — ontology at the next BUILD's config load,
+//   query_policy at the next QUERY (400, details.query_policy missing|invalid).
+//   The client-side mirrors below are the only pre-flight guard an operator
+//   gets; they never replace the server verdict (a PATCH/build/query error
+//   still surfaces verbatim when a mirror misses).
+// * ontology semantics (core/builds/config.py _load_ontology + TextOntology):
+//   the OMITTED key is the only legal "no vocabulary" — an explicit null is
+//   malformed, and a PRESENT block requires BOTH type lists non-empty. Saving
+//   an empty vocabulary therefore DELETES the key rather than writing {} or
+//   null. proposal_policy ∈ ("review", "auto") — core/graph/proposals.py.
+// * Every save spreads a FRESH config read inside the mutation (the
+//   useSaveChunking discipline, Codex #74): PATCH replaces the whole column,
+//   so a stale spread would resurrect config someone else already changed.
+
+export type OntologyDraft = {
+  entityTypes: string[];
+  relationTypes: string[];
+  proposalPolicy: "review" | "auto";
+};
+
+/** The project's ontology block as the settings form sees it — defensive
+ *  reads, same spirit as chunkingFromConfig (hand-written config can hold
+ *  anything). `present` distinguishes "no vocabulary declared" from an
+ *  empty-read block so the page can word the two states differently. */
+export function ontologyFromConfig(
+  config: Record<string, unknown>,
+): OntologyDraft & { present: boolean } {
+  const block = config["ontology"];
+  const strings = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((s): s is string => typeof s === "string") : [];
+  if (block && typeof block === "object" && !Array.isArray(block)) {
+    const b = block as Record<string, unknown>;
+    return {
+      present: true,
+      entityTypes: strings(b["entity_types"]),
+      relationTypes: strings(b["relation_types"]),
+      proposalPolicy: b["proposal_policy"] === "auto" ? "auto" : "review",
+    };
+  }
+  return { present: false, entityTypes: [], relationTypes: [], proposalPolicy: "review" };
+}
+
+function normalizeTypes(values: string[]): string[] {
+  const out: string[] = [];
+  for (const raw of values) {
+    const v = raw.trim();
+    if (v !== "" && !out.includes(v)) out.push(v);
+  }
+  return out;
+}
+
+/** Write (or delete) the ontology block. Empty draft = DELETE the key (see
+ *  the section comment); a one-sided draft is refused HERE because the build
+ *  would refuse it LATER (TextOntology requires both lists) — failing at save
+ *  time with a sentence beats failing at the next build with a stack trace. */
+export function useSaveOntology(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (draft: OntologyDraft) => {
+      const entityTypes = normalizeTypes(draft.entityTypes);
+      const relationTypes = normalizeTypes(draft.relationTypes);
+      if ((entityTypes.length === 0) !== (relationTypes.length === 0))
+        throw new Error(
+          "實體類型與關係類型必須同時提供,或同時清空(移除整份詞彙表)——只填一邊的詞彙表會在下次建置時失敗",
+        );
+      const fresh = await api.GET("/projects/{project}", {
+        params: { path: { project } },
+      });
+      if (fresh.error) throw new Error(fresh.error.error.message);
+      const current = (fresh.data.data.config ?? {}) as Record<string, unknown>;
+      const { ontology: _dropped, ...rest } = current;
+      const nextConfig =
+        entityTypes.length === 0
+          ? rest
+          : {
+              ...rest,
+              ontology: {
+                entity_types: entityTypes,
+                relation_types: relationTypes,
+                proposal_policy: draft.proposalPolicy,
+              },
+            };
+      const { data, error } = await api.PATCH("/projects/{project}", {
+        params: { path: { project } },
+        body: { config: nextConfig },
+      });
+      if (error) throw new Error(error.error.message);
+      return {
+        project: data.data,
+        saved: { entityTypes, relationTypes, proposalPolicy: draft.proposalPolicy },
+      };
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["project", project] }),
+  });
+}
+
+/** A COMPLETE, schema-valid query_policy for projects that have none yet —
+ *  every top-level field is required by the frozen contract, so the form
+ *  cannot write just the three operator knobs into the void. Safety posture:
+ *  sql/cypher disabled, block lists at the schema's frozen minimums.
+ *  Pinned against contracts/query_policy.schema.json by
+ *  queryPolicyTemplate.test.ts (required keys, consts, frozen contains). */
+export const DEFAULT_QUERY_POLICY = {
+  schema_version: "1.0",
+  default_mode: "hybrid",
+  max_top_k: 10,
+  max_graph_hops: 2,
+  max_sql_rows: 100,
+  max_latency_ms: 15000,
+  require_sources: true,
+  expose_debug: false,
+  text_to_sql: {
+    enabled: false,
+    readonly: true,
+    allowed_tables: [],
+    blocked_keywords: ["insert", "update", "delete", "drop", "alter", "truncate"],
+    max_rows: 100,
+    timeout_ms: 10000,
+  },
+  text_to_cypher: {
+    enabled: false,
+    readonly: true,
+    allowed_clauses: ["MATCH", "WHERE", "RETURN", "LIMIT"],
+    blocked: ["CREATE", "MERGE", "DELETE", "SET", "REMOVE", "CALL"],
+    max_rows: 100,
+    timeout_ms: 10000,
+  },
+} as const;
+
+export type QueryPolicyOperator = {
+  defaultMode: QueryMode;
+  maxTopK: number;
+  maxGraphHops: number;
+};
+
+/** The policy's operator-facing fields (and the flags the form needs) with
+ *  template fallback — defensive reads for the same reason as above. */
+export function policyFromConfig(config: Record<string, unknown>): QueryPolicyOperator & {
+  present: boolean;
+  sqlEnabled: boolean;
+  cypherEnabled: boolean;
+  sqlBlock: unknown;
+  cypherBlock: unknown;
+} {
+  const block = config["query_policy"];
+  const b =
+    block && typeof block === "object" && !Array.isArray(block)
+      ? (block as Record<string, unknown>)
+      : undefined;
+  const int = (v: unknown, fallback: number): number =>
+    typeof v === "number" && Number.isInteger(v) ? v : fallback;
+  const enabled = (sub: unknown): boolean =>
+    !!(
+      sub &&
+      typeof sub === "object" &&
+      !Array.isArray(sub) &&
+      (sub as Record<string, unknown>)["enabled"] === true
+    );
+  const modes: readonly QueryMode[] = ["semantic", "graph", "sql", "global", "hybrid"];
+  const mode = b?.["default_mode"];
+  return {
+    present: b !== undefined,
+    defaultMode: modes.includes(mode as QueryMode)
+      ? (mode as QueryMode)
+      : DEFAULT_QUERY_POLICY.default_mode,
+    maxTopK: int(b?.["max_top_k"], DEFAULT_QUERY_POLICY.max_top_k),
+    maxGraphHops: int(b?.["max_graph_hops"], DEFAULT_QUERY_POLICY.max_graph_hops),
+    sqlEnabled: b !== undefined ? enabled(b["text_to_sql"]) : false,
+    cypherEnabled: b !== undefined ? enabled(b["text_to_cypher"]) : false,
+    sqlBlock: b?.["text_to_sql"] ?? DEFAULT_QUERY_POLICY.text_to_sql,
+    cypherBlock: b?.["text_to_cypher"] ?? DEFAULT_QUERY_POLICY.text_to_cypher,
+  };
+}
+
+/** Write the operator fields into query_policy — spreading the FRESH block
+ *  (or the full template when the project has none: the frozen schema
+ *  requires every field, so a partial write would brick every query). The
+ *  sql-mode cross-check mirrors the schema's default_mode/text_to_sql allOf
+ *  against the FRESH block — a recheck, not a lock (class 10): the residual
+ *  race stands until the contract grows a version token. */
+export function useSaveQueryPolicy(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (op: QueryPolicyOperator) => {
+      if (!Number.isInteger(op.maxTopK) || op.maxTopK < 1)
+        throw new Error("單次檢索筆數上限(max_top_k)必須是 ≥ 1 的整數");
+      if (!Number.isInteger(op.maxGraphHops) || op.maxGraphHops < 1)
+        throw new Error("圖譜跳數上限(max_graph_hops)必須是 ≥ 1 的整數");
+      const fresh = await api.GET("/projects/{project}", {
+        params: { path: { project } },
+      });
+      if (fresh.error) throw new Error(fresh.error.error.message);
+      const current = (fresh.data.data.config ?? {}) as Record<string, unknown>;
+      const block = current["query_policy"];
+      const hasBlock = !!(block && typeof block === "object" && !Array.isArray(block));
+      const base: Record<string, unknown> = hasBlock
+        ? (block as Record<string, unknown>)
+        : { ...DEFAULT_QUERY_POLICY };
+      const sql = base["text_to_sql"];
+      const sqlEnabled = !!(
+        sql &&
+        typeof sql === "object" &&
+        !Array.isArray(sql) &&
+        (sql as Record<string, unknown>)["enabled"] === true
+      );
+      if (op.defaultMode === "sql" && !sqlEnabled)
+        throw new Error(
+          "此專案未啟用 SQL 查詢(text_to_sql.enabled 為關),預設模式不能選 SQL——政策 schema 禁止預設到一個自己停用的模式",
+        );
+      const nextPolicy = {
+        ...base,
+        default_mode: op.defaultMode,
+        max_top_k: op.maxTopK,
+        max_graph_hops: op.maxGraphHops,
+      };
+      const { data, error } = await api.PATCH("/projects/{project}", {
+        params: { path: { project } },
+        body: { config: { ...current, query_policy: nextPolicy } },
+      });
+      if (error) throw new Error(error.error.message);
+      return { project: data.data, saved: op, created: !hasBlock };
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["project", project] }),
+  });
+}

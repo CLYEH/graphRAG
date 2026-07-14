@@ -92,7 +92,18 @@ test("console shell loads with the project switcher and section nav", async ({ p
   await expect(page.getByRole("heading", { name: "總覽" })).toBeVisible();
   await expect(page.getByText(/尚未開始/)).toBeVisible();
   await expect(page.getByRole("combobox", { name: /project/i })).toHaveValue("acme");
-  for (const label of ["總覽", "匯入", "建置", "檢視", "清洗", "圖譜", "審核", "問答", "診斷"]) {
+  for (const label of [
+    "總覽",
+    "匯入",
+    "建置",
+    "檢視",
+    "清洗",
+    "圖譜",
+    "審核",
+    "問答",
+    "診斷",
+    "設定",
+  ]) {
     await expect(page.getByRole("link", { name: label, exact: true })).toBeVisible();
   }
 
@@ -671,4 +682,67 @@ test("graph explorer walks a neighborhood and opens an edge's evidence", async (
   await page.getByText("WORKS_WITH").click();
   await expect(page.getByText(/ada worked with charles/i)).toBeVisible();
   await expect(page.getByText("file:///corpus/ada.txt")).toBeVisible();
+});
+
+test("the settings page saves a vocabulary edit over a fresh-spread PATCH", async ({ page }) => {
+  const config = {
+    ontology: {
+      entity_types: ["EVENT"],
+      relation_types: ["PRACTICED_BY"],
+      proposal_policy: "review",
+    },
+    chunking: { max_chars: 500, overlap: 50 },
+  };
+  await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  let patched: { config?: Record<string, unknown> } | null = null;
+  await page.route("**/projects/acme", (route) => {
+    if (route.request().method() === "PATCH") {
+      patched = route.request().postDataJSON() as { config?: Record<string, unknown> };
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          data: {
+            name: "acme",
+            display_name: null,
+            description: null,
+            config: patched.config ?? {},
+            created_at: "2026-07-01T00:00:00Z",
+          },
+          meta: META,
+        }),
+      });
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          name: "acme",
+          display_name: null,
+          description: null,
+          // a real server serves what was just PATCHed — the post-save
+          // refetch must see the new vocabulary or the page's confirmation
+          // (a comparison, not an event) rightly refuses to stand
+          config: patched?.config ?? config,
+          created_at: "2026-07-01T00:00:00Z",
+        },
+        meta: META,
+      }),
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "設定", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "設定" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "知識類型" })).toBeVisible();
+
+  await page.getByLabel("新增實體類型").fill("PLACE");
+  await page.getByRole("button", { name: "加入實體類型" }).click();
+  await page.getByRole("button", { name: "儲存知識類型" }).click();
+
+  await expect(page.getByText("已儲存。")).toBeVisible();
+  // the PATCH spreads the whole config: the untouched chunking block rides along
+  expect(patched?.config?.["chunking"]).toEqual({ max_chars: 500, overlap: 50 });
 });
