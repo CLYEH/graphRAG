@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import {
@@ -34,8 +34,39 @@ function scoreWords(score: number): string {
 }
 
 export function ReviewCases({ project }: { project: string }) {
-  const { data: candidates, isPending, isError, error } = useMergeCandidates(project);
+  const { data: candidates, isPending, isError, error, isFetching } = useMergeCandidates(project);
   const [index, setIndex] = useState(0);
+  // Page-level guards (Codex #76 R4): both live HERE, not in the keyed card —
+  // per-card state is escapable by navigation.
+  // (a) `deciding`: while a decision POST is in flight the index must not move,
+  //     or it advances against the old list and silently skips the case that
+  //     slides into the removed row's slot.
+  // (b) `frozenKey`: one card proving scope loss freezes the WHOLE queue —
+  //     every other card is from the same dead snapshot. Anchored to the
+  //     queue's CONTENT (candidate-id join), not a fetch timestamp: a refetch
+  //     that returns the SAME rows keeps the freeze (re-proof would loop on
+  //     the cached context error), and one that returns a CHANGED queue
+  //     unfreezes exactly because the world visibly moved on.
+  const [deciding, setDeciding] = useState(false);
+  const [frozenKey, setFrozenKey] = useState<string | null>(null);
+  const queryClient = useQueryClient();
+  const queue = (candidates ?? []).filter((c) => c.status === "pending" || c.status === "deferred");
+  const queueKey = queue.map((c) => c.id).join(",");
+  const queueKeyRef = useRef(queueKey);
+  queueKeyRef.current = queueKey;
+  const onScopeLoss = useCallback(() => {
+    setFrozenKey(queueKeyRef.current);
+    void queryClient.invalidateQueries({ queryKey: ["merge-candidates", project] });
+  }, [queryClient, project]);
+  const scopeFrozen = frozenKey !== null && frozenKey === queueKey;
+  // A card change moots any in-flight decision from the PRIOR card, and the
+  // mutate-level onSettled is skipped when the card unmounts before the POST
+  // settles (react-query v5 gates mutate callbacks on hasListeners) — so the
+  // deciding-clear must not depend on that callback surviving unmount.
+  const currentId = queue[index]?.id;
+  useEffect(() => {
+    setDeciding(false);
+  }, [currentId]);
 
   if (isPending) return <p className="runs__muted">載入審核佇列…</p>;
   if (isError)
@@ -45,11 +76,10 @@ export function ReviewCases({ project }: { project: string }) {
       </p>
     );
 
-  // The queue endpoint returns only still-reviewable rows (pending + deferred —
-  // api/routers/review.py keeps the list identical to §19's pending_review
-  // gauge), so this filter is a defensive no-op today; it keeps a decided row
-  // from flashing back into the flow if that server rule ever loosens.
-  const queue = candidates.filter((c) => c.status === "pending" || c.status === "deferred");
+  // The queue keeps only still-reviewable rows (pending + deferred — the
+  // filter above mirrors api/routers/review.py, which keeps the list identical
+  // to §19's pending_review gauge; a defensive no-op today that stops a
+  // decided row from flashing back if that server rule ever loosens).
   if (queue.length === 0)
     return (
       <p className="runs__muted">
@@ -73,6 +103,10 @@ export function ReviewCases({ project }: { project: string }) {
       </div>
     );
   const current = queue[index];
+  // navigation is as dangerous as deciding while the world is in motion: an
+  // in-flight decision, a proven-stale queue, or a running refetch all mean
+  // "the list under this index is about to change"
+  const navLocked = deciding || scopeFrozen || isFetching;
 
   return (
     <div className="review__flow">
@@ -83,14 +117,14 @@ export function ReviewCases({ project }: { project: string }) {
         <button
           type="button"
           onClick={() => setIndex(Math.max(0, index - 1))}
-          disabled={index === 0}
+          disabled={index === 0 || navLocked}
         >
           上一筆
         </button>
         <button
           type="button"
           onClick={() => setIndex(Math.min(queue.length - 1, index + 1))}
-          disabled={index >= queue.length - 1}
+          disabled={index >= queue.length - 1 || navLocked}
         >
           下一筆
         </button>
@@ -101,6 +135,9 @@ export function ReviewCases({ project }: { project: string }) {
         candidate={current}
         project={project}
         onSkipped={() => setIndex(index + 1)}
+        scopeFrozen={scopeFrozen}
+        onScopeLoss={onScopeLoss}
+        onDecidingChange={setDeciding}
       />
     </div>
   );
@@ -110,31 +147,31 @@ function CaseCard({
   candidate,
   project,
   onSkipped,
+  scopeFrozen,
+  onScopeLoss,
+  onDecidingChange,
 }: {
   candidate: MergeCandidate;
   project: string;
   onSkipped: () => void;
+  scopeFrozen: boolean;
+  onScopeLoss: () => void;
+  onDecidingChange: (deciding: boolean) => void;
 }) {
   const [reason, setReason] = useState("");
   const [confirming, setConfirming] = useState<Extract<ReviewVerb, "approve" | "reject"> | null>(
     null,
   );
   const decide = useDecideMergeCandidate(project);
-  // Scope loss (class 19): a context read can PROVE the active build moved on
-  // (SubgraphScopeError, or a success stamped with a different build) — then
-  // this whole queue is stale and a decide would 404 against the rebound build
-  // (review.py re-resolves the active build). Proof blocks the verbs and
-  // refetches the queue; a scope-NEUTRAL context failure stays local and never
-  // blocks deciding (Codex #76 round 2).
-  const queryClient = useQueryClient();
-  const [scopeLost, setScopeLost] = useState(false);
-  const onScopeLoss = useCallback(() => {
-    setScopeLost(true);
-    void queryClient.invalidateQueries({ queryKey: ["merge-candidates", project] });
-  }, [queryClient, project]);
-  const blocked = decide.isPending || scopeLost;
+  // Scope loss (class 19, Codex #76 R2/R4): a context read can PROVE the
+  // active build moved on — the freeze lives in the PARENT (one proof freezes
+  // the whole stale queue, navigation included); this card only reports proof
+  // upward and obeys the frozen flag. A scope-NEUTRAL context failure stays
+  // local and never blocks deciding.
+  const blocked = decide.isPending || scopeFrozen;
 
   const submit = (verb: ReviewVerb) => {
+    onDecidingChange(true);
     decide.mutate(
       {
         candidateId: candidate.id,
@@ -148,6 +185,11 @@ function CaseCard({
         // same pair re-renders and「跳過,下次再問」skips nothing (Codex #76).
         onSuccess: () => {
           if (verb === "defer") onSkipped();
+        },
+        // best-effort: skipped if this card unmounted first (v5 gates mutate
+        // callbacks on hasListeners) — the parent's currentId effect covers that
+        onSettled: () => {
+          onDecidingChange(false);
         },
       },
     );
@@ -182,9 +224,10 @@ function CaseCard({
       {candidate.status === "deferred" && (
         <p className="review__note">這一筆先前已跳過;這次只能選「合併」或「分開」。</p>
       )}
-      {scopeLost && (
+      {scopeFrozen && (
         <p className="review__error">
-          知識庫版本已切換,這批審核清單已過期——正在重新載入最新佇列,此案暫停決定。
+          知識庫版本已切換,這批審核清單已過期——正在重新載入最新佇列,暫停所有決定。
+          若此訊息持續,請重新整理頁面。
         </p>
       )}
       <input

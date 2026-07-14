@@ -156,6 +156,45 @@ describe("ReviewCases", () => {
     expect(screen.getByText("第 2 筆,共 2 筆")).toBeInTheDocument();
   });
 
+  it("locks navigation while a decision POST is in flight (Codex #76 R4)", async () => {
+    // clicking 下一筆 mid-POST advances the index against the OLD list; when
+    // the decided row is removed, that index lands one case further and a
+    // pending case is silently skipped — so the nav freezes with the verbs
+    const second = namedCandidate({
+      id: "c2222222-2222-2222-2222-222222222222",
+      left_snapshot: { name: "區域探索館", type: "FACILITY" },
+      right_snapshot: { name: "區域探索廳", type: "FACILITY" },
+    });
+    stubReviewWorld({ candidates: [namedCandidate(), second] });
+    // a POST that never settles keeps the decision permanently in flight
+    vi.spyOn(api, "POST").mockImplementation((() => new Promise(() => {})) as never);
+    renderWithProviders(<ReviewCases project="acme" />);
+
+    expect(await screen.findByRole("button", { name: "下一筆" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "是,合併" }));
+    fireEvent.click(screen.getByRole("button", { name: "確定合併" }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "下一筆" })).toBeDisabled());
+    expect(screen.getByRole("button", { name: "上一筆" })).toBeDisabled();
+  });
+
+  it("one card's scope proof freezes the WHOLE queue, navigation included (Codex #76 R4)", async () => {
+    // the freeze lives in the parent: every card in the snapshot is from the
+    // same dead build, so navigating to case 2 must not re-arm the verbs
+    const second = namedCandidate({
+      id: "c2222222-2222-2222-2222-222222222222",
+      left_snapshot: { name: "區域探索館", type: "FACILITY" },
+      right_snapshot: { name: "區域探索廳", type: "FACILITY" },
+    });
+    stubReviewWorld({ candidates: [namedCandidate(), second], failSubgraph: "scope" });
+    renderWithProviders(<ReviewCases project="acme" />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "是,合併" })).toBeDisabled());
+    expect(screen.getByRole("button", { name: "下一筆" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "上一筆" })).toBeDisabled();
+    expect(screen.getByText(/暫停所有決定/)).toBeInTheDocument();
+  });
+
   it("offers a deferred case no skip and says why (§17: never re-defer)", async () => {
     stubReviewWorld({ candidates: [namedCandidate({ status: "deferred" })] });
     renderWithProviders(<ReviewCases project="acme" />);
