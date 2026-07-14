@@ -76,12 +76,25 @@ export function ReviewCases({ project }: { project: string }) {
         </button>
       </div>
       {/* key resets per-case state (reason, confirm) when the case changes */}
-      <CaseCard key={current.id} candidate={current} project={project} />
+      <CaseCard
+        key={current.id}
+        candidate={current}
+        project={project}
+        onSkipped={() => setIndex(safe + 1)}
+      />
     </div>
   );
 }
 
-function CaseCard({ candidate, project }: { candidate: MergeCandidate; project: string }) {
+function CaseCard({
+  candidate,
+  project,
+  onSkipped,
+}: {
+  candidate: MergeCandidate;
+  project: string;
+  onSkipped: () => void;
+}) {
   const [reason, setReason] = useState("");
   const [confirming, setConfirming] = useState<Extract<ReviewVerb, "approve" | "reject"> | null>(
     null,
@@ -89,11 +102,22 @@ function CaseCard({ candidate, project }: { candidate: MergeCandidate; project: 
   const decide = useDecideMergeCandidate(project);
 
   const submit = (verb: ReviewVerb) => {
-    decide.mutate({
-      candidateId: candidate.id,
-      verb,
-      reason: reason.trim() === "" ? null : reason.trim(),
-    });
+    decide.mutate(
+      {
+        candidateId: candidate.id,
+        verb,
+        reason: reason.trim() === "" ? null : reason.trim(),
+      },
+      {
+        // approve/reject leave the queue on refetch, so the clamp advances by
+        // itself; a DEFERRED row intentionally STAYS in the queue (review.py
+        // keeps pending+deferred), so without an explicit step forward the
+        // same pair re-renders and「跳過,下次再問」skips nothing (Codex #76).
+        onSuccess: () => {
+          if (verb === "defer") onSkipped();
+        },
+      },
+    );
     setConfirming(null);
   };
 

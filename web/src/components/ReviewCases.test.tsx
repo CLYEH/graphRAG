@@ -136,6 +136,26 @@ describe("ReviewCases", () => {
     );
   });
 
+  it("advances past a skipped case instead of re-presenting it (Codex #76)", async () => {
+    // a deferred row intentionally STAYS in the queue (review.py returns
+    // pending+deferred), so unlike approve/reject the clamp can't advance by
+    // itself — without an explicit step forward,「跳過,下次再問」re-renders
+    // the same pair as deferred and skips nothing
+    const second = namedCandidate({
+      id: "c2222222-2222-2222-2222-222222222222",
+      left_snapshot: { name: "區域探索館", type: "FACILITY" },
+      right_snapshot: { name: "區域探索廳", type: "FACILITY" },
+    });
+    stubReviewWorld({ candidates: [namedCandidate(), second] });
+    stubDecision(namedCandidate({ status: "deferred" }));
+    renderWithProviders(<ReviewCases project="acme" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "跳過,下次再問" }));
+
+    expect(await screen.findByText("區域探索館")).toBeInTheDocument();
+    expect(screen.getByText("第 2 筆,共 2 筆")).toBeInTheDocument();
+  });
+
   it("offers a deferred case no skip and says why (§17: never re-defer)", async () => {
     stubReviewWorld({ candidates: [namedCandidate({ status: "deferred" })] });
     renderWithProviders(<ReviewCases project="acme" />);
