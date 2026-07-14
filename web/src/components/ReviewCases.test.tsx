@@ -468,6 +468,55 @@ describe("ReviewCases", () => {
     expect(screen.getByRole("button", { name: "跳過,下次再問" })).toBeDisabled();
   });
 
+  it("locks the verbs while CACHED sentinels revalidate (Codex #76 R10)", async () => {
+    // navigating back to a seen case remounts its sentinels from cache — RQ
+    // serves the (possibly pre-build-swap) cached data with isFetching, not
+    // isPending, so an isPending-only gate re-arms the verbs on stale context
+    // until the revalidation lands. First visits resolve; every subgraph
+    // fetch after the two cases' four sides hangs, so the nav-back
+    // revalidation never settles and ONLY the isFetching gate can be what
+    // disables the verbs.
+    const second = namedCandidate({
+      id: "c2222222-2222-2222-2222-222222222222",
+      left_snapshot: { name: "區域探索館", type: "FACILITY" },
+      right_snapshot: { name: "區域探索廳", type: "FACILITY" },
+    });
+    let subgraphCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/merge-candidates")
+        return Promise.resolve({
+          data: { data: [namedCandidate(), second], meta: META_NULL },
+          error: undefined,
+        });
+      if (path === "/projects/{project}/graph/subgraph") {
+        subgraphCalls += 1;
+        if (subgraphCalls > 4) return new Promise(() => {});
+        return Promise.resolve({
+          data: { data: { nodes: [], edges: [] }, meta: META_NULL },
+          error: undefined,
+        });
+      }
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewCases project="acme" />
+      </QueryClientProvider>,
+    );
+
+    // case 1 settles and is decidable
+    await waitFor(() => expect(screen.getByRole("button", { name: "是,合併" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "下一筆" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "是,合併" })).toBeEnabled());
+
+    // back to case 1: cached sentinels revalidate against a hung GET — the
+    // verbs must wait even though the cache renders instantly
+    fireEvent.click(screen.getByRole("button", { name: "上一筆" }));
+    expect(await screen.findByText("台灣海洋科技館")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "是,合併" })).toBeDisabled());
+  });
+
   it("locks the verbs while the queue itself is refetching (Codex #76 R5)", async () => {
     // FE1's fail-closed gate on the write side: during a BACKGROUND refetch
     // (refocus, external invalidation) the rows on screen may be about to be

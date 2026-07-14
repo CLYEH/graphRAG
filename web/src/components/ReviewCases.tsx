@@ -233,17 +233,16 @@ function CaseCard({
     if (scopeProof) onScopeLoss();
   }, [scopeProof, onScopeLoss]);
 
-  // A PENDING sentinel is an undetermined verdict: before the first
-  // subgraph/relation round trip settles, this candidate may already belong
-  // to a dead build — the verbs wait until every sentinel settles into a
-  // proof (freeze) or a neutral answer (Codex #76 R9). A disabled relation
-  // query (no edge yet / no edge at all) reports isPending forever in RQ v5,
-  // so it only counts while its edge actually exists.
+  // An UNSETTLED sentinel is an undetermined verdict: before the first
+  // round trip settles (isPending) AND while cached sentinel data revalidates
+  // (isFetching without isPending — navigating back to a seen case remounts
+  // it from cache, and that cache may predate a build swap), this candidate
+  // may already belong to a dead build — the verbs wait until every sentinel
+  // settles into a proof (freeze) or a neutral answer (Codex #76 R9/R10).
+  // isFetching covers both windows; a disabled query (no edge yet / no edge
+  // at all) has fetchStatus idle, so it never counts.
   const scopeChecking =
-    subLeft.isPending ||
-    subRight.isPending ||
-    (edgeLeft !== undefined && relLeft.isPending) ||
-    (edgeRight !== undefined && relRight.isPending);
+    subLeft.isFetching || subRight.isFetching || relLeft.isFetching || relRight.isFetching;
 
   // queueRefreshing is the FE1 fail-closed gate on the WRITE side (R5): while
   // the queue refreshes, the rows on screen may be about to be replaced.
