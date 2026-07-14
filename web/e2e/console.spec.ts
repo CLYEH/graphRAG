@@ -71,15 +71,29 @@ function buildsResponse() {
 test("console shell loads with the project switcher and section nav", async ({ page }) => {
   await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme", "beta"])));
   await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  await page.route("**/projects/*/sources*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: [], meta: META }),
+    }),
+  );
+  await page.route("**/projects/*/builds*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: [], meta: META }),
+    }),
+  );
   await page.goto("/");
 
-  // the root redirects into the first project's health page, which renders the
-  // §19 status light once /health resolves
-  await expect(page.getByRole("heading", { name: /project health/i })).toBeVisible();
-  await expect(page.getByRole("status")).toHaveText("Healthy");
-  await expect(page.getByText("chunks")).toBeVisible();
+  // the root redirects into the first project's 總覽 (UXA2) — the page that
+  // says what to do next; a fresh project points at step ①
+  await expect(page.getByRole("heading", { name: "總覽" })).toBeVisible();
+  await expect(page.getByText(/尚未開始/)).toBeVisible();
   await expect(page.getByRole("combobox", { name: /project/i })).toHaveValue("acme");
   for (const label of [
+    "總覽",
     "Health",
     "Import",
     "Clean",
@@ -91,6 +105,74 @@ test("console shell loads with the project switcher and section nav", async ({ p
   ]) {
     await expect(page.getByRole("link", { name: label })).toBeVisible();
   }
+
+  // Health stays the diagnostics page, one click away
+  await page.getByRole("link", { name: "Health" }).click();
+  await expect(page.getByRole("heading", { name: /project health/i })).toBeVisible();
+  await expect(page.getByRole("status")).toHaveText("Healthy");
+});
+
+test("the overview walks the setup checklist and activates a build", async ({ page }) => {
+  await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  await page.route("**/projects/*/sources*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: [
+          {
+            id: "s1111111-aaaa-4aaa-8aaa-000000000001",
+            project: "acme",
+            kind: "text",
+            uri: "file:///data/corpus",
+            metadata: {},
+            created_at: "2026-07-01T00:00:00Z",
+          },
+        ],
+        meta: META,
+      }),
+    }),
+  );
+  const readyBuild = {
+    id: "b1111111-aaaa-4aaa-8aaa-000000000001",
+    project: "acme",
+    status: "ready",
+    config_hash: null,
+    source_hash: null,
+    started_at: "2026-07-01T00:00:00Z",
+    finished_at: "2026-07-01T00:05:00Z",
+    activated_at: null,
+    metrics: null,
+    eval: { score: 1.0, passed: 3, failed: 0 },
+  };
+  await page.route("**/projects/*/builds?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: [readyBuild], meta: META }),
+    }),
+  );
+  let activatePath = "";
+  let activateKey = "";
+  await page.route("**/builds/*/activate", (route) => {
+    activatePath = new URL(route.request().url()).pathname;
+    activateKey = route.request().headers()["idempotency-key"] ?? "";
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { ...readyBuild, status: "active" }, meta: META }),
+    });
+  });
+
+  await page.goto("/");
+  // steps ①-③ done, step ④ offers the activate button behind a confirm
+  await expect(page.getByText(/已建置,尚未上線/)).toBeVisible();
+  await page.getByRole("button", { name: "上線這個版本" }).click();
+  expect(activatePath).toBe("");
+  await page.getByRole("button", { name: "確定上線" }).click();
+  await expect.poll(() => activatePath).toMatch(/\/builds\/[^/]+\/activate$/);
+  expect(activateKey).toMatch(/[0-9a-f-]{36}/);
 });
 
 function mergeCandidatesResponse() {

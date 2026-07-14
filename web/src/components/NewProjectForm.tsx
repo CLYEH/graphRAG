@@ -5,17 +5,17 @@ import { useCreateProject } from "../api/queries";
 import { encodeProjectSegment, isPathAddressable } from "../project/projectRoute";
 import "./NewProjectForm.css";
 
-// Creates a project and drops the operator into it (its health page — the nav
-// then leads to Import). `name` is required (the projects primary key); display
-// name and description are optional and are omitted when blank. Fails loud — a
-// name clash or store outage shows its message rather than a silent no-op. Shared
-// by the root empty-state (bootstrap the first project, since /p/:project is
-// unreachable with none) and the Import page (create another). Navigates to health
-// rather than import so it agrees with RootRedirect's own projects-became-nonempty
-// redirect — otherwise, from the root, the create's invalidateQueries(["projects"])
-// re-renders the still-mounted RootRedirect into a competing <Navigate> that races
-// and clobbers this one. Uses the returned canonical name, base64url-encoded so any
-// key round-trips into the URL.
+// Creates a project and drops the operator into it (its 總覽 page — the setup
+// checklist is exactly what a fresh project needs, UXA2). `name` is required
+// (the projects primary key); display name and description are optional and are
+// omitted when blank. Fails loud — a name clash or store outage shows its
+// message rather than a silent no-op. Shared by the root empty-state (bootstrap
+// the first project, since /p/:project is unreachable with none) and the Import
+// page (create another). The target must AGREE with RootRedirect's own
+// projects-became-nonempty redirect — otherwise, from the root, the create's
+// invalidateQueries(["projects"]) re-renders the still-mounted RootRedirect
+// into a competing <Navigate> that races and clobbers this one. Uses the
+// returned canonical name, base64url-encoded so any key round-trips into the URL.
 export function NewProjectForm() {
   const [name, setName] = useState("");
   const [displayName, setDisplayName] = useState("");
@@ -34,7 +34,7 @@ export function NewProjectForm() {
   function submit() {
     create.mutate(
       { name: name.trim(), displayName, description },
-      { onSuccess: (project) => navigate(`/p/${encodeProjectSegment(project.name)}/health`) },
+      { onSuccess: (project) => navigate(`/p/${encodeProjectSegment(project.name)}/overview`) },
     );
   }
 

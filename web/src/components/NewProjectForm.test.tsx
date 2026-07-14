@@ -12,17 +12,17 @@ afterEach(() => {
 
 // The destination echoes the decoded :project param, so a successful create's
 // navigation is observable — proving both that it fired and that it landed in the
-// new project (its health page, which agrees with RootRedirect's own redirect).
-function HealthEcho() {
+// new project (its 總覽 page, which agrees with RootRedirect's own redirect).
+function OverviewEcho() {
   const { project } = useParams();
-  return <div>health for {project ? decodeProjectSegment(project) : ""}</div>;
+  return <div>overview for {project ? decodeProjectSegment(project) : ""}</div>;
 }
 
 function renderForm(route = "/") {
   return renderWithProviders(
     <Routes>
       <Route path="/" element={<NewProjectForm />} />
-      <Route path="/p/:project/health" element={<HealthEcho />} />
+      <Route path="/p/:project/overview" element={<OverviewEcho />} />
     </Routes>,
     { route },
   );
@@ -37,8 +37,8 @@ describe("NewProjectForm", () => {
     fireEvent.change(screen.getByLabelText(/display name/i), { target: { value: "Acme Inc" } });
     fireEvent.click(screen.getByRole("button", { name: /create project/i }));
 
-    // navigation lands in the created project (health, matching RootRedirect)
-    expect(await screen.findByText(/health for acme/i)).toBeInTheDocument();
+    // navigation lands in the created project (總覽, matching RootRedirect)
+    expect(await screen.findByText(/overview for acme/i)).toBeInTheDocument();
     // no Idempotency-Key: `name` allows unicode / >255 chars, which isn't a valid
     // HTTP header value — keying on it would break exactly the names the contract
     // permits; the projects PK dedups a retry instead (Codex #70)

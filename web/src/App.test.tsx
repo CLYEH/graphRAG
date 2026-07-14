@@ -46,11 +46,10 @@ describe("App shell", () => {
     const select = await screen.findByRole("combobox", { name: /project/i });
     fireEvent.change(select, { target: { value: "beta" } });
 
-    // navigating to /p/beta redirects to its health page and the switcher
-    // reflects the new active project (read back from the URL param). The health
-    // page loads async now, so await its heading rather than reading it sync.
+    // navigating to /p/beta redirects to its 總覽 (UXA2 landing) and the
+    // switcher reflects the new active project (read back from the URL param).
     expect(await screen.findByRole("combobox", { name: /project/i })).toHaveValue("beta");
-    expect(await screen.findByRole("heading", { name: /project health/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "總覽" })).toBeInTheDocument();
   });
 
   it("shows an empty state at the root when there are no projects", async () => {
@@ -60,12 +59,12 @@ describe("App shell", () => {
     expect(await screen.findByText(/no projects yet/i)).toBeInTheDocument();
   });
 
-  it("redirects the root to the first project's health page", async () => {
+  it("redirects the root to the first project's 總覽 page", async () => {
     stubProjects([project("acme")]);
     renderWithProviders(<App />, { route: "/" });
 
-    // lands on the health placeholder, proving the root redirect resolved
-    expect(await screen.findByRole("heading", { name: /project health/i })).toBeInTheDocument();
+    // lands on the 總覽 landing (UXA2), proving the root redirect resolved
+    expect(await screen.findByRole("heading", { name: "總覽" })).toBeInTheDocument();
   });
 
   it("surfaces an API failure instead of an empty switcher", async () => {
@@ -105,11 +104,11 @@ describe("App shell", () => {
   it("keeps a project whose key has URL-reserved characters openable and addressable", async () => {
     // a reserved char like "?" percent-encodes to a surviving segment (a%3Fb), so
     // the key is both openable (base64url route, Codex #65) and API-addressable —
-    // health loads end-to-end. Only "/" and "."/".." break (see next test).
+    // the 總覽 landing loads end-to-end. Only "/" and "."/".." break (see next test).
     stubProjects([project("a?b", "Questiony")]);
     renderWithProviders(<App />, { route: "/" });
 
-    expect(await screen.findByRole("heading", { name: /project health/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "總覽" })).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: /project/i })).toHaveValue("a?b");
   });
 
