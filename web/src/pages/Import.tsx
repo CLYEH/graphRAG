@@ -220,9 +220,9 @@ export function Import() {
 
   return (
     <section className="import">
-      <h1 className="import__title">Import</h1>
+      <h1 className="import__title">匯入資料</h1>
       <p className="import__sub">
-        Registering sources into <code>{project}</code>.
+        目前專案:<code>{project}</code>
       </p>
       <Sources project={project} />
       <RunPipeline
@@ -236,8 +236,8 @@ export function Import() {
         gatesLoaded={projects.data !== undefined && !projects.isFetching && !projects.isError}
       />
       <section className="import__section">
-        <h2>New project</h2>
-        <p className="runs__muted">Create a different project and switch to it.</p>
+        <h2>建立新專案</h2>
+        <p className="runs__muted">建立另一個專案並切換過去。</p>
         <NewProjectForm />
       </section>
     </section>
@@ -295,10 +295,11 @@ function Sources({ project }: { project: string }) {
 
   return (
     <section className="import__section">
-      <h2>Sources</h2>
+      <h2>資料來源</h2>
       <p className="runs__muted">
-        Sources are read from a local <code>file://</code> path: <b>text</b> reads a directory of
-        <code>.txt</code>/<code>.md</code> files; <b>structured</b> reads a CSV file.
+        來源是伺服器本機的 <code>file:///</code> 路徑(例:
+        <code>file:///C:/data/corpus</code>):<b>text</b> 讀整個資料夾的
+        <code>.txt</code>/<code>.md</code>;<b>structured</b> 讀單一 CSV 檔。
       </p>
       <form
         className="npf__form"
@@ -346,7 +347,7 @@ function Sources({ project }: { project: string }) {
           </>
         )}
         <button type="submit" disabled={!canAdd}>
-          {add.isPending ? "Adding…" : "Add source"}
+          {add.isPending ? "登記中…" : "登記來源"}
         </button>
         {badScheme && (
           <p className="npf__error">
@@ -356,7 +357,7 @@ function Sources({ project }: { project: string }) {
         )}
         {add.isError && (
           <p className="npf__error">
-            Add failed: {add.error instanceof Error ? add.error.message : "unknown error"}
+            登記失敗:{add.error instanceof Error ? add.error.message : "unknown error"}
           </p>
         )}
       </form>
@@ -450,11 +451,10 @@ function RunPipeline({
 
   return (
     <section className="import__section">
-      <h2>Run pipeline</h2>
+      <h2>建置</h2>
       <p className="runs__muted">
-        Both Ingest and Build run the full six-stage pipeline (ingest → summarize) — they differ
-        only in the recorded job kind, and either way spends graph, LLM, and indexing work. One run
-        at a time per project.
+        把登記好的資料變成可查詢的知識庫(讀取 → 清洗 → 圖譜抽取 → 索引 → 摘要,會呼叫
+        LLM,需要幾分鐘)。一個專案一次跑一個。
       </p>
       {ontologyInvalid && (
         <p className="npf__error">
@@ -478,30 +478,29 @@ function RunPipeline({
           they&apos;re fixed or removed via the API/CLI.
         </p>
       )}
+      {/* one verb (UXA3): ingest and build run the SAME six-stage pipeline
+          and differ only in the recorded job kind (Codex #70's finding) — two
+          buttons plus an engineering apology was the API leaking into the UI.
+          The Console always records the run as a build. */}
       <div className="import__actions">
-        <button
-          type="button"
-          onClick={() => run("ingest")}
-          disabled={!ready || trigger.isPending || blocked}
-        >
-          {trigger.isPending ? "Triggering…" : "Ingest"}
-        </button>
         <button
           type="button"
           onClick={() => run("build")}
           disabled={!ready || trigger.isPending || blocked}
         >
-          {trigger.isPending ? "Triggering…" : "Build"}
+          {trigger.isPending ? "啟動中…" : "開始建置"}
         </button>
       </div>
       {trigger.isError && (
         <p className="npf__error">
-          Trigger failed: {trigger.error instanceof Error ? trigger.error.message : "unknown error"}
+          建置啟動失敗:{trigger.error instanceof Error ? trigger.error.message : "unknown error"}
         </p>
       )}
       {accepted && (
-        <p className="runs__muted">
-          Accepted job <code>{accepted.job_id}</code> ({accepted.status}).
+        // words visible, id on hover (UXA3) — the live progress below is the
+        // thing the operator actually watches
+        <p className="runs__muted" title={accepted.job_id}>
+          建置已排入佇列,進度如下。
         </p>
       )}
       <JobProgress jobId={accepted?.job_id ?? null} />

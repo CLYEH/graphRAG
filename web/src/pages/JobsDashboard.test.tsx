@@ -28,9 +28,9 @@ describe("JobsDashboard", () => {
     stubBuilds([build({ status: "active" })]);
     renderAt(projectRoute("acme", "jobs"));
 
-    expect(await screen.findByRole("heading", { name: /pipeline/i })).toBeInTheDocument();
-    expect(screen.getByText(/watch a job/i)).toBeInTheDocument();
-    expect(await screen.findByText("active")).toBeInTheDocument(); // a run row badge
+    expect(await screen.findByRole("heading", { name: "建置與工作" })).toBeInTheDocument();
+    expect(screen.getByText(/追蹤工作/)).toBeInTheDocument();
+    expect(await screen.findByText("上線中")).toBeInTheDocument(); // a run row badge
   });
 
   it("reports an un-addressable project without fetching runs", async () => {

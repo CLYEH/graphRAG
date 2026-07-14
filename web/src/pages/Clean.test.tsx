@@ -70,7 +70,7 @@ describe("Clean", () => {
     const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
     renderClean();
 
-    fireEvent.click(await screen.findByRole("button", { name: /save 500\/50 to config/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /儲存 500\/50 到專案設定/ }));
 
     await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
     const body = (patch.mock.calls[0] as unknown as [string, { body: unknown }])[1].body as {
@@ -101,7 +101,7 @@ describe("Clean", () => {
     renderClean();
 
     fireEvent.change(await screen.findByLabelText(/max_chars/i), { target: { value: "1000" } });
-    fireEvent.click(screen.getByRole("button", { name: /save 1000\/50 to config/i }));
+    fireEvent.click(screen.getByRole("button", { name: /儲存 1000\/50 到專案設定/ }));
 
     await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
     const body = (patch.mock.calls[0] as unknown as [string, { body: unknown }])[1].body as {
@@ -127,9 +127,9 @@ describe("Clean", () => {
     renderClean();
 
     fireEvent.change(await screen.findByLabelText(/max_chars/i), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: /save 100\/50 to config/i }));
+    fireEvent.click(screen.getByRole("button", { name: /儲存 100\/50 到專案設定/ }));
 
-    expect(await screen.findByText(/save failed: overlap must satisfy/i)).toBeInTheDocument();
+    expect(await screen.findByText(/儲存失敗:overlap must satisfy/)).toBeInTheDocument();
     expect(patch).not.toHaveBeenCalled();
   });
 
@@ -151,9 +151,9 @@ describe("Clean", () => {
     const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
     renderClean();
 
-    fireEvent.click(await screen.findByRole("button", { name: /save .* to config/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /儲存 .* 到專案設定/ }));
 
-    expect(await screen.findByText(/save failed: pg gone/i)).toBeInTheDocument();
+    expect(await screen.findByText(/儲存失敗:pg gone/)).toBeInTheDocument();
     expect(patch).not.toHaveBeenCalled();
   });
 
@@ -167,7 +167,7 @@ describe("Clean", () => {
     renderClean();
 
     expect(await screen.findByText(/could not load the project/i)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /save/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /儲存/ })).not.toBeInTheDocument();
   });
 
   it("previews pasted text and renders chunks with offsets; nothing needs a build", async () => {
@@ -175,10 +175,10 @@ describe("Clean", () => {
     const post = vi.spyOn(api, "POST").mockResolvedValue(previewBody([CHUNK]) as never);
     renderClean();
 
-    fireEvent.change(await screen.findByLabelText(/text/i, { selector: "textarea" }), {
+    fireEvent.change(await screen.findByLabelText("文字內容", { selector: "textarea" }), {
       target: { value: "alpha beta gamma" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^preview$/i }));
+    fireEvent.click(screen.getByRole("button", { name: "預覽" }));
 
     expect(await screen.findByText("alpha beta")).toBeInTheDocument();
     expect(screen.getByText(/\[0, 10\)/)).toBeInTheDocument();
@@ -198,11 +198,11 @@ describe("Clean", () => {
     const post = vi.spyOn(api, "POST").mockResolvedValue(previewBody([CHUNK]) as never);
     renderClean();
 
-    fireEvent.change(await screen.findByLabelText(/text/i, { selector: "textarea" }), {
+    fireEvent.change(await screen.findByLabelText("文字內容", { selector: "textarea" }), {
       target: { value: "abc def" },
     });
     fireEvent.change(screen.getByLabelText(/max_chars/i), { target: { value: "300" } });
-    fireEvent.click(screen.getByRole("button", { name: /^preview$/i }));
+    fireEvent.click(screen.getByRole("button", { name: "預覽" }));
 
     await waitFor(() => expect(post).toHaveBeenCalled());
     const body = (post.mock.calls[0] as unknown as [string, { body: unknown }])[1].body as Record<
@@ -227,8 +227,8 @@ describe("Clean", () => {
     fireEvent.change(await screen.findByLabelText(/overlap/i), { target: { value: "60" } });
 
     expect(await screen.findByText(/overlap must satisfy/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^preview/i })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /save/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "預覽" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /儲存/ })).toBeDisabled();
   });
 
   it("marks a preview stale the moment any input changes — chunks must not impersonate new parameters", async () => {
@@ -240,21 +240,19 @@ describe("Clean", () => {
     vi.spyOn(api, "POST").mockResolvedValue(previewBody([CHUNK]) as never);
     renderClean();
 
-    fireEvent.change(await screen.findByLabelText(/text/i, { selector: "textarea" }), {
+    fireEvent.change(await screen.findByLabelText("文字內容", { selector: "textarea" }), {
       target: { value: "abc def" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^preview$/i }));
+    fireEvent.click(screen.getByRole("button", { name: "預覽" }));
     expect(await screen.findByText("alpha beta")).toBeInTheDocument();
-    expect(screen.queryByText(/changed since this preview/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/預覽後改過了/)).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText(/max_chars/i), { target: { value: "500" } }); // 500 > default overlap 200 — the pair mirror must NOT be what blocks the rerun
 
-    expect(await screen.findByText(/changed since this preview/i)).toBeInTheDocument();
+    expect(await screen.findByText(/預覽後改過了/)).toBeInTheDocument();
     // rerunning the preview clears the flag
-    fireEvent.click(screen.getByRole("button", { name: /^preview$/i }));
-    await waitFor(() =>
-      expect(screen.queryByText(/changed since this preview/i)).not.toBeInTheDocument(),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "預覽" }));
+    await waitFor(() => expect(screen.queryByText(/預覽後改過了/)).not.toBeInTheDocument());
   });
 
   it("keeps the stale flag when an input was edited WHILE the preview was in flight", async () => {
@@ -269,17 +267,17 @@ describe("Clean", () => {
       .mockImplementation((() => new Promise((res) => (resolvePreview = res))) as never);
     renderClean();
 
-    fireEvent.change(await screen.findByLabelText(/text/i, { selector: "textarea" }), {
+    fireEvent.change(await screen.findByLabelText("文字內容", { selector: "textarea" }), {
       target: { value: "abc def" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^preview/i }));
+    fireEvent.click(screen.getByRole("button", { name: "預覽" }));
     await waitFor(() => expect(post).toHaveBeenCalled()); // the request is ON the wire
     // ...and the edit lands while it is still in flight
     fireEvent.change(screen.getByLabelText(/max_chars/i), { target: { value: "500" } });
     resolvePreview(previewBody([CHUNK]));
 
     expect(await screen.findByText("alpha beta")).toBeInTheDocument();
-    expect(await screen.findByText(/changed since this preview/i)).toBeInTheDocument();
+    expect(await screen.findByText(/預覽後改過了/)).toBeInTheDocument();
   });
 
   it("marks the preview stale when a CONFIG refetch moves the fallback pair — no input event at all", async () => {
@@ -297,12 +295,12 @@ describe("Clean", () => {
     vi.spyOn(api, "POST").mockResolvedValue(previewBody([CHUNK]) as never);
     renderClean();
 
-    fireEvent.change(await screen.findByLabelText(/text/i, { selector: "textarea" }), {
+    fireEvent.change(await screen.findByLabelText("文字內容", { selector: "textarea" }), {
       target: { value: "abc def" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^preview$/i }));
+    fireEvent.click(screen.getByRole("button", { name: "預覽" }));
     expect(await screen.findByText("alpha beta")).toBeInTheDocument();
-    expect(screen.queryByText(/changed since this preview/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/預覽後改過了/)).not.toBeInTheDocument();
 
     // another tab / CLI PATCHed the config; the window-focus refetch picks it up
     act(() => {
@@ -310,7 +308,7 @@ describe("Clean", () => {
       focusManager.setFocused(true);
     });
 
-    expect(await screen.findByText(/changed since this preview/i)).toBeInTheDocument();
+    expect(await screen.findByText(/預覽後改過了/)).toBeInTheDocument();
   });
 
   it("withdraws the save confirmation when the effective pair moves past what was saved", async () => {
@@ -323,14 +321,12 @@ describe("Clean", () => {
     vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
     renderClean();
 
-    fireEvent.click(await screen.findByRole("button", { name: /save 100\/10 to config/i }));
-    expect(await screen.findByText(/saved 100\/10 — the next build/i)).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: /儲存 100\/10 到專案設定/ }));
+    expect(await screen.findByText(/已儲存 100\/10/)).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText(/max_chars/i), { target: { value: "800" } });
 
-    await waitFor(() =>
-      expect(screen.queryByText(/saved 100\/10 — the next build/i)).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.queryByText(/已儲存 100\/10/)).not.toBeInTheDocument());
   });
 
   it("surfaces a preview rejection loud, with the server's own message", async () => {
@@ -344,12 +340,12 @@ describe("Clean", () => {
     } as never);
     renderClean();
 
-    fireEvent.change(await screen.findByLabelText(/text/i, { selector: "textarea" }), {
+    fireEvent.change(await screen.findByLabelText("文字內容", { selector: "textarea" }), {
       target: { value: "abc" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^preview$/i }));
+    fireEvent.click(screen.getByRole("button", { name: "預覽" }));
 
-    expect(await screen.findByText(/preview failed: overlap must satisfy/i)).toBeInTheDocument();
+    expect(await screen.findByText(/預覽失敗:overlap must satisfy/)).toBeInTheDocument();
   });
 
   it("names the active build a document preview was served from", async () => {
@@ -376,12 +372,12 @@ describe("Clean", () => {
     vi.spyOn(api, "POST").mockResolvedValue(previewBody([CHUNK], "b1") as never);
     renderClean();
 
-    fireEvent.click(await screen.findByLabelText(/ingested document/i));
+    fireEvent.click(await screen.findByLabelText(/已匯入的文件/));
     fireEvent.change(await screen.findByLabelText(/^document/i, { selector: "select" }), {
       target: { value: "d1" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^preview$/i }));
+    fireEvent.click(screen.getByRole("button", { name: "預覽" }));
 
-    expect(await screen.findByText(/from active build b1/i)).toBeInTheDocument();
+    expect(await screen.findByText(/來自目前上線中的知識庫/)).toBeInTheDocument();
   });
 });

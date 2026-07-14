@@ -21,12 +21,12 @@ export function JobsDashboard() {
 
   return (
     <section className="pipeline">
-      <h1 className="pipeline__title">Pipeline</h1>
+      <h1 className="pipeline__title">建置與工作</h1>
 
-      <h2>Runs</h2>
+      <h2>建置紀錄</h2>
       <RunsTable project={project} />
 
-      <h2>Watch a job</h2>
+      <h2>追蹤工作(進階)</h2>
       <JobWatcher />
     </section>
   );

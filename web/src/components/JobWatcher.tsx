@@ -20,17 +20,18 @@ export function JobWatcher() {
       >
         <input
           className="watch__input"
-          aria-label="Job id"
-          placeholder="job id from graphrag build / ingest"
+          aria-label="工作識別碼"
+          placeholder="貼上 job id"
           value={input}
           onChange={(e) => setInput(e.target.value)}
         />
-        <button type="submit">Watch</button>
+        <button type="submit">追蹤</button>
       </form>
 
       {jobId === null && (
         <p className="runs__muted">
-          Paste a job id (returned by the CLI) to watch its progress live.
+          通常不需要用到:Import 頁觸發建置時會直接顯示即時進度。這裡可貼上工作識別碼(job
+          id)追蹤任何一個工作。
         </p>
       )}
       <JobProgress jobId={jobId} />

@@ -230,8 +230,8 @@ describe("Graph", () => {
       )) as never);
     renderGraph();
 
-    expect(await screen.findByText(/filters the 2 loaded entities only/i)).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText(/filter/i), { target: { value: "charles" } });
+    expect(await screen.findByText(/只過濾已載入的 2 個知識點/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("過濾"), { target: { value: "charles" } });
     expect(screen.getByRole("button", { name: /charles babbage/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /ada lovelace/i })).not.toBeInTheDocument();
   });
@@ -253,8 +253,8 @@ describe("Graph", () => {
     } as never);
     const view1 = renderGraph();
 
-    fireEvent.click(await screen.findByRole("button", { name: /load more entities/i }));
-    expect(await screen.findByText(/could not load more entities/i)).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: /載入更多/ }));
+    expect(await screen.findByText(/載入更多失敗/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /ada lovelace/i })).toBeInTheDocument(); // kept
 
     // the scope-gone direction: the WHOLE page fails closed, not just the column
@@ -270,7 +270,7 @@ describe("Graph", () => {
     } as never);
     const view2 = renderGraph();
     const col = view2.container;
-    fireEvent.click(await screen.findByRole("button", { name: /load more entities/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /載入更多/ }));
     expect(
       await screen.findByText(/could not load entities: no active build/i),
     ).toBeInTheDocument();
@@ -308,7 +308,7 @@ describe("Graph", () => {
         });
       return new Promise(() => {}); // nothing else answers
     }) as never);
-    fireEvent.click(screen.getByRole("button", { name: /load more entities/i }));
+    fireEvent.click(screen.getByRole("button", { name: /載入更多/ }));
 
     expect(
       await screen.findByText(/could not load entities: no active build/i),
@@ -348,7 +348,7 @@ describe("Graph", () => {
         });
       return new Promise(() => {});
     }) as never);
-    fireEvent.click(screen.getByRole("button", { name: /load more entities/i }));
+    fireEvent.click(screen.getByRole("button", { name: /載入更多/ }));
 
     expect(await screen.findByText(/would mix two builds/i)).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByText("WORKS_WITH")).not.toBeInTheDocument());

@@ -261,7 +261,12 @@ describe("Overview", () => {
         status: "needs_review",
         active_build_id: ACTIVE,
         pending_review: 55,
-        counts: { documents: 410, entities: 1409, relations: 1158 },
+        counts: {
+          documents: 410,
+          entities: 1409,
+          relations: 1158,
+          pending_merge_candidates: 55,
+        },
       }),
       sources: [source()],
       builds: [
@@ -380,6 +385,27 @@ describe("Overview", () => {
     expect(await screen.findByText(/新版本還沒有評測分數/)).toBeInTheDocument();
     expect(screen.getByText(new RegExp(`eval --build ${READY_ID} -- acme`))).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
+  });
+
+  it("shows no review card when the backlog is NOT merge candidates (Codex #78)", async () => {
+    // pending_review aggregates four review types; the card links to the
+    // merge-candidate flow, so an ontology/entity backlog must not deep-link
+    // the operator onto an empty review page
+    const ACTIVE = "b2222222-2222-2222-2222-222222222222";
+    stubOverview({
+      health: healthReport({
+        status: "needs_review",
+        active_build_id: ACTIVE,
+        pending_review: 7,
+        counts: { pending_merge_candidates: 0, pending_ontology_proposals: 7 },
+      }),
+      sources: [source()],
+      builds: [build({ id: ACTIVE, status: "active", eval: { score: 1 } })],
+    });
+    renderOverview();
+
+    expect(await screen.findByText(/服務中/)).toBeInTheDocument();
+    expect(screen.queryByText(/疑似重複的知識/)).not.toBeInTheDocument();
   });
 
   it("locks the activate write while the builds read is refetching (fail-closed)", async () => {

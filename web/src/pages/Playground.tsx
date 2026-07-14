@@ -28,7 +28,7 @@ export function Playground() {
 
   return (
     <section className="play">
-      <h1 className="play__title">Query Playground</h1>
+      <h1 className="play__title">問答測試</h1>
       <QueryConsole project={project} />
     </section>
   );
@@ -81,7 +81,7 @@ function QueryConsole({ project }: { project: string }) {
         }}
       >
         <label className="play__field">
-          mode
+          查詢模式
           <select value={mode} onChange={(e) => setMode(e.target.value as QueryMode)}>
             {MODES.map((m) => (
               <option key={m} value={m}>
@@ -92,25 +92,25 @@ function QueryConsole({ project }: { project: string }) {
         </label>
 
         <label className="play__field play__field--wide">
-          query
+          問題
           <textarea
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="ask a question"
+            placeholder="輸入你的問題"
             rows={2}
           />
         </label>
 
         {showTopK && (
           <label className="play__field">
-            top_k
+            結果數上限
             <input
               type="number"
               min={1}
               step={1}
               value={topKText}
               onChange={(e) => setTopKText(e.target.value)}
-              placeholder="policy default"
+              placeholder="政策預設"
             />
           </label>
         )}
@@ -122,15 +122,15 @@ function QueryConsole({ project }: { project: string }) {
               checked={includeGraph}
               onChange={(e) => setIncludeGraph(e.target.checked)}
             />
-            include graph mode
+            加入圖譜模式
           </label>
         )}
 
         {showGraph && (
           <fieldset className="play__graph-opts">
-            <legend>graph options</legend>
+            <legend>圖譜選項</legend>
             <label className="play__field">
-              template
+              查法(template)
               <select
                 value={template}
                 onChange={(e) => setTemplate(e.target.value as GraphOptions["template"])}
@@ -143,7 +143,7 @@ function QueryConsole({ project }: { project: string }) {
               </select>
             </label>
             <label className="play__field">
-              entity
+              起點實體(名稱)
               <input value={entity} onChange={(e) => setEntity(e.target.value)} />
             </label>
             {template === "path" && (

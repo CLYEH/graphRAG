@@ -89,6 +89,6 @@ describe("QueryResults", () => {
       <QueryResults result={queryResult({ build_id: "00000000-0000-0000-0000-000000000000" })} />,
     );
 
-    expect(screen.getByText(/degraded/i)).toBeInTheDocument();
+    expect(screen.getByText(/降級回應/)).toBeInTheDocument();
   });
 });

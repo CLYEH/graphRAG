@@ -24,12 +24,12 @@ export function QueryResults({ result }: { result: QueryResult }) {
     <div className="play__results">
       <div className="play__head">
         <span className="runs__badge runs__badge--info">{result.mode}</span>
-        <span className="play__meta">
-          build: {degraded ? "— (degraded)" : result.build_id.slice(0, 8)}
+        {/* the full build uuid rides the title attribute — visible chrome
+            carries words, hover carries the identifier (UXA3 translation layer) */}
+        <span className="play__meta" title={degraded ? undefined : result.build_id}>
+          {degraded ? "版本:—(降級回應)" : "版本:目前上線中的知識庫"}
         </span>
-        <span className="play__meta">
-          {result.results.length} result{result.results.length === 1 ? "" : "s"}
-        </span>
+        <span className="play__meta">{result.results.length} 筆結果</span>
       </div>
 
       {result.warnings.length > 0 && (
@@ -45,7 +45,7 @@ export function QueryResults({ result }: { result: QueryResult }) {
 
       {/* a 200 with warnings and no rows is a degraded success, not "no results" */}
       {result.results.length === 0 && result.warnings.length === 0 && (
-        <p className="runs__muted">No results.</p>
+        <p className="runs__muted">沒有找到相關結果。</p>
       )}
 
       <ol className="play__hits">
@@ -56,9 +56,9 @@ export function QueryResults({ result }: { result: QueryResult }) {
 
       {result.graph_context && (
         <p className="play__graph">
-          graph context: {result.graph_context.nodes.length} nodes,{" "}
-          {result.graph_context.edges.length} edges
-          {result.graph_context.paths ? `, ${result.graph_context.paths.length} paths` : ""}
+          圖譜脈絡:{result.graph_context.nodes.length} 個節點、
+          {result.graph_context.edges.length} 條關聯
+          {result.graph_context.paths ? `、${result.graph_context.paths.length} 條路徑` : ""}
         </p>
       )}
 
@@ -80,26 +80,33 @@ function Hit({ hit }: { hit: RetrievalResult }) {
       <div className="play__hit-head">
         <span className="runs__badge runs__badge--muted">{hit.result_type}</span>
         {hit.title && <strong>{hit.title}</strong>}
-        <span className="play__meta">score {hit.score.toFixed(3)}</span>
+        <span className="play__meta">相關度 {hit.score.toFixed(3)}</span>
         {hit.confidence != null && (
-          <span className="play__meta">conf {hit.confidence.toFixed(2)}</span>
+          <span className="play__meta">信心 {hit.confidence.toFixed(2)}</span>
         )}
       </div>
       {hit.text && <p className="play__text">{hit.text}</p>}
-      <ul className="play__sources">
-        {hit.source_refs.map((s, i) => (
-          <li key={i}>
-            <span className="runs__badge runs__badge--muted">{s.source_type}</span>{" "}
-            {/* the full id, not a slice — row refs are a lossless table:pk string
-                (core row_source_ref), so truncating hides the pk and makes two row
-                citations indistinguishable, breaking §16 traceability */}
-            <code>{s.id}</code>
-            {/* source_uri is rendered as text, never an href — an untrusted value
-                in an <a href> would be a fresh injection sink (the FE7 lesson) */}
-            {s.source_uri ? <span className="play__uri"> · {s.source_uri}</span> : null}
-          </li>
-        ))}
-      </ul>
+      {/* §16 traceability, folded (UXA3): rendering every ref as a full-width
+          line built a 17,450px wall of uuids on real data — the refs (FULL ids:
+          row refs are a lossless table:pk string per core row_source_ref, and
+          truncation would make two row citations indistinguishable) now live
+          behind a count-labelled disclosure, one click from verbatim. */}
+      {hit.source_refs.length > 0 && (
+        <details className="play__sources">
+          <summary>{hit.source_refs.length} 個來源引用</summary>
+          <ul>
+            {hit.source_refs.map((s, i) => (
+              <li key={i}>
+                <span className="runs__badge runs__badge--muted">{s.source_type}</span>{" "}
+                <code>{s.id}</code>
+                {/* source_uri is rendered as text, never an href — an untrusted
+                    value in an <a href> would be a fresh injection sink (FE7) */}
+                {s.source_uri ? <span className="play__uri"> · {s.source_uri}</span> : null}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
     </li>
   );
 }

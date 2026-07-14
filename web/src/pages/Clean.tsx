@@ -143,15 +143,14 @@ function CleanBody({ project }: { project: string }) {
 
   return (
     <section className="clean">
-      <h1 className="clean__title">Clean</h1>
+      <h1 className="clean__title">清洗(切塊預覽)</h1>
       <p className="clean__hint">
-        Preview how parameters chunk real content — nothing is stored — then save them to the
-        project config for the next build.
+        先用真實內容預覽切塊效果(不會寫入任何資料),滿意後存進專案設定,下一次建置生效。
       </p>
 
       <div className="clean__form">
         <fieldset className="clean__source">
-          <legend>Source</legend>
+          <legend>內容來源</legend>
           <label>
             <input
               type="radio"
@@ -159,7 +158,7 @@ function CleanBody({ project }: { project: string }) {
               checked={source === "text"}
               onChange={() => setSource("text")}
             />
-            Paste text
+            貼上文字
           </label>
           <label>
             <input
@@ -168,13 +167,13 @@ function CleanBody({ project }: { project: string }) {
               checked={source === "document"}
               onChange={() => setSource("document")}
             />
-            Ingested document (active build)
+            選擇已匯入的文件
           </label>
         </fieldset>
 
         {source === "text" ? (
           <label className="clean__field">
-            text
+            文字內容
             <textarea
               value={text}
               maxLength={MAX_TEXT}
@@ -192,7 +191,7 @@ function CleanBody({ project }: { project: string }) {
 
         <div className="clean__knobs">
           <label className="clean__field">
-            max_chars
+            每塊字元上限(max_chars)
             <input
               type="number"
               min={1}
@@ -202,7 +201,7 @@ function CleanBody({ project }: { project: string }) {
             />
           </label>
           <label className="clean__field">
-            overlap
+            重疊字元數(overlap)
             <input
               type="number"
               min={0}
@@ -212,9 +211,8 @@ function CleanBody({ project }: { project: string }) {
             />
           </label>
           <p className="clean__muted">
-            Empty = the project&apos;s configured value (shown as placeholder), falling back to the
-            engine defaults ({DEFAULT_CHUNKING.max_chars}/{DEFAULT_CHUNKING.overlap}) — the same
-            chain a build walks.
+            留空=用專案設定值(顯示為淡字),沒設定則用引擎預設(
+            {DEFAULT_CHUNKING.max_chars}/{DEFAULT_CHUNKING.overlap})——與建置時的取值順序一致。
           </p>
         </div>
 
@@ -226,26 +224,25 @@ function CleanBody({ project }: { project: string }) {
             disabled={!sourceReady || pairError !== null || preview.isPending}
             onClick={runPreview}
           >
-            {preview.isPending ? "Previewing…" : "Preview"}
+            {preview.isPending ? "預覽中…" : "預覽"}
           </button>
           <button type="button" disabled={pairError !== null || save.isPending} onClick={runSave}>
-            {save.isPending ? "Saving…" : `Save ${effectiveMax}/${effectiveOverlap} to config`}
+            {save.isPending ? "儲存中…" : `儲存 ${effectiveMax}/${effectiveOverlap} 到專案設定`}
           </button>
         </div>
 
         {save.isError && (
-          <p className="clean__line clean__line--error">Save failed: {message(save.error)}</p>
+          <p className="clean__line clean__line--error">儲存失敗:{message(save.error)}</p>
         )}
         {save.isSuccess && !save.isPending && savedStands && (
           <p className="clean__line">
-            Saved {savedPair?.max}/{savedPair?.overlap} — the next build will chunk with these
-            values.
+            已儲存 {savedPair?.max}/{savedPair?.overlap} — 下一次建置會用這組參數切塊。
           </p>
         )}
       </div>
 
       {preview.isError && (
-        <p className="clean__line clean__line--error">Preview failed: {message(preview.error)}</p>
+        <p className="clean__line clean__line--error">預覽失敗:{message(preview.error)}</p>
       )}
       {preview.data && !preview.isPending && <PreviewResult result={preview.data} stale={stale} />}
     </section>
@@ -291,7 +288,7 @@ function DocumentPicker({
           disabled={docs.isFetchingNextPage}
           onClick={() => docs.fetchNextPage()}
         >
-          {docs.isFetchingNextPage ? "Loading…" : "Load more documents"}
+          {docs.isFetchingNextPage ? "載入中…" : "載入更多"}
         </button>
       )}
     </label>
@@ -302,24 +299,28 @@ function PreviewResult({ result, stale }: { result: CleanPreviewResult; stale: b
   return (
     <div className="clean__result">
       <h2 className="clean__subtitle">
-        {result.chunks.length} chunk{result.chunks.length === 1 ? "" : "s"}
+        {result.chunks.length} 個切塊
         {result.buildId && (
-          <span className="clean__muted"> · from active build {result.buildId}</span>
+          // words on the surface, uuid on hover (UXA3): the build identity
+          // matters for provenance but the identifier is not chrome
+          <span className="clean__muted" title={result.buildId}>
+            {" "}
+            · 來自目前上線中的知識庫
+          </span>
         )}
       </h2>
       {stale && (
         <p className="clean__line clean__line--error">
-          Parameters or source changed since this preview — run Preview again before trusting these
-          chunks.
+          參數或內容在預覽後改過了——請重新按「預覽」,別直接相信下面的結果。
         </p>
       )}
       <table className="clean__table">
         <thead>
           <tr>
-            <th>Ordinal</th>
-            <th>Offsets</th>
-            <th>Tokens</th>
-            <th>Text</th>
+            <th>序號</th>
+            <th>位置(起-迄)</th>
+            <th>詞元數(估計)</th>
+            <th>內容</th>
           </tr>
         </thead>
         <tbody>
