@@ -282,6 +282,61 @@ describe("ReviewCases", () => {
     expect(screen.getByText("第 2 筆,共 2 筆")).toBeInTheDocument();
   });
 
+  it("an external replacement resets even while our decision is in flight (Codex #76 R8)", async () => {
+    // the armed flag records WHICH id we expect to vanish — a replacement that
+    // is NOT exactly "old queue minus that id" resets the walk even mid-POST;
+    // the boolean flag this replaces would consume the replacement as our own
+    // shrink and bury the single fresh case behind the end panel
+    const second = namedCandidate({
+      id: "c2222222-2222-2222-2222-222222222222",
+      left_snapshot: { name: "區域探索館", type: "FACILITY" },
+      right_snapshot: { name: "區域探索廳", type: "FACILITY" },
+    });
+    const fresh = namedCandidate({
+      id: "c3333333-3333-3333-3333-333333333333",
+      left_snapshot: { name: "海祭", type: "EVENT" },
+      right_snapshot: { name: "海祭儀式", type: "EVENT" },
+    });
+    let phase = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/merge-candidates")
+        return Promise.resolve({
+          data: { data: phase === 0 ? [namedCandidate(), second] : [fresh], meta: META_NULL },
+          error: undefined,
+        });
+      if (path === "/projects/{project}/graph/subgraph")
+        return Promise.resolve({
+          data: { data: { nodes: [], edges: [] }, meta: META_NULL },
+          error: undefined,
+        });
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    // the decision POST never settles: the id-flag stays armed with no
+    // disarm callback in sight — exactly the window R8 is about
+    vi.spyOn(api, "POST").mockImplementation((() => new Promise(() => {})) as never);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewCases project="acme" />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "下一筆" }));
+    expect(await screen.findByText("區域探索館")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "是,合併" }));
+    fireEvent.click(screen.getByRole("button", { name: "確定合併" }));
+
+    phase = 1;
+    void client.invalidateQueries({ queryKey: ["merge-candidates", "acme"] });
+
+    // [A,B] minus B ≠ [C]: not our shrink — reset to the fresh case instead of
+    // showing the end panel (index 1 ≥ length 1)
+    expect(await screen.findByText("海祭")).toBeInTheDocument();
+    expect(screen.getByText("第 1 筆,共 1 筆")).toBeInTheDocument();
+  });
+
   it("a FAILED decision disarms the expected-shrink flag (Codex #76 R7)", async () => {
     // the flag is armed BEFORE the mutate call (the invalidation refetch can
     // unmount the card and skip every mutate-level callback), so a failed POST

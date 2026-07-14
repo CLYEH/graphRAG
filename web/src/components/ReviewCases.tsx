@@ -67,24 +67,36 @@ export function ReviewCases({ project }: { project: string }) {
   useEffect(() => {
     setDeciding(false);
   }, [currentId]);
-  // Queue REPLACEMENT vs queue SHRINK (Codex #76 R6): when our own decision
+  // Queue REPLACEMENT vs queue SHRINK (Codex #76 R6/R8): when our own decision
   // removed a row, the walk keeps its position — the next case slides into the
-  // same slot, and deciding the tail lands on the end-of-pass panel (R3). But
-  // when the content changes WITHOUT a local decision (new active build,
-  // another tab, a project switch), the retained index would bury a shorter
-  // queue behind the end panel or start midway through a longer one — reset
-  // the walk. Defer never changes the content by itself, so the tail-defer
-  // end-panel state is untouched (queueKey identical → effect no-op).
-  const expectedShrinkRef = useRef(false);
-  const setExpectedShrink = useCallback((v: boolean) => {
-    expectedShrinkRef.current = v;
+  // same slot, and deciding the tail lands on the end-of-pass panel (R3). Any
+  // OTHER content change (new active build, another tab, a project switch)
+  // must reset the walk, or a shorter queue hides behind the end panel and a
+  // longer one starts midway. The two are told apart by the removal's SHAPE,
+  // not a boolean: the flag records WHICH candidate id we expect to vanish
+  // (armed synchronously before the mutate — R7), and only a new queue equal
+  // to the old one minus exactly that id counts as our shrink. A coincident
+  // external replacement therefore resets even while our POST is in flight
+  // (R8 closed the boolean flag's residual). Defer never changes the content
+  // by itself, so the tail-defer end-panel state is untouched.
+  const expectedRemovalRef = useRef<string | null>(null);
+  const setExpectedRemoval = useCallback((id: string | null) => {
+    expectedRemovalRef.current = id;
   }, []);
   const prevQueueKeyRef = useRef(queueKey);
   useEffect(() => {
     if (prevQueueKeyRef.current === queueKey) return;
+    const prevKey = prevQueueKeyRef.current;
     prevQueueKeyRef.current = queueKey;
-    if (expectedShrinkRef.current) expectedShrinkRef.current = false;
-    else setIndex(0);
+    const removal = expectedRemovalRef.current;
+    expectedRemovalRef.current = null;
+    const ourShrink =
+      removal !== null &&
+      prevKey
+        .split(",")
+        .filter((id) => id !== removal)
+        .join(",") === queueKey;
+    if (!ourShrink) setIndex(0);
   }, [queueKey]);
 
   if (isPending) return <p className="runs__muted">載入審核佇列…</p>;
@@ -154,7 +166,7 @@ export function ReviewCases({ project }: { project: string }) {
         candidate={current}
         project={project}
         onSkipped={() => setIndex(index + 1)}
-        setExpectedShrink={setExpectedShrink}
+        setExpectedRemoval={setExpectedRemoval}
         scopeFrozen={scopeFrozen}
         queueRefreshing={isFetching}
         onScopeLoss={onScopeLoss}
@@ -168,7 +180,7 @@ function CaseCard({
   candidate,
   project,
   onSkipped,
-  setExpectedShrink,
+  setExpectedRemoval,
   scopeFrozen,
   queueRefreshing,
   onScopeLoss,
@@ -177,7 +189,7 @@ function CaseCard({
   candidate: MergeCandidate;
   project: string;
   onSkipped: () => void;
-  setExpectedShrink: (v: boolean) => void;
+  setExpectedRemoval: (id: string | null) => void;
   scopeFrozen: boolean;
   queueRefreshing: boolean;
   onScopeLoss: () => void;
@@ -201,14 +213,15 @@ function CaseCard({
 
   const submit = (verb: ReviewVerb) => {
     onDecidingChange(true);
-    // approve/reject will remove the row — the expected-shrink flag must be
-    // armed BEFORE the mutate call: the hook-level onSuccess invalidates and
-    // AWAITS the refetch first, and that refetch can unmount this keyed card,
-    // skipping every mutate-level callback (v5 gates them on hasListeners) —
-    // an onSuccess-armed flag then never rises and the parent misreads our
-    // own shrink as an external replacement (Codex #76 R7). A failed POST
-    // disarms in onError (no shrink is coming).
-    if (verb !== "defer") setExpectedShrink(true);
+    // approve/reject will remove THIS row — record its id BEFORE the mutate
+    // call: the hook-level onSuccess invalidates and AWAITS the refetch first,
+    // and that refetch can unmount this keyed card, skipping every
+    // mutate-level callback (v5 gates them on hasListeners) — a
+    // callback-armed flag never rises (Codex #76 R7). Recording the ID rather
+    // than a boolean lets the parent verify the removal's shape, so a
+    // coincident external replacement still resets (R8). A failed POST
+    // disarms in onError (no removal is coming).
+    if (verb !== "defer") setExpectedRemoval(candidate.id);
     decide.mutate(
       {
         candidateId: candidate.id,
@@ -224,7 +237,7 @@ function CaseCard({
           if (verb === "defer") onSkipped();
         },
         onError: () => {
-          if (verb !== "defer") setExpectedShrink(false);
+          if (verb !== "defer") setExpectedRemoval(null);
         },
         // best-effort: skipped if this card unmounted first (v5 gates mutate
         // callbacks on hasListeners) — the parent's currentId effect covers that
