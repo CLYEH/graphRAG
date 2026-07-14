@@ -188,7 +188,7 @@ describe("Settings — query policy", () => {
     const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
     renderSettings();
 
-    await screen.findByText(/問答安全政策不完整/);
+    await screen.findByText(/問答安全政策不符規範/);
     const rebuild = screen.getByRole("button", { name: "以預設範本重建並儲存" });
     expect(rebuild).toBeEnabled(); // no edit needed — R1's rule extended
     fireEvent.click(rebuild);
@@ -200,6 +200,30 @@ describe("Settings — query policy", () => {
       max_top_k: 5,
       max_graph_hops: 4,
     });
+  });
+
+  it("rebuilds a KEY-COMPLETE block that violates value constraints — validity is the server's verdict, mirrored", async () => {
+    // Codex #79 R3: R2's key-set check let a complete-looking block with a
+    // bad value (schema_version "2.0" here; enabled-sql-empty-tables and
+    // shrunken frozen lists are corpus siblings) through as the spread base —
+    // same silent brick, one level deeper. The full predicate is pinned to
+    // the server validator by the parity corpus (policyValidityParity.test);
+    // this test pins the SETTINGS wiring: invalid ⇒ rebuild flow.
+    vi.spyOn(api, "GET").mockResolvedValue(
+      projectBody({
+        query_policy: { ...FULL_CONFIG.query_policy, schema_version: "2.0" },
+      }) as never,
+    );
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    await screen.findByText(/問答安全政策不符規範/);
+    fireEvent.click(screen.getByRole("button", { name: "以預設範本重建並儲存" }));
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    const policy = patchedConfig(patch)["query_policy"] as Record<string, unknown>;
+    expect(policy["schema_version"]).toBe("1.0"); // rebuilt, not spread
+    expect(policy["default_mode"]).toBe("semantic"); // operator fields still salvage
   });
 
   it("does not salvage a junk default_mode of sql — the rebuild target disables sql", async () => {

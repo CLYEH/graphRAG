@@ -411,8 +411,9 @@ function PolicySection({ project, config, locked }: SectionProps) {
       )}
       {pol.malformed && (
         <p className="settings__line settings__line--notice">
-          此專案的問答安全政策不完整或含未知欄位(可能是先前手動設定所致),問答會持續被拒絕。
-          儲存會以安全預設範本<strong>重建整份政策</strong>,只保留這一頁的三個欄位設定。
+          此專案的問答安全政策不符規範——欄位缺漏、含未知欄位或值超出允許範圍
+          (可能是先前手動設定所致),問答會持續被拒絕。儲存會以安全預設範本
+          <strong>重建整份政策</strong>,只保留這一頁的三個欄位設定。
         </p>
       )}
       <label className="settings__field">

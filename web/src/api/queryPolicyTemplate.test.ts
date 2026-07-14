@@ -76,7 +76,10 @@ describe("DEFAULT_QUERY_POLICY vs the frozen schema", () => {
     });
   }
 
-  it("text_to_cypher: allowed_clauses stays inside the frozen four-clause universe, non-empty", () => {
+  it("text_to_cypher: allowed_clauses IS the frozen clause universe, exactly", () => {
+    // exact equality, not just subset: isValidPolicyBlock derives the legal
+    // clause UNIVERSE from the template's list, so a template that carried
+    // only a subset would silently narrow what the client accepts
     const def = schema.$defs["TextToCypher"].properties["allowed_clauses"] as {
       minItems?: number;
       items?: { enum?: string[] };
@@ -85,6 +88,6 @@ describe("DEFAULT_QUERY_POLICY vs the frozen schema", () => {
       "allowed_clauses"
     ] as string[];
     expect(clauses.length).toBeGreaterThanOrEqual(def.minItems ?? 1);
-    for (const c of clauses) expect(def.items?.enum ?? []).toContain(c);
+    expect([...clauses].sort()).toEqual([...(def.items?.enum ?? [])].sort());
   });
 });

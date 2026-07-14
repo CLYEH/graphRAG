@@ -994,26 +994,69 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
-/** Key-set completeness against the template — whose keys the contract test
- *  (queryPolicyTemplate.test.ts) pins to the schema's required lists, so this
- *  checker is transitively pinned to contracts/query_policy.schema.json. A
- *  block from the curl-only era can be partial or carry typo'd extras;
- *  spreading it would PATCH "successfully" while every query keeps rejecting
- *  the policy (Codex #79 R2) — the schema requires ALL fields and forbids
- *  unknowns, so the key SETS must match exactly (top level and both guardrail
- *  sub-blocks). Value TYPES stay the server's verdict. */
-export function isCompletePolicyBlock(block: unknown): boolean {
+/** Mirror of the SERVER's policy validity verdict — the predicate deciding
+ *  whether an existing query_policy is a usable spread base or must be
+ *  rebuilt on the template. The server's oracle is query_policy_from_mapping
+ *  (core/mcp/policy.py): frozen-schema jsonschema validation + the §21 typed
+ *  re-checks; a hand-written block that fails it 400s EVERY query while the
+ *  settings PATCH "succeeds" (Codex #79 R2 for missing keys, R3 for
+ *  key-complete blocks violating VALUE constraints — bad schema_version, an
+ *  enabled sql with an empty whitelist, a shrunken frozen blocked list).
+ *  Parity is enforced mechanically from one corpus both suites read
+ *  (tests/fixtures/query_policy_validity.json; the pytest half runs the REAL
+ *  validator — the fileUriGate pattern), so this mirror cannot drift
+ *  silently. Frozen lists derive from DEFAULT_QUERY_POLICY, which
+ *  queryPolicyTemplate.test.ts pins to the schema's contains/enum clauses. */
+export function isValidPolicyBlock(block: unknown): boolean {
   if (!isRecord(block)) return false;
+  const T = DEFAULT_QUERY_POLICY;
   const sameKeys = (a: Record<string, unknown>, b: Record<string, unknown>): boolean => {
     const ak = Object.keys(a).sort();
     const bk = Object.keys(b).sort();
     return ak.length === bk.length && ak.every((k, i) => k === bk[i]);
   };
-  if (!sameKeys(block, DEFAULT_QUERY_POLICY)) return false;
-  for (const sub of ["text_to_sql", "text_to_cypher"] as const) {
-    const s = block[sub];
-    if (!isRecord(s) || !sameKeys(s, DEFAULT_QUERY_POLICY[sub])) return false;
-  }
+  const posInt = (v: unknown): boolean => typeof v === "number" && Number.isInteger(v) && v >= 1;
+  const strList = (v: unknown, pattern?: RegExp): v is string[] =>
+    Array.isArray(v) &&
+    v.every((s) => typeof s === "string" && s.length > 0 && (!pattern || pattern.test(s))) &&
+    new Set(v).size === v.length;
+
+  // top level: exact key set (all required, additionalProperties false)
+  if (!sameKeys(block, T)) return false;
+  if (block["schema_version"] !== "1.0") return false;
+  const modes: readonly QueryMode[] = ["semantic", "graph", "sql", "global", "hybrid"];
+  if (!modes.includes(block["default_mode"] as QueryMode)) return false;
+  for (const k of ["max_top_k", "max_graph_hops", "max_sql_rows", "max_latency_ms"])
+    if (!posInt(block[k])) return false;
+  if (block["require_sources"] !== true) return false;
+  if (typeof block["expose_debug"] !== "boolean") return false;
+
+  const sql = block["text_to_sql"];
+  if (!isRecord(sql) || !sameKeys(sql, T.text_to_sql)) return false;
+  if (typeof sql["enabled"] !== "boolean" || sql["readonly"] !== true) return false;
+  if (!strList(sql["allowed_tables"])) return false;
+  if (!strList(sql["blocked_keywords"], /^[a-z_]+$/)) return false;
+  for (const kw of T.text_to_sql.blocked_keywords)
+    if (!(sql["blocked_keywords"] as string[]).includes(kw)) return false;
+  if (!posInt(sql["max_rows"]) || !posInt(sql["timeout_ms"])) return false;
+  // enabled sql with an empty whitelist is a deny-all contradiction (if/then)
+  if (sql["enabled"] === true && (sql["allowed_tables"] as string[]).length === 0) return false;
+
+  const cy = block["text_to_cypher"];
+  if (!isRecord(cy) || !sameKeys(cy, T.text_to_cypher)) return false;
+  if (typeof cy["enabled"] !== "boolean" || cy["readonly"] !== true) return false;
+  if (!strList(cy["allowed_clauses"])) return false;
+  const clauses = cy["allowed_clauses"] as string[];
+  if (clauses.length < 1) return false;
+  const universe: readonly string[] = T.text_to_cypher.allowed_clauses;
+  if (!clauses.every((c) => universe.includes(c))) return false;
+  if (!strList(cy["blocked"], /^[A-Z_]+$/)) return false;
+  for (const kw of T.text_to_cypher.blocked)
+    if (!(cy["blocked"] as string[]).includes(kw)) return false;
+  if (!posInt(cy["max_rows"]) || !posInt(cy["timeout_ms"])) return false;
+
+  // the schema's allOf: a default of sql needs sql enabled
+  if (block["default_mode"] === "sql" && sql["enabled"] !== true) return false;
   return true;
 }
 
@@ -1030,7 +1073,7 @@ export function policyFromConfig(config: Record<string, unknown>): QueryPolicyOp
   // an incomplete block will be REBUILT on the template at save time, so the
   // form's derived flags (sql option, 進階 folds) must describe the template,
   // not the junk — only the three operator fields are salvaged for seeding
-  const malformed = b !== undefined && !isCompletePolicyBlock(b);
+  const malformed = b !== undefined && !isValidPolicyBlock(b);
   const usable = b !== undefined && !malformed ? b : undefined;
   const int = (v: unknown, fallback: number): number =>
     typeof v === "number" && Number.isInteger(v) ? v : fallback;
@@ -1081,7 +1124,7 @@ export function useSaveQueryPolicy(project: string) {
       // missing required fields (Codex #79 R2) — rebuild it on the template,
       // salvaging only the operator fields this save carries. Checked against
       // the FRESH block, same as the sql cross-check below.
-      const usable = isCompletePolicyBlock(block);
+      const usable = isValidPolicyBlock(block);
       const base: Record<string, unknown> = usable
         ? (block as Record<string, unknown>)
         : { ...DEFAULT_QUERY_POLICY };
