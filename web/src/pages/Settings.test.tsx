@@ -153,6 +153,24 @@ describe("Settings — ontology", () => {
 });
 
 describe("Settings — query policy", () => {
+  it("creates the default policy WITHOUT requiring an edit first — the missing state is itself unsaved", async () => {
+    // Codex #79 R1: gating the create button on draft !== null forced an
+    // arbitrary field change before the operator could accept the safe
+    // defaults — leaving query/graph unusable until they invented an edit.
+    vi.spyOn(api, "GET").mockResolvedValue(
+      projectBody({ chunking: { max_chars: 500, overlap: 50 } }) as never,
+    );
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    const create = await screen.findByRole("button", { name: "以預設範本建立並儲存" });
+    expect(create).toBeEnabled(); // no edit needed
+    fireEvent.click(create);
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    expect(patchedConfig(patch)["query_policy"]).toEqual(DEFAULT_QUERY_POLICY);
+  });
+
   it("creates a COMPLETE schema-valid policy from the template when the project has none", async () => {
     // The frozen contract requires every top-level field — writing only the
     // three operator knobs would brick every query with 400 "invalid". The

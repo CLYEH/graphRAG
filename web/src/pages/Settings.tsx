@@ -466,7 +466,13 @@ function PolicySection({ project, config, locked }: SectionProps) {
       <div className="settings__actions">
         <button
           type="button"
-          disabled={locked || save.isPending || draft === null || fieldError !== null}
+          // a MISSING policy is itself unsaved state: the template on screen
+          // lives nowhere else, so creating it AS-IS is a meaningful save —
+          // requiring an arbitrary edit first would gate the whole query
+          // feature behind a pointless field change (Codex #79 R1)
+          disabled={
+            locked || save.isPending || (pol.present && draft === null) || fieldError !== null
+          }
           onClick={runSave}
         >
           {save.isPending ? "儲存中…" : pol.present ? "儲存問答安全設定" : "以預設範本建立並儲存"}
