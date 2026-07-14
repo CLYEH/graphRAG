@@ -128,8 +128,9 @@ export function useCancelJob(jobId: string | null) {
 // scoped like the other project reads; pages through next_cursor so the whole
 // queue is reachable, and fails loud so a store outage / no-active-build surfaces
 // (with the API's message) rather than an empty queue that reads as "nothing to
-// review". All statuses are returned — decided rows stay visible as an audit
-// trail, their actions disabled by the §17 gate below.
+// review". The server returns only still-reviewable rows (pending + deferred —
+// api/routers/review.py keeps the list identical to §19's pending_review gauge;
+// decided rows stay in the SoR for audit but never ride this endpoint).
 export function useMergeCandidates(project: string | undefined) {
   return useQuery({
     queryKey: ["merge-candidates", project],

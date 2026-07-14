@@ -112,8 +112,8 @@ function mergeCandidatesResponse() {
           decided_at: null,
           reason: null,
           impact: null,
-          left_snapshot: null,
-          right_snapshot: null,
+          left_snapshot: { name: "國立海洋科技博物館", type: "FACILITY" },
+          right_snapshot: { name: "海科館", type: "FACILITY" },
         },
       ],
       meta: META,
@@ -168,13 +168,28 @@ test("the review section shows the queue and records a decision", async ({ page 
     });
   });
 
+  // the case card's context fetches (UXA1) — empty graph keeps the flow honest
+  await page.route("**/projects/*/graph/subgraph*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { nodes: [], edges: [] }, meta: META }),
+    }),
+  );
+
   await page.goto("/");
   await page.getByRole("link", { name: "Review" }).click();
 
-  await expect(page.getByRole("heading", { name: /entity review/i })).toBeVisible();
-  await expect(page.getByText("pending")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "實體審核" })).toBeVisible();
+  // the decision surface leads with the snapshot NAMES, never the id prefix (UXA1)
+  await expect(page.getByText("國立海洋科技博物館")).toBeVisible();
+  await expect(page.getByText("c1111111")).not.toBeVisible();
 
-  await page.getByRole("button", { name: "Approve" }).click();
+  // approve is §17-terminal: the first click only opens the confirm — nothing
+  // posts until the explicit second step
+  await page.getByRole("button", { name: "是,合併" }).click();
+  expect(approvePath).toBe("");
+  await page.getByRole("button", { name: "確定合併" }).click();
   // the approve verb must reach its own path (not reject/defer, not a body verb)
   await expect.poll(() => approvePath).toMatch(/\/merge-candidates\/[^/]+\/approve$/);
 });

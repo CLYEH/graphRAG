@@ -204,6 +204,45 @@ export function stubMergeCandidates(candidates: MergeCandidate[]) {
     .mockResolvedValue({ data: { data: candidates, meta: META }, error: undefined } as never);
 }
 
+export type SubgraphStub = {
+  nodes: { id: string; label?: string | null }[];
+  edges: { id: string; src: string; dst: string; type: string }[];
+};
+
+// Route-aware GET stub for the UXA1 review flow: the case card fans out to
+// three endpoints (queue, subgraph-per-entity, relation detail), so a single
+// mockResolvedValue would feed queue-shaped data to the context fetches — the
+// contract marks GraphContext.edges required, and the component rightly
+// trusts that instead of null-guarding an impossible shape.
+export function stubReviewWorld({
+  candidates,
+  subgraph = { nodes: [], edges: [] },
+  relation,
+  failSubgraph = false,
+}: {
+  candidates: MergeCandidate[];
+  subgraph?: SubgraphStub;
+  relation?: { id: string; evidence?: { id: string; evidence_type: string; quote?: string }[] };
+  failSubgraph?: boolean;
+}) {
+  return vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+    if (path === "/projects/{project}/merge-candidates")
+      return Promise.resolve({ data: { data: candidates, meta: META }, error: undefined });
+    if (path === "/projects/{project}/graph/subgraph") {
+      if (failSubgraph)
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "STORE_UNAVAILABLE", message: "graph store down" } },
+          response: { status: 503 },
+        });
+      return Promise.resolve({ data: { data: subgraph, meta: META }, error: undefined });
+    }
+    if (path === "/projects/{project}/relations/{relation_id}")
+      return Promise.resolve({ data: { data: relation, meta: META }, error: undefined });
+    throw new Error(`unstubbed GET ${path}`);
+  }) as never);
+}
+
 // POST stub for the decision endpoints — resolves with the updated candidate.
 export function stubDecision(updated: MergeCandidate) {
   return vi

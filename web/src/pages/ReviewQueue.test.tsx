@@ -8,6 +8,7 @@ import {
   projectRoute,
   renderWithProviders,
   stubMergeCandidates,
+  stubReviewWorld,
 } from "../test-utils";
 
 function renderAt(key: string) {
@@ -24,12 +25,17 @@ afterEach(() => {
 });
 
 describe("ReviewQueue", () => {
-  it("renders the review queue for an addressable project", async () => {
-    stubMergeCandidates([mergeCandidate({ status: "pending" })]);
+  it("renders the review flow for an addressable project", async () => {
+    stubReviewWorld({
+      candidates: [
+        mergeCandidate({ status: "pending", left_snapshot: { name: "海祭", type: "EVENT" } }),
+      ],
+    });
     renderAt("acme");
 
-    expect(await screen.findByRole("heading", { name: /entity review/i })).toBeInTheDocument();
-    expect(await screen.findByText("pending")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "實體審核" })).toBeInTheDocument();
+    expect(await screen.findByText("海祭")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "是,合併" })).toBeEnabled();
   });
 
   it("reports an un-addressable key instead of firing a doomed request", () => {
