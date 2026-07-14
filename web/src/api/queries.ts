@@ -110,7 +110,17 @@ export function useActivateBuild(project: string) {
           header: { "Idempotency-Key": idempotencyKey },
         },
       });
-      if (error) throw new Error(error.error.message);
+      if (error) {
+        // the §14 refusal's SUBSTANCE lives in details.failures (the gate
+        // strings) — error.message is a generic "activation preflight failed
+        // for build <uuid>" line; throwing only the message would render the
+        // exact kind of dead end Track 4 exists to remove (Codex #77 R2)
+        const details = error.error.details as { failures?: unknown } | null | undefined;
+        const failures = Array.isArray(details?.failures)
+          ? details.failures.filter((f): f is string => typeof f === "string")
+          : [];
+        throw new Error(failures.length > 0 ? failures.join("\n") : error.error.message);
+      }
       return data.data;
     },
     onSuccess: () => {

@@ -131,24 +131,106 @@ describe("Overview", () => {
     expect(screen.getByRole("button", { name: "上線這個版本" })).toBeEnabled();
   });
 
-  it("renders the server's §14 refusal verbatim, with the CLI hint when it names eval", async () => {
+  it("renders the server's refusal verbatim, with the CLI hint ONLY for the missing-score case", async () => {
     // the server owns §14 — the UI relays its message and turns it into
     // guidance instead of a dead end
     stubOverview({
       sources: [source()],
       builds: [build({ id: READY_ID, status: "ready", eval: { score: 1 } })],
     });
+    // the REAL refusal envelope: a generic message with the gate strings in
+    // details.failures (tests/test_builds_api_integration.py) — mocking the
+    // gate string into .message was a shape the server never emits
     vi.spyOn(api, "POST").mockResolvedValue({
       data: undefined,
-      error: { error: { code: "VALIDATION_ERROR", message: "build has no eval scores (§14)" } },
+      error: {
+        error: {
+          code: "BUILD_NOT_READY",
+          message: "activation preflight failed for build b1111111",
+          details: {
+            failures: [
+              "eval gate (§20): candidate build has no eval score — run `graphrag eval` on it first; an unmeasured candidate cannot pass the gate",
+            ],
+          },
+        },
+      },
     } as never);
     renderOverview();
 
     fireEvent.click(await screen.findByRole("button", { name: "上線這個版本" }));
     fireEvent.click(screen.getByRole("button", { name: "確定上線" }));
 
-    expect(await screen.findByText(/上線失敗:build has no eval scores/)).toBeInTheDocument();
+    expect(await screen.findByText(/上線失敗:eval gate/)).toBeInTheDocument();
     expect(screen.getByText(/先在終端機執行/)).toBeInTheDocument();
+  });
+
+  it("does NOT claim missing scores for OTHER eval-gate refusals (Codex #77 R2)", async () => {
+    // the gate also refuses failed golden cases / unscored ACTIVE builds — a
+    // blanket eval-regex would misdiagnose those as「還沒有評測分數」and send
+    // the operator down the wrong recovery path; the verbatim message stands alone
+    stubOverview({
+      sources: [source()],
+      builds: [build({ id: READY_ID, status: "ready", eval: { score: 1 } })],
+    });
+    vi.spyOn(api, "POST").mockResolvedValue({
+      data: undefined,
+      error: {
+        error: {
+          code: "BUILD_NOT_READY",
+          message: "activation preflight failed for build b1111111",
+          details: {
+            failures: [
+              "eval gate (§20): 2 golden case(s) below their min_score in the candidate's eval report — activation blocked",
+            ],
+          },
+        },
+      },
+    } as never);
+    renderOverview();
+
+    fireEvent.click(await screen.findByRole("button", { name: "上線這個版本" }));
+    fireEvent.click(screen.getByRole("button", { name: "確定上線" }));
+
+    expect(await screen.findByText(/上線失敗:eval gate/)).toBeInTheDocument();
+    expect(screen.queryByText(/還沒有評測分數/)).not.toBeInTheDocument();
+  });
+
+  it("shell-escapes quotes/dollars/backticks in the CLI hint (Codex #77 R2 round 2)", async () => {
+    // the first escape implementation was a no-op ("\\$1" in intent, "$1" at
+    // runtime) and its spaces-only test could not tell — this key pins the
+    // actual escaping of every dangerous character
+    stubOverview({
+      sources: [source()],
+      builds: [build({ id: READY_ID, status: "ready", eval: null })],
+    });
+    renderWithProviders(
+      <Routes>
+        <Route path="/p/:project/overview" element={<Overview />} />
+      </Routes>,
+      { route: projectRoute('a"b$c`d', "overview") },
+    );
+
+    const code = await screen.findByText((text) => text.includes('eval "a\\"b\\$c\\`d" --build'), {
+      selector: "code",
+    });
+    expect(code).toBeInTheDocument();
+  });
+
+  it("shell-quotes a project key with spaces in the CLI hint (Codex #77 R2)", async () => {
+    stubOverview({
+      sources: [source()],
+      builds: [build({ id: READY_ID, status: "ready", eval: null })],
+    });
+    renderWithProviders(
+      <Routes>
+        <Route path="/p/:project/overview" element={<Overview />} />
+      </Routes>,
+      { route: projectRoute("my corpus", "overview") },
+    );
+
+    expect(
+      await screen.findByText(new RegExp(`eval "my corpus" --build ${READY_ID}`)),
+    ).toBeInTheDocument();
   });
 
   it("active project: 服務中 status, scale strip, all steps done, review deep link", async () => {

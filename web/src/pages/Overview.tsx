@@ -63,6 +63,13 @@ export function Overview() {
   );
 }
 
+/** Shell-quotes a value for the copyable CLI hints: the contract only bans
+ *  "/" and "."/".." in project keys, so spaces and metacharacters are legal —
+ *  pasted unquoted, `my corpus` parses as two arguments (Codex #77 R2). */
+function shellQuote(v: string): string {
+  return /^[A-Za-z0-9_.-]+$/.test(v) ? v : '"' + v.replace(/([\\"$`])/g, "\\$1") + '"';
+}
+
 const BUILT_STATUSES = new Set(["ready", "active", "archived"]);
 
 function OverviewBody({ project }: { project: string }) {
@@ -145,7 +152,7 @@ function OverviewBody({ project }: { project: string }) {
             <p className="overview__cli">
               新版本還沒有評測分數(沒有分數的版本不能上線)——先在終端機執行:
               <code>
-                uv run python -m cli.main eval {project} --build {updateCandidate.id}
+                uv run python -m cli.main eval {shellQuote(project)} --build {updateCandidate.id}
               </code>
             </p>
           )}
@@ -187,7 +194,7 @@ function OverviewBody({ project }: { project: string }) {
               <span className="overview__cli">
                 目前評測要在終端機執行:
                 <code>
-                  uv run python -m cli.main eval {project} --build {candidate.id}
+                  uv run python -m cli.main eval {shellQuote(project)} --build {candidate.id}
                 </code>
               </span>
             ) : null
@@ -309,11 +316,11 @@ function ActivateControl({
             上線失敗:
             {activate.error instanceof Error ? activate.error.message : "unknown error"}
           </p>
-          {/eval|評測|score/i.test(String(activate.error?.message ?? "")) && (
+          {/candidate build has no eval score/.test(String(activate.error?.message ?? "")) && (
             <p className="overview__cli">
-              看起來還沒有評測分數——先在終端機執行:
+              這個版本還沒有評測分數——先在終端機執行:
               <code>
-                uv run python -m cli.main eval {project} --build {candidate.id}
+                uv run python -m cli.main eval {shellQuote(project)} --build {candidate.id}
               </code>
             </p>
           )}
