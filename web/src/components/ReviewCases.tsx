@@ -213,22 +213,38 @@ function CaseCard({
   // decide would 404 (review.py rebinds the active build per request).
   const subLeft = useSubgraph(project, candidate.left_entity_id, 1);
   const subRight = useSubgraph(project, candidate.right_entity_id, 1);
-  const edgeLeft = subLeft.data?.graph.edges.find(
-    (e) => e.src === candidate.left_entity_id || e.dst === candidate.left_entity_id,
-  );
-  const edgeRight = subRight.data?.graph.edges.find(
-    (e) => e.src === candidate.right_entity_id || e.dst === candidate.right_entity_id,
-  );
+  // The probe edge derives ONLY from a currently-successful, settled subgraph
+  // (Codex #76 R11): after a failed or in-flight refetch RQ keeps the old
+  // sub.data, and an edge taken from that zombie graph would keep an obsolete
+  // relation sentinel alive — a hung stale relation would lock the verbs
+  // forever after a merely-neutral subgraph failure, and a stale edge's 404
+  // could freeze the queue without any settled current evidence.
+  const edgeLeft =
+    subLeft.isSuccess && !subLeft.isFetching
+      ? subLeft.data.graph.edges.find(
+          (e) => e.src === candidate.left_entity_id || e.dst === candidate.left_entity_id,
+        )
+      : undefined;
+  const edgeRight =
+    subRight.isSuccess && !subRight.isFetching
+      ? subRight.data.graph.edges.find(
+          (e) => e.src === candidate.right_entity_id || e.dst === candidate.right_entity_id,
+        )
+      : undefined;
   const relLeft = useRelation(project, edgeLeft ? edgeLeft.id : undefined);
   const relRight = useRelation(project, edgeRight ? edgeRight.id : undefined);
 
   // buildId null = the meta didn't name a build — not proof of anything;
   // only a NAMED, DIFFERENT build proves the swap.
-  const sideProof = (sub: SubResult, rel: RelResult): boolean =>
+  // the relation term is gated on the edge EXISTING NOW: a disabled relation
+  // query retains its cached error, and a DetailScopeGoneError earned against
+  // an edge from a previous graph must not freeze the current one (R11)
+  const sideProof = (sub: SubResult, rel: RelResult, edge: SubEdge | undefined): boolean =>
     (sub.isError && sub.error instanceof SubgraphScopeError) ||
     (sub.isSuccess && sub.data.buildId !== null && sub.data.buildId !== candidate.build_id) ||
-    (rel.isError && rel.error instanceof DetailScopeGoneError);
-  const scopeProof = sideProof(subLeft, relLeft) || sideProof(subRight, relRight);
+    (edge !== undefined && rel.isError && rel.error instanceof DetailScopeGoneError);
+  const scopeProof =
+    sideProof(subLeft, relLeft, edgeLeft) || sideProof(subRight, relRight, edgeRight);
   useEffect(() => {
     if (scopeProof) onScopeLoss();
   }, [scopeProof, onScopeLoss]);
@@ -300,14 +316,14 @@ function CaseCard({
           sub={subLeft}
           rel={relLeft}
           edge={edgeLeft}
-          scopeLost={sideProof(subLeft, relLeft)}
+          scopeLost={sideProof(subLeft, relLeft, edgeLeft)}
         />
         <EntityPanel
           snapshot={candidate.right_snapshot}
           sub={subRight}
           rel={relRight}
           edge={edgeRight}
-          scopeLost={sideProof(subRight, relRight)}
+          scopeLost={sideProof(subRight, relRight, edgeRight)}
         />
       </div>
       <p className="review__score">{scoreWords(candidate.score)}</p>
@@ -442,7 +458,7 @@ function EntityContext({
 }) {
   if (scopeLost)
     return <p className="review__context review__context--muted">知識庫版本已切換,此案已過期。</p>;
-  if (sub.isPending) return <p className="review__context">載入上下文…</p>;
+  if (sub.isFetching) return <p className="review__context">載入上下文…</p>;
   if (sub.isError)
     return (
       <p className="review__context review__context--muted">

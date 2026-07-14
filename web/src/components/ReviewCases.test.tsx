@@ -468,6 +468,86 @@ describe("ReviewCases", () => {
     expect(screen.getByRole("button", { name: "跳過,下次再問" })).toBeDisabled();
   });
 
+  it("a stale relation sentinel neither locks nor freezes after a neutral subgraph failure (Codex #76 R11)", async () => {
+    // after a NEUTRAL subgraph refetch failure RQ keeps the old sub.data — an
+    // edge derived from that zombie graph would keep an obsolete relation
+    // probe alive: its 404 (earned against the OLD graph) would freeze the
+    // queue without any settled current evidence, and a hung probe would lock
+    // the verbs forever. With the edge gated on a settled-successful subgraph,
+    // the neutral failure stays a local line and the verbs come back.
+    const EDGE = {
+      id: "r1000000-0000-0000-0000-000000000000",
+      src: LEFT,
+      dst: "e3000000-0000-0000-0000-000000000000",
+      type: "LOCATED_IN",
+    };
+    let subCalls = 0;
+    let relCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/merge-candidates")
+        return Promise.resolve({
+          data: { data: [namedCandidate()], meta: META_NULL },
+          error: undefined,
+        });
+      if (path === "/projects/{project}/graph/subgraph") {
+        subCalls += 1;
+        if (subCalls <= 2)
+          return Promise.resolve({
+            data: {
+              data: { nodes: [{ id: LEFT, label: "左" }], edges: [EDGE] },
+              meta: META_NULL,
+            },
+            error: undefined,
+          });
+        // the refetch fails scope-NEUTRALLY — cached data survives in RQ
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "STORE_UNAVAILABLE", message: "graph store down" } },
+          response: { status: 503 },
+        });
+      }
+      if (path === "/projects/{project}/relations/{relation_id}") {
+        relCalls += 1;
+        // ONLY the first probe succeeds: the invalidation-time relation
+        // refetch — which pre-fix still targets the zombie edge — must hit
+        // the 404, or this branch is dead code and the test is a false green
+        // (reviewer's revert-probe caught exactly that)
+        if (relCalls <= 1)
+          return Promise.resolve({
+            data: { data: { id: EDGE.id, evidence: [] }, meta: META_NULL },
+            error: undefined,
+          });
+        // a stale-edge probe would answer 404 — must NOT freeze the queue
+        return Promise.resolve({
+          data: undefined,
+          error: { error: { code: "VALIDATION_ERROR", message: "relation not found" } },
+          response: { status: 404 },
+        });
+      }
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewCases project="acme" />
+      </QueryClientProvider>,
+    );
+
+    // first pass settles: evidenced relation visible, verbs enabled
+    await waitFor(() => expect(screen.getAllByText(/LOCATED_IN/).length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getByRole("button", { name: "是,合併" })).toBeEnabled());
+
+    // external revalidation: subgraph now fails neutrally
+    void client.invalidateQueries();
+
+    await waitFor(() => expect(screen.getAllByText(/上下文載入失敗/).length).toBeGreaterThan(0));
+    // no freeze from the stale relation's 404, and the verbs come back
+    expect(screen.queryByText(/暫停所有決定/)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "是,合併" })).toBeEnabled());
+  });
+
   it("locks the verbs while CACHED sentinels revalidate (Codex #76 R10)", async () => {
     // navigating back to a seen case remounts its sentinels from cache — RQ
     // serves the (possibly pre-build-swap) cached data with isFetching, not
