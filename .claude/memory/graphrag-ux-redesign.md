@@ -26,3 +26,10 @@ Phase B=UXB1 設定頁表單(既有 PATCH);Phase C=UXC1 契約 v1.2(**eval+uploa
 DR-002 bump 已核准**,§26 記錄隨 UXC1 PR 落地)+UXC2 評測頁/上傳 UI。
 主線斷頭現況:config=curl、eval=CLI(無端點)、activate=curl(見 [[graphrag-sample-data-hakeguan]]
 的 G5 與 .discuss/hakeguan/GAPS.md)——A2/B1/C 依序補齊。
+
+**UXA1 ✅ merged(PR #76,2026-07-14,37692bb)**:Review 頁重設計上線。
+12 輪 Codex/16 P2 全修——新有狀態互動面的狀態機被逐輪枚舉(教訓入
+[[graphrag-loop-paused-pr5]] class 20)。最終架構:mutation+凍結+index 全在頁面層,
+CaseCard 只留哨兵查詢與 UI;write gate = deciding||scopeFrozen||queueRefreshing||
+scopeChecking(全 isFetching 基準)。下一個:UXA2(總覽落地頁+activate 按鈕)。
+

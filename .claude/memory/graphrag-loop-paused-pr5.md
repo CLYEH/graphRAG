@@ -156,3 +156,18 @@ metadata:
 歷史脈絡(2026-07-03 更新的快照,僅供追溯,不代表現況):P0/P1 契約與 H1–H3 harness(fail-loud gates、triage 規則、watcher/doc lane/收據/governance)皆已 merge;當時正要開工 P2(build/activation + Alembic)。
 
 相關:[[codex-plus-one-merge-gate]]、[[graphrag-architecture]]
+
+**Class 20 — 寫入生命週期的宿主 × keyed 子元件瞬時卸載(PR #76,12 輪 16 P2)**:
+RQ v5 的 mutate 層 callback 綁 hasListeners——**keyed 子元件在父層資料變動的過渡
+render 會瞬時 re-key 卸載**,callback 靜默消失。同一陷阱在單一 PR 咬了三次
+(R4 nit:onSettled 清旗;R7:onSuccess arm 旗;R12:defer advance + onError disarm
+全滅)。修到底=寫入的完整生命週期(arm/disarm/advance/error/pending)住在**不會
+卸載的層級**(頁面),卡片只留 UI;過渡期補丁=「mutate 前同步 arm + 事後形狀驗證」
+(R7+R8:記錄「預期消失的 id」而非布林,新佇列==舊佇列-該id 才算自家縮短)。
+判準:每個 mutate callback 問「父層任何資料變動會讓我的宿主 remount 嗎?」
+子教訓:(a) **哨兵狀態機要枚舉完備**——pending/快取重驗(isFetching≠isPending)/
+neutral-error/proof-error/success-但-build-不符/disabled-殘留快取錯誤,每格都要有
+指定語意,R9-R11 才掃完;殭屍資料(error 狀態仍保留舊 data)導出的下游探針=獨立
+一格。(b) **lock test 必須實跑 revert-probe**——R11 測試假綠(404 分支是死碼),
+reviewer 實測 revert 才抓到;推理「應該有鑑別力」不算數。(c) 新的有狀態互動面
+=先枚舉完整狀態機再推第一版,否則 Codex 會逐輪幫你枚舉(12 輪 vs FE 平均 2 輪)。
