@@ -990,40 +990,69 @@ export type QueryPolicyOperator = {
 
 /** The policy's operator-facing fields (and the flags the form needs) with
  *  template fallback — defensive reads for the same reason as above. */
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+/** Key-set completeness against the template — whose keys the contract test
+ *  (queryPolicyTemplate.test.ts) pins to the schema's required lists, so this
+ *  checker is transitively pinned to contracts/query_policy.schema.json. A
+ *  block from the curl-only era can be partial or carry typo'd extras;
+ *  spreading it would PATCH "successfully" while every query keeps rejecting
+ *  the policy (Codex #79 R2) — the schema requires ALL fields and forbids
+ *  unknowns, so the key SETS must match exactly (top level and both guardrail
+ *  sub-blocks). Value TYPES stay the server's verdict. */
+export function isCompletePolicyBlock(block: unknown): boolean {
+  if (!isRecord(block)) return false;
+  const sameKeys = (a: Record<string, unknown>, b: Record<string, unknown>): boolean => {
+    const ak = Object.keys(a).sort();
+    const bk = Object.keys(b).sort();
+    return ak.length === bk.length && ak.every((k, i) => k === bk[i]);
+  };
+  if (!sameKeys(block, DEFAULT_QUERY_POLICY)) return false;
+  for (const sub of ["text_to_sql", "text_to_cypher"] as const) {
+    const s = block[sub];
+    if (!isRecord(s) || !sameKeys(s, DEFAULT_QUERY_POLICY[sub])) return false;
+  }
+  return true;
+}
+
 export function policyFromConfig(config: Record<string, unknown>): QueryPolicyOperator & {
   present: boolean;
+  malformed: boolean;
   sqlEnabled: boolean;
   cypherEnabled: boolean;
   sqlBlock: unknown;
   cypherBlock: unknown;
 } {
   const block = config["query_policy"];
-  const b =
-    block && typeof block === "object" && !Array.isArray(block)
-      ? (block as Record<string, unknown>)
-      : undefined;
+  const b = isRecord(block) ? block : undefined;
+  // an incomplete block will be REBUILT on the template at save time, so the
+  // form's derived flags (sql option, 進階 folds) must describe the template,
+  // not the junk — only the three operator fields are salvaged for seeding
+  const malformed = b !== undefined && !isCompletePolicyBlock(b);
+  const usable = b !== undefined && !malformed ? b : undefined;
   const int = (v: unknown, fallback: number): number =>
     typeof v === "number" && Number.isInteger(v) ? v : fallback;
-  const enabled = (sub: unknown): boolean =>
-    !!(
-      sub &&
-      typeof sub === "object" &&
-      !Array.isArray(sub) &&
-      (sub as Record<string, unknown>)["enabled"] === true
-    );
+  const enabled = (sub: unknown): boolean => isRecord(sub) && sub["enabled"] === true;
   const modes: readonly QueryMode[] = ["semantic", "graph", "sql", "global", "hybrid"];
   const mode = b?.["default_mode"];
   return {
     present: b !== undefined,
-    defaultMode: modes.includes(mode as QueryMode)
-      ? (mode as QueryMode)
-      : DEFAULT_QUERY_POLICY.default_mode,
+    malformed,
+    // a malformed block rebuilds on the template, whose text_to_sql is
+    // disabled — salvaging a junk default_mode of "sql" would seed the form
+    // to a value its own save refuses (the R1 dead-end, one click later)
+    defaultMode:
+      modes.includes(mode as QueryMode) && !(malformed && mode === "sql")
+        ? (mode as QueryMode)
+        : DEFAULT_QUERY_POLICY.default_mode,
     maxTopK: int(b?.["max_top_k"], DEFAULT_QUERY_POLICY.max_top_k),
     maxGraphHops: int(b?.["max_graph_hops"], DEFAULT_QUERY_POLICY.max_graph_hops),
-    sqlEnabled: b !== undefined ? enabled(b["text_to_sql"]) : false,
-    cypherEnabled: b !== undefined ? enabled(b["text_to_cypher"]) : false,
-    sqlBlock: b?.["text_to_sql"] ?? DEFAULT_QUERY_POLICY.text_to_sql,
-    cypherBlock: b?.["text_to_cypher"] ?? DEFAULT_QUERY_POLICY.text_to_cypher,
+    sqlEnabled: usable !== undefined ? enabled(usable["text_to_sql"]) : false,
+    cypherEnabled: usable !== undefined ? enabled(usable["text_to_cypher"]) : false,
+    sqlBlock: usable?.["text_to_sql"] ?? DEFAULT_QUERY_POLICY.text_to_sql,
+    cypherBlock: usable?.["text_to_cypher"] ?? DEFAULT_QUERY_POLICY.text_to_cypher,
   };
 }
 
@@ -1047,8 +1076,13 @@ export function useSaveQueryPolicy(project: string) {
       if (fresh.error) throw new Error(fresh.error.error.message);
       const current = (fresh.data.data.config ?? {}) as Record<string, unknown>;
       const block = current["query_policy"];
-      const hasBlock = !!(block && typeof block === "object" && !Array.isArray(block));
-      const base: Record<string, unknown> = hasBlock
+      // a PARTIAL/malformed block (the curl-only era) must not be the spread
+      // base: the PATCH would "succeed" while queries keep 400ing on the
+      // missing required fields (Codex #79 R2) — rebuild it on the template,
+      // salvaging only the operator fields this save carries. Checked against
+      // the FRESH block, same as the sql cross-check below.
+      const usable = isCompletePolicyBlock(block);
+      const base: Record<string, unknown> = usable
         ? (block as Record<string, unknown>)
         : { ...DEFAULT_QUERY_POLICY };
       const sql = base["text_to_sql"];
@@ -1073,7 +1107,7 @@ export function useSaveQueryPolicy(project: string) {
         body: { config: { ...current, query_policy: nextPolicy } },
       });
       if (error) throw new Error(error.error.message);
-      return { project: data.data, saved: op, created: !hasBlock };
+      return { project: data.data, saved: op, created: !usable };
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["project", project] }),
   });

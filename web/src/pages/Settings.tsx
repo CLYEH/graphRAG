@@ -409,6 +409,12 @@ function PolicySection({ project, config, locked }: SectionProps) {
           查詢均停用)。
         </p>
       )}
+      {pol.malformed && (
+        <p className="settings__line settings__line--notice">
+          此專案的問答安全政策不完整或含未知欄位(可能是先前手動設定所致),問答會持續被拒絕。
+          儲存會以安全預設範本<strong>重建整份政策</strong>,只保留這一頁的三個欄位設定。
+        </p>
+      )}
       <label className="settings__field">
         <span className="settings__label">
           預設問答模式<span className="settings__rawkey">(default_mode)</span>
@@ -466,16 +472,26 @@ function PolicySection({ project, config, locked }: SectionProps) {
       <div className="settings__actions">
         <button
           type="button"
-          // a MISSING policy is itself unsaved state: the template on screen
-          // lives nowhere else, so creating it AS-IS is a meaningful save —
-          // requiring an arbitrary edit first would gate the whole query
-          // feature behind a pointless field change (Codex #79 R1)
+          // a MISSING or MALFORMED policy is itself unsaved state: what this
+          // save would write (the template) lives nowhere on the server, so
+          // saving AS-IS is meaningful — requiring an arbitrary edit first
+          // would gate the whole query feature behind a pointless field
+          // change (Codex #79 R1; R2 extends it to partial curl-era blocks)
           disabled={
-            locked || save.isPending || (pol.present && draft === null) || fieldError !== null
+            locked ||
+            save.isPending ||
+            (pol.present && !pol.malformed && draft === null) ||
+            fieldError !== null
           }
           onClick={runSave}
         >
-          {save.isPending ? "儲存中…" : pol.present ? "儲存問答安全設定" : "以預設範本建立並儲存"}
+          {save.isPending
+            ? "儲存中…"
+            : pol.malformed
+              ? "以預設範本重建並儲存"
+              : pol.present
+                ? "儲存問答安全設定"
+                : "以預設範本建立並儲存"}
         </button>
         {draft !== null && !save.isPending && (
           <button type="button" onClick={() => setDraft(null)}>

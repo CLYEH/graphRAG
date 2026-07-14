@@ -171,6 +171,85 @@ describe("Settings — query policy", () => {
     expect(patchedConfig(patch)["query_policy"]).toEqual(DEFAULT_QUERY_POLICY);
   });
 
+  it("REBUILDS a partial curl-era policy on the template — never spreads an incomplete base", async () => {
+    // Codex #79 R2: a block like {default_mode, max_top_k, max_graph_hops}
+    // (hand-written before this page existed) passed the old object check and
+    // became the spread base — the PATCH "succeeded" while every query kept
+    // 400ing on the missing required fields (PATCH validates nothing). The
+    // save must rebuild on the template, salvaging only the operator fields;
+    // the page must say so up front and enable the save without a prior edit
+    // (the R1 rule extended: what this save writes lives nowhere on the server).
+    vi.spyOn(api, "GET").mockResolvedValue(
+      projectBody({
+        query_policy: { default_mode: "semantic", max_top_k: 5, max_graph_hops: 4 },
+        chunking: { max_chars: 500, overlap: 50 },
+      }) as never,
+    );
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    await screen.findByText(/問答安全政策不完整/);
+    const rebuild = screen.getByRole("button", { name: "以預設範本重建並儲存" });
+    expect(rebuild).toBeEnabled(); // no edit needed — R1's rule extended
+    fireEvent.click(rebuild);
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    expect(patchedConfig(patch)["query_policy"]).toEqual({
+      ...DEFAULT_QUERY_POLICY,
+      default_mode: "semantic", // the salvaged operator fields
+      max_top_k: 5,
+      max_graph_hops: 4,
+    });
+  });
+
+  it("does not salvage a junk default_mode of sql — the rebuild target disables sql", async () => {
+    // Seeding the form to "sql" from a malformed block re-creates R1's dead
+    // end one click later: the rebuilt policy has text_to_sql disabled, so
+    // the save the form invites would refuse its own seeded value.
+    vi.spyOn(api, "GET").mockResolvedValue(
+      projectBody({ query_policy: { default_mode: "sql", max_top_k: 9 } }) as never,
+    );
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    fireEvent.click(await screen.findByRole("button", { name: "以預設範本重建並儲存" }));
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    const policy = patchedConfig(patch)["query_policy"] as Record<string, unknown>;
+    expect(policy["default_mode"]).toBe("hybrid"); // template's mode, not the junk "sql"
+    expect(policy["max_top_k"]).toBe(9); // other operator fields still salvage
+  });
+
+  it("rebuilds on the template even when the block DEGRADES between page load and save", async () => {
+    // The fresh-read discipline applied to completeness: the page loaded a
+    // COMPLETE policy, but by save time another writer had replaced it with a
+    // partial one — spreading the page's belief would ship the same silent
+    // brick R2 names. The completeness check must run against the FRESH block.
+    let gets = 0;
+    vi.spyOn(api, "GET").mockImplementation((() =>
+      Promise.resolve(
+        ++gets === 1
+          ? projectBody(FULL_CONFIG)
+          : projectBody({
+              ...FULL_CONFIG,
+              query_policy: { default_mode: "global" },
+            }),
+      )) as never);
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    fireEvent.change(await screen.findByLabelText(/單次檢索筆數上限/), {
+      target: { value: "7" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "儲存問答安全設定" }));
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    const policy = patchedConfig(patch)["query_policy"] as Record<string, unknown>;
+    expect(policy["schema_version"]).toBe("1.0"); // template-complete, not the partial junk
+    expect(policy["text_to_sql"]).toEqual(DEFAULT_QUERY_POLICY.text_to_sql);
+    expect(policy["max_top_k"]).toBe(7); // the operator's edit still lands
+  });
+
   it("creates a COMPLETE schema-valid policy from the template when the project has none", async () => {
     // The frozen contract requires every top-level field — writing only the
     // three operator knobs would brick every query with 400 "invalid". The
