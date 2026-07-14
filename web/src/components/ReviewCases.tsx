@@ -66,6 +66,7 @@ export function ReviewCases({ project }: { project: string }) {
   const currentId = queue[index]?.id;
   useEffect(() => {
     setDeciding(false);
+    setDecideError(null);
   }, [currentId]);
   // Queue REPLACEMENT vs queue SHRINK (Codex #76 R6/R8): when our own decision
   // removed a row, the walk keeps its position — the next case slides into the
@@ -83,6 +84,53 @@ export function ReviewCases({ project }: { project: string }) {
   const setExpectedRemoval = useCallback((id: string | null) => {
     expectedRemovalRef.current = id;
   }, []);
+  // Advancing past a deferred case must locate it in the queue AS OF success
+  // time (Codex #76 R12): the defer POST can be in flight while an external
+  // replacement repositions the row (R6/R8 reset), and a callback that closed
+  // over the render-time index would then jump from a position that no longer
+  // exists — skipping a case or landing on the end panel spuriously. If the
+  // deferred case is gone entirely, the reset already positioned the walk.
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
+  const skipPast = useCallback((candidateId: string) => {
+    const at = queueRef.current.findIndex((c) => c.id === candidateId);
+    if (at >= 0) setIndex(at + 1);
+  }, []);
+  // The decision MUTATION lives at the page level (Codex #76 R12): mutate-level
+  // callbacks are skipped when their owning component unmounts (v5 gates them
+  // on hasListeners), and the card DOES transiently unmount during an external
+  // queue replacement (the pre-reset render points the key at a different
+  // candidate). A card-owned mutation therefore silently drops the defer
+  // advance / removal disarm in exactly the races R6-R8 handle; the page-owned
+  // observer lives as long as the flow and its callbacks always run.
+  const decide = useDecideMergeCandidate(project);
+  const [decideError, setDecideError] = useState<string | null>(null);
+  const submitDecision = (candidate: MergeCandidate, verb: ReviewVerb, reason: string | null) => {
+    setDeciding(true);
+    setDecideError(null);
+    // approve/reject will remove THIS row — record its id BEFORE the mutate
+    // call (R7: armed synchronously, nothing to skip); the parent's queueKey
+    // effect verifies the removal's SHAPE (R8).
+    if (verb !== "defer") setExpectedRemoval(candidate.id);
+    decide.mutate(
+      { candidateId: candidate.id, verb, reason },
+      {
+        // a deferred row STAYS in the queue (review.py keeps pending+deferred),
+        // so the walk must step past it explicitly — located in the queue AS OF
+        // success time, not a render-time index (R12)
+        onSuccess: () => {
+          if (verb === "defer") skipPast(candidate.id);
+        },
+        onError: (err) => {
+          if (verb !== "defer") setExpectedRemoval(null);
+          setDecideError(err instanceof Error ? err.message : "unknown error");
+        },
+        onSettled: () => {
+          setDeciding(false);
+        },
+      },
+    );
+  };
   const prevQueueKeyRef = useRef(queueKey);
   useEffect(() => {
     if (prevQueueKeyRef.current === queueKey) return;
@@ -165,13 +213,13 @@ export function ReviewCases({ project }: { project: string }) {
         key={current.id}
         candidate={current}
         project={project}
-        onSkipped={() => setIndex(index + 1)}
-        setExpectedRemoval={setExpectedRemoval}
+        onSubmit={(verb, reason) => submitDecision(current, verb, reason)}
+        deciding={deciding}
         scopeFrozen={scopeFrozen}
         queueRefreshing={isFetching}
         onScopeLoss={onScopeLoss}
-        onDecidingChange={setDeciding}
       />
+      {decideError !== null && <p className="review__error">決定送出失敗:{decideError}</p>}
     </div>
   );
 }
@@ -179,27 +227,24 @@ export function ReviewCases({ project }: { project: string }) {
 function CaseCard({
   candidate,
   project,
-  onSkipped,
-  setExpectedRemoval,
+  onSubmit,
+  deciding,
   scopeFrozen,
   queueRefreshing,
   onScopeLoss,
-  onDecidingChange,
 }: {
   candidate: MergeCandidate;
   project: string;
-  onSkipped: () => void;
-  setExpectedRemoval: (id: string | null) => void;
+  onSubmit: (verb: ReviewVerb, reason: string | null) => void;
+  deciding: boolean;
   scopeFrozen: boolean;
   queueRefreshing: boolean;
   onScopeLoss: () => void;
-  onDecidingChange: (deciding: boolean) => void;
 }) {
   const [reason, setReason] = useState("");
   const [confirming, setConfirming] = useState<Extract<ReviewVerb, "approve" | "reject"> | null>(
     null,
   );
-  const decide = useDecideMergeCandidate(project);
 
   // The four context reads are SCOPE SENTINELS, owned here so proof and
   // pendingness are computed in one place (Codex #76 R9): subgraph(hops=1)
@@ -262,43 +307,10 @@ function CaseCard({
 
   // queueRefreshing is the FE1 fail-closed gate on the WRITE side (R5): while
   // the queue refreshes, the rows on screen may be about to be replaced.
-  const blocked = decide.isPending || scopeFrozen || queueRefreshing || scopeChecking;
+  const blocked = deciding || scopeFrozen || queueRefreshing || scopeChecking;
 
   const submit = (verb: ReviewVerb) => {
-    onDecidingChange(true);
-    // approve/reject will remove THIS row — record its id BEFORE the mutate
-    // call: the hook-level onSuccess invalidates and AWAITS the refetch first,
-    // and that refetch can unmount this keyed card, skipping every
-    // mutate-level callback (v5 gates them on hasListeners) — a
-    // callback-armed flag never rises (Codex #76 R7). Recording the ID rather
-    // than a boolean lets the parent verify the removal's shape, so a
-    // coincident external replacement still resets (R8). A failed POST
-    // disarms in onError (no removal is coming).
-    if (verb !== "defer") setExpectedRemoval(candidate.id);
-    decide.mutate(
-      {
-        candidateId: candidate.id,
-        verb,
-        reason: reason.trim() === "" ? null : reason.trim(),
-      },
-      {
-        // approve/reject leave the queue on refetch, so the clamp advances by
-        // itself; a DEFERRED row intentionally STAYS in the queue (review.py
-        // keeps pending+deferred), so without an explicit step forward the
-        // same pair re-renders and「跳過,下次再問」skips nothing (Codex #76).
-        onSuccess: () => {
-          if (verb === "defer") onSkipped();
-        },
-        onError: () => {
-          if (verb !== "defer") setExpectedRemoval(null);
-        },
-        // best-effort: skipped if this card unmounted first (v5 gates mutate
-        // callbacks on hasListeners) — the parent's currentId effect covers that
-        onSettled: () => {
-          onDecidingChange(false);
-        },
-      },
-    );
+    onSubmit(verb, reason.trim() === "" ? null : reason.trim());
     setConfirming(null);
   };
 
@@ -370,11 +382,6 @@ function CaseCard({
             取消
           </button>
         </div>
-      )}
-      {decide.isError && (
-        <p className="review__error">
-          決定送出失敗:{decide.error instanceof Error ? decide.error.message : "unknown error"}
-        </p>
       )}
       <details className="review__advanced">
         <summary>進階(原始資料)</summary>

@@ -174,6 +174,71 @@ describe("ReviewCases", () => {
     expect(screen.getByText("第 2 筆,共 2 筆")).toBeInTheDocument();
   });
 
+  it("advances a deferred case from its position at SUCCESS time (Codex #76 R12)", async () => {
+    // the defer POST can be in flight while an external replacement
+    // repositions the row: deferring B at index 1 of [A,B,C], another tab
+    // removes A → the reset puts B at index 0 — a stale closure would then
+    // setIndex(old 1 + 1 = 2) and land on the end panel, skipping C entirely;
+    // locating B in the current queue advances to C instead
+    const a = namedCandidate();
+    const b = namedCandidate({
+      id: "c2222222-2222-2222-2222-222222222222",
+      left_snapshot: { name: "區域探索館", type: "FACILITY" },
+      right_snapshot: { name: "區域探索廳", type: "FACILITY" },
+    });
+    const c = namedCandidate({
+      id: "c3333333-3333-3333-3333-333333333333",
+      left_snapshot: { name: "海祭", type: "EVENT" },
+      right_snapshot: { name: "海祭儀式", type: "EVENT" },
+    });
+    let phase = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/merge-candidates")
+        return Promise.resolve({
+          data: { data: phase === 0 ? [a, b, c] : [b, c], meta: META_NULL },
+          error: undefined,
+        });
+      if (path === "/projects/{project}/graph/subgraph")
+        return Promise.resolve({
+          data: { data: { nodes: [], edges: [] }, meta: META_NULL },
+          error: undefined,
+        });
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    let resolvePost: (v: unknown) => void = () => {};
+    vi.spyOn(api, "POST").mockImplementation(
+      (() =>
+        new Promise((resolve) => {
+          resolvePost = resolve;
+        })) as never,
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewCases project="acme" />
+      </QueryClientProvider>,
+    );
+
+    // walk to B and defer it — the POST hangs for now
+    fireEvent.click(await screen.findByRole("button", { name: "下一筆" }));
+    await clickWhenEnabled("跳過,下次再問");
+
+    // external replacement removes A while the defer is in flight: the reset
+    // (not our shrink — defer never arms the removal flag) puts B at index 0
+    phase = 1;
+    await client.invalidateQueries({ queryKey: ["merge-candidates", "acme"] });
+    expect(await screen.findByText("第 1 筆,共 2 筆")).toBeInTheDocument();
+    expect(screen.getByText("區域探索館")).toBeInTheDocument();
+
+    // the defer now succeeds: advance PAST B where it lives NOW → C
+    resolvePost({
+      data: { data: { ...b, status: "deferred" }, meta: META_NULL },
+      error: undefined,
+    });
+    expect(await screen.findByText("海祭")).toBeInTheDocument();
+    expect(screen.getByText("第 2 筆,共 2 筆")).toBeInTheDocument();
+  });
+
   it("locks navigation while a decision POST is in flight (Codex #76 R4)", async () => {
     // clicking 下一筆 mid-POST advances the index against the OLD list; when
     // the decided row is removed, that index lands one case further and a
