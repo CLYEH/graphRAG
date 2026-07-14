@@ -399,7 +399,7 @@ function ChunksTab({ project, selected, onSelect }: TabProps) {
           cell: (c) => <span title={c.document_id}>(懸停看識別碼)</span>,
         },
         { header: "內容開頭", cell: (c) => c.text.slice(0, 80) },
-        { header: "字元數", cell: (c) => c.token_count ?? "—" },
+        { header: "詞元數(估計)", cell: (c) => c.token_count ?? "—" },
       ]}
       query={list}
       selectedId={id}

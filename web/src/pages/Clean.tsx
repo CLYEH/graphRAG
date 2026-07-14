@@ -319,7 +319,7 @@ function PreviewResult({ result, stale }: { result: CleanPreviewResult; stale: b
           <tr>
             <th>序號</th>
             <th>位置(起-迄)</th>
-            <th>字元數</th>
+            <th>詞元數(估計)</th>
             <th>內容</th>
           </tr>
         </thead>

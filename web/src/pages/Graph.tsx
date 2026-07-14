@@ -514,7 +514,7 @@ function EntityFields({ e }: { e: Entity }) {
       <Field label="型別">{e.type}</Field>
       <Field label="狀態">{e.status}</Field>
       <Field label="審核狀態">{e.review_status ?? "—"}</Field>
-      <Field label="來源">{e.created_by ?? "—"}</Field>
+      <Field label="建立者">{e.created_by ?? "—"}</Field>
       {/* raw identifiers live behind the 進階 fold (UXA3): the fingerprint is
           an engineering key, not a fact about the entity */}
       <details className="graph__advanced">
@@ -540,7 +540,7 @@ function RelationFields({ r }: { r: Relation }) {
       <Field label="信心">{r.confidence ?? "—"}</Field>
       <Field label="狀態">{r.status}</Field>
       <Field label="審核狀態">{r.review_status ?? "—"}</Field>
-      <Field label="來源">{r.created_by ?? "—"}</Field>
+      <Field label="建立者">{r.created_by ?? "—"}</Field>
       <Field label="原文證據">
         {r.evidence && r.evidence.length > 0 ? (
           <ul className="graph__evidence">
