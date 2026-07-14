@@ -65,7 +65,11 @@ export function Overview() {
 
 /** Shell-quotes a value for the copyable CLI hints: the contract only bans
  *  "/" and "."/".." in project keys, so spaces and metacharacters are legal —
- *  pasted unquoted, `my corpus` parses as two arguments (Codex #77 R2). */
+ *  pasted unquoted, `my corpus` parses as two arguments (Codex #77 R2). The
+ *  hints ALSO order the command as `eval --build <id> -- <project>`: quoting
+ *  cannot save a leading-dash key (the shell strips quotes before argv and
+ *  argparse reads `-foo` as an option), but everything after `--` is
+ *  positional (Codex #77 R3, verified against cli/main.py). */
 function shellQuote(v: string): string {
   return /^[A-Za-z0-9_.-]+$/.test(v) ? v : '"' + v.replace(/([\\"$`])/g, "\\$1") + '"';
 }
@@ -152,7 +156,7 @@ function OverviewBody({ project }: { project: string }) {
             <p className="overview__cli">
               新版本還沒有評測分數(沒有分數的版本不能上線)——先在終端機執行:
               <code>
-                uv run python -m cli.main eval {shellQuote(project)} --build {updateCandidate.id}
+                uv run python -m cli.main eval --build {updateCandidate.id} -- {shellQuote(project)}
               </code>
             </p>
           )}
@@ -194,7 +198,7 @@ function OverviewBody({ project }: { project: string }) {
               <span className="overview__cli">
                 目前評測要在終端機執行:
                 <code>
-                  uv run python -m cli.main eval {shellQuote(project)} --build {candidate.id}
+                  uv run python -m cli.main eval --build {candidate.id} -- {shellQuote(project)}
                 </code>
               </span>
             ) : null
@@ -320,7 +324,7 @@ function ActivateControl({
             <p className="overview__cli">
               這個版本還沒有評測分數——先在終端機執行:
               <code>
-                uv run python -m cli.main eval {shellQuote(project)} --build {candidate.id}
+                uv run python -m cli.main eval --build {candidate.id} -- {shellQuote(project)}
               </code>
             </p>
           )}

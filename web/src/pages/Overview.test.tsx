@@ -86,7 +86,7 @@ describe("Overview", () => {
     renderOverview();
 
     expect(await screen.findByText(/已建置,尚未上線/)).toBeInTheDocument();
-    expect(screen.getByText(new RegExp(`eval acme --build ${READY_ID}`))).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(`eval --build ${READY_ID} -- acme`))).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
   });
 
@@ -210,9 +210,30 @@ describe("Overview", () => {
       { route: projectRoute('a"b$c`d', "overview") },
     );
 
-    const code = await screen.findByText((text) => text.includes('eval "a\\"b\\$c\\`d" --build'), {
+    const code = await screen.findByText((text) => text.includes('-- "a\\"b\\$c\\`d"'), {
       selector: "code",
     });
+    expect(code).toBeInTheDocument();
+  });
+
+  it("orders the eval command so a leading-dash key stays positional (Codex #77 R3)", async () => {
+    // quoting cannot save `-foo`: the shell strips quotes before argv and
+    // argparse reads it as an option — everything after `--` is positional
+    stubOverview({
+      sources: [source()],
+      builds: [build({ id: READY_ID, status: "ready", eval: null })],
+    });
+    renderWithProviders(
+      <Routes>
+        <Route path="/p/:project/overview" element={<Overview />} />
+      </Routes>,
+      { route: projectRoute("-corpus", "overview") },
+    );
+
+    const code = await screen.findByText(
+      (text) => text.includes(`eval --build ${READY_ID} -- -corpus`),
+      { selector: "code" },
+    );
     expect(code).toBeInTheDocument();
   });
 
@@ -229,7 +250,7 @@ describe("Overview", () => {
     );
 
     expect(
-      await screen.findByText(new RegExp(`eval "my corpus" --build ${READY_ID}`)),
+      await screen.findByText(new RegExp(`eval --build ${READY_ID} -- "my corpus"`)),
     ).toBeInTheDocument();
   });
 
@@ -277,7 +298,7 @@ describe("Overview", () => {
 
     // the CLI command names the NEWER build even though it is listed second
     expect(
-      await screen.findByText(new RegExp(`eval acme --build ${READY_ID}`)),
+      await screen.findByText(new RegExp(`eval --build ${READY_ID} -- acme`)),
     ).toBeInTheDocument();
     expect(screen.queryByText(new RegExp(OLD_ID))).not.toBeInTheDocument();
   });
@@ -357,7 +378,7 @@ describe("Overview", () => {
     renderOverview();
 
     expect(await screen.findByText(/新版本還沒有評測分數/)).toBeInTheDocument();
-    expect(screen.getByText(new RegExp(`eval acme --build ${READY_ID}`))).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(`eval --build ${READY_ID} -- acme`))).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
   });
 
