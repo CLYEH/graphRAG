@@ -125,7 +125,7 @@ function HealthView({ report }: { report: HealthReport }) {
 
       <h2>投影一致性</h2>
       {drift.length > 0 ? (
-        <dl className="health__grid">
+        <dl className="health__grid health__grid--drift">
           {drift.map(([store, detail]) => (
             <div key={store}>
               <dt>{store}</dt>
