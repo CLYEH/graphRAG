@@ -33,6 +33,15 @@ import type { Build } from "../api/queries";
 // - The activation target is captured AT CLICK (id shown in the confirm); if
 //   the world moved meanwhile the server refuses and the message shows — the
 //   UI never pre-empts §14.
+// - "Newest ready" is computed by started_at, NOT list order: the builds API
+//   pages by UUID id desc (core/builds/lifecycle.py list_builds_page), which
+//   is arbitrary in time — picking the first ready row would offer an
+//   arbitrary older version (Codex #77).
+// - Activation is NOT once-only onboarding: an active project that finishes a
+//   newer evaluated ready build gets an UPDATE card with the same activate
+//   control (eval-gated: without scores it hands over the CLI command) —
+//   otherwise the Console's only activate path disappears after first launch
+//   (Codex #77).
 export function Overview() {
   const project = useActiveProject();
 
@@ -72,10 +81,23 @@ function OverviewBody({ project }: { project: string }) {
 
   const h = health.data;
   const activeBuild = builds.data.find((b) => b.id === h.active_build_id);
-  // the activation candidate: the active build if one exists (step ③ then
-  // reads ITS eval), else the newest ready build (API order: newest first)
-  const newestReady = builds.data.find((b) => b.status === "ready");
+  // newest READY by started_at — the API's id-desc order is arbitrary in time
+  const newestReady = builds.data
+    .filter((b) => b.status === "ready")
+    .sort((a, b) => (b.started_at ?? "").localeCompare(a.started_at ?? ""))[0];
+  // the ONBOARDING candidate: the active build if one exists (step ③ then
+  // reads ITS eval), else the newest ready build
   const candidate = activeBuild ?? newestReady;
+  // the UPDATE candidate: a ready build STRICTLY NEWER than the active one —
+  // activation archives only the previously-active build (lifecycle.py), so an
+  // OLDER ready build can linger; offering it as「更新的版本」would be a
+  // mislabelled downgrade (reviewer catch on Codex #77 R1-B)
+  const updateCandidate =
+    activeBuild !== undefined &&
+    newestReady !== undefined &&
+    (newestReady.started_at ?? "") > (activeBuild.started_at ?? "")
+      ? newestReady
+      : undefined;
 
   const step1 = sources.data.length > 0;
   const step2 = builds.data.some((b) => BUILT_STATUSES.has(b.status));
@@ -103,6 +125,31 @@ function OverviewBody({ project }: { project: string }) {
         <Link to="../review" className="overview__card overview__card--action">
           ⚠ 有 {h.pending_review} 筆疑似重複的知識等你確認 <span aria-hidden>→</span> 前往審核
         </Link>
+      )}
+
+      {updateCandidate && (
+        <div className="overview__card">
+          <p className="overview__updatetitle">
+            🆕 有更新的建置版本可上線
+            {updateCandidate.started_at ? `(建置於 ${formatTime(updateCandidate.started_at)})` : ""}
+          </p>
+          {updateCandidate.eval !== null ? (
+            <ActivateControl
+              key={updateCandidate.id}
+              project={project}
+              candidate={updateCandidate}
+              writeLocked={builds.isFetching || health.isFetching}
+              confirmText="上線後,所有頁面與查詢立即改讀新版本(目前版本自動下線)。確定?"
+            />
+          ) : (
+            <p className="overview__cli">
+              新版本還沒有評測分數(沒有分數的版本不能上線)——先在終端機執行:
+              <code>
+                uv run python -m cli.main eval {project} --build {updateCandidate.id}
+              </code>
+            </p>
+          )}
+        </div>
       )}
 
       {step4 && (
@@ -201,11 +248,83 @@ function formatTime(iso: string): string {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString("zh-TW", { hour12: false });
 }
 
-// Step ④ owns the missing activate button. The write gate is born fail-closed:
-// in-flight mutation OR a builds/health refetch locks it (the candidate row may
-// be about to change under the click). Two-step confirm; the server's §14
-// refusal renders verbatim — with the CLI eval hint when the refusal is about
-// missing scores, so the message is guidance rather than a dead end.
+// The activate control: button → two-step confirm → mutation, with the §14
+// refusal rendered verbatim plus the CLI eval hint when it names missing
+// scores. Shared by step ④ (onboarding) and the update card (a newer ready
+// build on an already-active project) — one write path, one gate discipline.
+function ActivateControl({
+  project,
+  candidate,
+  writeLocked,
+  confirmText,
+}: {
+  project: string;
+  candidate: Build;
+  writeLocked: boolean;
+  confirmText: string;
+}) {
+  const activate = useActivateBuild(project);
+  const [confirming, setConfirming] = useState(false);
+  // one random key per MOUNT — and both call sites key this component by
+  // candidate.id, so a target swap REMOUNTS it (fresh key, fresh confirm
+  // state): retries against the same build reuse the key (a lost 2xx replays
+  // instead of double-activating; reuse after a FAILED attempt is safe — the
+  // server rolls back failed activations, only successes enter the
+  // idempotency store), while a stored success can never 409
+  // IDEMPOTENCY_CONFLICT against a different build
+  const idempotencyKey = useMemo(() => crypto.randomUUID(), []);
+  const blocked = activate.isPending || writeLocked;
+
+  return (
+    <div className="overview__activate">
+      {!confirming && (
+        <button type="button" onClick={() => setConfirming(true)} disabled={blocked}>
+          上線這個版本
+        </button>
+      )}
+      {confirming && (
+        <div className="overview__confirm" role="alertdialog" aria-label="確認上線">
+          <p>{confirmText}</p>
+          <button
+            type="button"
+            disabled={blocked}
+            onClick={() =>
+              activate.mutate(
+                { buildId: candidate.id, idempotencyKey },
+                { onSettled: () => setConfirming(false) },
+              )
+            }
+          >
+            確定上線
+          </button>
+          <button type="button" disabled={blocked} onClick={() => setConfirming(false)}>
+            取消
+          </button>
+        </div>
+      )}
+      {activate.isPending && <p className="overview__stephint">上線中…</p>}
+      {activate.isError && (
+        <div className="overview__error">
+          <p>
+            上線失敗:
+            {activate.error instanceof Error ? activate.error.message : "unknown error"}
+          </p>
+          {/eval|評測|score/i.test(String(activate.error?.message ?? "")) && (
+            <p className="overview__cli">
+              看起來還沒有評測分數——先在終端機執行:
+              <code>
+                uv run python -m cli.main eval {project} --build {candidate.id}
+              </code>
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Step ④ owns the onboarding activate button (the update flow reuses
+// ActivateControl above).
 function ActivateStep({
   project,
   done,
@@ -219,15 +338,6 @@ function ActivateStep({
   candidate: Build | undefined;
   writeLocked: boolean;
 }) {
-  const activate = useActivateBuild(project);
-  const [confirming, setConfirming] = useState(false);
-  // one random key per component MOUNT: retries within this mount reuse it
-  // (a lost 2xx replays instead of double-activating), and reuse after a
-  // FAILED attempt is safe because the server rolls back failed activations —
-  // only success responses ever enter the idempotency store
-  const idempotencyKey = useMemo(() => crypto.randomUUID(), []);
-  const blocked = activate.isPending || writeLocked;
-
   return (
     <li
       className={
@@ -245,47 +355,14 @@ function ActivateStep({
           {done && <span className="overview__stepdone">完成</span>}
         </p>
         {!done && <p className="overview__stephint">啟用建置好的版本,所有查詢從此讀它</p>}
-        {!done && active && candidate && !confirming && (
-          <button type="button" onClick={() => setConfirming(true)} disabled={blocked}>
-            上線這個版本
-          </button>
-        )}
-        {!done && confirming && candidate && (
-          <div className="overview__confirm" role="alertdialog" aria-label="確認上線">
-            <p>上線後,所有頁面與查詢立即改讀這個版本(舊版本自動下線)。確定?</p>
-            <button
-              type="button"
-              disabled={blocked}
-              onClick={() =>
-                activate.mutate(
-                  { buildId: candidate.id, idempotencyKey },
-                  { onSettled: () => setConfirming(false) },
-                )
-              }
-            >
-              確定上線
-            </button>
-            <button type="button" disabled={blocked} onClick={() => setConfirming(false)}>
-              取消
-            </button>
-          </div>
-        )}
-        {activate.isPending && <p className="overview__stephint">上線中…</p>}
-        {activate.isError && (
-          <div className="overview__error">
-            <p>
-              上線失敗:
-              {activate.error instanceof Error ? activate.error.message : "unknown error"}
-            </p>
-            {candidate && /eval|評測|score/i.test(String(activate.error?.message ?? "")) && (
-              <p className="overview__cli">
-                看起來還沒有評測分數——先在終端機執行:
-                <code>
-                  uv run python -m cli.main eval {project} --build {candidate.id}
-                </code>
-              </p>
-            )}
-          </div>
+        {!done && active && candidate && (
+          <ActivateControl
+            key={candidate.id}
+            project={project}
+            candidate={candidate}
+            writeLocked={writeLocked}
+            confirmText="上線後,所有頁面與查詢立即改讀這個版本(舊版本自動下線)。確定?"
+          />
         )}
       </div>
     </li>

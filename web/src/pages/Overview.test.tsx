@@ -180,6 +180,105 @@ describe("Overview", () => {
     expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
   });
 
+  it("targets the newest ready build by started_at, not list order (Codex #77)", async () => {
+    // the builds API pages by UUID id desc — arbitrary in time; an OLDER ready
+    // build listed first must not become the activation target
+    const OLD_ID = "b0ldbldb-0000-4000-8000-000000000000";
+    stubOverview({
+      sources: [source()],
+      builds: [
+        build({ id: OLD_ID, status: "ready", eval: null, started_at: "2026-07-01T00:00:00Z" }),
+        build({ id: READY_ID, status: "ready", eval: null, started_at: "2026-07-02T00:00:00Z" }),
+      ],
+    });
+    renderOverview();
+
+    // the CLI command names the NEWER build even though it is listed second
+    expect(
+      await screen.findByText(new RegExp(`eval acme --build ${READY_ID}`)),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(new RegExp(OLD_ID))).not.toBeInTheDocument();
+  });
+
+  it("offers an update card when an active project grows a newer evaluated ready build (Codex #77)", async () => {
+    // activation is not once-only onboarding: without this card the Console's
+    // ONLY activate path would vanish after first launch
+    const ACTIVE = "b2222222-2222-2222-2222-222222222222";
+    stubOverview({
+      health: healthReport({ active_build_id: ACTIVE, counts: {} }),
+      sources: [source()],
+      builds: [
+        build({ id: ACTIVE, status: "active", eval: { score: 1 } }),
+        build({
+          id: READY_ID,
+          status: "ready",
+          eval: { score: 1 },
+          started_at: "2026-07-02T00:00:00Z",
+        }),
+      ],
+    });
+    const post = vi.spyOn(api, "POST").mockResolvedValue({
+      data: { data: build({ id: READY_ID, status: "active" }), meta: META },
+      error: undefined,
+    } as never);
+    renderOverview();
+
+    expect(await screen.findByText(/有更新的建置版本可上線/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "上線這個版本" }));
+    fireEvent.click(screen.getByRole("button", { name: "確定上線" }));
+    await waitFor(() => {
+      const [, opts] = post.mock.calls[0] as [string, Record<string, unknown>];
+      const params = (opts as { params: { path: { build_id: string } } }).params;
+      expect(params.path.build_id).toBe(READY_ID);
+    });
+  });
+
+  it("never offers a LINGERING OLDER ready build as an update (downgrade guard)", async () => {
+    // activation archives only the previously-active build, so an older ready
+    // build lingers; labelling it 有更新的版本 would offer a downgrade
+    const ACTIVE = "b2222222-2222-2222-2222-222222222222";
+    stubOverview({
+      health: healthReport({ active_build_id: ACTIVE, counts: {} }),
+      sources: [source()],
+      builds: [
+        build({
+          id: ACTIVE,
+          status: "active",
+          eval: { score: 1 },
+          started_at: "2026-07-02T00:00:00Z",
+        }),
+        build({
+          id: READY_ID,
+          status: "ready",
+          eval: { score: 1 },
+          started_at: "2026-07-01T00:00:00Z",
+        }),
+      ],
+    });
+    renderOverview();
+
+    expect(await screen.findByText(/服務中/)).toBeInTheDocument();
+    expect(screen.queryByText(/有更新的建置版本可上線/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
+  });
+
+  it("the update card without eval scores hands over the CLI command, no button", async () => {
+    const ACTIVE = "b2222222-2222-2222-2222-222222222222";
+    stubOverview({
+      health: healthReport({ active_build_id: ACTIVE, counts: {} }),
+      sources: [source()],
+      builds: [
+        build({ id: ACTIVE, status: "active", eval: { score: 1 } }),
+        build({ id: READY_ID, status: "ready", eval: null, started_at: "2026-07-02T00:00:00Z" }),
+      ],
+    });
+    renderOverview();
+
+    expect(await screen.findByText(/新版本還沒有評測分數/)).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(`eval acme --build ${READY_ID}`))).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
+  });
+
   it("locks the activate write while the builds read is refetching (fail-closed)", async () => {
     // R5/R10 applied at birth: a (re)fetching builds list means the candidate
     // row may be about to change — the write waits for the settled world.
