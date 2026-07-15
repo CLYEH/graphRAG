@@ -71,6 +71,19 @@ def test_managed_source_ingests_only_registered_files(tmp_path: Path) -> None:
     assert {p.raw for p in read_text_documents(tmp_path)} == {"keep", "leaked"}
 
 
+def test_managed_source_with_an_empty_registered_list_ingests_nothing(tmp_path: Path) -> None:
+    """Presence — not truthiness — is the managed signal. A managed source with an
+    EMPTY registered map ingests NOTHING (an empty authoritative list), never a
+    directory scan: a malformed/emptied managed source must not silently fall back
+    to reading UNREGISTERED files. An explicit None, by contrast, is a plain
+    directory source. WHY: this is the class-of-bug where a managed source degrades
+    to a directory scan and ingests orphan files the registered list excluded."""
+    (tmp_path / "orphan.txt").write_text("leaked", encoding="utf-8")  # on disk, unregistered
+    assert list(read_text_documents(tmp_path, {})) == []  # managed + empty → nothing
+    # None (the default / absent stash) still means a plain directory scan
+    assert {p.raw for p in read_text_documents(tmp_path, None)} == {"leaked"}
+
+
 def test_managed_source_fails_loudly_on_a_missing_registered_file(tmp_path: Path) -> None:
     """The registered file list is authoritative in BOTH directions: a file the
     managed source LISTS but that is absent from disk (a lost write / disk loss)

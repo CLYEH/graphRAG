@@ -66,27 +66,29 @@ def read_text_documents(
     ``metadata_by_filename`` carries the DR-010 metadata envelope captured at
     upload time, keyed by the file's stored (on-disk) name — the managed-source
     stash the ingest connector threads onto ``documents.metadata`` (UXC1b
-    capture → persist). When it is NON-EMPTY the source is a MANAGED one whose
-    registered file list is AUTHORITATIVE in BOTH directions: it is the ITERATION
-    SOURCE, so (a) an on-disk file NOT registered — an orphan left by a failed /
-    rolled-back upload — is never ingested with fallback metadata, and (b) a
-    registered file MISSING from disk fails LOUDLY (the SoR says the upload was
-    accepted; silently ingesting fewer documents would corrupt results). The keys
-    are UNTRUSTED (a source's ``metadata['files']`` is stored as-is), so each is
-    validated to a bare in-root filename before it is joined to ``root`` — a name
-    with a path separator / dot segment / absolute path is refused, never read. An
-    EMPTY/absent stash is a plain directory source: every accepted file under the
-    tree is read, each falling back to the connector-derived ``{"filename": ...}``
-    — the original behavior for a non-upload source or a file placed on disk
-    directly.
+    capture → persist). When it is PRESENT (not None — even an empty map) the
+    source is a MANAGED one whose registered file list is AUTHORITATIVE in BOTH
+    directions: it is the ITERATION SOURCE, so (a) an on-disk file NOT registered —
+    an orphan left by a failed / rolled-back upload — is never ingested with
+    fallback metadata, and (b) a registered file MISSING from disk fails LOUDLY
+    (the SoR says the upload was accepted; silently ingesting fewer documents would
+    corrupt results). Presence, not truthiness, is the managed signal: an empty map
+    ingests NOTHING (an empty authoritative list), never a directory scan — a
+    managed source must not silently degrade to reading unregistered files. The
+    keys are UNTRUSTED (a source's ``metadata['files']`` is stored as-is), so each
+    is validated to a bare in-root filename before it is joined to ``root`` — a
+    name with a path separator / dot segment / absolute path is refused, never
+    read. An ABSENT (None) stash is a plain directory source: every accepted file
+    under the tree is read, each falling back to the connector-derived
+    ``{"filename": ...}`` — the original behavior for a non-upload source or a file
+    placed on disk directly.
     """
     if not root.is_dir():
         raise NotADirectoryError(f"document source root {root} is not a directory")
-    stash = metadata_by_filename or {}
-    if stash:
+    if metadata_by_filename is not None:
         base = root.resolve()
         # Managed source: iterate the REGISTERED list (sorted), not the directory.
-        for name in sorted(stash):
+        for name in sorted(metadata_by_filename):
             # The registered names are UNTRUSTED: a text source's metadata['files']
             # is stored as-is by the sources API, so a key like '../other/secret.md'
             # or an absolute '/etc/passwd' would make `root / name` read OUTSIDE the
@@ -124,7 +126,7 @@ def read_text_documents(
                 source_uri=path.resolve().as_uri(),
                 raw=path.read_text(encoding="utf-8"),
                 mime=TEXT_SUFFIXES[suffix],
-                metadata=stash[name],
+                metadata=metadata_by_filename[name],
             )
         return
     for path in sorted(root.rglob("*")):

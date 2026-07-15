@@ -96,6 +96,36 @@ async def test_chunk_ref_gains_only_allowlisted_document_metadata() -> None:
     assert "governance" not in ref.metadata["document"]
 
 
+async def test_stable_chunk_ref_resolves_via_document_content_hash() -> None:
+    """Entity/graph hits cite chunks by their STABLE ref (``chunk:<content_hash>:
+    <ordinal>`` — ``core.graph.documents.chunk_source_ref``), NOT a ``chunks.id``
+    UUID. The enricher must resolve those through ``documents.content_hash`` — else
+    allowlisted document metadata never surfaces on entity results (the common
+    text-backed hit), and rule-6 enrichment silently does nothing for them."""
+    content_hash = "a" * 64
+    stable_ref = f"chunk:{content_hash}:3"
+    exposure = MetadataExposure(fields=("context.title",))
+    ref = SourceRef(
+        source_type="chunk",
+        id=stable_ref,
+        source_uri="file:///c.txt",
+        metadata={"start_offset": 0, "end_offset": 5},
+    )
+    # a repo with NO chunk rows (the UUID path finds nothing) but a document whose
+    # content_hash matches the stable ref — only the stable-ref path can resolve it
+    repo = cast(
+        BuildScopedRepo,
+        _FakeRepo(
+            chunk_rows=[],
+            document_rows=[SimpleNamespace(id=_DOC, content_hash=content_hash, metadata=_ENVELOPE)],
+        ),
+    )
+    enriched = await enrich_response_metadata(_response(ref), repo, exposure)
+    got = enriched.results[0].source_refs[0]
+    assert got.metadata["document"] == {"context": {"title": "Ruling 42"}}
+    assert got.metadata["start_offset"] == 0  # chunk-local metadata preserved
+
+
 async def test_empty_allowlist_leaves_response_unchanged() -> None:
     response = _response(_chunk_ref())
     enriched = await enrich_response_metadata(response, _repo(), MetadataExposure(fields=()))

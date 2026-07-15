@@ -244,12 +244,30 @@ def _files_metadata(source: Source) -> dict[str, dict[str, Any]] | None:
     """The per-file metadata envelopes an upload stashed on a managed text source
     (``metadata["files"]``, keyed by stored filename — see
     :func:`core.registry.store.upsert_managed_source`), or None for a source with
-    no such stash (a non-upload text source). Threaded into the text connector so
-    each document carries its DR-010 envelope onto ``documents.metadata``."""
+    no such stash (a non-upload text source, scanned as a plain directory).
+
+    A ``files`` key that IS a dict marks the source MANAGED (its registered file
+    list is authoritative — see :func:`~core.ingest.connectors.read_text_documents`).
+    A malformed entry (a value that is not an envelope object) is rejected LOUD,
+    never silently dropped: dropping every bad entry would leave ``{}``, which the
+    connector would read as a plain directory and scan — ingesting unregistered
+    orphan files the managed list was supposed to exclude. Threaded into the text
+    connector so each document carries its DR-010 envelope onto ``documents.metadata``.
+    """
     files = source.metadata.get("files")
     if not isinstance(files, dict):
         return None
-    return {name: env for name, env in files.items() if isinstance(env, dict)}
+    validated: dict[str, dict[str, Any]] = {}
+    for name, env in files.items():
+        if not isinstance(env, dict):
+            raise SourceResolutionError(
+                f"managed source {source.id} file {name!r} has a non-object metadata "
+                f"entry {type(env).__name__} — the managed file list maps each stored "
+                "name to its DR-010 envelope object; a malformed entry fails loud rather "
+                "than silently degrading the source to an unmanaged directory scan"
+            )
+        validated[name] = env
+    return validated
 
 
 def _required_meta(source: Source, key: str) -> str:

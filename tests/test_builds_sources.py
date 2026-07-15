@@ -45,6 +45,42 @@ def test_text_source_yields_a_payload_per_text_file(tmp_path: Path) -> None:
     assert {p.mime for p in payloads} == {"text/plain", "text/markdown"}
 
 
+def test_managed_text_source_threads_envelopes_onto_payloads(tmp_path: Path) -> None:
+    """A managed text source (``metadata['files']`` present) routes each stored
+    file's DR-010 envelope onto its payload — the capture→persist path UXC1b needs."""
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    payloads = list(
+        resolve_source(
+            _source(
+                tmp_path.as_uri(),
+                kind="text",
+                metadata={"files": {"a.txt": {"context": {"title": "A"}}}},
+            )
+        )
+    )
+    assert [p.raw for p in payloads] == ["alpha"]
+    assert payloads[0].metadata == {"context": {"title": "A"}}
+
+
+def test_managed_text_source_rejects_a_malformed_files_entry(tmp_path: Path) -> None:
+    """A managed text source's ``metadata['files']`` maps each stored name to its
+    DR-010 envelope OBJECT. A non-object entry must fail LOUD: silently dropping it
+    (and, if every entry drops, leaving ``{}`` that the connector reads as a plain
+    directory) would scan and ingest UNREGISTERED orphan files the authoritative
+    managed list was supposed to exclude — a rejected/failed upload affecting a build."""
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    with pytest.raises(SourceResolutionError, match="non-object metadata entry"):
+        list(
+            resolve_source(
+                _source(
+                    tmp_path.as_uri(),
+                    kind="text",
+                    metadata={"files": {"a.txt": "not-an-object"}},
+                )
+            )
+        )
+
+
 def test_structured_source_yields_a_payload_per_row(tmp_path: Path) -> None:
     csv = tmp_path / "companies.csv"
     csv.write_text("id,name\n1,Acme\n2,Globex\n", encoding="utf-8")
