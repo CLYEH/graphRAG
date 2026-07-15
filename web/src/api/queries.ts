@@ -739,9 +739,21 @@ export function usePreviewClean(project: string) {
  *  from page-age to one round trip; the residual concurrent-write race is real
  *  (a recheck is not a lock — class 10) but closing it needs a version token
  *  in the frozen contract, a DR-002 round this task cannot open. */
+/** The shared mutationKey for the three Settings section saves. The page reads
+ *  its in-flight count via useIsMutating to lock EVERY section while ANY save is
+ *  pending — because each save spreads its own FRESH read of the whole config
+ *  column, two same-page saves launched before the first PATCH lands both read
+ *  the pre-save config and the later PATCH drops the earlier section's change
+ *  (Codex #79 R10, a lost update). This closes the SAME-PAGE double-submit
+ *  fully; the CROSS-WRITER race (another tab / the CLI) is the separate,
+ *  version-token-shaped gap the save docstrings note. project-scoped so the key
+ *  never matches another project's saves. */
+export const settingsSaveMutationKey = (project: string) => ["settings-save", project] as const;
+
 export function useSaveChunking(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationKey: settingsSaveMutationKey(project),
     mutationFn: async (args: { max_chars?: number; overlap?: number }) => {
       const fresh = await api.GET("/projects/{project}", {
         params: { path: { project } },
@@ -1017,6 +1029,7 @@ export type OntologyEdits = {
 export function useSaveOntology(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationKey: settingsSaveMutationKey(project),
     mutationFn: async (edits: OntologyEdits) => {
       const fresh = await api.GET("/projects/{project}", {
         params: { path: { project } },
@@ -1234,6 +1247,7 @@ export type QueryPolicySave = {
 export function useSaveQueryPolicy(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationKey: settingsSaveMutationKey(project),
     mutationFn: async ({ edits, salvaged }: QueryPolicySave) => {
       const posInt = (v: number, label: string) => {
         if (!Number.isInteger(v) || v < 1) throw new Error(`${label}必須是 ≥ 1 的整數`);

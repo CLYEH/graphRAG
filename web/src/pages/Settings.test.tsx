@@ -728,6 +728,47 @@ describe("Settings — project identity", () => {
   });
 });
 
+describe("Settings — concurrent save safety", () => {
+  it("locks every section while ANY save is in flight — a sibling can't race a lost update (R10)", async () => {
+    // Codex #79 R10: each section save spreads its OWN fresh read of the whole
+    // config column, so clicking ontology-save (in flight) then chunking-save
+    // before the first PATCH lands makes both read the pre-save config and the
+    // second PATCH drop the first section's change (a lost update). locked now
+    // ORs in useIsMutating on the shared settings-save key, so a pending save
+    // freezes every section's affordances until it settles. The refetch after a
+    // save keeps proj.isFetching true afterward; this guards the IN-FLIGHT
+    // window before that. Reverting the `|| saving` leaves the sibling button
+    // enabled mid-flight and this fails.
+    vi.spyOn(api, "GET").mockResolvedValue(projectBody(FULL_CONFIG) as never);
+    let releasePatch: ((v: unknown) => void) | null = null;
+    const patch = vi
+      .spyOn(api, "PATCH")
+      .mockImplementation((() => new Promise((r) => (releasePatch = r))) as never);
+    renderSettings();
+
+    // dirty two sections at once
+    fireEvent.change(await screen.findByLabelText("新增實體類型"), { target: { value: "PLACE" } });
+    fireEvent.click(screen.getByRole("button", { name: "加入實體類型" }));
+    fireEvent.change(screen.getByLabelText(/每塊字元上限/), { target: { value: "800" } });
+
+    const ontologySave = screen.getByRole("button", { name: "儲存知識類型" });
+    const chunkingSave = screen.getByRole("button", { name: "儲存 800/50 到專案設定" });
+    expect(ontologySave).toBeEnabled();
+    expect(chunkingSave).toBeEnabled();
+
+    // fire ontology save; its PATCH hangs so the mutation stays pending
+    fireEvent.click(ontologySave);
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+
+    // the sibling chunking save is now LOCKED — no second racing PATCH possible
+    await waitFor(() => expect(chunkingSave).toBeDisabled());
+
+    // release; exactly one PATCH ever fired
+    await act(async () => releasePatch!(projectBody(FULL_CONFIG)));
+    expect(patch).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("Settings — fail closed", () => {
   it("shows no forms before the config read settles — a form without the real config saves a wipe", async () => {
     vi.spyOn(api, "GET").mockImplementation((() => new Promise(() => {})) as never);

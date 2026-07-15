@@ -1,3 +1,4 @@
+import { useIsMutating } from "@tanstack/react-query";
 import { useState } from "react";
 
 import {
@@ -6,6 +7,7 @@ import {
   chunkingMalformed,
   ontologyFromConfig,
   policyFromConfig,
+  settingsSaveMutationKey,
   useProject,
   useSaveChunking,
   useSaveOntology,
@@ -70,6 +72,9 @@ export function Settings() {
 
 function SettingsBody({ project }: { project: string }) {
   const proj = useProject(project);
+  // in-flight count of this project's section saves — a hook, so it MUST run
+  // before the early returns below (Rules of Hooks); consumed by `locked`.
+  const saving = useIsMutating({ mutationKey: settingsSaveMutationKey(project) }) > 0;
 
   if (proj.isPending) return <p className="settings__line">載入專案設定中…</p>;
   if (proj.isError && proj.data === undefined)
@@ -79,8 +84,15 @@ function SettingsBody({ project }: { project: string }) {
 
   const config = (proj.data?.config ?? {}) as Record<string, unknown>;
   // fail CLOSED at the affordance: a refetching or refetch-failed read means
-  // the baselines on screen may not be the server's truth — saves wait
-  const locked = proj.isFetching || proj.isError;
+  // the baselines on screen may not be the server's truth — saves wait. `saving`
+  // (above) also locks EVERY section while ANY section save is in flight: each
+  // save spreads its own fresh read of the whole config column, so two same-page
+  // saves fired before the first PATCH lands would both read the pre-save config
+  // and the second would drop the first section's change (Codex #79 R10, a lost
+  // update). The invalidate→refetch after a save keeps proj.isFetching true
+  // afterward; `saving` covers the IN-FLIGHT window before that, which
+  // isFetching misses.
+  const locked = proj.isFetching || proj.isError || saving;
 
   return (
     <div className="settings">
