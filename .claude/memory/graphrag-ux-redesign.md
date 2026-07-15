@@ -61,3 +61,19 @@ R10=同頁併發存丟更新(`useIsMutating` 頁級鎖;跨寫者仍是版本 tok
 (eval+upload 端點,DR-002 bump 已核准,§26 記錄隨 PR 落地),改凍結契約=先確認 owner
 仍要這條路後開工。
 
+**2026-07-15 — 兩份文件化作 TASKS(owner 指示)**:讀 `.discuss/hakeguan/GAPS.md` + 外部功能
+評估 `.discuss/codex_review/FUNCTIONAL_REVIEW_2026-07-15.md`,經 owner 拍板轉成任務。三個岔路
+owner 定案:**(1) UXC1 拆成 UXC1a(契約 v1.2:eval+upload+通用文件 metadata envelope)/UXC1b
+(stage-1 metadata 傳遞)**——review §P0#4 只堅持「upload 契約要能帶 metadata」,故 envelope 語意
+(system/context/governance 三 namespace + 專案自訂 schema + exposure allowlist,安全邊界設計進契約)
+進 UXC1a,實作只做 capture→persist→snapshot→enrich-on-read;下游(chunk-local/搜尋索引/embedding/
+自動抽取/entity 升級)進路線圖。**(2) 答案合成定調 retrieval-first**(不做合成,「問答測試→檢索測試」
+改名併進 UXC2)。**(3) P2 用 A 方案**(近期切片寫成正式任務、P2 大包只留詳細路線圖註記,不拆任務——
+「進佇列≠會做,完整度靠執行不靠佇列長度;通用/維運最不能靠大量淺任務」)。**新增 Track 5 功能完整化與
+長期維運**:CFG1(⚠️統一 Console/MCP config SoR,推翻 07-10 決策,待確認)/SRC1(xlsx connector)/
+SRC2(⚠️來源生命週期,DR-002,待確認)/GOV1(型別漂移根病:跨型別 resolve)/GOV2(治理中心)/
+GOV3(ontology proposal 審核)/GOV4(merge Filter fail-loud)/QP1(NL→自動 graph plan)/SS1(server-side
+搜尋)/SS2(引用卡片 resolve,修 UXA3 過度宣稱)/RB1(retry lineage)。GAPS 對照表已回填帳本頂。
+**驗證發現**:UXA3 checkoff 宣稱 source_refs 成 resolved cards,實際 `QueryResults.tsx:94-108` 只折疊沒
+解析名字(→SS2);Console/MCP config 雙源是 07-10 刻意設計(→CFG1 需再確認才動)。
+
