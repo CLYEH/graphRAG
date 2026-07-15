@@ -1,0 +1,127 @@
+{
+  "description": "Parity corpus for the query_policy validity predicate (Codex #79 R3). Two independent gates read this same file: the server's query_policy_from_mapping (tests/test_query_policy_validity_parity.py — the REAL validator: frozen jsonschema + §21 typed re-checks) and the Console's isValidPolicyBlock (web/src/api/policyValidityParity.test.ts — the settings save-base check). When they drift, a hand-written policy the server rejects becomes a spread base the settings save 'succeeds' with, and every query keeps 400ing — the silent brick this corpus exists to prevent. base IS the Console's DEFAULT_QUERY_POLICY (asserted byte-equal by the vitest half), so the pytest half also proves the template the Console writes passes the real validator. Cases are base + set/unset mutations (dotted paths) or a whole-document replace.",
+  "base": {
+    "schema_version": "1.0",
+    "default_mode": "hybrid",
+    "max_top_k": 10,
+    "max_graph_hops": 2,
+    "max_sql_rows": 100,
+    "max_latency_ms": 15000,
+    "require_sources": true,
+    "expose_debug": false,
+    "text_to_sql": {
+      "enabled": false,
+      "readonly": true,
+      "allowed_tables": [],
+      "blocked_keywords": ["insert", "update", "delete", "drop", "alter", "truncate"],
+      "max_rows": 100,
+      "timeout_ms": 10000
+    },
+    "text_to_cypher": {
+      "enabled": false,
+      "readonly": true,
+      "allowed_clauses": ["MATCH", "WHERE", "RETURN", "LIMIT"],
+      "blocked": ["CREATE", "MERGE", "DELETE", "SET", "REMOVE", "CALL"],
+      "max_rows": 100,
+      "timeout_ms": 10000
+    }
+  },
+  "cases": [
+    { "name": "template-as-is", "valid": true },
+    {
+      "name": "sql-enabled-with-tables",
+      "valid": true,
+      "set": { "text_to_sql.enabled": true, "text_to_sql.allowed_tables": ["exhibits"] }
+    },
+    {
+      "name": "default-sql-while-enabled",
+      "valid": true,
+      "set": {
+        "default_mode": "sql",
+        "text_to_sql.enabled": true,
+        "text_to_sql.allowed_tables": ["exhibits"]
+      }
+    },
+    {
+      "name": "extended-blocked-lists",
+      "valid": true,
+      "set": {
+        "text_to_sql.blocked_keywords": [
+          "insert",
+          "update",
+          "delete",
+          "drop",
+          "alter",
+          "truncate",
+          "grant"
+        ],
+        "text_to_cypher.blocked": ["CREATE", "MERGE", "DELETE", "SET", "REMOVE", "CALL", "LOAD"]
+      }
+    },
+    {
+      "name": "restricted-clause-subset",
+      "valid": true,
+      "set": { "text_to_cypher.allowed_clauses": ["MATCH", "RETURN"] }
+    },
+    { "name": "bad-schema-version", "valid": false, "set": { "schema_version": "2.0" } },
+    { "name": "sql-enabled-empty-tables", "valid": false, "set": { "text_to_sql.enabled": true } },
+    {
+      "name": "missing-frozen-sql-keyword",
+      "valid": false,
+      "set": { "text_to_sql.blocked_keywords": ["insert", "update", "delete", "drop", "alter"] }
+    },
+    { "name": "default-sql-while-disabled", "valid": false, "set": { "default_mode": "sql" } },
+    { "name": "unknown-default-mode", "valid": false, "set": { "default_mode": "keyword" } },
+    { "name": "missing-top-level-key", "valid": false, "unset": ["max_latency_ms"] },
+    { "name": "extra-top-level-key", "valid": false, "set": { "note": "hi" } },
+    { "name": "require-sources-false", "valid": false, "set": { "require_sources": false } },
+    { "name": "sql-readonly-false", "valid": false, "set": { "text_to_sql.readonly": false } },
+    { "name": "cypher-readonly-false", "valid": false, "set": { "text_to_cypher.readonly": false } },
+    { "name": "zero-top-k", "valid": false, "set": { "max_top_k": 0 } },
+    { "name": "fractional-top-k", "valid": false, "set": { "max_top_k": 10.5 } },
+    { "name": "string-number-rows", "valid": false, "set": { "max_sql_rows": "100" } },
+    { "name": "expose-debug-string", "valid": false, "set": { "expose_debug": "no" } },
+    {
+      "name": "clause-outside-frozen-universe",
+      "valid": false,
+      "set": { "text_to_cypher.allowed_clauses": ["MATCH", "CALL"] }
+    },
+    {
+      "name": "empty-allowed-clauses",
+      "valid": false,
+      "set": { "text_to_cypher.allowed_clauses": [] }
+    },
+    {
+      "name": "missing-frozen-cypher-blocked",
+      "valid": false,
+      "set": { "text_to_cypher.blocked": ["CREATE", "MERGE", "DELETE", "SET", "REMOVE"] }
+    },
+    { "name": "sub-block-missing-key", "valid": false, "unset": ["text_to_sql.timeout_ms"] },
+    { "name": "sub-block-extra-key", "valid": false, "set": { "text_to_cypher.note": "hi" } },
+    {
+      "name": "duplicate-blocked-keyword",
+      "valid": false,
+      "set": {
+        "text_to_sql.blocked_keywords": [
+          "insert",
+          "insert",
+          "update",
+          "delete",
+          "drop",
+          "alter",
+          "truncate"
+        ]
+      }
+    },
+    {
+      "name": "uppercase-sql-keyword",
+      "valid": false,
+      "set": {
+        "text_to_sql.blocked_keywords": ["INSERT", "update", "delete", "drop", "alter", "truncate"]
+      }
+    },
+    { "name": "zero-cypher-timeout", "valid": false, "set": { "text_to_cypher.timeout_ms": 0 } },
+    { "name": "array-not-object", "valid": false, "replace": [] },
+    { "name": "string-not-object", "valid": false, "replace": "hybrid" }
+  ]
+}

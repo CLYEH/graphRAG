@@ -1,0 +1,53 @@
+{
+  "description": "Parity corpus for the ontology-block validity predicate (Codex #79 R4). Two independent gates read this same file: the server's load_build_config (tests/test_ontology_block_validity_parity.py — the REAL loader: core/builds/config.py _load_ontology + TextOntology) and the Console's isValidOntologyBlock (web/src/api/ontologyValidityParity.test.ts — the settings 'is this block repairable-clean or does it need a repair save' check). When they drift, a hand-written ontology block the server rejects looks clean in the settings form and the repair value is never written, so builds stay blocked (the silent brick this corpus prevents). base is a VALID ontology block; cases are base + set/unset mutations (dotted paths) or a whole-block replace. Only the ONTOLOGY key's value is under test — the parity harnesses wrap each block as {ontology: <block>}, and the absent-key (legal no-vocabulary) state is not a case here.",
+  "base": {
+    "entity_types": ["EVENT"],
+    "relation_types": ["PRACTICED_BY"],
+    "proposal_policy": "review"
+  },
+  "cases": [
+    { "name": "base-review", "valid": true },
+    { "name": "proposal-auto", "valid": true, "set": { "proposal_policy": "auto" } },
+    { "name": "proposal-omitted-defaults", "valid": true, "unset": ["proposal_policy"] },
+    {
+      "name": "multiple-types",
+      "valid": true,
+      "set": { "entity_types": ["EVENT", "PLACE"], "relation_types": ["PRACTICED_BY", "LOCATED_IN"] }
+    },
+    { "name": "proposal-typo", "valid": false, "set": { "proposal_policy": "keep" } },
+    { "name": "proposal-not-string", "valid": false, "set": { "proposal_policy": 5 } },
+    { "name": "proposal-bool", "valid": false, "set": { "proposal_policy": true } },
+    { "name": "unknown-key", "valid": false, "set": { "propose_policy": "review" } },
+    {
+      "name": "both-empty",
+      "valid": false,
+      "set": { "entity_types": [], "relation_types": [] }
+    },
+    { "name": "both-omitted", "valid": false, "unset": ["entity_types", "relation_types"] },
+    { "name": "one-sided-missing-relations", "valid": false, "set": { "relation_types": [] } },
+    { "name": "one-sided-missing-entities", "valid": false, "set": { "entity_types": [] } },
+    { "name": "entity-types-not-array", "valid": false, "set": { "entity_types": "EVENT" } },
+    {
+      "name": "entity-types-item-not-string",
+      "valid": false,
+      "set": { "entity_types": ["EVENT", 5] }
+    },
+    {
+      "name": "relation-types-item-not-string",
+      "valid": false,
+      "set": { "relation_types": [true] }
+    },
+    { "name": "blank-entity-type", "valid": false, "set": { "entity_types": [""] } },
+    { "name": "whitespace-entity-type", "valid": false, "set": { "entity_types": ["  "] } },
+    { "name": "blank-relation-type", "valid": false, "set": { "relation_types": [""] } },
+    { "name": "whitespace-relation-type", "valid": false, "set": { "relation_types": ["\t"] } },
+    {
+      "name": "blank-among-valid-entity-types",
+      "valid": false,
+      "set": { "entity_types": ["EVENT", ""] }
+    },
+    { "name": "block-null", "valid": false, "replace": null },
+    { "name": "block-array", "valid": false, "replace": [] },
+    { "name": "block-scalar", "valid": false, "replace": "ontology" }
+  ]
+}

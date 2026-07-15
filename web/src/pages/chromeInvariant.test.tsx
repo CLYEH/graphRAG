@@ -11,6 +11,7 @@ import { Inspect } from "./Inspect";
 import { Clean } from "./Clean";
 import { Graph } from "./Graph";
 import { Import } from "./Import";
+import { Settings } from "./Settings";
 import { QueryResults } from "../components/QueryResults";
 import { api } from "../api/client";
 import {
@@ -205,6 +206,62 @@ function stubWorld() {
             created_at: "2026-07-01T00:00:00Z",
           },
         ]);
+      case "/projects/{project}":
+        // uuid-laden where the settings page must NOT render them bare:
+        // structured_mappings never renders at all, and the sql guardrail
+        // block (with a uuid-suffixed table name) is confined to a fold
+        return ok({
+          name: "acme",
+          display_name: null,
+          description: null,
+          config: {
+            ontology: {
+              entity_types: ["EVENT"],
+              relation_types: ["PRACTICED_BY"],
+              proposal_policy: "review",
+            },
+            chunking: { max_chars: 400, overlap: 60 },
+            query_policy: {
+              schema_version: "1.0",
+              default_mode: "hybrid",
+              max_top_k: 10,
+              max_graph_hops: 2,
+              max_sql_rows: 100,
+              max_latency_ms: 15000,
+              require_sources: true,
+              expose_debug: false,
+              text_to_sql: {
+                enabled: false,
+                readonly: true,
+                allowed_tables: ["t_1a2b3c4d-aaaa-4aaa-8aaa-000000000001"],
+                blocked_keywords: ["insert", "update", "delete", "drop", "alter", "truncate"],
+                max_rows: 100,
+                timeout_ms: 10000,
+              },
+              text_to_cypher: {
+                enabled: false,
+                readonly: true,
+                allowed_clauses: ["MATCH", "WHERE", "RETURN", "LIMIT"],
+                blocked: ["CREATE", "MERGE", "DELETE", "SET", "REMOVE", "CALL"],
+                max_rows: 100,
+                timeout_ms: 10000,
+              },
+            },
+            structured_mappings: {
+              exhibits: {
+                entities: {
+                  ex: {
+                    entity_type: "EXHIBIT",
+                    name_column: "name",
+                    disambiguator_column: "c1111111-aaaa-4aaa-8aaa-000000000001",
+                  },
+                },
+                relations: [],
+              },
+            },
+          },
+          created_at: "2026-07-01T00:00:00Z",
+        });
       case "/projects/{project}/documents":
         return ok([
           {
@@ -342,6 +399,13 @@ describe("chrome invariant — no raw ids or store vocabulary outside folds", ()
     await waitFor(() => expect(runBtn).toBeEnabled());
     fireEvent.click(runBtn);
     await screen.findByText(/建置已排入佇列/);
+    assertChromeClean(container);
+  });
+
+  it("設定 (Settings) — the uuid-laden guardrail blocks stay inside their folds", async () => {
+    stubWorld();
+    const { container } = renderPage(<Settings />, "settings");
+    await screen.findByText("知識類型");
     assertChromeClean(container);
   });
 
