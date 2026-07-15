@@ -62,6 +62,30 @@ def test_managed_text_source_threads_envelopes_onto_payloads(tmp_path: Path) -> 
     assert payloads[0].metadata == {"context": {"title": "A"}}
 
 
+@pytest.mark.parametrize("bad_files", [[], None, "x", 5])
+def test_managed_text_source_rejects_a_non_object_files_value(
+    tmp_path: Path, bad_files: Any
+) -> None:
+    """A PRESENT ``files`` key marks the source managed; a non-object value (``[]``,
+    ``null``, a string, a number — all storable in free-form source metadata) is
+    malformed and must fail LOUD. Returning None here would send resolve_source down
+    the unmanaged directory-scan path, ingesting unregistered orphan files. Presence
+    of the key, not the value's truthiness, is what distinguishes managed from plain."""
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    with pytest.raises(SourceResolutionError, match="non-object 'files'"):
+        list(resolve_source(_source(tmp_path.as_uri(), kind="text", metadata={"files": bad_files})))
+
+
+def test_text_source_without_a_files_key_scans_as_a_directory(tmp_path: Path) -> None:
+    """The COUNTERPART to the malformed-value rejection: an ABSENT files key is a
+    plain (non-upload) text source — scanned as a directory, not rejected. This pins
+    the present-vs-absent distinction so a future refactor can't collapse them."""
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    payloads = list(resolve_source(_source(tmp_path.as_uri(), kind="text", metadata={"other": 1})))
+    assert [p.raw for p in payloads] == ["alpha"]
+    assert payloads[0].metadata == {"filename": "a.txt"}  # connector-derived fallback
+
+
 def test_managed_text_source_rejects_a_malformed_files_entry(tmp_path: Path) -> None:
     """A managed text source's ``metadata['files']`` maps each stored name to its
     DR-010 envelope OBJECT. A non-object entry must fail LOUD: silently dropping it

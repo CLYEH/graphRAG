@@ -389,11 +389,18 @@ async def upsert_managed_source(
     prior_files = source.metadata.get("files", {})
     merged_files = {**prior_files, **files} if isinstance(prior_files, dict) else dict(files)
     merged_metadata = {**source.metadata, "files": merged_files}
+    # (Re)assert the managed kind on update, not just insert: a source row may
+    # already exist at this uri from POST /sources with a NON-text kind (structured
+    # / null / typo). resolve_source dispatches on kind, so leaving it would route
+    # this accepted managed-text upload to the wrong connector (or none) and never
+    # ingest it — the endpoint returned 201 pointing at a source that will not build.
+    # This uri is the upload system's own managed corpus dir, so forcing kind=text
+    # is the intent-preserving fix (there is no legitimate other-kind source here).
     row = (
         await conn.execute(
             tables.sources.update()
             .where(tables.sources.c.id == source.id)
-            .values(metadata=merged_metadata)
+            .values(kind=kind, metadata=merged_metadata)
             .returning(*_SOURCE_COLS)
         )
     ).one()

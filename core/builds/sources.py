@@ -246,17 +246,27 @@ def _files_metadata(source: Source) -> dict[str, dict[str, Any]] | None:
     :func:`core.registry.store.upsert_managed_source`), or None for a source with
     no such stash (a non-upload text source, scanned as a plain directory).
 
-    A ``files`` key that IS a dict marks the source MANAGED (its registered file
-    list is authoritative — see :func:`~core.ingest.connectors.read_text_documents`).
-    A malformed entry (a value that is not an envelope object) is rejected LOUD,
-    never silently dropped: dropping every bad entry would leave ``{}``, which the
-    connector would read as a plain directory and scan — ingesting unregistered
-    orphan files the managed list was supposed to exclude. Threaded into the text
-    connector so each document carries its DR-010 envelope onto ``documents.metadata``.
+    The PRESENCE of a ``files`` key marks the source MANAGED (its registered file
+    list is authoritative — see :func:`~core.ingest.connectors.read_text_documents`);
+    its ABSENCE is a plain (non-upload) text source, scanned as a directory. So the
+    two are distinguished by key presence, NOT by the value's truthiness: a present
+    ``files`` whose value is malformed — not a dict (``[]``, ``null``, a string), or
+    a dict with a non-object entry — is rejected LOUD. Returning None for a malformed
+    value would send ``resolve_source`` down the unmanaged directory-scan path,
+    ingesting unregistered orphan files the managed list was supposed to exclude.
+    Threaded into the text connector so each document carries its DR-010 envelope
+    onto ``documents.metadata``.
     """
-    files = source.metadata.get("files")
+    if "files" not in source.metadata:
+        return None  # no managed-file stash: a plain (non-upload) text source
+    files = source.metadata["files"]
     if not isinstance(files, dict):
-        return None
+        raise SourceResolutionError(
+            f"managed source {source.id} has a non-object 'files' metadata value "
+            f"({type(files).__name__}) — a present 'files' key marks the source managed, "
+            "so a non-object value is malformed and fails loud rather than silently "
+            "degrading the source to an unmanaged directory scan"
+        )
     validated: dict[str, dict[str, Any]] = {}
     for name, env in files.items():
         if not isinstance(env, dict):

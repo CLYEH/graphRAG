@@ -32,6 +32,7 @@ from core.registry import (
     list_projects,
     list_sources,
     update_project,
+    upsert_managed_source,
 )
 from core.stores.tables import (
     builds,
@@ -163,6 +164,35 @@ async def test_add_source_requires_project_and_lists(migrated: None) -> None:
             listed, after = await list_sources(conn, name, limit=10)
             assert [x.id for x in listed] == [s.id]
             assert after is None
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_upsert_managed_source_forces_kind_text_on_a_reused_row(migrated: None) -> None:
+    """WHY: the upload endpoint returns 201 pointing at the source this upserts, and
+    builds dispatch by ``source.kind`` in ``resolve_source``. If a row already exists
+    at the managed corpus uri from ``POST /sources`` with a NON-text kind (structured
+    / null / typo), merging only the ``files`` metadata would leave that kind — so the
+    accepted managed-text upload routes to the wrong connector (or none) and is never
+    ingested. Upsert must (re)assert kind=text on the reused row, not just on insert."""
+    engine = _engine()
+    name = _proj()
+    uri = "file:///managed/corpus"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=name)
+            # a pre-existing conflicting source at the managed uri (structured)
+            stale = await add_source(
+                conn, name, uri=uri, kind="structured", metadata={"table": "t"}
+            )
+            reused = await upsert_managed_source(
+                conn, name, uri=uri, kind="text", files={"a.txt": {"context": {"title": "A"}}}
+            )
+            assert reused.id == stale.id  # same row reused (by project, uri), not a new one
+            assert reused.kind == "text"  # kind FORCED to the managed kind
+            assert reused.metadata["files"] == {"a.txt": {"context": {"title": "A"}}}
             await trans.rollback()
     finally:
         await engine.dispose()
