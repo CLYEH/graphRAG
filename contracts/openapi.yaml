@@ -1480,14 +1480,17 @@ components:
         server cannot drop the server-owned namespace (DR-010 rule 1). Wiring the
         envelope here makes it load-bearing rather than a dangling type.
       additionalProperties: false
-      required: [filename, status, document_uri, metadata]
+      required: [filename, original_filename, status, document_uri, metadata]
       properties:
         filename:
           type: string
           description: Server-sanitized stored name (client filenames are never used as paths).
         original_filename:
-          type: ["string", "null"]
-          description: The filename as submitted; kept as document metadata.
+          type: string
+          description: |
+            The filename as submitted — the client's matching key back to its
+            selection and to the filename-keyed upload metadata. Required (non-null)
+            so every success row is correlatable.
         status:
           type: string
           enum: [accepted]
@@ -1505,14 +1508,13 @@ components:
         is required and non-empty, so a client can always explain why a file was
         not stored.
       additionalProperties: false
-      required: [filename, status, reason]
+      required: [original_filename, status, reason]
       properties:
-        filename:
-          type: string
-          description: Echoes the submitted name of the rejected file.
         original_filename:
-          type: ["string", "null"]
-          description: The filename as submitted.
+          type: string
+          description: |
+            The filename as submitted — the reject row's identity and the client's
+            matching key (a rejected file has no stored name).
         status:
           type: string
           enum: [rejected]
@@ -1520,6 +1522,7 @@ components:
           type: string
           minLength: 1
           description: Why the file was rejected (e.g. extension not allowlisted, single-file size limit).
+        filename: false
         document_uri: false
 
     UploadedFile:
@@ -1543,7 +1546,12 @@ components:
           type: ["string", "null"]
           format: uuid
         files:
+          description: |
+            One entry per submitted file (accepted or rejected). Non-empty: the
+            request carries ≥1 file, so an empty manifest would be a silent all-drop,
+            which the no-silent-drop guarantee forbids.
           type: array
+          minItems: 1
           items:
             $ref: "#/components/schemas/UploadedFile"
 

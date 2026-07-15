@@ -764,9 +764,18 @@ def test_upload_endpoint_contract(spec: dict[str, Any]) -> None:
     assert "reason" in rejected["required"]
     assert rejected["properties"]["reason"]["minLength"] == 1
     assert rejected["properties"]["document_uri"] is False
+    assert rejected["properties"]["filename"] is False  # nothing stored for a reject
     accepted = by_status["accepted"]
     assert "document_uri" in accepted["required"]
     assert accepted["properties"]["reason"] is False
+    # the submitted filename is the client's matching key back to its selection and
+    # to the (filename-keyed) upload metadata — required + non-null on BOTH variants
+    # so every manifest row is correlatable (Codex PR#80)
+    for variant in (accepted, rejected):
+        assert "original_filename" in variant["required"]
+        assert variant["properties"]["original_filename"]["type"] == "string"
+    # the manifest is non-empty for a non-empty upload — no silent all-drop (Codex PR#80)
+    assert data["properties"]["files"]["minItems"] == 1
 
 
 def test_document_metadata_envelope_shape(spec: dict[str, Any]) -> None:

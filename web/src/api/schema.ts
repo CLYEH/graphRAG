@@ -973,8 +973,12 @@ export interface components {
     UploadedFileAccepted: {
       /** @description Server-sanitized stored name (client filenames are never used as paths). */
       filename: string;
-      /** @description The filename as submitted; kept as document metadata. */
-      original_filename?: string | null;
+      /**
+       * @description The filename as submitted — the client's matching key back to its
+       *     selection and to the filename-keyed upload metadata. Required (non-null)
+       *     so every success row is correlatable.
+       */
+      original_filename: string;
       /** @enum {string} */
       status: "accepted";
       /** @description Canonical file:// uri the managed source points at (BA9 rules). */
@@ -988,14 +992,16 @@ export interface components {
      *     not stored.
      */
     UploadedFileRejected: {
-      /** @description Echoes the submitted name of the rejected file. */
-      filename: string;
-      /** @description The filename as submitted. */
-      original_filename?: string | null;
+      /**
+       * @description The filename as submitted — the reject row's identity and the client's
+       *     matching key (a rejected file has no stored name).
+       */
+      original_filename: string;
       /** @enum {string} */
       status: "rejected";
       /** @description Why the file was rejected (e.g. extension not allowlisted, single-file size limit). */
       reason: string;
+      filename?: never;
       document_uri?: never;
     };
     /**
@@ -1014,6 +1020,11 @@ export interface components {
        * @description The canonical managed source registered/updated; null when nothing was accepted.
        */
       source_id: string | null;
+      /**
+       * @description One entry per submitted file (accepted or rejected). Non-empty: the
+       *     request carries ≥1 file, so an empty manifest would be a silent all-drop,
+       *     which the no-silent-drop guarantee forbids.
+       */
       files: components["schemas"]["UploadedFile"][];
     };
     /**
