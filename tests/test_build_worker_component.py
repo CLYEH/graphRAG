@@ -316,8 +316,12 @@ async def test_run_eval_task_terminalizes_on_store_error_never_strands_running(
     async def _boom(*a: Any, **k: Any) -> Any:
         raise RuntimeError("neo4j connection refused")  # a store outage, not a refusal
 
+    async def _not_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False  # no cancel — this test isolates the store-outage path
+
     monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
@@ -367,6 +371,93 @@ async def test_run_eval_task_rejects_project_name_escaping_projects_dir(
     assert result == "failed"
     assert loaded == []  # the traversal read never happened
     assert statuses == ["failed"]  # failed at the guard, before the 'running' mark
+
+
+async def test_run_eval_task_honors_cancellation_before_starting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: /jobs/{id}/cancel flags cancel_requested cooperatively. An eval accepted
+    # for cancellation must NOT run to completion and report success — it is
+    # terminalized 'cancelled' before any work (no golden load, no run_eval).
+    statuses: list[str] = []
+    loaded: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return True
+
+    def _load_golden(path: Any) -> Any:
+        loaded.append(str(path))  # must NOT run for a cancelled job
+        return "GOLDEN"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "is_cancel_requested", _cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr("core.eval.golden.load_golden", _load_golden)
+
+    ctx = {"engine": _FakeEngine(), "neo4j": _FakeNeo4j(), "owner": "worker-abc"}
+    result = await bw.run_eval_task(ctx, "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "cancelled"
+    assert loaded == []  # no eval work started
+    assert statuses == ["cancelled"]  # terminalized before the 'running' mark
+
+
+async def test_run_eval_task_cancel_during_run_finalizes_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # a cancel that arrives AFTER the pre-start check but during run_eval finalizes
+    # the job 'cancelled', not 'done' (mirrors run_build's terminalize). The finalize
+    # must LOCK the row (FOR UPDATE) BEFORE reading cancel_requested — the lock is the
+    # cutoff (class-10: the decisive read lives under the write's lock, not a prior
+    # unlocked SELECT), so we also pin lock→read ordering.
+    checks = {"n": 0}
+    statuses: list[str] = []
+    events: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _cancel_on_finalize(conn: Any, job_id: uuid.UUID) -> bool:
+        checks["n"] += 1
+        events.append(f"cancel_read#{checks['n']}")
+        return checks["n"] > 1  # False at the pre-start check, True at finalize
+
+    async def _lock_job(conn: Any, job_id: uuid.UUID) -> None:
+        events.append("lock")  # the FOR UPDATE cutoff — must precede the finalize read
+        return None
+
+    async def _run_eval(*a: Any, **k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "is_cancel_requested", _cancel_on_finalize)
+    monkeypatch.setattr(bw, "lock_job", _lock_job)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+
+    ctx = {
+        "engine": _FakeEngine(),
+        "neo4j": _FakeNeo4j(),
+        "qdrant": "QD",
+        "embedder": "EMB",
+        "llm": "LLM",
+        "owner": "worker-abc",
+    }
+    result = await bw.run_eval_task(ctx, "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "cancelled"
+    assert statuses == ["running", "cancelled"]  # ran, then cancelled at finalize
+    # the finalize acquires the row lock BEFORE its cancel read (#2): a cancel
+    # racing the finalize is decided under the lock, never lost to an unlocked read.
+    assert events == ["cancel_read#1", "lock", "cancel_read#2"]
 
 
 async def test_enqueue_build_uses_job_id_dedup() -> None:

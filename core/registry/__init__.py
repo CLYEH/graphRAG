@@ -20,6 +20,7 @@ from core.registry.jobs import (
     get_job,
     get_job_at,
     is_cancel_requested,
+    lock_job,
     request_cancel,
     set_progress,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "is_cancel_requested",
     "list_projects",
     "list_sources",
+    "lock_job",
     "request_cancel",
     "set_progress",
     "update_project",

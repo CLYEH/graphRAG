@@ -8,6 +8,7 @@ be cited at query time.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -68,6 +69,20 @@ def test_managed_source_ingests_only_registered_files(tmp_path: Path) -> None:
     # sanity: with NO stash (a plain directory source) both files ARE read — the
     # restrict-to-registered rule is scoped to managed sources only
     assert {p.raw for p in read_text_documents(tmp_path)} == {"keep", "leaked"}
+
+
+def test_managed_source_fails_loudly_on_a_missing_registered_file(tmp_path: Path) -> None:
+    """The registered file list is authoritative in BOTH directions: a file the
+    managed source LISTS but that is absent from disk (a lost write / disk loss)
+    fails LOUDLY. WHY: the SoR says the upload was accepted, so silently ingesting
+    fewer documents than registered would corrupt results with no signal."""
+    (tmp_path / "present.txt").write_text("here", encoding="utf-8")
+    stash: dict[str, dict[str, Any]] = {
+        "present.txt": {"context": {}},
+        "gone.txt": {"context": {}},
+    }  # gone.txt absent
+    with pytest.raises(FileNotFoundError, match="gone.txt"):
+        list(read_text_documents(tmp_path, stash))
 
 
 def test_csv_rows_carry_citable_identity_and_canonical_content(tmp_path: Path) -> None:

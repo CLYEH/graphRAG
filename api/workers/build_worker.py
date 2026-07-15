@@ -56,6 +56,8 @@ from core.registry import (
     find_reapable_jobs,
     find_unenqueued_jobs,
     get_project,
+    is_cancel_requested,
+    lock_job,
     set_progress,
 )
 from core.stores.graph import graph_driver
@@ -149,6 +151,14 @@ async def run_eval_task(
                 ValueError(f"project {project!r} is not a valid projects-dir path component"),
             )
             return "failed"
+        # Cancellation checkpoint BEFORE starting work: /jobs/{id}/cancel flags
+        # cancel_requested cooperatively (like a build's between-stage checks), so
+        # an eval accepted for cancellation must not run to completion and report
+        # success — terminalize it 'cancelled' and do no work.
+        async with engine.begin() as conn:
+            if await is_cancel_requested(conn, eval_job):
+                await set_progress(conn, eval_job, status="cancelled", finished_at=sa.func.now())
+                return "cancelled"
         try:
             golden = load_golden(root / "eval" / "golden.yaml")
             policy = load_query_policy(root / "config.yaml")
@@ -176,11 +186,21 @@ async def run_eval_task(
         except Exception as exc:  # noqa: BLE001 — the eval boundary, mirroring run_build's stage boundary: ANY error once 'running' (a refusal like a vanished build / unconfigured model, OR a store outage) must terminalize the jobs row, never leave it 'running'+unleased for no sweep to recover. (CancelledError is BaseException → still propagates, same job_timeout mitigation as run_build.)
             await _fail_job(engine, eval_job, exc)
             return "failed"
+        # Finalize honoring a cancel that arrived DURING the run, mirroring run_build's
+        # terminalize (orchestrator §5): LOCK the job row FOR UPDATE, THEN read
+        # cancel_requested UNDER the lock — the lock is the cancellation cutoff. A
+        # cancel committed before it (incl. one accepted mid-eval) is honored; one
+        # racing in after blocks on the lock and, finding a terminal job, is cleanly
+        # rejected by request_cancel's status-guarded UPDATE (no 'accepted but
+        # ignored' limbo). The class-10 TOCTOU lesson: the decisive read belongs
+        # under the write's row lock, never a prior unlocked SELECT.
         async with engine.begin() as conn:
+            await lock_job(conn, eval_job)  # FOR UPDATE — the cancel cutoff
+            status = "cancelled" if await is_cancel_requested(conn, eval_job) else "done"
             await set_progress(
-                conn, eval_job, status="done", progress=1.0, finished_at=sa.func.now()
+                conn, eval_job, status=status, progress=1.0, finished_at=sa.func.now()
             )
-        return "done"
+        return status
 
 
 async def reenqueue_build(

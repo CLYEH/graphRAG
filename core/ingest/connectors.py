@@ -67,30 +67,51 @@ def read_text_documents(
     upload time, keyed by the file's stored (on-disk) name — the managed-source
     stash the ingest connector threads onto ``documents.metadata`` (UXC1b
     capture → persist). When it is NON-EMPTY the source is a MANAGED one whose
-    registered file list is AUTHORITATIVE: only those files are ingested, so a
-    file left in the scanned corpus by a failed / rolled-back upload (present on
-    disk but never registered) is never ingested with fallback metadata — the
-    managed source's durable file list, not the raw directory contents, decides
-    what belongs to it. An EMPTY/absent stash is a plain directory source: every
-    accepted file is read, each falling back to the connector-derived
-    ``{"filename": ...}`` — the original behavior for a non-upload source or a
-    file placed on disk directly.
+    registered file list is AUTHORITATIVE in BOTH directions: it is the ITERATION
+    SOURCE, so (a) an on-disk file NOT registered — an orphan left by a failed /
+    rolled-back upload — is never ingested with fallback metadata, and (b) a
+    registered file MISSING from disk fails LOUDLY (the SoR says the upload was
+    accepted; silently ingesting fewer documents would corrupt results). An
+    EMPTY/absent stash is a plain directory source: every accepted file under the
+    tree is read, each falling back to the connector-derived ``{"filename": ...}``
+    — the original behavior for a non-upload source or a file placed on disk
+    directly.
     """
     if not root.is_dir():
         raise NotADirectoryError(f"document source root {root} is not a directory")
     stash = metadata_by_filename or {}
-    registered_only = bool(stash)  # a managed source: its file list is authoritative
+    if stash:
+        # Managed source: iterate the REGISTERED list (sorted), not the directory.
+        for name in sorted(stash):
+            path = root / name
+            suffix = path.suffix.lower()
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"registered upload file {name!r} is missing from {root} — the "
+                    "managed source lists it but it is not on disk (a lost write); "
+                    "ingesting fewer documents than the SoR accepted would corrupt results"
+                )
+            if suffix not in TEXT_SUFFIXES:
+                raise ValueError(
+                    f"registered upload file {name!r} has an unaccepted suffix {suffix!r} "
+                    f"(accepted: {sorted(TEXT_SUFFIXES)})"
+                )
+            yield DocumentPayload(
+                source_uri=path.resolve().as_uri(),
+                raw=path.read_text(encoding="utf-8"),
+                mime=TEXT_SUFFIXES[suffix],
+                metadata=stash[name],
+            )
+        return
     for path in sorted(root.rglob("*")):
         suffix = path.suffix.lower()
         if not path.is_file() or suffix not in TEXT_SUFFIXES:
             continue
-        if registered_only and path.name not in stash:
-            continue  # an orphan not in the managed source's registered files — skip
         yield DocumentPayload(
             source_uri=path.resolve().as_uri(),
             raw=path.read_text(encoding="utf-8"),
             mime=TEXT_SUFFIXES[suffix],
-            metadata=stash.get(path.name, {"filename": path.name}),
+            metadata={"filename": path.name},
         )
 
 
