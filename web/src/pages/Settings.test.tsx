@@ -280,6 +280,30 @@ describe("Settings — query policy", () => {
     expect(policy["default_mode"]).toBe("semantic"); // operator fields still salvage
   });
 
+  it("does not salvage an OUT-OF-RANGE operator field — a max_top_k of 0 must not lock the rebuild button", async () => {
+    // Codex #79 R5 (the R3 value-domain class, in the salvage): the block is
+    // malformed via max_top_k: 0, which isValidPolicyBlock correctly flags —
+    // but seeding that 0 into the form trips the form's own fieldError, which
+    // disabled the very "rebuild with template" button meant to repair it, so
+    // accepting the safe defaults was impossible without first editing the
+    // bad field. The salvage must fall back to the template default (≥ 1).
+    vi.spyOn(api, "GET").mockResolvedValue(
+      projectBody({ query_policy: { ...FULL_CONFIG.query_policy, max_top_k: 0 } }) as never,
+    );
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    await screen.findByText(/問答安全政策不符規範/);
+    const rebuild = screen.getByRole("button", { name: "以預設範本重建並儲存" });
+    expect(rebuild).toBeEnabled(); // no edit needed despite the 0 in the saved block
+    fireEvent.click(rebuild);
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    const policy = patchedConfig(patch)["query_policy"] as Record<string, unknown>;
+    expect(policy["max_top_k"]).toBe(DEFAULT_QUERY_POLICY.max_top_k); // fell back, not 0
+    expect(policy["max_graph_hops"]).toBe(3); // the VALID salvaged field still lands
+  });
+
   it("does not salvage a junk default_mode of sql — the rebuild target disables sql", async () => {
     // Seeding the form to "sql" from a malformed block re-creates R1's dead
     // end one click later: the rebuilt policy has text_to_sql disabled, so

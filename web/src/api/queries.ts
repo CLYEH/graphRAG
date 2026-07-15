@@ -1128,8 +1128,13 @@ export function policyFromConfig(config: Record<string, unknown>): QueryPolicyOp
   // not the junk — only the three operator fields are salvaged for seeding
   const malformed = b !== undefined && !isValidPolicyBlock(b);
   const usable = b !== undefined && !malformed ? b : undefined;
+  // the operator knobs seed the form, so an OUT-OF-RANGE salvaged value
+  // (max_top_k: 0 in a malformed block) would trip the form's own fieldError
+  // and disable the very rebuild button meant to repair it (Codex #79 R5,
+  // the R3 value-domain class in the salvage) — fall back to the template
+  // default, same as the sql default_mode guard below. Schema minimum is 1.
   const int = (v: unknown, fallback: number): number =>
-    typeof v === "number" && Number.isInteger(v) ? v : fallback;
+    typeof v === "number" && Number.isInteger(v) && v >= 1 ? v : fallback;
   const enabled = (sub: unknown): boolean => isRecord(sub) && sub["enabled"] === true;
   const modes: readonly QueryMode[] = ["semantic", "graph", "sql", "global", "hybrid"];
   const mode = b?.["default_mode"];
