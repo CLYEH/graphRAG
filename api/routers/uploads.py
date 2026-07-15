@@ -40,7 +40,7 @@ from api.schemas import DocumentMetadataInput
 from core.config import get_settings
 from core.ingest.connectors import TEXT_SUFFIXES
 from core.metadata import MetadataValidationError, build_envelope, load_metadata_schema
-from core.metadata.schema import MetadataSchema
+from core.metadata.schema import MetadataConfigError, MetadataSchema
 from core.registry import ProjectNotFoundError, get_project, upsert_managed_source
 
 router = APIRouter(tags=["sources"])
@@ -118,7 +118,15 @@ async def upload_documents_endpoint(
         )
 
     metadata_by_name = _parse_metadata_field(form.get("metadata"), set(submitted_names))
-    schema = load_metadata_schema(project_row.config)
+    try:
+        schema = load_metadata_schema(project_row.config)
+    except MetadataConfigError as exc:
+        # a malformed project metadata_schema is a config validation problem → a
+        # typed 400 (same strictness as the query router's exposure loading),
+        # never a 500 INTERNAL that hides an operator-fixable config error
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR, str(exc), details={"metadata_schema": "invalid"}
+        ) from exc
 
     async def produce() -> tuple[int, dict[str, Any]]:
         manifest, accepted = await _process_files(
@@ -256,17 +264,24 @@ def _validate_file(
         return f"extension {suffix or '(none)'!r} is not allowlisted (allowed: {allowed})", None
     if len(content) > settings.upload_max_file_bytes:
         return f"file exceeds the {settings.upload_max_file_bytes}-byte single-file limit", None
-    if entry is None:
-        return None, None
-    try:
-        parsed = DocumentMetadataInput.model_validate(entry)
-    except ValidationError as exc:
-        return f"metadata is invalid: {_first_pydantic_error(exc)}", None
-    if parsed.context is not None:
+    parsed: DocumentMetadataInput | None = None
+    context_to_check: dict[str, Any] = {}
+    if entry is not None:
         try:
-            schema.validate_context(parsed.context.model_dump())
-        except MetadataValidationError as exc:
-            return f"metadata does not match the project schema: {exc}", None
+            parsed = DocumentMetadataInput.model_validate(entry)
+        except ValidationError as exc:
+            return f"metadata is invalid: {_first_pydantic_error(exc)}", None
+        if parsed.context is not None:
+            context_to_check = parsed.context.model_dump()
+    # validate the context against the project schema ALWAYS — with an empty
+    # context when the file supplied none. Skipping this on the no-metadata (or
+    # no-context) path would silently accept a file that OMITS a REQUIRED
+    # attribute, making the schema non-load-bearing for the common
+    # "no metadata supplied" case (a class-23 write-side silent brick).
+    try:
+        schema.validate_context(context_to_check)
+    except MetadataValidationError as exc:
+        return f"metadata does not match the project schema: {exc}", None
     return None, parsed
 
 

@@ -262,3 +262,66 @@ def test_valid_metadata_is_stamped_into_the_envelope(
     assert envelope["governance"] == {"visibility": "restricted"}
     assert envelope["system"]["connector"] == "upload"
     assert envelope["schema_version"] == "1.0"
+
+
+def test_missing_required_attribute_rejects_file_with_no_metadata(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY: a project's REQUIRED attribute must be enforced even when the client
+    # supplies NO metadata for a file — else the schema is non-load-bearing for
+    # the common "no metadata" case and silently stores a document later stages
+    # assume was rejected (a class-23 write-side silent brick).
+    _project(
+        monkeypatch,
+        config={
+            "metadata_schema": {"attributes": {"case_number": {"type": "string", "required": True}}}
+        },
+    )
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    resp = client.post(_URL, files=[("files", ("req.txt", b"body", "text/plain"))])
+    assert resp.status_code == 201  # a per-file STATED reject, not a whole-request failure
+    row = resp.json()["data"]["files"][0]
+    assert row["status"] == "rejected"
+    assert "required attribute 'case_number'" in row["reason"]
+    assert resp.json()["data"]["source_id"] is None  # nothing accepted → no source
+
+
+def test_missing_required_attribute_rejects_file_with_metadata_but_no_context(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # the same gap on the metadata-present-but-no-context path: governance only,
+    # no context → the required attribute is still missing and must reject.
+    _project(
+        monkeypatch,
+        config={
+            "metadata_schema": {"attributes": {"case_number": {"type": "string", "required": True}}}
+        },
+    )
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    metadata = {"doc.txt": {"governance": {"visibility": "public"}}}
+    resp = client.post(
+        _URL,
+        files=[("files", ("doc.txt", b"x", "text/plain"))],
+        data={"metadata": json.dumps(metadata)},
+    )
+    assert resp.status_code == 201
+    row = resp.json()["data"]["files"][0]
+    assert row["status"] == "rejected" and "required attribute 'case_number'" in row["reason"]
+
+
+def test_malformed_metadata_schema_is_400_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY: a malformed projects.config.metadata_schema (e.g. an unsupported
+    # attribute type left by PATCH /projects) is a config VALIDATION problem — the
+    # endpoint must return a typed 400, same as the query router does for a bad
+    # exposure block, never a 500 INTERNAL that hides an operator-fixable error.
+    _project(monkeypatch, config={"metadata_schema": {"attributes": {"x": {"type": "bogus"}}}})
+    _settings(monkeypatch, tmp_path)
+    resp = client.post(_URL, files=[("files", ("a.txt", b"hi", "text/plain"))])
+    assert resp.status_code == 400
+    error = resp.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert error["details"] == {"metadata_schema": "invalid"}
