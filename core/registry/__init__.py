@@ -37,6 +37,7 @@ from core.registry.store import (
     list_projects,
     list_sources,
     update_project,
+    upsert_managed_source,
 )
 
 __all__ = [
@@ -67,4 +68,5 @@ __all__ = [
     "request_cancel",
     "set_progress",
     "update_project",
+    "upsert_managed_source",
 ]

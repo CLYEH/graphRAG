@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import sqlalchemy as sa
@@ -61,9 +62,17 @@ from core.stores.vectors import vector_client
 
 logger = logging.getLogger(__name__)
 
-#: arq task name — enqueue and the WorkerSettings registration must agree, so the
-#: string is defined once (arq registers a plain coroutine under its __name__).
+#: arq task names — enqueue and the WorkerSettings registration must agree, so the
+#: strings are defined once (arq registers a plain coroutine under its __name__).
 BUILD_TASK = "run_build_task"
+EVAL_TASK = "run_eval_task"
+
+#: The ``jobs.kind`` the reaper re-dispatches onto ``EVAL_TASK`` (with the job's
+#: ``build_id``) instead of ``BUILD_TASK``. build/ingest jobs both run the §5
+#: pipeline via ``BUILD_TASK``; an eval job is the one kind that maps elsewhere, so
+#: crash/lost-dispatch recovery must branch on it. The eval trigger stamps this
+#: same string (api.routers.builds), so creator and reaper can't drift.
+EVAL_JOB_KIND = "eval"
 
 
 def _redis_settings() -> RedisSettings:
@@ -81,6 +90,84 @@ async def enqueue_build(redis: ArqRedis, project: str, job_id: uuid.UUID) -> boo
     """
     job = await redis.enqueue_job(BUILD_TASK, project, str(job_id), _job_id=str(job_id))
     return job is not None
+
+
+async def enqueue_eval(
+    redis: ArqRedis, project: str, job_id: uuid.UUID, build_id: uuid.UUID
+) -> bool:
+    """Enqueue an eval job (UXC1b); True if a new dispatch was enqueued, False if
+    arq dedup-refused it. ``_job_id=str(job_id)`` gives arq's own dispatch dedup,
+    same as ``enqueue_build``; the DB execution lease is the crash-safe backstop.
+    The eval endpoint calls this after ``create_job(kind="eval", build_id=…)``."""
+    job = await redis.enqueue_job(
+        EVAL_TASK, project, str(job_id), str(build_id), _job_id=str(job_id)
+    )
+    return job is not None
+
+
+async def run_eval_task(
+    ctx: dict[str, Any], project: str, job_id: str, build_id: str
+) -> str | None:
+    """arq task: run the project's golden set against a NAMED build under the
+    execution lease, writing the report to ``builds.eval`` (the same core path
+    ``cli/main.py eval`` walks — DR-010). Returns the terminal job status, or
+    None if a live peer already holds the lease (a deliberate no-op dispatch).
+
+    The golden set and query policy are the project's on-disk config
+    (``<projects_dir>/<project>/eval/…`` — CFG1 will unify this with the
+    ``projects.config`` registry). ANY failure once the job is marked ``running``
+    — a deterministic refusal (missing/invalid golden or policy, a vanished build,
+    an unconfigured model) OR a store/infra outage (Neo4j/Qdrant/Postgres-read) —
+    is recorded terminal on the durable jobs row and NOT retried. This mirrors
+    ``run_build``'s stage boundary (§22): an eval must never strand the row
+    ``running``+unleased, which NO sweep recovers (``find_reapable_jobs`` needs a
+    held lease; ``find_unenqueued_jobs`` needs ``queued``) and would lock the
+    project out of every future job via ``create_job_exclusive``. The caller
+    re-runs — eval is idempotent (it just re-writes ``builds.eval``)."""
+    from core.eval.golden import GoldenError, load_golden
+    from core.eval.runner import models_needed, run_eval
+    from core.llm.factory import LLMNotConfiguredError
+    from core.mcp.policy import PolicyError, load_query_policy
+
+    engine = ctx["engine"]
+    eval_job = uuid.UUID(job_id)
+    target_build = uuid.UUID(build_id)
+    async with job_lease(engine, eval_job, ctx["owner"]) as acquired:
+        if not acquired:
+            return None  # a live peer is executing this job — deliberate no-op
+        root = Path(get_settings().projects_dir) / project
+        try:
+            golden = load_golden(root / "eval" / "golden.yaml")
+            policy = load_query_policy(root / "config.yaml")
+            needs_embedder, needs_llm = models_needed(golden, policy)
+            embedder = ctx["embedder"] if needs_embedder else None
+            llm = ctx["llm"] if needs_llm else None
+        except (GoldenError, PolicyError, LLMNotConfiguredError) as exc:
+            await _fail_job(engine, eval_job, exc)
+            return "failed"
+        async with engine.begin() as conn:
+            await set_progress(conn, eval_job, status="running", progress=0.0)
+        try:
+            async with engine.connect() as conn, ctx["neo4j"].session() as session:
+                await run_eval(
+                    conn,
+                    ctx["qdrant"],
+                    session,
+                    embedder,
+                    llm,
+                    project,
+                    target_build,
+                    golden,
+                    policy,
+                )
+        except Exception as exc:  # noqa: BLE001 — the eval boundary, mirroring run_build's stage boundary: ANY error once 'running' (a refusal like a vanished build / unconfigured model, OR a store outage) must terminalize the jobs row, never leave it 'running'+unleased for no sweep to recover. (CancelledError is BaseException → still propagates, same job_timeout mitigation as run_build.)
+            await _fail_job(engine, eval_job, exc)
+            return "failed"
+        async with engine.begin() as conn:
+            await set_progress(
+                conn, eval_job, status="done", progress=1.0, finished_at=sa.func.now()
+            )
+        return "done"
 
 
 async def reenqueue_build(
@@ -109,6 +196,30 @@ async def reenqueue_build(
     return job is not None
 
 
+async def reenqueue_eval(
+    redis: ArqRedis,
+    project: str,
+    job_id: uuid.UUID,
+    build_id: uuid.UUID,
+    *,
+    stale_expiry: datetime,
+) -> bool:
+    """Re-dispatch a crashed eval (BA2d-3 reaper), the eval-task sibling of
+    ``reenqueue_build``: same deterministic per-stale-lease arq id
+    (``reap:<job>:<expiry>`` — one pending recovery per stale lease, not one per
+    tick), onto ``EVAL_TASK`` with the job's target ``build_id`` so recovery
+    resumes the eval instead of mis-running it as a build. The DB execution lease
+    stays the single-executor guarantee."""
+    job = await redis.enqueue_job(
+        EVAL_TASK,
+        project,
+        str(job_id),
+        str(build_id),
+        _job_id=f"reap:{job_id}:{stale_expiry.isoformat()}",
+    )
+    return job is not None
+
+
 async def reap_stuck_builds(ctx: dict[str, Any]) -> int:
     """BA2d-3 cron: re-enqueue builds whose worker crashed, decoupling crash
     recovery from arq's (now generous) job_timeout.
@@ -121,7 +232,9 @@ async def reap_stuck_builds(ctx: dict[str, Any]) -> int:
     stale lease dedup instead of piling up duplicates. A second sweep (BA2e)
     covers the window BEFORE any lease exists: ``queued`` jobs that never
     acquired one past the enqueue grace (``find_unenqueued_jobs``) get the
-    trigger's ``enqueue_build`` replayed under the job's own arq id. An idle
+    trigger's enqueue replayed under the job's own arq id. Both sweeps dispatch
+    by ``kind`` — build/ingest onto ``BUILD_TASK``, eval onto ``EVAL_TASK`` with
+    its target build_id — so a crashed eval resumes as an eval. An idle
     tick is a no-op; ``unique=True`` (see WorkerSettings) runs this on one
     worker per tick. Returns the number of NEW dispatches enqueued
     (dedup-suppressed ones don't count)."""
@@ -131,26 +244,55 @@ async def reap_stuck_builds(ctx: dict[str, Any]) -> int:
         reapable = await find_reapable_jobs(conn)
         unenqueued = await find_unenqueued_jobs(conn, get_settings().job_enqueue_grace_seconds)
     enqueued = 0
-    for job_id, project, stale_expiry in reapable:
-        if await reenqueue_build(redis, project, job_id, stale_expiry=stale_expiry):
+    for job_id, project, kind, build_id, stale_expiry in reapable:
+        if kind == EVAL_JOB_KIND:
+            # an eval resumes as an eval — never mis-recovered as a build; the
+            # jobs row carries the target build_id (create_job_exclusive stamps it)
+            if not _reap_eval_ok(job_id, build_id):
+                continue
+            assert build_id is not None
+            dispatched = await reenqueue_eval(
+                redis, project, job_id, build_id, stale_expiry=stale_expiry
+            )
+        else:
+            dispatched = await reenqueue_build(redis, project, job_id, stale_expiry=stale_expiry)
+        if dispatched:
             enqueued += 1
     # BA2e queued-sweep: a job whose trigger-time enqueue was lost (class-12
     # window BEFORE any lease exists — invisible to the expired-lease sweep
     # above) gets the trigger's lost step replayed verbatim; the two predicates
     # are disjoint on lease_owner, so no job is swept twice. A job merely
     # backlogged past the grace is dedup-refused under its own arq id (no-op).
-    for job_id, project in unenqueued:
-        if await enqueue_build(redis, project, job_id):
+    for job_id, project, kind, build_id in unenqueued:
+        if kind == EVAL_JOB_KIND:
+            if not _reap_eval_ok(job_id, build_id):
+                continue
+            assert build_id is not None
+            dispatched = await enqueue_eval(redis, project, job_id, build_id)
+        else:
+            dispatched = await enqueue_build(redis, project, job_id)
+        if dispatched:
             enqueued += 1
     if reapable or unenqueued:
         logger.info(
-            "reaper: %d stuck + %d unenqueued build(s), %d newly (re-)dispatched: %s",
+            "reaper: %d stuck + %d unenqueued job(s), %d newly (re-)dispatched: %s",
             len(reapable),
             len(unenqueued),
             enqueued,
-            [str(j) for j, _, _ in reapable] + [str(j) for j, _ in unenqueued],
+            [str(j) for j, *_ in reapable] + [str(j) for j, *_ in unenqueued],
         )
     return enqueued
+
+
+def _reap_eval_ok(job_id: uuid.UUID, build_id: uuid.UUID | None) -> bool:
+    """An eval job with no ``build_id`` can't be re-dispatched (``EVAL_TASK`` needs
+    its target) — a contradiction ``create_job_exclusive(kind="eval", build_id=…)``
+    forbids, but if one ever appears, skip+log it rather than crash the whole reaper
+    tick (which would strand every other stuck job)."""
+    if build_id is None:
+        logger.error("reaper: eval job %s has no build_id; cannot re-dispatch", job_id)
+        return False
+    return True
 
 
 async def run_build_task(ctx: dict[str, Any], project: str, job_id: str) -> str | None:
@@ -267,7 +409,7 @@ class WorkerSettings:
     """arq worker entrypoint — ``uv run poe worker`` /
     ``arq api.workers.build_worker.WorkerSettings``."""
 
-    functions = [run_build_task]
+    functions = [run_build_task, run_eval_task]
     # BA2d-3 crash-recovery reaper: twice a minute (~1-min recovery given the 60s
     # lease TTL), re-enqueue builds whose worker crashed. unique=True → one worker
     # runs it per tick; a short timeout keeps it off the generous build job_timeout;

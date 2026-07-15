@@ -12,6 +12,7 @@ to the frozen error codes; SQL never leaks upward.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -332,6 +333,70 @@ async def add_source(
         if _sqlstate(exc) == _SQLSTATE_FK:
             raise ProjectNotFoundError(project) from exc
         raise
+    return Source(*row)
+
+
+async def upsert_managed_source(
+    conn: AsyncConnection,
+    project: str,
+    *,
+    uri: str,
+    kind: str,
+    files: Mapping[str, dict[str, Any]],
+) -> Source:
+    """Register or update the ONE canonical managed source for a project (DR-010).
+
+    The upload endpoint drops files into a per-project managed corpus directory
+    and calls this to point a single ``file://`` source at that directory,
+    stashing each accepted file's stored metadata envelope under
+    ``metadata["files"][<stored filename>]``. The ingest connector threads that
+    envelope onto ``documents.metadata`` at build time (capture → persist), so
+    this stash is the capture-to-build bridge, not the long-term home. Repeated
+    uploads MERGE into the same source (by ``(project, uri)``) rather than mint a
+    new one per upload — a project's managed corpus is one source.
+
+    Serializes concurrent uploads to the same project by locking the project row
+    (FOR UPDATE) before the find-or-create — the same row a concurrent insert
+    takes FOR KEY SHARE — so two uploads can't each insert a managed source.
+    Raises ProjectNotFoundError if the project is absent."""
+    locked = (
+        await conn.execute(
+            sa.select(tables.projects.c.name)
+            .where(tables.projects.c.name == project)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if locked is None:
+        raise ProjectNotFoundError(project)
+    existing = (
+        await conn.execute(
+            sa.select(*_SOURCE_COLS)
+            .where(tables.sources.c.project == project, tables.sources.c.uri == uri)
+            .order_by(tables.sources.c.added_at.asc(), tables.sources.c.id.asc())
+            .limit(1)
+        )
+    ).one_or_none()
+    if existing is None:
+        row = (
+            await conn.execute(
+                tables.sources.insert()
+                .values(project=project, kind=kind, uri=uri, metadata={"files": dict(files)})
+                .returning(*_SOURCE_COLS)
+            )
+        ).one()
+        return Source(*row)
+    source = Source(*existing)
+    prior_files = source.metadata.get("files", {})
+    merged_files = {**prior_files, **files} if isinstance(prior_files, dict) else dict(files)
+    merged_metadata = {**source.metadata, "files": merged_files}
+    row = (
+        await conn.execute(
+            tables.sources.update()
+            .where(tables.sources.c.id == source.id)
+            .values(metadata=merged_metadata)
+            .returning(*_SOURCE_COLS)
+        )
+    ).one()
     return Source(*row)
 
 

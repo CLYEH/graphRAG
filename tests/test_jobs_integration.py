@@ -505,13 +505,15 @@ async def test_find_unenqueued_jobs_matches_only_lost_queued_rows(migrated: None
             await set_progress(conn, running.id, status="running")
             await set_progress(conn, done.id, status="done")
 
-            found = {j for j, _ in await find_unenqueued_jobs(conn, 120.0)}
+            found = {j for j, *_ in await find_unenqueued_jobs(conn, 120.0)}
             mine = {fresh.id, lost.id, leased.id, running.id, done.id}
             assert found & mine == {lost.id}
-            # each hit carries its project (the reaper enqueues with it)
-            assert (lost.id, project) in await find_unenqueued_jobs(conn, 120.0)
+            # each hit carries (project, kind, build_id) — the reaper dispatches by
+            # kind (build/ingest → BUILD_TASK, eval → EVAL_TASK) and a build has no
+            # build_id on the row
+            assert (lost.id, project, "build", None) in await find_unenqueued_jobs(conn, 120.0)
             # the grace is respected: nothing 10 minutes old matches an hour-long grace
-            assert {j for j, _ in await find_unenqueued_jobs(conn, 3600.0)} & mine == set()
+            assert {j for j, *_ in await find_unenqueued_jobs(conn, 3600.0)} & mine == set()
             await trans.rollback()
     finally:
         await engine.dispose()

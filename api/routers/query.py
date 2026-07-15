@@ -33,6 +33,7 @@ from api.schemas import GraphOptions, GraphQueryRequest, HybridQueryRequest, Que
 from core.llm.factory import LLMNotConfiguredError
 from core.mcp.policy import PolicyError, QueryPolicy, hybrid_policy, query_policy_from_mapping
 from core.mcp.server import run_bounded_query
+from core.metadata.schema import MetadataConfigError, MetadataExposure, load_metadata_exposure
 from core.query.global_reports import global_summary as run_global
 from core.query.graph import GraphQueryParams
 from core.query.graph import graph_query as run_graph
@@ -47,7 +48,7 @@ router = APIRouter(tags=["query"])
 _NIL_BUILD = "00000000-0000-0000-0000-000000000000"
 
 
-async def _load_policy(request: Request, project: str) -> QueryPolicy:
+async def _load_policy(request: Request, project: str) -> tuple[QueryPolicy, MetadataExposure]:
     """Project 404 first, active build 409 second, THEN the registry-config
     policy (the BA3c seam) — the inspect ``_bind`` precedence (Codex #60 R3):
     a bootstrap project with no active build must hear the frozen
@@ -82,7 +83,8 @@ async def _load_policy(request: Request, project: str) -> QueryPolicy:
             ErrorCode.STORE_UNAVAILABLE,
             "registry store unavailable while resolving the project policy",
         ) from exc
-    block = (proj.config or {}).get("query_policy")
+    config = proj.config or {}
+    block = config.get("query_policy")
     if block is None:
         raise ApiError(
             ErrorCode.VALIDATION_ERROR,
@@ -91,11 +93,21 @@ async def _load_policy(request: Request, project: str) -> QueryPolicy:
             details={"query_policy": "missing"},
         )
     try:
-        return query_policy_from_mapping(block)
+        policy = query_policy_from_mapping(block)
     except PolicyError as exc:
         raise ApiError(
             ErrorCode.VALIDATION_ERROR, str(exc), details={"query_policy": "invalid"}
         ) from exc
+    try:
+        # the document-metadata exposure allowlist (DR-010 rule 7) from the same
+        # registry config — a malformed block is a 400, same strictness as the
+        # policy, never a half-armed exposure guard
+        exposure = load_metadata_exposure(config)
+    except MetadataConfigError as exc:
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR, str(exc), details={"metadata_exposure": "invalid"}
+        ) from exc
+    return policy, exposure
 
 
 def _graph_params(options: GraphOptions) -> GraphQueryParams:
@@ -115,7 +127,7 @@ async def _run_mode(
     query: str,
     runner: Any,
 ) -> dict[str, Any]:
-    policy = await _load_policy(request, project)
+    policy, exposure = await _load_policy(request, project)
     try:
         context = project_query_context(request, project)
     except LLMNotConfiguredError as exc:
@@ -123,7 +135,9 @@ async def _run_mode(
         # a typed 503 naming the missing config, never a coarse 500
         raise ApiError(ErrorCode.STORE_UNAVAILABLE, str(exc)) from exc
     try:
-        mcp_dict = await run_bounded_query(context, policy, f"query_{mode}", query, runner(policy))
+        mcp_dict = await run_bounded_query(
+            context, policy, f"query_{mode}", query, runner(policy), exposure=exposure
+        )
     except NoActiveBuildError as exc:
         raise translate_registry_error(exc) from exc
     build_id = mcp_dict.get("build_id")

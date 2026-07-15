@@ -298,6 +298,47 @@ async def test_run_build_task_reuses_pinned_config_on_resume(
     assert loaded["raw"] != drifted  # …NOT the drifted live config
 
 
+async def test_run_eval_task_terminalizes_on_store_error_never_strands_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: once the eval job is marked 'running', a store outage out of run_eval
+    # (Neo4j/Qdrant/Postgres-read down) must terminalize the jobs row, not let the
+    # error propagate. If it propagated, job_lease's finally releases the lease and
+    # the row is left 'running'+unleased — which NO sweep recovers (find_reapable
+    # needs a held lease; find_unenqueued needs 'queued'), permanently locking the
+    # project out of every future job via create_job_exclusive. So it must end
+    # 'failed', mirroring run_build's stage boundary.
+    statuses: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _boom(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("neo4j connection refused")  # a store outage, not a refusal
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _boom)
+
+    ctx = {
+        "engine": _FakeEngine(),
+        "neo4j": _FakeNeo4j(),
+        "qdrant": "QD",
+        "embedder": "EMB",
+        "llm": "LLM",
+        "owner": "worker-abc",
+    }
+    result = await bw.run_eval_task(ctx, "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "failed"  # terminal, not a propagated exception
+    # marked running, then FAILED — never left dangling at 'running'
+    assert statuses == ["running", "failed"]
+
+
 async def test_enqueue_build_uses_job_id_dedup() -> None:
     calls: dict[str, Any] = {}
 
@@ -347,7 +388,9 @@ async def test_reenqueue_build_uses_a_deterministic_per_stale_lease_id() -> None
     assert calls[0][:2] == (bw.BUILD_TASK, ("proj", str(jid)))
 
 
-async def _no_unenqueued(conn: Any, grace: float) -> list[tuple[uuid.UUID, str]]:
+async def _no_unenqueued(
+    conn: Any, grace: float
+) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None]]:
     return []
 
 
@@ -359,8 +402,9 @@ async def test_reap_stuck_builds_reenqueues_each_crashed_job(
     e2 = datetime(2026, 7, 9, 1, 0, 30, tzinfo=UTC)
     enq: list[Any] = []
 
-    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
-        return [(j1, "p1", e1), (j2, "p2", e2)]
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        # build/ingest jobs carry no build_id on the jobs row → build-family branch
+        return [(j1, "p1", "build", None, e1), (j2, "p2", "ingest", None, e2)]
 
     class _Redis:
         async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
@@ -386,8 +430,8 @@ async def test_reap_stuck_builds_counts_only_new_dispatches(
     # stale row keeps matching every 30s tick. arq refuses the duplicate id
     # (enqueue_job → None) and the tick must report 0 new dispatches — the reaper
     # piles up NO duplicates for one crashed job.
-    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
-        return [(uuid.uuid4(), "p1", datetime(2026, 7, 9, tzinfo=UTC))]
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        return [(uuid.uuid4(), "p1", "build", None, datetime(2026, 7, 9, tzinfo=UTC))]
 
     class _Redis:
         async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
@@ -405,7 +449,7 @@ async def test_reap_stuck_builds_is_a_noop_when_nothing_crashed(
 ) -> None:
     enq: list[Any] = []
 
-    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
         return []  # no expired leases → an idle tick
 
     class _Redis:
@@ -434,12 +478,16 @@ async def test_reap_stuck_builds_replays_lost_enqueues(
     enq: list[Any] = []
     seen_grace: list[float] = []
 
-    async def _none_reapable(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
+    async def _none_reapable(
+        conn: Any,
+    ) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
         return []
 
-    async def _find_lost(conn: Any, grace: float) -> list[tuple[uuid.UUID, str]]:
+    async def _find_lost(
+        conn: Any, grace: float
+    ) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None]]:
         seen_grace.append(grace)
-        return [(j1, "p1"), (j2, "p2")]
+        return [(j1, "p1", "build", None), (j2, "p2", "ingest", None)]
 
     class _Redis:
         async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
@@ -465,11 +513,13 @@ async def test_reap_stuck_builds_counts_both_sweeps(
     crashed, lost = uuid.uuid4(), uuid.uuid4()
     expiry = datetime(2026, 7, 10, 1, 0, 0, tzinfo=UTC)
 
-    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
-        return [(crashed, "p1", expiry)]
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        return [(crashed, "p1", "build", None, expiry)]
 
-    async def _find_lost(conn: Any, grace: float) -> list[tuple[uuid.UUID, str]]:
-        return [(lost, "p2")]
+    async def _find_lost(
+        conn: Any, grace: float
+    ) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None]]:
+        return [(lost, "p2", "build", None)]
 
     class _Redis:
         async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
@@ -480,6 +530,101 @@ async def test_reap_stuck_builds_counts_both_sweeps(
     reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
 
     assert reaped == 2  # one crashed re-dispatch + one replayed lost enqueue
+
+
+async def test_reap_reenqueues_crashed_eval_as_eval_task_not_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: an eval job maps to EVAL_TASK, not BUILD_TASK. Before the reaper became
+    # kind-aware, a crashed eval (expired lease, non-terminal) was re-dispatched as
+    # a build — running run_build against an eval job's id, corrupting recovery. It
+    # must resume as an eval, carrying the job's target build_id, under the same
+    # deterministic per-stale-lease reap id.
+    eval_job, target_build = uuid.uuid4(), uuid.uuid4()
+    expiry = datetime(2026, 7, 11, 2, 0, 0, tzinfo=UTC)
+    enq: list[Any] = []
+
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        return [(eval_job, "p1", "eval", target_build, expiry)]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            enq.append((fn, args, _job_id))
+            return object()
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    monkeypatch.setattr(bw, "find_unenqueued_jobs", _no_unenqueued)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 1
+    assert enq == [
+        (
+            bw.EVAL_TASK,
+            ("p1", str(eval_job), str(target_build)),
+            f"reap:{eval_job}:{expiry.isoformat()}",
+        )
+    ]
+
+
+async def test_reap_replays_lost_eval_enqueue_as_eval_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (BA2e queued-sweep, eval): a lost eval dispatch (queued, no lease) must be
+    # replayed as EVAL_TASK under the job's OWN arq id — the eval trigger's exact
+    # enqueue_eval — not as a build.
+    eval_job, target_build = uuid.uuid4(), uuid.uuid4()
+    enq: list[Any] = []
+
+    async def _none_reapable(
+        conn: Any,
+    ) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        return []
+
+    async def _find_lost(
+        conn: Any, grace: float
+    ) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None]]:
+        return [(eval_job, "p1", "eval", target_build)]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            enq.append((fn, args, _job_id))
+            return object()
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _none_reapable)
+    monkeypatch.setattr(bw, "find_unenqueued_jobs", _find_lost)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 1
+    assert enq == [(bw.EVAL_TASK, ("p1", str(eval_job), str(target_build)), str(eval_job))]
+
+
+async def test_reap_skips_eval_job_missing_build_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: EVAL_TASK cannot run without its target build_id. That state is forbidden
+    # by create_job_exclusive(kind="eval", build_id=…), but if a malformed eval row
+    # ever appears the reaper must skip it (logged) rather than crash the tick —
+    # which would strand every OTHER stuck job the same tick would have recovered.
+    eval_job, good = uuid.uuid4(), uuid.uuid4()
+    expiry = datetime(2026, 7, 11, 3, 0, 0, tzinfo=UTC)
+    enq: list[Any] = []
+
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        # a broken eval row (no build_id) alongside a healthy build — the build
+        # must still be recovered
+        return [(eval_job, "p1", "eval", None, expiry), (good, "p2", "build", None, expiry)]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            enq.append((fn, args, _job_id))
+            return object()
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    monkeypatch.setattr(bw, "find_unenqueued_jobs", _no_unenqueued)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 1  # only the healthy build was re-dispatched
+    assert enq == [(bw.BUILD_TASK, ("p2", str(good)), f"reap:{good}:{expiry.isoformat()}")]
 
 
 async def test_on_startup_builds_the_dep_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -520,7 +665,7 @@ async def test_on_shutdown_closes_every_engine() -> None:
 
 
 def test_worker_settings_shape() -> None:
-    assert bw.WorkerSettings.functions == [bw.run_build_task]
+    assert bw.WorkerSettings.functions == [bw.run_build_task, bw.run_eval_task]
     # accessed on the class, these are the plain module coroutines arq calls
     assert bw.WorkerSettings.on_startup is bw.on_startup
     assert bw.WorkerSettings.on_shutdown is bw.on_shutdown

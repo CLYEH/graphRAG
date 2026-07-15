@@ -355,17 +355,51 @@ async def test_find_reapable_jobs_returns_only_crashed_executions(migrated: None
         async with engine.connect() as conn:
             reapable = await find_reapable_jobs(conn)
 
-        ids = {job_id for job_id, _, _ in reapable}
+        ids = {job_id for job_id, *_ in reapable}
         assert crashed in ids  # expired held lease + running → reaped
         assert early_crash in ids  # expired held lease + still queued (pre-running crash) → reaped
         assert live not in ids  # heartbeating (expiry in the future)
         assert released not in ids  # never acquired a lease
         assert terminal not in ids  # terminal status, even with an expired lease
-        # returns (id, project, stale expiry) — the expiry is the recovery-generation
+        # returns (id, project, kind, build_id, stale expiry) — kind/build_id let the
+        # reaper re-dispatch onto the right task; the expiry is the recovery-generation
         # marker the reaper derives its dedup id from
-        row = next(r for r in reapable if r[0] == crashed)
-        assert row[1] == project
-        assert row[2] is not None
+        _id, row_project, row_kind, row_build_id, row_expiry = next(
+            r for r in reapable if r[0] == crashed
+        )
+        assert row_project == project
+        assert row_kind == "build"  # a build job → BUILD_TASK on recovery
+        assert row_build_id is None  # build/ingest jobs carry no build_id on the row
+        assert row_expiry is not None
+    finally:
+        await _cleanup(engine, project)
+
+
+async def test_find_reapable_jobs_reads_eval_kind_and_build_id(migrated: None) -> None:
+    # WHY: the reaper re-dispatches an eval onto EVAL_TASK (with its target build_id),
+    # never as a build. That branch is only correct if the SQL projection actually
+    # reads kind + build_id back from the crashed eval row — so pin it over real
+    # Postgres, not just the mocked component branch.
+    engine = _engine()
+    project = _proj()
+    target_build = uuid.uuid4()
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+            eval_job = (await create_job(conn, project, "eval", build_id=target_build)).id
+        async with engine.begin() as conn:
+            await acquire_lease(conn, eval_job, "dead", 60.0)
+        await _expire_lease(engine, eval_job, status="running")
+
+        async with engine.connect() as conn:
+            reapable = await find_reapable_jobs(conn)
+
+        row = next(r for r in reapable if r[0] == eval_job)
+        _id, row_project, row_kind, row_build_id, row_expiry = row
+        assert row_project == project
+        assert row_kind == "eval"  # → EVAL_TASK on recovery, not BUILD_TASK
+        assert row_build_id == target_build  # the eval's target, carried to re-dispatch
+        assert row_expiry is not None
     finally:
         await _cleanup(engine, project)
 

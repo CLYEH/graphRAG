@@ -21,7 +21,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -52,7 +52,9 @@ def content_hash(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def read_text_documents(root: Path) -> Iterator[DocumentPayload]:
+def read_text_documents(
+    root: Path, metadata_by_filename: Mapping[str, dict[str, Any]] | None = None
+) -> Iterator[DocumentPayload]:
     """Yield one payload per accepted text file under ``root`` (recursive).
 
     Deterministic order (sorted paths) so two runs over the same tree produce
@@ -60,9 +62,17 @@ def read_text_documents(root: Path) -> Iterator[DocumentPayload]:
     with unaccepted suffixes are silently not SELECTED (they are out of scope
     by definition, not failed items); an accepted file that cannot be decoded
     raises — a corrupt source is a loud failure, not a skipped item.
+
+    ``metadata_by_filename`` carries the DR-010 metadata envelope captured at
+    upload time, keyed by the file's stored (on-disk) name — the managed-source
+    stash the ingest connector threads onto ``documents.metadata`` (UXC1b
+    capture → persist). A file with a stashed envelope takes it verbatim; a file
+    without one (a non-upload source, or a file placed on disk directly) falls
+    back to the connector-derived ``{"filename": ...}`` as before.
     """
     if not root.is_dir():
         raise NotADirectoryError(f"document source root {root} is not a directory")
+    stash = metadata_by_filename or {}
     for path in sorted(root.rglob("*")):
         suffix = path.suffix.lower()
         if not path.is_file() or suffix not in TEXT_SUFFIXES:
@@ -71,7 +81,7 @@ def read_text_documents(root: Path) -> Iterator[DocumentPayload]:
             source_uri=path.resolve().as_uri(),
             raw=path.read_text(encoding="utf-8"),
             mime=TEXT_SUFFIXES[suffix],
-            metadata={"filename": path.name},
+            metadata=stash.get(path.name, {"filename": path.name}),
         )
 
 

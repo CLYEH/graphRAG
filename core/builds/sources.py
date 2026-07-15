@@ -27,6 +27,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, unquote_to_bytes, urlparse
 from urllib.request import url2pathname
 
@@ -239,6 +240,18 @@ def _local_path(source: Source) -> Path:
     return resolved
 
 
+def _files_metadata(source: Source) -> dict[str, dict[str, Any]] | None:
+    """The per-file metadata envelopes an upload stashed on a managed text source
+    (``metadata["files"]``, keyed by stored filename — see
+    :func:`core.registry.store.upsert_managed_source`), or None for a source with
+    no such stash (a non-upload text source). Threaded into the text connector so
+    each document carries its DR-010 envelope onto ``documents.metadata``."""
+    files = source.metadata.get("files")
+    if not isinstance(files, dict):
+        return None
+    return {name: env for name, env in files.items() if isinstance(env, dict)}
+
+
 def _required_meta(source: Source, key: str) -> str:
     """A required non-empty string from a structured source's metadata."""
     value = source.metadata.get(key)
@@ -259,7 +272,7 @@ def resolve_source(source: Source) -> Iterator[DocumentPayload]:
     surface loud when the ingest stage iterates the stream.
     """
     if source.kind == "text":
-        return read_text_documents(_local_path(source))
+        return read_text_documents(_local_path(source), _files_metadata(source))
     if source.kind == "structured":
         return read_csv_rows(
             _local_path(source),

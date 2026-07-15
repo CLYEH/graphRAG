@@ -26,6 +26,7 @@ from typing import Any
 import jsonschema
 import yaml
 
+from core.metadata.schema import MetadataExposure, load_metadata_exposure
 from core.query.policy import TextToCypher, TextToSql
 
 #: Where the frozen schema can live: a source checkout keeps contracts/ at
@@ -122,6 +123,24 @@ def load_query_policy(config_path: Path) -> QueryPolicy:
     if not isinstance(raw, dict) or "query_policy" not in raw:
         raise PolicyError(f"project config {config_path} has no query_policy block")
     return query_policy_from_mapping(raw["query_policy"])
+
+
+def load_metadata_exposure_from_file(config_path: Path) -> MetadataExposure:
+    """Load the project's ``metadata_exposure`` allowlist from ``config.yaml``
+    (the MCP/CLI source, dual to the Console's ``projects.config`` — same split
+    as :func:`load_query_policy`). An absent block is the FAIL-CLOSED empty
+    allowlist (DR-010 rule 7 — nothing exposed by default); a malformed block
+    fails LOUD at server startup (:class:`~core.metadata.schema.MetadataConfigError`),
+    never half-armed mid-query."""
+    try:
+        raw = yaml.safe_load(config_path.read_text("utf-8"))
+    except FileNotFoundError:
+        return MetadataExposure(fields=())
+    except yaml.YAMLError as exc:
+        raise PolicyError(f"project config is not valid YAML: {exc}") from exc
+    if not isinstance(raw, dict):
+        return MetadataExposure(fields=())
+    return load_metadata_exposure(raw)
 
 
 def query_policy_from_mapping(document: Any) -> QueryPolicy:

@@ -38,21 +38,27 @@ from neo4j.exceptions import DriverError, Neo4jError
 from qdrant_client.http.exceptions import ApiException
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from api.deps import Conn, neo4j_driver, qdrant_client, response_meta
+from api.deps import Conn, Queue, neo4j_driver, qdrant_client, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
 from api.pagination import decode_id_cursor, encode_cursor
 from api.registry_errors import translate_registry_error
 from api.routers._query import reject_unsupported_query
-from api.schemas import build_dto
+from api.schemas import build_dto, job_accepted_dto
+from api.workers.build_worker import EVAL_JOB_KIND, enqueue_eval
 from core.builds.lifecycle import (
     BuildInfo,
     activate_in_caller_txn,
     get_build_info,
     list_builds_page,
 )
-from core.registry import ProjectNotFoundError, get_project
+from core.registry import (
+    JobConflictError,
+    ProjectNotFoundError,
+    create_job_exclusive,
+    get_project,
+)
 
 router = APIRouter(tags=["builds"])
 
@@ -243,3 +249,46 @@ async def rollback_build_endpoint(
     return await _run_rollback(
         request, conn, project, build_id, idempotency_key, allow_archived=True, history_exempt=True
     )
+
+
+@router.post("/projects/{project}/builds/{build_id}/eval")
+async def run_build_eval_endpoint(
+    request: Request,
+    conn: Conn,
+    get_redis: Queue,
+    project: str,
+    build_id: uuid.UUID,
+    idempotency_key: _IdempotencyKey = None,
+) -> JSONResponse:
+    """Run the project's golden set against the NAMED build as an async job
+    (UXC1b, DR-010) — the same core path the CLI eval walks; the report lands in
+    ``builds.eval`` where the activation gate already reads §14 scores, so
+    Console gating gets zero new coupling. Mirrors the trigger endpoints: one
+    active job per project (409 ``JOB_CONFLICT``), enqueue IN-BAND before commit
+    (the class-12 window), 202 + the job envelope, watchable via
+    ``GET /jobs/{id}/events``. The build is named in the path (no request body);
+    a bad/unready build is a REFUSAL the eval job records, not a synchronous
+    gate — the CLI path refuses the same way."""
+
+    async def produce() -> tuple[int, dict[str, Any]]:
+        try:
+            job = await create_job_exclusive(conn, project, EVAL_JOB_KIND, build_id=build_id)
+        except (ProjectNotFoundError, JobConflictError) as exc:
+            raise translate_registry_error(exc) from exc
+        # queue touched HERE only — a §27 replay or a 409 must be served even
+        # with Redis unreachable (the Queue dep is a lazy handle), same as _trigger
+        await enqueue_eval(await get_redis(), project, job.id, build_id)
+        return 202, success(job_accepted_dto(job), **response_meta(request))
+
+    if idempotency_key:
+        status, resp = await run_idempotent(
+            conn,
+            key=idempotency_key,
+            project=project,
+            endpoint="runBuildEval",
+            req_hash=request_hash("POST", request.url.path, await request.body()),
+            produce=produce,
+        )
+        return JSONResponse(status_code=status, content=resp)
+    status, resp = await produce()
+    return JSONResponse(status_code=status, content=jsonable_encoder(resp))

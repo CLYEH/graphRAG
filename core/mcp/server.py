@@ -37,7 +37,7 @@ import asyncio
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, cast
 
@@ -51,11 +51,18 @@ from sqlalchemy.pool import NullPool
 from core.config import get_settings
 from core.llm.factory import chat_model, embedding_model
 from core.mcp.context import ProjectContext
-from core.mcp.policy import QueryPolicy, hybrid_policy, load_query_policy
+from core.mcp.policy import (
+    QueryPolicy,
+    hybrid_policy,
+    load_metadata_exposure_from_file,
+    load_query_policy,
+)
+from core.metadata.schema import MetadataExposure
 from core.query.global_reports import global_summary as run_global
 from core.query.graph import GraphQueryParams
 from core.query.graph import graph_query as run_graph
 from core.query.hybrid import hybrid_query as run_hybrid
+from core.query.metadata_enrich import enrich_response_metadata
 from core.query.results import McpResponse, QueryWarning
 from core.query.semantic import semantic_search as run_semantic
 from core.query.sql import sql_query as run_sql
@@ -116,6 +123,10 @@ async def _bounded(
                 # inner timer can see — the binding itself)
                 remaining_ms = max(int((deadline - time.monotonic()) * 1000), 1)
                 response: McpResponse = await runner(deps, remaining_ms)
+                # enrich chunk source_refs with the exposed slice of their
+                # document metadata (DR-010 rule 6/7) — one place for every
+                # modality, inside the deadline + the build-scoped binding
+                response = await enrich_response_metadata(response, deps.repo, runtime.exposure)
                 return response.to_dict()
     except TimeoutError:
         detail = "" if bound_build else " during scope binding"
@@ -189,15 +200,18 @@ def _introspection_timeout(runtime: _Runtime, build_id: str | None, subject: str
 
 @dataclass
 class _Runtime:
-    """The lifespan-held state: one context + one validated policy."""
+    """The lifespan-held state: one context + one validated policy + the
+    document-metadata exposure allowlist (fail-closed empty by default)."""
 
     context: ProjectContext
     policy: QueryPolicy
+    exposure: MetadataExposure = field(default_factory=lambda: MetadataExposure(fields=()))
 
 
 def build_server(project: str, config_path: Path) -> FastMCP:
     """One project's MCP server, policy-validated at build time (fail loud)."""
     policy = load_query_policy(config_path)
+    exposure = load_metadata_exposure_from_file(config_path)
 
     @asynccontextmanager
     async def lifespan(_server: FastMCP) -> AsyncIterator[_Runtime]:
@@ -214,7 +228,7 @@ def build_server(project: str, config_path: Path) -> FastMCP:
             llm=chat_model(),
         )
         try:
-            yield _Runtime(context=context, policy=policy)
+            yield _Runtime(context=context, policy=policy, exposure=exposure)
         finally:
             await context.aclose()
 
@@ -495,6 +509,7 @@ async def run_bounded_query(
     tool: str,
     query: str,
     runner: Any,
+    exposure: MetadataExposure | None = None,
 ) -> dict[str, Any]:
     """Public seam for non-MCP facades (the Console query playground, BA6):
     the SAME §21 wall-clock deadline + per-call binding + §22 typed
@@ -502,5 +517,12 @@ async def run_bounded_query(
     facades, so the REST playground can never drift from the MCP tools
     (class 5). ``runner(deps, remaining_ms) -> McpResponse`` exactly as the
     tools pass it; the returned dict is the §16 shape (the REST layer
-    reprojects it onto the frozen QueryResult)."""
-    return await _bounded(_Runtime(context=context, policy=policy), tool, query, runner)
+    reprojects it onto the frozen QueryResult). ``exposure`` is the caller's
+    document-metadata allowlist (the Console reads it from ``projects.config``);
+    None is the fail-closed empty allowlist."""
+    runtime = _Runtime(
+        context=context,
+        policy=policy,
+        exposure=exposure or MetadataExposure(fields=()),
+    )
+    return await _bounded(runtime, tool, query, runner)

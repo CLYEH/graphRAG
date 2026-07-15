@@ -138,7 +138,9 @@ def test_reprojection_onto_the_frozen_query_result(
     _queryable(monkeypatch)
     captured: dict[str, Any] = {}
 
-    async def fake_bounded(context: Any, policy: Any, tool: str, query: str, runner: Any) -> Any:
+    async def fake_bounded(
+        context: Any, policy: Any, tool: str, query: str, runner: Any, exposure: Any = None
+    ) -> Any:
         captured.update({"tool": tool, "query": query, "max_latency": policy.max_latency_ms})
         captured["held_connections"] = fake_engine.open
         return _mcp_dict()
@@ -173,7 +175,9 @@ def test_top_k_is_accepted_and_reaches_the_mode(
         captured_k.append(k)
         return _mcp_dict()
 
-    async def fake_bounded(context: Any, policy: Any, tool: str, query: str, runner: Any) -> Any:
+    async def fake_bounded(
+        context: Any, policy: Any, tool: str, query: str, runner: Any, exposure: Any = None
+    ) -> Any:
         deps = SimpleNamespace(repo=None, vectors=None, embedder=None)
         return await runner(deps, 1000)
 
@@ -199,7 +203,7 @@ def test_top_k_is_accepted_and_reaches_the_mode(
         return _mcp_dict()
 
     async def fake_bounded_sql(
-        context: Any, policy: Any, tool: str, query: str, runner: Any
+        context: Any, policy: Any, tool: str, query: str, runner: Any, exposure: Any = None
     ) -> Any:
         deps = SimpleNamespace(sql_reader=None, llm=None)
         return await runner(deps, 1000)
@@ -312,7 +316,9 @@ def test_graph_options_thread_to_the_real_runner(
         captured.update({"params": params, "query": query, "max_hops": max_hops})
         return _mcp_dict(tool="graph_query")
 
-    async def fake_bounded(context: Any, policy: Any, tool: str, query: str, runner: Any) -> Any:
+    async def fake_bounded(
+        context: Any, policy: Any, tool: str, query: str, runner: Any, exposure: Any = None
+    ) -> Any:
         captured["tool"] = tool
         return await runner(SimpleNamespace(graph=None, repo=None), 1000)
 
@@ -342,7 +348,9 @@ def test_graph_guardrail_stays_in_envelope(
     _queryable(monkeypatch)
     scope = SimpleNamespace(project="p", build_id=uuid.uuid4())
 
-    async def fake_bounded(context: Any, policy: Any, tool: str, query: str, runner: Any) -> Any:
+    async def fake_bounded(
+        context: Any, policy: Any, tool: str, query: str, runner: Any, exposure: Any = None
+    ) -> Any:
         response = await runner(SimpleNamespace(graph=scope, repo=scope), 1000)
         return response.to_dict()
 
@@ -382,7 +390,9 @@ def test_hybrid_threads_remaining_budget_top_k_and_params(
         )
         return _mcp_dict(tool="hybrid_query")
 
-    async def fake_bounded(context: Any, policy: Any, tool: str, query: str, runner: Any) -> Any:
+    async def fake_bounded(
+        context: Any, policy: Any, tool: str, query: str, runner: Any, exposure: Any = None
+    ) -> Any:
         captured["tool"] = tool
         return await runner(SimpleNamespace(), 1234)
 

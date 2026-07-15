@@ -119,11 +119,17 @@ async def create_job(
     return Job(*row)
 
 
-async def create_job_exclusive(conn: AsyncConnection, project: str, kind: str) -> Job:
+async def create_job_exclusive(
+    conn: AsyncConnection, project: str, kind: str, *, build_id: uuid.UUID | None = None
+) -> Job:
     """``create_job`` guarded by the single-active-job-per-project rule the
     trigger endpoints enforce (the contract's 409 ``JOB_CONFLICT`` "overlapping
     job") — storage itself allows overlapping jobs (the BA2d lease/reaper design
     depends on that), so the guard lives HERE, not in a constraint.
+
+    ``build_id`` records the build this job targets at creation (UXC1b's eval job
+    names the build in its path); a build job leaves it None for the orchestrator
+    to resolve.
 
     Race-safe the way ``delete_project`` is: lock the parent projects row FIRST
     (FOR UPDATE — an app-level count-then-insert would be TOCTOU, and a
@@ -157,7 +163,7 @@ async def create_job_exclusive(conn: AsyncConnection, project: str, kind: str) -
     ).scalar_one_or_none()
     if active is not None:
         raise JobConflictError(project, active)
-    return await create_job(conn, project, kind)
+    return await create_job(conn, project, kind, build_id=build_id)
 
 
 async def get_job(conn: AsyncConnection, job_id: uuid.UUID) -> Job | None:
@@ -341,26 +347,35 @@ async def release_lease(conn: AsyncConnection, job_id: uuid.UUID, owner: str) ->
     )
 
 
-async def find_reapable_jobs(conn: AsyncConnection) -> list[tuple[uuid.UUID, str, datetime]]:
+async def find_reapable_jobs(
+    conn: AsyncConnection,
+) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
     """Jobs whose execution lease has EXPIRED while the job is still non-terminal —
     a worker acquired the lease then stopped heartbeating (crashed / event-loop
     starved), so its dispatch is stuck mid-flight. Returns
-    ``(id, project, lease_expires_at)`` for each; the BA2d-3 reaper re-enqueues
-    them for a fresh dispatch that reclaims the now-free lease and resumes. The
-    stale expiry doubles as the recovery GENERATION marker: it stays byte-stable
-    while the row sits crashed (only an acquire/renew moves it), so the reaper
-    derives its arq dedup id from it — one pending recovery per stale lease, not
-    one per tick. Nothing else matches: a LIVE worker keeps ``lease_expires_at``
-    in the future; a completed run released the lease (``lease_owner`` NULL); a
-    never-dispatched job never acquired one. Because the worker enters the lease
-    FIRST (before its preflight), any crash mid-dispatch — even before run_build —
-    leaves a held lease this predicate sees. The job's own status gates on
-    non-terminal (``queued``/``running``) so a build that finished but crashed
-    before the lease release isn't pointlessly re-run."""
+    ``(id, project, kind, build_id, lease_expires_at)`` for each; the BA2d-3 reaper
+    re-enqueues them for a fresh dispatch that reclaims the now-free lease and
+    resumes. ``kind`` (and ``build_id`` for an ``eval`` job) is returned so the
+    reaper re-dispatches onto the RIGHT arq task — a crashed eval must resume as an
+    eval, never be mis-recovered as a build. The stale expiry doubles as the
+    recovery GENERATION marker: it stays byte-stable while the row sits crashed
+    (only an acquire/renew moves it), so the reaper derives its arq dedup id from
+    it — one pending recovery per stale lease, not one per tick. Nothing else
+    matches: a LIVE worker keeps ``lease_expires_at`` in the future; a completed
+    run released the lease (``lease_owner`` NULL); a never-dispatched job never
+    acquired one. Because the worker enters the lease FIRST (before its preflight),
+    any crash mid-dispatch — even before run_build — leaves a held lease this
+    predicate sees. The job's own status gates on non-terminal (``queued``/
+    ``running``) so a build that finished but crashed before the lease release
+    isn't pointlessly re-run."""
     rows = (
         await conn.execute(
             sa.select(
-                tables.jobs.c.id, tables.jobs.c.project, tables.jobs.c.lease_expires_at
+                tables.jobs.c.id,
+                tables.jobs.c.project,
+                tables.jobs.c.kind,
+                tables.jobs.c.build_id,
+                tables.jobs.c.lease_expires_at,
             ).where(
                 tables.jobs.c.lease_owner.is_not(None),
                 tables.jobs.c.lease_expires_at < sa.func.now(),
@@ -368,12 +383,12 @@ async def find_reapable_jobs(conn: AsyncConnection) -> list[tuple[uuid.UUID, str
             )
         )
     ).all()
-    return [(row.id, row.project, row.lease_expires_at) for row in rows]
+    return [(row.id, row.project, row.kind, row.build_id, row.lease_expires_at) for row in rows]
 
 
 async def find_unenqueued_jobs(
     conn: AsyncConnection, grace_seconds: float
-) -> list[tuple[uuid.UUID, str]]:
+) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None]]:
     """Jobs whose arq dispatch appears LOST — still ``queued``, never acquired an
     execution lease, and older than ``grace_seconds`` (DB clock) — the sibling of
     ``find_reapable_jobs`` for the class-12 window BEFORE the lease exists. The
@@ -381,9 +396,11 @@ async def find_unenqueued_jobs(
     job can only arise from Redis losing an acked enqueue or from a dispatch that
     raced the trigger's commit and no-opped (the row wasn't visible yet); either
     way nothing in arq or the lease sweep will ever touch the row again. Returns
-    ``(id, project)`` for each; the reaper re-runs the trigger's lost step —
-    ``enqueue_build`` under the job's own arq id — which arq dedup-refuses while
-    a genuine dispatch is merely backlogged past the grace (harmless no-op), so a
+    ``(id, project, kind, build_id)`` for each; the reaper re-runs the trigger's
+    lost step under the job's own arq id — ``enqueue_build`` for a build/ingest job,
+    ``enqueue_eval`` for an ``eval`` job (``kind``/``build_id`` pick the task, so a
+    lost eval dispatch isn't replayed as a build) — which arq dedup-refuses while a
+    genuine dispatch is merely backlogged past the grace (harmless no-op), so a
     false positive costs nothing. A job that crashed AFTER arq pickup but BEFORE
     lease acquire also matches; its own-id enqueue is refused while the crashed
     dispatch's in-progress key lingers, and recovery falls back to arq's own
@@ -391,7 +408,12 @@ async def find_unenqueued_jobs(
     class BA2d-3 accepts."""
     rows = (
         await conn.execute(
-            sa.select(tables.jobs.c.id, tables.jobs.c.project).where(
+            sa.select(
+                tables.jobs.c.id,
+                tables.jobs.c.project,
+                tables.jobs.c.kind,
+                tables.jobs.c.build_id,
+            ).where(
                 tables.jobs.c.status == "queued",
                 tables.jobs.c.lease_owner.is_(None),
                 tables.jobs.c.created_at
@@ -399,7 +421,7 @@ async def find_unenqueued_jobs(
             )
         )
     ).all()
-    return [(row.id, row.project) for row in rows]
+    return [(row.id, row.project, row.kind, row.build_id) for row in rows]
 
 
 async def capture_config_snapshot(
