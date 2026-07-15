@@ -375,18 +375,22 @@ function ChunkingSection({ project, config, locked }: SectionProps) {
 function PolicySection({ project, config, locked }: SectionProps) {
   const pol = policyFromConfig(config);
   const save = useSaveQueryPolicy(project);
-  const [draft, setDraft] = useState<{
-    defaultMode: QueryMode;
-    maxTopKText: string;
-    maxGraphHopsText: string;
-  } | null>(null);
-  const [savedKey, setSavedKey] = useState<string | null>(null);
+  // per-field edits (undefined = untouched, tracking the baseline) — a save
+  // must send ONLY what was edited so untouched fields resolve from the fresh
+  // block, never revert a concurrent change (Codex #79 R6, the chunking rule)
+  const [edits, setEdits] = useState<{
+    defaultMode?: QueryMode;
+    maxTopKText?: string;
+    maxGraphHopsText?: string;
+  }>({});
+  const [savedOps, setSavedOps] = useState<string | null>(null);
 
-  const shown = draft ?? {
-    defaultMode: pol.defaultMode,
-    maxTopKText: String(pol.maxTopK),
-    maxGraphHopsText: String(pol.maxGraphHops),
+  const shown = {
+    defaultMode: edits.defaultMode ?? pol.defaultMode,
+    maxTopKText: edits.maxTopKText ?? String(pol.maxTopK),
+    maxGraphHopsText: edits.maxGraphHopsText ?? String(pol.maxGraphHops),
   };
+  const dirty = Object.keys(edits).length > 0;
   const maxTopK = Number(shown.maxTopKText);
   const maxGraphHops = Number(shown.maxGraphHopsText);
   const fieldError =
@@ -395,18 +399,30 @@ function PolicySection({ project, config, locked }: SectionProps) {
       : !Number.isInteger(maxGraphHops) || maxGraphHops < 1
         ? "圖譜跳數上限(max_graph_hops)必須是 ≥ 1 的整數"
         : null;
-  const key = (d: typeof shown) =>
-    JSON.stringify([d.defaultMode, d.maxTopKText, d.maxGraphHopsText]);
-  const savedStands = savedKey !== null && savedKey === key(shown);
+  const key = (o: { defaultMode: QueryMode; maxTopK: number; maxGraphHops: number }) =>
+    JSON.stringify([o.defaultMode, o.maxTopK, o.maxGraphHops]);
+  const savedStands =
+    savedOps !== null &&
+    savedOps === key({ defaultMode: shown.defaultMode, maxTopK, maxGraphHops });
 
   function runSave() {
-    const snapshot = shown;
     save.mutate(
-      { defaultMode: snapshot.defaultMode, maxTopK, maxGraphHops },
       {
-        onSuccess: () => {
-          setSavedKey(key(snapshot));
-          setDraft(null);
+        edits: {
+          ...(edits.defaultMode !== undefined ? { defaultMode: edits.defaultMode } : {}),
+          ...(edits.maxTopKText !== undefined ? { maxTopK } : {}),
+          ...(edits.maxGraphHopsText !== undefined ? { maxGraphHops } : {}),
+        },
+        salvaged: {
+          defaultMode: pol.defaultMode,
+          maxTopK: pol.maxTopK,
+          maxGraphHops: pol.maxGraphHops,
+        },
+      },
+      {
+        onSuccess: (r) => {
+          setSavedOps(key(r.saved));
+          setEdits({});
         },
       },
     );
@@ -435,7 +451,7 @@ function PolicySection({ project, config, locked }: SectionProps) {
         <select
           value={shown.defaultMode}
           disabled={locked || save.isPending}
-          onChange={(e) => setDraft({ ...shown, defaultMode: e.target.value as QueryMode })}
+          onChange={(e) => setEdits({ ...edits, defaultMode: e.target.value as QueryMode })}
         >
           {MODES.map((m) => (
             <option
@@ -461,7 +477,7 @@ function PolicySection({ project, config, locked }: SectionProps) {
           type="number"
           value={shown.maxTopKText}
           disabled={locked || save.isPending}
-          onChange={(e) => setDraft({ ...shown, maxTopKText: e.target.value })}
+          onChange={(e) => setEdits({ ...edits, maxTopKText: e.target.value })}
         />
       </label>
       <label className="settings__field">
@@ -472,7 +488,7 @@ function PolicySection({ project, config, locked }: SectionProps) {
           type="number"
           value={shown.maxGraphHopsText}
           disabled={locked || save.isPending}
-          onChange={(e) => setDraft({ ...shown, maxGraphHopsText: e.target.value })}
+          onChange={(e) => setEdits({ ...edits, maxGraphHopsText: e.target.value })}
         />
       </label>
       <p className="settings__field">
@@ -493,7 +509,7 @@ function PolicySection({ project, config, locked }: SectionProps) {
           disabled={
             locked ||
             save.isPending ||
-            (pol.present && !pol.malformed && draft === null) ||
+            (pol.present && !pol.malformed && !dirty) ||
             fieldError !== null
           }
           onClick={runSave}
@@ -506,8 +522,8 @@ function PolicySection({ project, config, locked }: SectionProps) {
                 ? "儲存問答安全設定"
                 : "以預設範本建立並儲存"}
         </button>
-        {draft !== null && !save.isPending && (
-          <button type="button" onClick={() => setDraft(null)}>
+        {dirty && !save.isPending && (
+          <button type="button" onClick={() => setEdits({})}>
             還原未存的修改
           </button>
         )}

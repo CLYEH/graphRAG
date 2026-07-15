@@ -1157,20 +1157,35 @@ export function policyFromConfig(config: Record<string, unknown>): QueryPolicyOp
   };
 }
 
+/** What a policy save carries: the operator fields the user actually EDITED
+ *  (undefined = untouched), plus the page's SALVAGED view of all three as the
+ *  fallback for a rebuild (where the fresh block is invalid and offers no
+ *  value to resolve an untouched field against). */
+export type QueryPolicySave = {
+  edits: { defaultMode?: QueryMode; maxTopK?: number; maxGraphHops?: number };
+  salvaged: QueryPolicyOperator;
+};
+
 /** Write the operator fields into query_policy — spreading the FRESH block
- *  (or the full template when the project has none: the frozen schema
- *  requires every field, so a partial write would brick every query). The
- *  sql-mode cross-check mirrors the schema's default_mode/text_to_sql allOf
- *  against the FRESH block — a recheck, not a lock (class 10): the residual
- *  race stands until the contract grows a version token. */
+ *  (or the full template when the project has none / is malformed: the frozen
+ *  schema requires every field, so a partial write would brick every query).
+ *  Untouched operator fields resolve from the FRESH block, not the page's
+ *  snapshot (the useSaveChunking discipline, Codex #74/#79 R6): saving one
+ *  edited knob must not silently revert a concurrent change to another. When
+ *  the fresh block is invalid there is no value to preserve, so a rebuild
+ *  falls back to the page's salvaged view. The sql-mode cross-check mirrors
+ *  the schema's default_mode/text_to_sql allOf against the FRESH base — a
+ *  recheck, not a lock (class 10). */
 export function useSaveQueryPolicy(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (op: QueryPolicyOperator) => {
-      if (!Number.isInteger(op.maxTopK) || op.maxTopK < 1)
-        throw new Error("單次檢索筆數上限(max_top_k)必須是 ≥ 1 的整數");
-      if (!Number.isInteger(op.maxGraphHops) || op.maxGraphHops < 1)
-        throw new Error("圖譜跳數上限(max_graph_hops)必須是 ≥ 1 的整數");
+    mutationFn: async ({ edits, salvaged }: QueryPolicySave) => {
+      const posInt = (v: number, label: string) => {
+        if (!Number.isInteger(v) || v < 1) throw new Error(`${label}必須是 ≥ 1 的整數`);
+      };
+      if (edits.maxTopK !== undefined) posInt(edits.maxTopK, "單次檢索筆數上限(max_top_k)");
+      if (edits.maxGraphHops !== undefined)
+        posInt(edits.maxGraphHops, "圖譜跳數上限(max_graph_hops)");
       const fresh = await api.GET("/projects/{project}", {
         params: { path: { project } },
       });
@@ -1179,13 +1194,26 @@ export function useSaveQueryPolicy(project: string) {
       const block = current["query_policy"];
       // a PARTIAL/malformed block (the curl-only era) must not be the spread
       // base: the PATCH would "succeed" while queries keep 400ing on the
-      // missing required fields (Codex #79 R2) — rebuild it on the template,
-      // salvaging only the operator fields this save carries. Checked against
-      // the FRESH block, same as the sql cross-check below.
+      // missing required fields (Codex #79 R2) — rebuild it on the template.
       const usable = isValidPolicyBlock(block);
       const base: Record<string, unknown> = usable
         ? (block as Record<string, unknown>)
         : { ...DEFAULT_QUERY_POLICY };
+      // untouched fields resolve from the FRESH valid block (preserve a
+      // concurrent edit); a rebuild has no valid fresh source, so it falls
+      // back to the salvaged view the operator was looking at (R6).
+      const freshOps: QueryPolicyOperator = usable
+        ? {
+            defaultMode: base["default_mode"] as QueryMode,
+            maxTopK: base["max_top_k"] as number,
+            maxGraphHops: base["max_graph_hops"] as number,
+          }
+        : salvaged;
+      const resolved: QueryPolicyOperator = {
+        defaultMode: edits.defaultMode ?? freshOps.defaultMode,
+        maxTopK: edits.maxTopK ?? freshOps.maxTopK,
+        maxGraphHops: edits.maxGraphHops ?? freshOps.maxGraphHops,
+      };
       const sql = base["text_to_sql"];
       const sqlEnabled = !!(
         sql &&
@@ -1193,22 +1221,22 @@ export function useSaveQueryPolicy(project: string) {
         !Array.isArray(sql) &&
         (sql as Record<string, unknown>)["enabled"] === true
       );
-      if (op.defaultMode === "sql" && !sqlEnabled)
+      if (resolved.defaultMode === "sql" && !sqlEnabled)
         throw new Error(
           "此專案未啟用 SQL 查詢(text_to_sql.enabled 為關),預設模式不能選 SQL——政策 schema 禁止預設到一個自己停用的模式",
         );
       const nextPolicy = {
         ...base,
-        default_mode: op.defaultMode,
-        max_top_k: op.maxTopK,
-        max_graph_hops: op.maxGraphHops,
+        default_mode: resolved.defaultMode,
+        max_top_k: resolved.maxTopK,
+        max_graph_hops: resolved.maxGraphHops,
       };
       const { data, error } = await api.PATCH("/projects/{project}", {
         params: { path: { project } },
         body: { config: { ...current, query_policy: nextPolicy } },
       });
       if (error) throw new Error(error.error.message);
-      return { project: data.data, saved: op, created: !usable };
+      return { project: data.data, saved: resolved, created: !usable };
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["project", project] }),
   });

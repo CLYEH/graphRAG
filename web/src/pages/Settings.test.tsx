@@ -402,6 +402,39 @@ describe("Settings — query policy", () => {
     expect(policy["text_to_sql"]).toEqual(custom.text_to_sql); // guardrail block verbatim
   });
 
+  it("preserves a CONCURRENT change to an untouched operator field — only the edited knob is written (R6)", async () => {
+    // Codex #79 R6 (the chunking fresh-resolution rule, #74): the page loaded
+    // default_mode "semantic" + max_graph_hops 3; by save time a concurrent
+    // tab changed them to "graph"/7 (still valid). The operator edits ONLY
+    // max_top_k. The save must keep the FRESH default_mode/hops — sending all
+    // three from the page's snapshot would silently revert the concurrent edit.
+    let gets = 0;
+    vi.spyOn(api, "GET").mockImplementation((() =>
+      Promise.resolve(
+        gets++ === 0
+          ? projectBody(FULL_CONFIG)
+          : projectBody({
+              ...FULL_CONFIG,
+              query_policy: {
+                ...FULL_CONFIG.query_policy,
+                default_mode: "graph",
+                max_graph_hops: 7,
+              },
+            }),
+      )) as never);
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    fireEvent.change(await screen.findByLabelText(/單次檢索筆數上限/), { target: { value: "8" } });
+    fireEvent.click(screen.getByRole("button", { name: "儲存問答安全設定" }));
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    const policy = patchedConfig(patch)["query_policy"] as Record<string, unknown>;
+    expect(policy["default_mode"]).toBe("graph"); // fresh concurrent value, NOT the page's "semantic"
+    expect(policy["max_graph_hops"]).toBe(7); // untouched → preserved from fresh
+    expect(policy["max_top_k"]).toBe(8); // the operator's actual edit
+  });
+
   it("blocks default_mode=sql when the FRESH read has text_to_sql disabled — the schema allOf, mirrored at the last moment", async () => {
     // Class-10 shaped: the page loaded a policy with sql ENABLED (so the
     // option is selectable), but by save time another writer disabled it.
