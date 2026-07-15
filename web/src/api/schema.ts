@@ -905,11 +905,14 @@ export interface components {
       [key: string]: unknown;
     };
     /**
-     * @description General document context supplied by the user or source system. The
-     *     concrete fields are defined by each project's metadata schema
-     *     (type/required/display/filterable, in projects.config — DR-010 rule 2);
-     *     this envelope fixes only the stable shape, never a global field list, so
-     *     it stays domain-agnostic.
+     * @description General document context supplied by the user or source system. `title`
+     *     and `document_type` are the stable core; every PROJECT-DEFINED field lives
+     *     under `attributes` (a per-project bag whose keys' type/required/display/
+     *     filterable are defined by projects.config.metadata_schema — DR-010 rule 2).
+     *     The core stays closed (additionalProperties:false) so the envelope is a
+     *     fixed shape, not a global field enum, while `attributes` keeps it
+     *     domain-agnostic — a project adds `case_number` as `attributes.case_number`,
+     *     never as a new top-level key.
      */
     DocumentMetadataContext: {
       /** @description Human display name for the document. */
