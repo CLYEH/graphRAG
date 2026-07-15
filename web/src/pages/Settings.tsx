@@ -13,7 +13,7 @@ import {
 import { isPathAddressable, useActiveProject } from "../project/projectRoute";
 import "./Settings.css";
 
-import type { OntologyDraft, QueryMode } from "../api/queries";
+import type { OntologyDraft, OntologyEdits, QueryMode } from "../api/queries";
 
 // UXB1 設定頁 (DESIGN §6/§21): the three config blocks an operator actually
 // tunes — 知識類型 (ontology), 切塊 (chunking), 問答安全 (query_policy) — as
@@ -162,16 +162,18 @@ function ChipEditor({
 function OntologySection({ project, config, locked }: SectionProps) {
   const base = ontologyFromConfig(config);
   const save = useSaveOntology(project);
-  // draft === null means "clean, show the server baseline" — a sibling save's
-  // refetch updates the baseline without touching an in-progress edit here
-  const [draft, setDraft] = useState<OntologyDraft | null>(null);
+  // per-field edits (undefined = untouched, tracking the baseline) — a save
+  // must send ONLY what was edited so untouched fields resolve from the fresh
+  // block, never revert a concurrent change (Codex #79 R7, the chunking rule)
+  const [edits, setEdits] = useState<OntologyEdits>({});
   const [savedKey, setSavedKey] = useState<string | null>(null);
 
-  const shown: OntologyDraft = draft ?? {
-    entityTypes: base.entityTypes,
-    relationTypes: base.relationTypes,
-    proposalPolicy: base.proposalPolicy,
+  const shown: OntologyDraft = {
+    entityTypes: edits.entityTypes ?? base.entityTypes,
+    relationTypes: edits.relationTypes ?? base.relationTypes,
+    proposalPolicy: edits.proposalPolicy ?? base.proposalPolicy,
   };
+  const dirty = Object.keys(edits).length > 0;
   const key = (d: OntologyDraft) =>
     JSON.stringify([d.entityTypes, d.relationTypes, d.proposalPolicy]);
   const bothEmpty = shown.entityTypes.length === 0 && shown.relationTypes.length === 0;
@@ -179,19 +181,25 @@ function OntologySection({ project, config, locked }: SectionProps) {
   // a PRESENT-but-malformed persisted block (a curl-era typo'd proposal_policy,
   // an unknown key, an empty vocabulary) is itself unsaved state: the form
   // shows the salvaged-clean version, which lives nowhere on the server, so
-  // saving it is a repair — enable even with draft === null (Codex #79 R4,
-  // the ontology sibling of the R1/R2 policy rule)
+  // saving it is a repair — enable even without an edit (Codex #79 R4, the
+  // ontology sibling of the R1/R2 policy rule)
   const malformed = base.malformed;
   const savedStands = savedKey !== null && savedKey === key(shown);
 
   function runSave() {
-    const snapshot = shown;
-    save.mutate(snapshot, {
-      onSuccess: () => {
-        setSavedKey(key(snapshot));
-        setDraft(null);
+    save.mutate(
+      {
+        ...(edits.entityTypes !== undefined ? { entityTypes: edits.entityTypes } : {}),
+        ...(edits.relationTypes !== undefined ? { relationTypes: edits.relationTypes } : {}),
+        ...(edits.proposalPolicy !== undefined ? { proposalPolicy: edits.proposalPolicy } : {}),
       },
-    });
+      {
+        onSuccess: (r) => {
+          setSavedKey(key(r.saved));
+          setEdits({});
+        },
+      },
+    );
   }
 
   return (
@@ -206,14 +214,14 @@ function OntologySection({ project, config, locked }: SectionProps) {
         rawKey="entity_types"
         values={shown.entityTypes}
         disabled={locked || save.isPending}
-        onChange={(next) => setDraft({ ...shown, entityTypes: next })}
+        onChange={(next) => setEdits({ ...edits, entityTypes: next })}
       />
       <ChipEditor
         label="關係類型"
         rawKey="relation_types"
         values={shown.relationTypes}
         disabled={locked || save.isPending}
-        onChange={(next) => setDraft({ ...shown, relationTypes: next })}
+        onChange={(next) => setEdits({ ...edits, relationTypes: next })}
       />
       <div className="settings__field">
         <span className="settings__label">
@@ -231,7 +239,7 @@ function OntologySection({ project, config, locked }: SectionProps) {
               name={`ontology-policy-${project}`}
               checked={shown.proposalPolicy === value}
               disabled={locked || save.isPending}
-              onChange={() => setDraft({ ...shown, proposalPolicy: value })}
+              onChange={() => setEdits({ ...edits, proposalPolicy: value })}
             />
             {label}
           </label>
@@ -251,7 +259,7 @@ function OntologySection({ project, config, locked }: SectionProps) {
       <div className="settings__actions">
         <button
           type="button"
-          disabled={locked || save.isPending || oneSided || (!malformed && draft === null)}
+          disabled={locked || save.isPending || oneSided || (!malformed && !dirty)}
           onClick={runSave}
         >
           {save.isPending
@@ -260,8 +268,8 @@ function OntologySection({ project, config, locked }: SectionProps) {
               ? "儲存(移除整份詞彙表)"
               : "儲存知識類型"}
         </button>
-        {draft !== null && !save.isPending && (
-          <button type="button" onClick={() => setDraft(null)}>
+        {dirty && !save.isPending && (
+          <button type="button" onClick={() => setEdits({})}>
             還原未存的修改
           </button>
         )}

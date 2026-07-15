@@ -957,25 +957,39 @@ function normalizeTypes(values: string[]): string[] {
   return out;
 }
 
-/** Write (or delete) the ontology block. Empty draft = DELETE the key (see
- *  the section comment); a one-sided draft is refused HERE because the build
- *  would refuse it LATER (TextOntology requires both lists) — failing at save
- *  time with a sentence beats failing at the next build with a stack trace. */
+/** The ontology fields the operator actually EDITED (undefined = untouched). */
+export type OntologyEdits = {
+  entityTypes?: string[];
+  relationTypes?: string[];
+  proposalPolicy?: "review" | "auto";
+};
+
+/** Write (or delete) the ontology block. Untouched fields resolve from the
+ *  FRESH block, never the page's snapshot (the useSaveChunking discipline,
+ *  Codex #74/#79 R7): editing one field must not silently revert a concurrent
+ *  change to another. ontologyFromConfig(current) yields the fresh view for
+ *  every case — a valid block's vocabulary, a malformed block's salvage, or an
+ *  absent block's empty view (so a concurrent delete is respected, not
+ *  resurrected). Empty resolved vocabulary = DELETE the key; a one-sided
+ *  result is refused HERE because the build would refuse it LATER
+ *  (TextOntology requires both lists). */
 export function useSaveOntology(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (draft: OntologyDraft) => {
-      const entityTypes = normalizeTypes(draft.entityTypes);
-      const relationTypes = normalizeTypes(draft.relationTypes);
-      if ((entityTypes.length === 0) !== (relationTypes.length === 0))
-        throw new Error(
-          "實體類型與關係類型必須同時提供,或同時清空(移除整份詞彙表)——只填一邊的詞彙表會在下次建置時失敗",
-        );
+    mutationFn: async (edits: OntologyEdits) => {
       const fresh = await api.GET("/projects/{project}", {
         params: { path: { project } },
       });
       if (fresh.error) throw new Error(fresh.error.error.message);
       const current = (fresh.data.data.config ?? {}) as Record<string, unknown>;
+      const freshView = ontologyFromConfig(current);
+      const entityTypes = normalizeTypes(edits.entityTypes ?? freshView.entityTypes);
+      const relationTypes = normalizeTypes(edits.relationTypes ?? freshView.relationTypes);
+      const proposalPolicy = edits.proposalPolicy ?? freshView.proposalPolicy;
+      if ((entityTypes.length === 0) !== (relationTypes.length === 0))
+        throw new Error(
+          "實體類型與關係類型必須同時提供,或同時清空(移除整份詞彙表)——只填一邊的詞彙表會在下次建置時失敗",
+        );
       const { ontology: _dropped, ...rest } = current;
       const nextConfig =
         entityTypes.length === 0
@@ -985,7 +999,7 @@ export function useSaveOntology(project: string) {
               ontology: {
                 entity_types: entityTypes,
                 relation_types: relationTypes,
-                proposal_policy: draft.proposalPolicy,
+                proposal_policy: proposalPolicy,
               },
             };
       const { data, error } = await api.PATCH("/projects/{project}", {
@@ -995,7 +1009,7 @@ export function useSaveOntology(project: string) {
       if (error) throw new Error(error.error.message);
       return {
         project: data.data,
-        saved: { entityTypes, relationTypes, proposalPolicy: draft.proposalPolicy },
+        saved: { entityTypes, relationTypes, proposalPolicy },
       };
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["project", project] }),

@@ -151,6 +151,45 @@ describe("Settings — ontology", () => {
     expect(ontology["proposal_policy"]).toBe("auto");
   });
 
+  it("preserves a CONCURRENT vocabulary change when only proposal_policy is edited (R7)", async () => {
+    // Codex #79 R7 (the R6 concurrent-preserve rule, on the ontology save): the
+    // page loaded {[EVENT]/[PRACTICED_BY]/review}; a concurrent tab expanded the
+    // vocabulary to add PLACE / LOCATED_IN. The operator flips ONLY the policy
+    // radio to auto. The save must keep the FRESH vocabulary, not revert it to
+    // the page's snapshot — untouched fields resolve from the fresh block.
+    let gets = 0;
+    vi.spyOn(api, "GET").mockImplementation((() =>
+      Promise.resolve(
+        gets++ === 0
+          ? projectBody({
+              ontology: {
+                entity_types: ["EVENT"],
+                relation_types: ["PRACTICED_BY"],
+                proposal_policy: "review",
+              },
+            })
+          : projectBody({
+              ontology: {
+                entity_types: ["EVENT", "PLACE"],
+                relation_types: ["PRACTICED_BY", "LOCATED_IN"],
+                proposal_policy: "review",
+              },
+            }),
+      )) as never);
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    fireEvent.click(await screen.findByLabelText("自動採用")); // edit ONLY proposal_policy
+    fireEvent.click(screen.getByRole("button", { name: "儲存知識類型" }));
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    expect(patchedConfig(patch)["ontology"]).toEqual({
+      entity_types: ["EVENT", "PLACE"], // fresh concurrent vocabulary, preserved
+      relation_types: ["PRACTICED_BY", "LOCATED_IN"], // ditto
+      proposal_policy: "auto", // the operator's actual edit
+    });
+  });
+
   it("REPAIRS a malformed ontology block WITHOUT an edit — the salvaged form is itself unsaved", async () => {
     // Codex #79 R4 (the ontology sibling of the policy R1/R2): a hand-written
     // block with a typo'd proposal_policy renders as a clean `review` form
