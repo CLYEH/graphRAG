@@ -57,7 +57,15 @@ export function Settings() {
       </p>
     );
 
-  return <SettingsBody project={project} />;
+  // key by project: React Router reuses this tree across a /p/A → /p/B param
+  // change, and when B's project query is already cached useProject renders B
+  // with no loading remount — so without a key the section useState drafts from
+  // A would survive and A's unsaved edit could be PATCHed onto B (Codex #79 R9,
+  // the cross-IDENTITY face of the class-20 draft-lifecycle family). The key
+  // forces a remount on a project change (drafts reset) while a SAME-project
+  // refetch keeps the key stable, so the sibling-save draft-survival discipline
+  // above is untouched.
+  return <SettingsBody key={project} project={project} />;
 }
 
 function SettingsBody({ project }: { project: string }) {

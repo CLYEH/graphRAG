@@ -1,5 +1,6 @@
-import { act, fireEvent, screen, waitFor } from "@testing-library/react";
-import { Route, Routes } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Settings } from "./Settings";
@@ -645,6 +646,85 @@ describe("Settings — drafts survive sibling saves", () => {
 
     expect(screen.getByRole("button", { name: "移除 PLACE" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "儲存知識類型" })).toBeEnabled();
+  });
+});
+
+describe("Settings — project identity", () => {
+  // A test-only control that navigates within the shared router/QueryClient, so
+  // a project switch reuses the Settings tree exactly as production routing does.
+  function NavTo({ to, children }: { to: string; children: string }) {
+    const nav = useNavigate();
+    return (
+      <button type="button" onClick={() => nav(to)}>
+        {children}
+      </button>
+    );
+  }
+
+  it("resets section drafts on a project switch — A's unsaved edit cannot be written onto B (R9)", async () => {
+    // Codex #79 R9 (the cross-IDENTITY face of the class-20 draft-lifecycle
+    // family): React Router reuses this tree across /p/alpha → /p/beta, and with
+    // beta's project query ALREADY CACHED useProject renders beta with no
+    // loading remount — so without a per-project key the section useState drafts
+    // from alpha survive, alpha's unsaved ontology edit stays "dirty" against
+    // beta, and a save PATCHes alpha's vocabulary onto beta. keying SettingsBody
+    // by project forces a remount on the switch (drafts reset) while a
+    // same-project refetch keeps the key stable (the sibling-save survival test
+    // above still holds). Reverting the key makes this test fail: the "移除
+    // PLACE" chip bleeds into beta and its save re-enables.
+    const CONFIG_ALPHA = {
+      ontology: {
+        entity_types: ["EVENT"],
+        relation_types: ["PRACTICED_BY"],
+        proposal_policy: "review",
+      },
+    };
+    const CONFIG_BETA = {
+      ontology: { entity_types: ["PERSON"], relation_types: ["KNOWS"], proposal_policy: "review" },
+    };
+    vi.spyOn(api, "GET").mockImplementation(((
+      _path: string,
+      opts: { params: { path: { project: string } } },
+    ) =>
+      Promise.resolve(
+        projectBody(opts.params.path.project === "beta" ? CONFIG_BETA : CONFIG_ALPHA),
+      )) as never);
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // routes carry the base64url-ENCODED segment (useActiveProject decodes it);
+    // the API/query still sees the decoded "alpha"/"beta", which the GET mock keys on.
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={[projectRoute("beta", "settings")]}>
+          <NavTo to={projectRoute("alpha", "settings")}>go-alpha</NavTo>
+          <NavTo to={projectRoute("beta", "settings")}>go-beta</NavTo>
+          <Routes>
+            <Route path="/p/:project/settings" element={<Settings />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // 1. warm beta's cache with a real mount+fetch, then leave for alpha
+    await screen.findByRole("button", { name: "移除 PERSON" });
+    fireEvent.click(screen.getByRole("button", { name: "go-alpha" }));
+
+    // 2. on alpha, dirty the ontology draft (add PLACE) — now unsaved state
+    await screen.findByRole("button", { name: "移除 EVENT" });
+    fireEvent.change(screen.getByLabelText("新增實體類型"), { target: { value: "PLACE" } });
+    fireEvent.click(screen.getByRole("button", { name: "加入實體類型" }));
+    await screen.findByRole("button", { name: "移除 PLACE" }); // draft is dirty
+
+    // 3. switch back to beta — cached, so NO loading remount masks the bug
+    fireEvent.click(screen.getByRole("button", { name: "go-beta" }));
+
+    // beta shows ITS OWN vocabulary; alpha's draft is gone and unsavable
+    await screen.findByRole("button", { name: "移除 PERSON" });
+    expect(screen.queryByRole("button", { name: "移除 PLACE" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "移除 EVENT" })).toBeNull();
+    expect(screen.getByRole("button", { name: "儲存知識類型" })).toBeDisabled();
+    expect(patch).not.toHaveBeenCalled(); // A's draft never reached B
   });
 });
 
