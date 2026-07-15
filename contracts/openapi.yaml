@@ -1469,9 +1469,15 @@ components:
 
     UploadedFileAccepted:
       type: object
-      description: An accepted file — registered into the managed source with a canonical uri.
+      description: |
+        An accepted file — registered into the managed source with a canonical uri
+        and its STORED metadata envelope. `metadata` is the full
+        DocumentMetadataEnvelope: the server-stamped `system`/`schema_version` plus
+        the client's `context`/`governance`, so the response freezes that the
+        server cannot drop the server-owned namespace (DR-010 rule 1). Wiring the
+        envelope here makes it load-bearing rather than a dangling type.
       additionalProperties: false
-      required: [filename, status, document_uri]
+      required: [filename, status, document_uri, metadata]
       properties:
         filename:
           type: string
@@ -1485,6 +1491,8 @@ components:
         document_uri:
           type: string
           description: Canonical file:// uri the managed source points at (BA9 rules).
+        metadata:
+          $ref: "#/components/schemas/DocumentMetadataEnvelope"
         reason: false
 
     UploadedFileRejected:

@@ -786,3 +786,9 @@ def test_document_metadata_envelope_shape(spec: dict[str, Any]) -> None:
     assert "system" not in metadata_input["properties"]
     assert "schema_version" not in metadata_input["properties"]
     assert set(metadata_input["properties"]) == {"context", "governance"}
+    # the envelope is load-bearing, not a dead type: the accepted-upload response
+    # carries the STORED envelope, so the server-stamped system/schema_version
+    # can't be silently dropped (Codex PR#80 P1). The full envelope requires them.
+    accepted = schemas["UploadedFileAccepted"]
+    assert "metadata" in accepted["required"]
+    assert accepted["properties"]["metadata"]["$ref"].endswith("/DocumentMetadataEnvelope")

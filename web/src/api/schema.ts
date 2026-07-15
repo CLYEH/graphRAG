@@ -959,7 +959,14 @@ export interface components {
       context?: components["schemas"]["DocumentMetadataContext"];
       governance?: components["schemas"]["DocumentMetadataGovernance"];
     };
-    /** @description An accepted file — registered into the managed source with a canonical uri. */
+    /**
+     * @description An accepted file — registered into the managed source with a canonical uri
+     *     and its STORED metadata envelope. `metadata` is the full
+     *     DocumentMetadataEnvelope: the server-stamped `system`/`schema_version` plus
+     *     the client's `context`/`governance`, so the response freezes that the
+     *     server cannot drop the server-owned namespace (DR-010 rule 1). Wiring the
+     *     envelope here makes it load-bearing rather than a dangling type.
+     */
     UploadedFileAccepted: {
       /** @description Server-sanitized stored name (client filenames are never used as paths). */
       filename: string;
@@ -969,6 +976,7 @@ export interface components {
       status: "accepted";
       /** @description Canonical file:// uri the managed source points at (BA9 rules). */
       document_uri: string;
+      metadata: components["schemas"]["DocumentMetadataEnvelope"];
       reason?: never;
     };
     /**
