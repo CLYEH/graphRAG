@@ -81,6 +81,18 @@ class DocumentMetadataContextInput(BaseModel):
     document_type: str | None = None
     attributes: dict[str, Any] | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_null_attributes(cls, data: Any) -> Any:
+        # title/document_type ARE nullable (string|null core), but the frozen
+        # contract makes `attributes` an OBJECT when present, not nullable. An
+        # explicit null would parse to None, validate_context would treat it as {},
+        # and the stored envelope would silently rewrite it to {} — drift. Reject
+        # an explicit-null attributes (present-and-null), same as the sub-objects.
+        if isinstance(data, dict) and "attributes" in data and data["attributes"] is None:
+            raise ValueError("attributes must be an object when present, not null")
+        return data
+
 
 class DocumentMetadataGovernanceInput(BaseModel):
     """The contract DocumentMetadataGovernance (DR-010): visibility/classification

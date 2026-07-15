@@ -339,6 +339,36 @@ async def test_run_eval_task_terminalizes_on_store_error_never_strands_running(
     assert statuses == ["running", "failed"]
 
 
+async def test_run_eval_task_rejects_project_name_escaping_projects_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: the eval worker reads <projects_dir>/<project>/{eval/golden.yaml,
+    # config.yaml}. A project named '..' would read config OUTSIDE the projects
+    # root (a traversal, the same class the upload corpus guards). It must fail the
+    # job BEFORE any on-disk config read — never load a file outside the root.
+    statuses: list[str] = []
+    loaded: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    def _load_golden(path: Any) -> Any:
+        loaded.append(str(path))  # must NOT run for an unsafe project name
+        return "GOLDEN"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr("core.eval.golden.load_golden", _load_golden)
+
+    ctx = {"engine": _FakeEngine(), "neo4j": _FakeNeo4j(), "owner": "worker-abc"}
+    result = await bw.run_eval_task(ctx, "..", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "failed"
+    assert loaded == []  # the traversal read never happened
+    assert statuses == ["failed"]  # failed at the guard, before the 'running' mark
+
+
 async def test_enqueue_build_uses_job_id_dedup() -> None:
     calls: dict[str, Any] = {}
 

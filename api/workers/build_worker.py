@@ -50,6 +50,7 @@ from core.builds.orchestrator import BuildNotResumableError, run_build
 from core.builds.stages import default_stages
 from core.config import get_settings
 from core.llm.factory import chat_model, embedding_model
+from core.paths import safe_project_subdir
 from core.registry import (
     capture_config_snapshot,
     find_reapable_jobs,
@@ -135,7 +136,19 @@ async def run_eval_task(
     async with job_lease(engine, eval_job, ctx["owner"]) as acquired:
         if not acquired:
             return None  # a live peer is executing this job — deliberate no-op
-        root = Path(get_settings().projects_dir) / project
+        # Path-safety BEFORE reading any on-disk config: the project name is a
+        # path component of projects_dir, but it is only length-validated — a name
+        # like '..' would read <projects_dir>/../{eval/golden.yaml,config.yaml},
+        # OUTSIDE the projects root. The same guard the upload corpus uses; an
+        # unsafe name is a deterministic refusal (a retry can't fix it).
+        root = safe_project_subdir(Path(get_settings().projects_dir), project)
+        if root is None:
+            await _fail_job(
+                engine,
+                eval_job,
+                ValueError(f"project {project!r} is not a valid projects-dir path component"),
+            )
+            return "failed"
         try:
             golden = load_golden(root / "eval" / "golden.yaml")
             policy = load_query_policy(root / "config.yaml")

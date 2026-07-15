@@ -369,3 +369,25 @@ def test_null_metadata_subobject_rejects_file(
     assert row["status"] == "rejected"
     assert "metadata is invalid" in row["reason"]
     assert "must be an object when present" in row["reason"]
+
+
+def test_null_context_attributes_rejects_file(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY: the contract makes context.attributes an OBJECT when present, not
+    # nullable. `{"context": {"attributes": null}}` must reject, not be normalized
+    # to an empty object — the same non-nullable rule as the context/governance
+    # sub-objects, one level deeper.
+    _project(monkeypatch)
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    metadata = {"doc.txt": {"context": {"attributes": None}}}
+    resp = client.post(
+        _URL,
+        files=[("files", ("doc.txt", b"x", "text/plain"))],
+        data={"metadata": json.dumps(metadata)},
+    )
+    assert resp.status_code == 201
+    row = resp.json()["data"]["files"][0]
+    assert row["status"] == "rejected"
+    assert "attributes must be an object when present" in row["reason"]

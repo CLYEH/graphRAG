@@ -41,6 +41,7 @@ from core.config import get_settings
 from core.ingest.connectors import TEXT_SUFFIXES
 from core.metadata import MetadataValidationError, build_envelope, load_metadata_schema
 from core.metadata.schema import MetadataConfigError, MetadataSchema
+from core.paths import safe_project_subdir
 from core.registry import ProjectNotFoundError, get_project, upsert_managed_source
 
 router = APIRouter(tags=["sources"])
@@ -174,12 +175,11 @@ def _reject_unsafe_corpus_path(settings: Any, project: str) -> None:
     but ``ProjectCreate`` only checks ``min_length`` — a name like ``..`` or one
     with separators would let the corpus escape the root, writing generated files
     outside it AND registering that escaped dir as the canonical source (a later
-    build could then ingest unrelated local files). Require the name to resolve to
-    a DIRECT child of the corpus root. Kept SYNC (like ``_corpus_dir``) so the
-    filesystem-touching ``resolve()`` stays off the async endpoint's blocking-call
-    lint, and called BEFORE any file I/O."""
-    corpus_base = Path(settings.upload_corpus_dir).resolve()
-    if (corpus_base / project).resolve().parent != corpus_base:
+    build could then ingest unrelated local files). Delegates the containment rule
+    to the shared ``safe_project_subdir`` (the same guard the eval worker uses).
+    Kept SYNC (like ``_corpus_dir``) so the filesystem-touching ``resolve()`` stays
+    off the async endpoint's blocking-call lint, and called BEFORE any file I/O."""
+    if safe_project_subdir(Path(settings.upload_corpus_dir), project) is None:
         raise ApiError(
             ErrorCode.VALIDATION_ERROR,
             f"project {project!r} is not a valid managed-corpus path component",
@@ -189,8 +189,11 @@ def _reject_unsafe_corpus_path(settings: Any, project: str) -> None:
 
 def _corpus_dir(settings: Any, project: str) -> Path:
     """The project's managed corpus directory (absolute), created on demand. The
-    same path across uploads so the managed source is ONE per project."""
-    root = Path(settings.upload_corpus_dir).resolve() / project
+    same path across uploads so the managed source is ONE per project. The
+    endpoint has already rejected an unsafe project name
+    (``_reject_unsafe_corpus_path``), so the containment re-check here can't fail."""
+    root = safe_project_subdir(Path(settings.upload_corpus_dir), project)
+    assert root is not None  # guarded by _reject_unsafe_corpus_path before any I/O
     root.mkdir(parents=True, exist_ok=True)
     return root
 
