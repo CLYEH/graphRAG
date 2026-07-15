@@ -74,6 +74,10 @@ async def upload_documents_endpoint(
             details={"project": project},
         )
 
+    # Path-safety BEFORE any filesystem I/O (a 400, fail-closed): a project name
+    # like '..' or one with separators would let the corpus escape the root.
+    _reject_unsafe_corpus_path(settings, project)
+
     # 413: refuse an oversized upload by its declared Content-Length FIRST, so an
     # honest large body is rejected before it is buffered; the post-read length
     # check backstops a missing/short Content-Length (the body is still bounded
@@ -161,6 +165,26 @@ async def upload_documents_endpoint(
         return JSONResponse(status_code=status, content=resp)
     status, resp = await produce()
     return JSONResponse(status_code=status, content=jsonable_encoder(resp))
+
+
+def _reject_unsafe_corpus_path(settings: Any, project: str) -> None:
+    """Raise a 400 if the project name would escape the managed-corpus root.
+
+    The project name is a path component of ``upload_corpus_dir`` (``_corpus_dir``),
+    but ``ProjectCreate`` only checks ``min_length`` — a name like ``..`` or one
+    with separators would let the corpus escape the root, writing generated files
+    outside it AND registering that escaped dir as the canonical source (a later
+    build could then ingest unrelated local files). Require the name to resolve to
+    a DIRECT child of the corpus root. Kept SYNC (like ``_corpus_dir``) so the
+    filesystem-touching ``resolve()`` stays off the async endpoint's blocking-call
+    lint, and called BEFORE any file I/O."""
+    corpus_base = Path(settings.upload_corpus_dir).resolve()
+    if (corpus_base / project).resolve().parent != corpus_base:
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            f"project {project!r} is not a valid managed-corpus path component",
+            details={"project": project},
+        )
 
 
 def _corpus_dir(settings: Any, project: str) -> Path:

@@ -325,3 +325,47 @@ def test_malformed_metadata_schema_is_400_not_500(
     error = resp.json()["error"]
     assert error["code"] == "VALIDATION_ERROR"
     assert error["details"] == {"metadata_schema": "invalid"}
+
+
+def test_project_name_escaping_corpus_root_is_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY: the project name is a managed-corpus PATH COMPONENT; a name like '..'
+    # would let the corpus escape upload_corpus_dir — writing generated files
+    # under the parent dir and registering that escaped dir as the canonical
+    # source, so a later build could ingest unrelated local files. Must be a 400,
+    # BEFORE any filesystem I/O.
+    _project(monkeypatch)  # get_project stub returns a project for any name
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    resp = client.post(
+        "/projects/%2E%2E/uploads", files=[("files", ("a.txt", b"hi", "text/plain"))]
+    )
+    assert resp.status_code == 400
+    error = resp.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert "path component" in error["message"]
+    # nothing escaped: no file was written outside the corpus root
+    assert not list(tmp_path.parent.glob("*.txt"))
+
+
+def test_null_metadata_subobject_rejects_file(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY: the frozen contract makes context/governance OPTIONAL properties, not
+    # nullable. An explicit null (`{"context": null}`) must be a VALIDATION_ERROR,
+    # not silently accepted and stored as an empty envelope (contract drift).
+    _project(monkeypatch)
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    metadata = {"doc.txt": {"context": None}}
+    resp = client.post(
+        _URL,
+        files=[("files", ("doc.txt", b"x", "text/plain"))],
+        data={"metadata": json.dumps(metadata)},
+    )
+    assert resp.status_code == 201  # per-file STATED reject (same as other bad metadata)
+    row = resp.json()["data"]["files"][0]
+    assert row["status"] == "rejected"
+    assert "metadata is invalid" in row["reason"]
+    assert "must be an object when present" in row["reason"]

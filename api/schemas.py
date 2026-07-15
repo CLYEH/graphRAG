@@ -104,6 +104,20 @@ class DocumentMetadataInput(BaseModel):
     context: DocumentMetadataContextInput | None = None
     governance: DocumentMetadataGovernanceInput | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_null_subobjects(cls, data: Any) -> Any:
+        # context/governance are OPTIONAL (may be absent) but NON-NULLABLE when
+        # present — the frozen contract makes them optional properties, not
+        # nullable. An explicit null would otherwise parse to None
+        # (indistinguishable from absent) and be stored as an empty envelope,
+        # drifting from the contract. Check key PRESENCE so absent stays valid.
+        if isinstance(data, dict):
+            for key in ("context", "governance"):
+                if key in data and data[key] is None:
+                    raise ValueError(f"{key} must be an object when present, not null")
+        return data
+
 
 class IngestRequest(BaseModel):
     """The contract IngestRequest — parsed to its shape, then ``source_ids``
