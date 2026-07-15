@@ -176,6 +176,12 @@ function OntologySection({ project, config, locked }: SectionProps) {
     JSON.stringify([d.entityTypes, d.relationTypes, d.proposalPolicy]);
   const bothEmpty = shown.entityTypes.length === 0 && shown.relationTypes.length === 0;
   const oneSided = (shown.entityTypes.length === 0) !== (shown.relationTypes.length === 0);
+  // a PRESENT-but-malformed persisted block (a curl-era typo'd proposal_policy,
+  // an unknown key, an empty vocabulary) is itself unsaved state: the form
+  // shows the salvaged-clean version, which lives nowhere on the server, so
+  // saving it is a repair — enable even with draft === null (Codex #79 R4,
+  // the ontology sibling of the R1/R2 policy rule)
+  const malformed = base.malformed;
   const savedStands = savedKey !== null && savedKey === key(shown);
 
   function runSave() {
@@ -231,6 +237,12 @@ function OntologySection({ project, config, locked }: SectionProps) {
           </label>
         ))}
       </div>
+      {malformed && (
+        <p className="settings__line settings__line--notice">
+          此專案目前的知識類型設定不符規範(欄位缺漏、含未知欄位、或新類型處理值無效),建置會失敗。
+          下方是依現有內容整理後的版本,確認後儲存即可修正。
+        </p>
+      )}
       {oneSided && (
         <p className="settings__line settings__line--error">
           實體類型與關係類型必須同時提供,或同時清空(移除整份詞彙表)。
@@ -239,12 +251,12 @@ function OntologySection({ project, config, locked }: SectionProps) {
       <div className="settings__actions">
         <button
           type="button"
-          disabled={locked || save.isPending || draft === null || oneSided}
+          disabled={locked || save.isPending || oneSided || (!malformed && draft === null)}
           onClick={runSave}
         >
           {save.isPending
             ? "儲存中…"
-            : bothEmpty && base.present
+            : bothEmpty && (base.present || malformed)
               ? "儲存(移除整份詞彙表)"
               : "儲存知識類型"}
         </button>

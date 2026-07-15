@@ -873,26 +873,79 @@ export type OntologyDraft = {
   proposalPolicy: "review" | "auto";
 };
 
+/** The two legal ontology proposal policies — mirror of PROPOSAL_POLICIES in
+ *  core/graph/proposals.py. Drift is caught by the ontology parity corpus. */
+export const PROPOSAL_POLICIES = ["review", "auto"] as const;
+
+/** Mirror of the SERVER's verdict on whether a PRESENT ontology block would
+ *  load (core/builds/config.py _load_ontology + TextOntology): the block must
+ *  be an object, carry only {entity_types, relation_types, proposal_policy},
+ *  a present proposal_policy must be one of PROPOSAL_POLICIES, the two type
+ *  fields (when present) must be string arrays, and BOTH must resolve
+ *  non-empty. A block that fails this raises at the next BUILD while the
+ *  settings PATCH "succeeds" — the same silent brick the policy mirror guards
+ *  (Codex #79 R4, the ontology sibling). Pinned to the real loader by
+ *  tests/fixtures/ontology_block_validity.json (the query_policy parity
+ *  pattern); the absent key is NOT this function's concern (it is the legal
+ *  no-vocabulary state, handled by the caller). */
+export function isValidOntologyBlock(block: unknown): boolean {
+  if (!isRecord(block)) return false; // _mapping raises on a non-object
+  for (const k of Object.keys(block))
+    if (k !== "entity_types" && k !== "relation_types" && k !== "proposal_policy") return false;
+  if ("proposal_policy" in block) {
+    const p = block["proposal_policy"];
+    if (
+      typeof p !== "string" ||
+      !PROPOSAL_POLICIES.includes(p as (typeof PROPOSAL_POLICIES)[number])
+    )
+      return false;
+  }
+  // TextOntology rejects blank/whitespace-only type values too (ontology.py:
+  // `if not value.strip()`), not just an empty list — a bare _str_list check
+  // would accept [""] which the build refuses
+  const strList = (v: unknown): v is string[] =>
+    Array.isArray(v) && v.every((s) => typeof s === "string" && s.trim().length > 0);
+  const ents = "entity_types" in block ? block["entity_types"] : [];
+  const rels = "relation_types" in block ? block["relation_types"] : [];
+  if (!strList(ents) || !strList(rels)) return false;
+  return ents.length > 0 && rels.length > 0; // TextOntology requires both
+}
+
 /** The project's ontology block as the settings form sees it — defensive
  *  reads, same spirit as chunkingFromConfig (hand-written config can hold
  *  anything). `present` distinguishes "no vocabulary declared" from an
- *  empty-read block so the page can word the two states differently. */
+ *  empty-read block; `malformed` flags a PRESENT block the build would reject
+ *  (Codex #79 R4) so the page treats it as repairable rather than clean — the
+ *  salvaged (filtered/fallback) values shown below are what a repair save
+ *  writes. */
 export function ontologyFromConfig(
   config: Record<string, unknown>,
-): OntologyDraft & { present: boolean } {
+): OntologyDraft & { present: boolean; malformed: boolean } {
+  const keyExists = Object.prototype.hasOwnProperty.call(config, "ontology");
   const block = config["ontology"];
+  const malformed = keyExists && !isValidOntologyBlock(block);
+  // salvage EXACTLY what a save would write (normalizeTypes: trim + drop
+  // blanks + dedup) so the "整理後的版本" the malformed notice promises is the
+  // block the repair save actually persists — a raw pass-through would show a
+  // blank chip the mutation then strips, desyncing the form from the write
   const strings = (v: unknown): string[] =>
-    Array.isArray(v) ? v.filter((s): s is string => typeof s === "string") : [];
-  if (block && typeof block === "object" && !Array.isArray(block)) {
-    const b = block as Record<string, unknown>;
+    normalizeTypes(Array.isArray(v) ? v.filter((s): s is string => typeof s === "string") : []);
+  if (isRecord(block)) {
     return {
       present: true,
-      entityTypes: strings(b["entity_types"]),
-      relationTypes: strings(b["relation_types"]),
-      proposalPolicy: b["proposal_policy"] === "auto" ? "auto" : "review",
+      malformed,
+      entityTypes: strings(block["entity_types"]),
+      relationTypes: strings(block["relation_types"]),
+      proposalPolicy: block["proposal_policy"] === "auto" ? "auto" : "review",
     };
   }
-  return { present: false, entityTypes: [], relationTypes: [], proposalPolicy: "review" };
+  return {
+    present: false,
+    malformed,
+    entityTypes: [],
+    relationTypes: [],
+    proposalPolicy: "review",
+  };
 }
 
 function normalizeTypes(values: string[]): string[] {

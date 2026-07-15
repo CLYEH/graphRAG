@@ -150,6 +150,60 @@ describe("Settings — ontology", () => {
     const ontology = patchedConfig(patch)["ontology"] as Record<string, unknown>;
     expect(ontology["proposal_policy"]).toBe("auto");
   });
+
+  it("REPAIRS a malformed ontology block WITHOUT an edit — the salvaged form is itself unsaved", async () => {
+    // Codex #79 R4 (the ontology sibling of the policy R1/R2): a hand-written
+    // block with a typo'd proposal_policy renders as a clean `review` form
+    // with draft === null, so the save stayed disabled and the corrected value
+    // was never written — builds stay blocked while the page looks clean. The
+    // malformed block is itself unsaved state: the notice shows, the save
+    // enables with no edit, and it writes the salvaged-clean block. Predicate
+    // parity with the real loader is pinned separately (ontologyValidityParity).
+    vi.spyOn(api, "GET").mockResolvedValue(
+      projectBody({
+        ontology: {
+          entity_types: ["EVENT"],
+          relation_types: ["PRACTICED_BY"],
+          proposal_policy: "typo",
+        },
+      }) as never,
+    );
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    await screen.findByText(/知識類型設定不符規範/);
+    const saveBtn = screen.getByRole("button", { name: "儲存知識類型" });
+    expect(saveBtn).toBeEnabled(); // no edit needed — the repair IS the save
+    fireEvent.click(saveBtn);
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    expect(patchedConfig(patch)["ontology"]).toEqual({
+      entity_types: ["EVENT"],
+      relation_types: ["PRACTICED_BY"],
+      proposal_policy: "review", // the junk "typo" fell back to the safe default
+    });
+  });
+
+  it("repairs an empty malformed ontology ({}) by DELETING the key", async () => {
+    // {} is malformed to the build (TextOntology needs both lists), but its
+    // salvage is an empty vocabulary — the repair is deletion, not a rewrite,
+    // and the button must offer it without a prior edit.
+    vi.spyOn(api, "GET").mockResolvedValue(
+      projectBody({ ontology: {}, chunking: { max_chars: 500, overlap: 50 } }) as never,
+    );
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    await screen.findByText(/知識類型設定不符規範/);
+    const del = screen.getByRole("button", { name: "儲存(移除整份詞彙表)" });
+    expect(del).toBeEnabled();
+    fireEvent.click(del);
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    const config = patchedConfig(patch);
+    expect("ontology" in config).toBe(false); // deleted, not {} / null
+    expect(config["chunking"]).toEqual({ max_chars: 500, overlap: 50 }); // sibling survives
+  });
 });
 
 describe("Settings — query policy", () => {
