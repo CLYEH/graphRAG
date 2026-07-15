@@ -66,17 +66,26 @@ def read_text_documents(
     ``metadata_by_filename`` carries the DR-010 metadata envelope captured at
     upload time, keyed by the file's stored (on-disk) name — the managed-source
     stash the ingest connector threads onto ``documents.metadata`` (UXC1b
-    capture → persist). A file with a stashed envelope takes it verbatim; a file
-    without one (a non-upload source, or a file placed on disk directly) falls
-    back to the connector-derived ``{"filename": ...}`` as before.
+    capture → persist). When it is NON-EMPTY the source is a MANAGED one whose
+    registered file list is AUTHORITATIVE: only those files are ingested, so a
+    file left in the scanned corpus by a failed / rolled-back upload (present on
+    disk but never registered) is never ingested with fallback metadata — the
+    managed source's durable file list, not the raw directory contents, decides
+    what belongs to it. An EMPTY/absent stash is a plain directory source: every
+    accepted file is read, each falling back to the connector-derived
+    ``{"filename": ...}`` — the original behavior for a non-upload source or a
+    file placed on disk directly.
     """
     if not root.is_dir():
         raise NotADirectoryError(f"document source root {root} is not a directory")
     stash = metadata_by_filename or {}
+    registered_only = bool(stash)  # a managed source: its file list is authoritative
     for path in sorted(root.rglob("*")):
         suffix = path.suffix.lower()
         if not path.is_file() or suffix not in TEXT_SUFFIXES:
             continue
+        if registered_only and path.name not in stash:
+            continue  # an orphan not in the managed source's registered files — skip
         yield DocumentPayload(
             source_uri=path.resolve().as_uri(),
             raw=path.read_text(encoding="utf-8"),

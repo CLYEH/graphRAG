@@ -371,6 +371,31 @@ def test_null_metadata_subobject_rejects_file(
     assert "must be an object when present" in row["reason"]
 
 
+def test_failed_source_registration_writes_no_corpus_file(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY: bytes must reach the scanned corpus only AFTER the managed-source
+    # registration is in the transaction. If upsert fails (e.g. a concurrent
+    # project delete raises ProjectNotFoundError), NO file may be left on disk —
+    # else a later build would ingest that orphan with fallback metadata.
+    from core.registry import ProjectNotFoundError
+
+    _project(monkeypatch)
+    _settings(monkeypatch, tmp_path)
+
+    async def failing_upsert(conn: Any, project: str, *, uri: str, kind: str, files: Any) -> Any:
+        raise ProjectNotFoundError(project)
+
+    monkeypatch.setattr("api.routers.uploads.upsert_managed_source", failing_upsert)
+
+    resp = client.post(_URL, files=[("files", ("a.txt", b"hi", "text/plain"))])
+    assert resp.status_code == 404  # ProjectNotFoundError → PROJECT_NOT_FOUND
+    # the corpus dir may exist (created for the manifest URI) but holds NO file:
+    # the write is strictly after the (failed) registration
+    corpus = tmp_path / "demo"
+    assert not (corpus.exists() and list(corpus.glob("*.txt")))
+
+
 def test_null_context_attributes_rejects_file(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:

@@ -67,16 +67,11 @@ async def upload_documents_endpoint(
     if not content_type.startswith("multipart/form-data"):
         raise HTTPException(status_code=415, detail="uploads require multipart/form-data")
 
-    project_row = await get_project(conn, project)
-    if project_row is None:
-        raise ApiError(
-            ErrorCode.PROJECT_NOT_FOUND,
-            f"project {project!r} not found",
-            details={"project": project},
-        )
-
     # Path-safety BEFORE any filesystem I/O (a 400, fail-closed): a project name
     # like '..' or one with separators would let the corpus escape the root.
+    # (Depends only on the name — deterministic per request, so it is safe to run
+    # before the idempotent replay; project existence/config are checked inside
+    # produce, see below.)
     _reject_unsafe_corpus_path(settings, project)
 
     # 413: refuse an oversized upload by its declared Content-Length FIRST, so an
@@ -123,17 +118,29 @@ async def upload_documents_endpoint(
         )
 
     metadata_by_name = _parse_metadata_field(form.get("metadata"), set(submitted_names))
-    try:
-        schema = load_metadata_schema(project_row.config)
-    except MetadataConfigError as exc:
-        # a malformed project metadata_schema is a config validation problem → a
-        # typed 400 (same strictness as the query router's exposure loading),
-        # never a 500 INTERNAL that hides an operator-fixable config error
-        raise ApiError(
-            ErrorCode.VALIDATION_ERROR, str(exc), details={"metadata_schema": "invalid"}
-        ) from exc
 
     async def produce() -> tuple[int, dict[str, Any]]:
+        # Project existence + config are read INSIDE the idempotent region so a
+        # retry with the same Idempotency-Key after the project was deleted (404)
+        # or its metadata_schema changed (400) REPLAYS the stored response rather
+        # than surfacing a fresh error — run_idempotent's reserve-fail path skips
+        # produce entirely, and the idempotency row isn't project-FK-scoped.
+        project_row = await get_project(conn, project)
+        if project_row is None:
+            raise ApiError(
+                ErrorCode.PROJECT_NOT_FOUND,
+                f"project {project!r} not found",
+                details={"project": project},
+            )
+        try:
+            schema = load_metadata_schema(project_row.config)
+        except MetadataConfigError as exc:
+            # a malformed project metadata_schema is a config validation problem →
+            # a typed 400 (same strictness as the query router's exposure loading),
+            # never a 500 INTERNAL that hides an operator-fixable config error
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR, str(exc), details={"metadata_schema": "invalid"}
+            ) from exc
         manifest, accepted = await _process_files(
             files, metadata_by_name, schema, settings, project
         )
@@ -150,6 +157,11 @@ async def upload_documents_endpoint(
                 )
             except ProjectNotFoundError as exc:
                 raise translate_registry_error(exc) from exc
+            # Write the bytes only AFTER the source registration is in the txn, so a
+            # failed upsert (e.g. a concurrent project delete) leaves no orphan in
+            # the scanned corpus. A file orphaned by a later COMMIT failure is still
+            # never ingested — read_text_documents only reads REGISTERED files.
+            _write_corpus_files(corpus_dir, accepted)
             source_id = str(source.id)
         result = {"source_id": source_id, "files": manifest}
         return 201, success(result, **response_meta(request))
@@ -239,8 +251,10 @@ async def _process_files(
     project: str,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, dict[str, Any], bytes]]]:
     """Validate every file, returning (manifest, accepted). ``accepted`` carries
-    (stored_name, envelope, content) — files are written to disk only after ALL
-    are validated, so a rejected file never leaves an orphan."""
+    (stored_name, envelope, content) — the CONTENT is held in memory and NOT
+    written here; the caller writes it only AFTER the managed-source registration
+    is in the transaction (``_write_corpus_files``), so a failed registration
+    leaves no file in the scanned corpus."""
     manifest: list[dict[str, Any]] = []
     accepted: list[tuple[str, dict[str, Any], bytes]] = []
     for part in files:
@@ -265,11 +279,19 @@ async def _process_files(
                 "metadata": envelope,
             }
         )
-    corpus_dir = _corpus_dir(settings, project) if accepted else None
-    for stored_name, _envelope, content in accepted:
-        assert corpus_dir is not None
-        (corpus_dir / stored_name).write_bytes(content)
     return manifest, accepted
+
+
+def _write_corpus_files(
+    corpus_dir: Path, accepted: list[tuple[str, dict[str, Any], bytes]]
+) -> None:
+    """Write each accepted file's bytes into the managed corpus under its stored
+    name. Called only AFTER ``upsert_managed_source`` has registered them in the
+    transaction, so an upsert failure (e.g. a concurrent project delete) never
+    leaves an orphan in the scanned corpus. Kept SYNC (like ``_corpus_dir``) so
+    the pathlib writes stay off the async endpoint's blocking-call lint."""
+    for stored_name, _envelope, content in accepted:
+        (corpus_dir / stored_name).write_bytes(content)
 
 
 def _validate_file(

@@ -51,6 +51,25 @@ def test_text_connector_refuses_a_missing_root(tmp_path: Path) -> None:
         list(read_text_documents(tmp_path / "nope"))
 
 
+def test_managed_source_ingests_only_registered_files(tmp_path: Path) -> None:
+    """A managed upload source's registered file list (a NON-EMPTY stash) is
+    AUTHORITATIVE: only registered files are ingested. WHY: a file left in the
+    scanned corpus by a failed / rolled-back upload (present on disk but never
+    registered) must never be ingested with fallback metadata — a rejected/failed
+    upload cannot be allowed to affect a later build's results."""
+    (tmp_path / "registered.txt").write_text("keep", encoding="utf-8")
+    (tmp_path / "orphan.txt").write_text("leaked", encoding="utf-8")  # on disk, unregistered
+    stash = {"registered.txt": {"context": {"title": "Kept"}}}
+
+    payloads = list(read_text_documents(tmp_path, stash))
+
+    assert [p.raw for p in payloads] == ["keep"]  # the orphan is NOT ingested
+    assert payloads[0].metadata == {"context": {"title": "Kept"}}  # the registered envelope
+    # sanity: with NO stash (a plain directory source) both files ARE read — the
+    # restrict-to-registered rule is scoped to managed sources only
+    assert {p.raw for p in read_text_documents(tmp_path)} == {"keep", "leaked"}
+
+
 def test_csv_rows_carry_citable_identity_and_canonical_content(tmp_path: Path) -> None:
     """§27.2 row refs cite table + pk, so both are minted at ingest; raw is
     canonical JSON (sorted keys) so a re-export with reordered columns does

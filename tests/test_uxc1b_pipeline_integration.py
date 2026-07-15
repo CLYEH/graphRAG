@@ -47,7 +47,7 @@ from core.query.semantic import semantic_search
 from core.registry import create_project, list_sources
 from core.stores.graph import BuildScopedGraphProjector, graph_driver
 from core.stores.repo import BuildScopedRepo, BuildScopedWriter
-from core.stores.tables import builds, documents, sources
+from core.stores.tables import builds, documents, idempotency_keys, projects, sources
 from core.stores.vectors import (
     BuildScopedVectorProjector,
     BuildScopedVectorRepo,
@@ -362,6 +362,67 @@ async def test_repeated_uploads_merge_into_one_canonical_source(
     finally:
         await engine.dispose()
         await _cleanup(qdrant, project)
+
+
+async def test_idempotent_upload_replays_after_project_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, migrated: None
+) -> None:
+    """WHY (§27): the upload endpoint reads project existence/config INSIDE the
+    idempotent producer, so a retry with the same Idempotency-Key after the
+    project is DELETED replays the stored 201 — the idempotency row is not
+    project-FK-scoped — instead of surfacing a fresh 404. A byte-identical body
+    is required (multipart boundaries would otherwise change the request hash), so
+    the raw body is posted twice verbatim."""
+    monkeypatch.setenv("GRAPHRAG_UPLOAD_CORPUS_DIR", str(tmp_path))
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    boundary = "uxc1bpartboundary"
+    raw_body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="files"; filename="a.txt"\r\n'
+        "Content-Type: text/plain\r\n\r\n"
+        "hello world\r\n"
+        f"--{boundary}--\r\n"
+    ).encode()
+    headers = {
+        "Idempotency-Key": f"k-{uuid.uuid4().hex[:8]}",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    }
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+        app = create_app()
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client,
+        ):
+            first = await client.post(
+                f"/projects/{project}/uploads", content=raw_body, headers=headers
+            )
+            assert first.status_code == 201, first.text
+            first_body = first.json()
+
+            # delete the project — sources/documents cascade, but the idempotency
+            # row does NOT (it is not project-FK-scoped), so the stored 201 survives
+            async with engine.connect() as conn, conn.begin():
+                await conn.execute(sources.delete().where(sources.c.project == project))
+                await conn.execute(documents.delete().where(documents.c.project == project))
+                await conn.execute(projects.delete().where(projects.c.name == project))
+
+            # same key + byte-identical body → REPLAY the stored 201, not a 404 for
+            # the now-deleted project (the mutable precheck lives inside produce)
+            retry = await client.post(
+                f"/projects/{project}/uploads", content=raw_body, headers=headers
+            )
+            assert retry.status_code == 201, retry.text
+            assert retry.json() == first_body  # verbatim replay
+    finally:
+        async with engine.connect() as conn, conn.begin():
+            await conn.execute(
+                idempotency_keys.delete().where(idempotency_keys.c.project == project)
+            )
+            await conn.execute(projects.delete().where(projects.c.name == project))
+        await engine.dispose()
 
 
 async def _index_build(
