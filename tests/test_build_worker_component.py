@@ -343,6 +343,40 @@ async def test_run_eval_task_terminalizes_on_store_error_never_strands_running(
     assert statuses == ["running", "failed"]
 
 
+async def test_run_eval_task_terminalizes_on_a_preflight_loader_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: preflight (load the golden set / policy, pick models) is all-LOCAL, so a
+    # bad golden PATH is a deterministic refusal but NOT one of the expected
+    # GoldenError/PolicyError types — a directory / bad perms raises OSError, invalid
+    # UTF-8 raises UnicodeDecodeError. If such an error escaped, job_lease releases
+    # the lease but the row stays 'queued'+unleased: the queued-sweep replays the bad
+    # eval FOREVER and create_job_exclusive blocks every later job for the project. So
+    # it must terminalize 'failed', BEFORE the 'running' mark (never a 'running' here).
+    statuses: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _not_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    def _boom_load(path: Any) -> Any:
+        raise OSError("golden.yaml is a directory")  # a preflight I/O error, not GoldenError
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr("core.eval.golden.load_golden", _boom_load)
+
+    ctx = {"engine": _FakeEngine(), "neo4j": _FakeNeo4j(), "owner": "worker-abc"}
+    result = await bw.run_eval_task(ctx, "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "failed"  # terminal, never left 'queued' for the sweep to loop
+    assert statuses == ["failed"]  # failed at preflight, before any 'running' mark
+
+
 async def test_run_eval_task_rejects_project_name_escaping_projects_dir(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

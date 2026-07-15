@@ -127,11 +127,10 @@ async def run_eval_task(
     held lease; ``find_unenqueued_jobs`` needs ``queued``) and would lock the
     project out of every future job via ``create_job_exclusive``. The caller
     re-runs — eval is idempotent (it just re-writes ``builds.eval``)."""
-    from core.eval.golden import GoldenError, load_golden
+    from core.eval.golden import load_golden
     from core.eval.inputs import eval_input_paths
     from core.eval.runner import models_needed, run_eval
-    from core.llm.factory import LLMNotConfiguredError
-    from core.mcp.policy import PolicyError, load_query_policy
+    from core.mcp.policy import load_query_policy
 
     engine = ctx["engine"]
     eval_job = uuid.UUID(job_id)
@@ -167,7 +166,7 @@ async def run_eval_task(
             needs_embedder, needs_llm = models_needed(golden, policy)
             embedder = ctx["embedder"] if needs_embedder else None
             llm = ctx["llm"] if needs_llm else None
-        except (GoldenError, PolicyError, LLMNotConfiguredError) as exc:
+        except Exception as exc:  # noqa: BLE001 — preflight is ALL-LOCAL (read+parse+validate the golden set / policy, pick models). GoldenError/PolicyError/LLMNotConfiguredError are the expected refusals, but a bad golden/policy PATH is equally deterministic: a directory or bad perms raises OSError, invalid UTF-8 raises UnicodeDecodeError, malformed YAML its own error. ANY escape here strands the job 'queued'+unleased (job_lease's finally released the lease before the 'running' mark), which the queued-sweep replays FOREVER and create_job_exclusive uses to block every later job for the project. So terminalize like the run phase below, never propagate. (CancelledError is BaseException → still propagates.)
             await _fail_job(engine, eval_job, exc)
             return "failed"
         async with engine.begin() as conn:
