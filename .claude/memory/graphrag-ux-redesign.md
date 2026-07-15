@@ -77,3 +77,21 @@ GOV3(ontology proposal 審核)/GOV4(merge Filter fail-loud)/QP1(NL→自動 grap
 **驗證發現**:UXA3 checkoff 宣稱 source_refs 成 resolved cards,實際 `QueryResults.tsx:94-108` 只折疊沒
 解析名字(→SS2);Console/MCP config 雙源是 07-10 刻意設計(→CFG1 需再確認才動)。
 
+**UXC1a ✅ merged(PR #80,2026-07-15,7e85b13)——Phase C 起點**:契約 v1.2 上線——
+`contracts/openapi.yaml` info.version 1.1→1.2,新增 2 路徑(`POST /projects/{project}/uploads`
+uploadDocuments、`POST …/builds/{build_id}/eval` runBuildEval)+ 通用文件 metadata envelope
+(system server-owned/immutable、context 封閉核心 `{title, document_type}`+開放 `attributes` 袋、
+governance、schema_version;input 只收 context/governance,exposure allowlist 為 runtime 策略走
+query_policy 前例)。DR-010 記入 DESIGN §26。**純契約層(0 runtime)**:mcp_response.schema.json
+不動(SourceRef.metadata 已寬鬆),web/src/api/schema.ts 每輪機械重生(`npm --prefix web run gen:api`)。
+**5 輪 Codex(契約 5 面各一輪)**:主病根=保證寫進散文卻沒結構凍結——manifest 缺 `minItems:1`
+(可表示「全部靜默丟棄」)、rejected 缺 `required:[reason]+minLength`、envelope component 定義卻沒
+`$ref`(dead)、`original_filename` optional 使 per-file 關聯失效、context prose 說 project-defined 與
+`additionalProperties:false` 矛盾。教訓入 [[graphrag-loop-paused-pr5]] **class 24**(散文承諾必須結構凍結;
+已把「guarantee→結構 pin」矩陣寫進 code-reviewer.md §8)。**UXC2 follow-up(Codex reply-resolve)**:
+`format:binary` 在 openapi-typescript 出 `string[]`,FE `File`/`Blob` 對不上=消費端 job,UXC2 需 gen
+transform 或 wrapper(runtime openapi-fetch 送 FormData 不看編譯型別,契約語意正確)。
+**下一站:UXC1b**——後端實作三端點 + stage-1 metadata 傳遞(capture→validate→persist(documents.metadata)
+→snapshot 入 build→讀時 enrich source_ref.metadata(chunk→document 走 Postgres SoR)→經 allowlist 曝露);
+integration test 驅 upload→build→eval→activate,metadata 跨三個無關文件情境驗證,無 meeting-specific 路徑。
+

@@ -601,7 +601,33 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
    EACH one independently. Fixing the face a finding names leaves the next
    face as next round.
    - **Schema text** (class-1 value constraints: no-op values, cross-field
-     pairs, additionalProperties).
+     pairs, additionalProperties). AND the guarantee→structural-pin matrix
+     (UXC1a/#80, 5 rounds — one per unpinned promise of a single upload
+     object): every "never/always/must/only" the description or the DESIGN
+     record PROMISES must have a STRUCTURAL pin in the schema, or a conformant
+     server can violate it. Run the matrix before first push: a "no silent
+     drop" promise → the manifest array gets `minItems: 1` (an empty array is
+     "dropped everything", representable = the bug); a "rejected item states
+     its reason" promise → the rejected variant `required: [reason]` +
+     `minLength: 1` (optional/empty is a hole); mutually-exclusive variants →
+     `oneOf` with the OTHER variant's keys declared as the `false` schema
+     (`document_uri: false`) so codegen emits `?: never` (bare `required`/`not`
+     → `unknown | unknown`, the §8 client-type bullet). A defined-but-
+     UNREFERENCED component is DEAD — it pins nothing: grep every new schema
+     for a `$ref` and either wire it into a request/response (a server-stamped
+     envelope must be `$ref`'d by the response that returns it) or delete it. A
+     correlation key the design relies on to map a response row back to its
+     request (an `original_filename` when metadata is keyed by submitted
+     filename) is `required` + non-null in the response, in EVERY variant. A
+     guarantee a conformant static type CANNOT capture (a per-project exposure
+     allowlist — the served field set varies by config) is NOT dropped: freeze
+     the POLICY SHAPE and document runtime enforcement + its test, per the
+     query_policy precedent — but do not mint ANOTHER unreferenced policy
+     component to "hold" it (that repeats the dead-component miss). And align
+     the prose to the schema, not the reverse: a `context` block that is
+     `additionalProperties: false` (closed core + an open `attributes` bag)
+     must not be described as "project-defined fields" (which reads as a
+     top-level-open contract) — class-3 self-consistency on the contract face.
    - **Runtime validator equivalence**: Pydantic's LAX defaults diverge from
      JSON Schema in at least three places — bool passes `int` (coerces to
      1/0; `strict=True`), numeric strings pass `int` (`strict=True`), and
