@@ -353,7 +353,10 @@ async def upsert_managed_source(
     envelope onto ``documents.metadata`` at build time (capture → persist), so
     this stash is the capture-to-build bridge, not the long-term home. Repeated
     uploads MERGE into the same source (by ``(project, uri)``) rather than mint a
-    new one per upload — a project's managed corpus is one source.
+    new one per upload — a project's managed corpus is one source. If duplicate
+    rows already exist at that uri (the ``sources`` table has no ``(project, uri)``
+    uniqueness), ALL are coalesced to the one canonical managed-text shape so none
+    is left stale — ``list_sources`` feeds every matching row to the build.
 
     Serializes concurrent uploads to the same project by locking the project row
     (FOR UPDATE) before the find-or-create — the same row a concurrent insert
@@ -368,15 +371,14 @@ async def upsert_managed_source(
     ).one_or_none()
     if locked is None:
         raise ProjectNotFoundError(project)
-    existing = (
+    existing_rows = (
         await conn.execute(
             sa.select(*_SOURCE_COLS)
             .where(tables.sources.c.project == project, tables.sources.c.uri == uri)
             .order_by(tables.sources.c.added_at.asc(), tables.sources.c.id.asc())
-            .limit(1)
         )
-    ).one_or_none()
-    if existing is None:
+    ).all()
+    if not existing_rows:
         row = (
             await conn.execute(
                 tables.sources.insert()
@@ -385,24 +387,33 @@ async def upsert_managed_source(
             )
         ).one()
         return Source(*row)
-    source = Source(*existing)
-    prior_files = source.metadata.get("files", {})
-    merged_files = {**prior_files, **files} if isinstance(prior_files, dict) else dict(files)
-    merged_metadata = {**source.metadata, "files": merged_files}
-    # (Re)assert the managed kind on update, not just insert: a source row may
-    # already exist at this uri from POST /sources with a NON-text kind (structured
-    # / null / typo). resolve_source dispatches on kind, so leaving it would route
-    # this accepted managed-text upload to the wrong connector (or none) and never
-    # ingest it — the endpoint returned 201 pointing at a source that will not build.
-    # This uri is the upload system's own managed corpus dir, so forcing kind=text
-    # is the intent-preserving fix (there is no legitimate other-kind source here).
+    # Coalesce EVERY row at (project, uri), not just the oldest. The table has no
+    # (project, uri) uniqueness, so a project can hold duplicate managed-corpus
+    # rows, and list_sources feeds ALL of them to the build. A stale duplicate left
+    # behind would corrupt or break an otherwise-correct upload: a fileless text row
+    # directory-scans the corpus and persists FALLBACK metadata, and a non-text row
+    # fails the build in resolve_source. So merge the files of all matching rows with
+    # the new ones (union) and rewrite EVERY matching row to the one canonical
+    # managed-text shape — kind=text, metadata={"files": …}, exactly what a fresh
+    # insert writes. Non-files metadata on a stale row is dropped: it is inert for
+    # the text connector and this IS the canonical managed form. (Malformed prior
+    # entries are NOT filtered here — _files_metadata raises on them at read time,
+    # loud, rather than this silently dropping them.)
+    merged_files: dict[str, dict[str, Any]] = {}
+    for existing in existing_rows:
+        prior = Source(*existing).metadata.get("files")
+        if isinstance(prior, dict):
+            merged_files.update(prior)
+    merged_files.update(files)
+    await conn.execute(
+        tables.sources.update()
+        .where(tables.sources.c.project == project, tables.sources.c.uri == uri)
+        .values(kind=kind, metadata={"files": merged_files})
+    )
+    # return the canonical (oldest) row, re-read to reflect the coalescing update
+    canonical_id = Source(*existing_rows[0]).id
     row = (
-        await conn.execute(
-            tables.sources.update()
-            .where(tables.sources.c.id == source.id)
-            .values(kind=kind, metadata=merged_metadata)
-            .returning(*_SOURCE_COLS)
-        )
+        await conn.execute(sa.select(*_SOURCE_COLS).where(tables.sources.c.id == canonical_id))
     ).one()
     return Source(*row)
 

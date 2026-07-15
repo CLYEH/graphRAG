@@ -198,6 +198,41 @@ async def test_upsert_managed_source_forces_kind_text_on_a_reused_row(migrated: 
         await engine.dispose()
 
 
+async def test_upsert_managed_source_coalesces_all_duplicate_rows(migrated: None) -> None:
+    """WHY: ``sources`` has no ``(project, uri)`` uniqueness, so a project can hold
+    MULTIPLE rows at the managed corpus uri, and ``list_sources`` feeds EVERY one to
+    the build. Canonicalizing only the oldest would leave a stale duplicate: a fileless
+    text row directory-scans the corpus (persisting fallback metadata) and a non-text
+    row fails the build. Upsert must coalesce ALL matching rows to the one canonical
+    managed-text shape, merging their file stashes — no stale row survives."""
+    engine = _engine()
+    name = _proj()
+    uri = "file:///managed/corpus"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=name)
+            # two pre-existing duplicate rows at the managed uri: a fileless text row
+            # (would directory-scan) and a non-text row (would fail the build)
+            fileless = await add_source(conn, name, uri=uri, kind="text", metadata={})
+            nontext = await add_source(
+                conn, name, uri=uri, kind="structured", metadata={"table": "t"}
+            )
+            await upsert_managed_source(
+                conn, name, uri=uri, kind="text", files={"a.txt": {"context": {}}}
+            )
+            listed, _ = await list_sources(conn, name, limit=10)
+            managed = [s for s in listed if s.uri == uri]
+            assert {s.id for s in managed} == {fileless.id, nontext.id}  # both preserved
+            # ...and BOTH are now canonical managed-text carrying the files stash —
+            # no stale fileless/non-text row is left for the build to trip over
+            assert all(s.kind == "text" for s in managed)
+            assert all(s.metadata.get("files") == {"a.txt": {"context": {}}} for s in managed)
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
 async def test_list_sources_keyset_pagination(migrated: None) -> None:
     """The sources keyset (added_at desc, id desc) is distinct from projects'
     and must page live without skips/dupes."""
