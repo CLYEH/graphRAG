@@ -82,6 +82,38 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/projects/{project}/uploads": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Upload document file(s) into the project's managed corpus (v1.2, DR-010)
+     * @description Multipart upload of one or more files into a server-managed corpus
+     *     directory, registering/updating ONE canonical `file://` source (BA9
+     *     uri-normalization stays server-owned). Client filenames are never used as
+     *     paths — each file is sanitized to a generated name, the original kept as
+     *     metadata. Optional per-file document metadata (`context`/`governance`
+     *     only — `system` is stamped server-side, DR-010 rule 1) may accompany the
+     *     upload, keyed by the submitted filename. Files are accepted or rejected
+     *     individually — a rejected extension or oversized single file is a STATED
+     *     per-file refusal, never a silent drop. The whole request is refused with
+     *     `415` when the body is not `multipart/form-data` and `413` when its total
+     *     size exceeds the configured limit.
+     */
+    post: operations["uploadDocuments"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/projects/{project}/build": {
     parameters: {
       query?: never;
@@ -179,6 +211,37 @@ export interface paths {
     put?: never;
     /** Roll back to a previous ready/archived build (atomic, DR-001) */
     post: operations["rollbackBuild"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/projects/{project}/builds/{build_id}/eval": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        build_id: components["parameters"]["BuildIdPath"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Run the project's golden set against a build (async job, DESIGN §20/§27.5, v1.2)
+     * @description Runs the project's configured golden set against the NAMED build — the
+     *     same core eval path the CLI walks — landing the result where activation
+     *     preflight reads §14 scores, so Console gating works with zero new
+     *     coupling. Async (a golden set is unbounded work): returns `202` + a job
+     *     envelope, watchable via `GET /jobs/{job_id}/events`. No request body: the
+     *     build is named in the path and the golden set is the project's configured
+     *     one. Idempotent per (build, golden-set fingerprint) — a duplicate run over
+     *     the same build and golden set replays via the Idempotency-Key rather than
+     *     recomputing.
+     */
+    post: operations["runBuildEval"];
     delete?: never;
     options?: never;
     head?: never;
@@ -829,6 +892,99 @@ export interface components {
       reason?: string | null;
     };
     /**
+     * @description System/connector-generated document context — stamped server-side and
+     *     immutable to clients (DR-010 rule 1). Never accepted on upload.
+     */
+    DocumentMetadataSystem: {
+      /** @description The connector that produced the document (e.g. upload, url, database). */
+      connector?: string;
+      original_filename?: string | null;
+    } & {
+      [key: string]: unknown;
+    };
+    /**
+     * @description General document context supplied by the user or source system. The
+     *     concrete fields are defined by each project's metadata schema
+     *     (type/required/display/filterable, in projects.config — DR-010 rule 2);
+     *     this envelope fixes only the stable shape, never a global field list, so
+     *     it stays domain-agnostic.
+     */
+    DocumentMetadataContext: {
+      /** @description Human display name for the document. */
+      title?: string | null;
+      /** @description Project-defined document type. */
+      document_type?: string | null;
+      /** @description Project-defined key/values, typed by the project metadata schema. */
+      attributes?: {
+        [key: string]: unknown;
+      };
+    };
+    /**
+     * @description Visibility / sensitivity / retention. MUST NOT be mixed into embedding
+     *     text (DR-010 rule 3); exposure to agents is gated by the project-level
+     *     exposure allowlist (projects.config, DR-010 rule 7), never by mere
+     *     presence in this object.
+     */
+    DocumentMetadataGovernance: {
+      /** @description e.g. internal / public / restricted (project-defined vocabulary). */
+      visibility?: string | null;
+      classification?: string | null;
+    } & {
+      [key: string]: unknown;
+    };
+    /**
+     * @description Stable-core document metadata envelope (DR-010). `system` is server-owned,
+     *     `context` is project-defined document context, `governance` controls
+     *     exposure/retention. Document-level metadata is stored once (DR-010 rule 5);
+     *     chunk-local context (page/section/speaker/time) is separate and not a copy
+     *     of this envelope.
+     */
+    DocumentMetadataEnvelope: {
+      /** @description Envelope version; server-stamped, not client-writable. */
+      schema_version: string;
+      system: components["schemas"]["DocumentMetadataSystem"];
+      context: components["schemas"]["DocumentMetadataContext"];
+      governance: components["schemas"]["DocumentMetadataGovernance"];
+    };
+    /**
+     * @description Client-supplied document metadata on upload: `context` and `governance`
+     *     ONLY. `system` and `schema_version` are stamped server-side and rejected
+     *     here (additionalProperties:false — the system namespace is structurally
+     *     not client-writable, DR-010 rule 1), so human input can never silently
+     *     overwrite connector/system metadata (DR-010 rule 4).
+     */
+    DocumentMetadataInput: {
+      context?: components["schemas"]["DocumentMetadataContext"];
+      governance?: components["schemas"]["DocumentMetadataGovernance"];
+    };
+    /**
+     * @description Per-file outcome of an upload — an honest manifest: a rejected file is a
+     *     STATED refusal with a reason, never a silent drop (DR-010).
+     */
+    UploadedFile: {
+      /**
+       * @description Server-sanitized stored name (client filenames are never used as
+       *     paths); echoes the submitted name for a rejected file.
+       */
+      filename: string;
+      /** @description The filename as submitted; kept as document metadata. */
+      original_filename?: string | null;
+      /** @enum {string} */
+      status: "accepted" | "rejected";
+      /** @description Why a file was rejected (e.g. extension not allowlisted); null when accepted. */
+      reason?: string | null;
+      /** @description Canonical file:// uri the managed source points at (BA9 rules); null when rejected. */
+      document_uri?: string | null;
+    };
+    UploadResult: {
+      /**
+       * Format: uuid
+       * @description The canonical managed source registered/updated; null when nothing was accepted.
+       */
+      source_id: string | null;
+      files: components["schemas"]["UploadedFile"][];
+    };
+    /**
      * @description Build lifecycle (DESIGN §4/§14).
      * @enum {string}
      */
@@ -1268,6 +1424,10 @@ export interface components {
       data: components["schemas"]["JobAccepted"];
       meta: components["schemas"]["Meta"];
     };
+    UploadResponse: {
+      data: components["schemas"]["UploadResult"];
+      meta: components["schemas"]["Meta"];
+    };
     DocumentResponse: {
       data: components["schemas"]["Document"];
       meta: components["schemas"]["Meta"];
@@ -1337,6 +1497,9 @@ export interface components {
      *     404 `PROJECT_NOT_FOUND`/`BUILD_NOT_FOUND`/`JOB_NOT_FOUND` · 409
      *     `IDEMPOTENCY_CONFLICT`/`JOB_CONFLICT`/`BUILD_NOT_READY`/`NO_ACTIVE_BUILD` ·
      *     429 `RATE_LIMITED` · 503 `STORE_UNAVAILABLE` · 504 `QUERY_TIMEOUT` · 500 `INTERNAL`.
+     *     The upload endpoint also returns 413 (total size over the limit) and 415
+     *     (body not multipart/form-data); like a 405, these carry no dedicated code and
+     *     surface as VALIDATION_ERROR through the coarse 4xx fallback.
      */
     Error: {
       headers: {
@@ -1667,6 +1830,53 @@ export interface operations {
       default: components["responses"]["Error"];
     };
   };
+  uploadDocuments: {
+    parameters: {
+      query?: never;
+      header?: {
+        /**
+         * @description Client-generated key (≤255 chars). Same key + same request hash replays the
+         *     stored original response; same key + different request hash → `409
+         *     IDEMPOTENCY_CONFLICT`. Keys expire after the configured TTL (default 24h 🔧).
+         */
+        "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+      };
+      path: {
+        project: components["parameters"]["ProjectPath"];
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "multipart/form-data": {
+          files: string[];
+          /**
+           * @description Optional document metadata keyed by each file's submitted
+           *     filename → its DocumentMetadataInput (context/governance only;
+           *     the system namespace is stamped server-side and rejected here).
+           */
+          metadata?: {
+            [key: string]: components["schemas"]["DocumentMetadataInput"];
+          };
+        };
+      };
+    };
+    responses: {
+      /** @description Upload processed; per-file manifest + the managed source. */
+      201: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["UploadResponse"];
+        };
+      };
+      409: components["responses"]["Conflict"];
+      413: components["responses"]["Error"];
+      415: components["responses"]["Error"];
+      default: components["responses"]["Error"];
+    };
+  };
   triggerBuild: {
     parameters: {
       query?: never;
@@ -1816,6 +2026,38 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["BuildResponse"];
+        };
+      };
+      409: components["responses"]["Conflict"];
+      default: components["responses"]["Error"];
+    };
+  };
+  runBuildEval: {
+    parameters: {
+      query?: never;
+      header?: {
+        /**
+         * @description Client-generated key (≤255 chars). Same key + same request hash replays the
+         *     stored original response; same key + different request hash → `409
+         *     IDEMPOTENCY_CONFLICT`. Keys expire after the configured TTL (default 24h 🔧).
+         */
+        "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+      };
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        build_id: components["parameters"]["BuildIdPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Eval job accepted. */
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["JobAcceptedResponse"];
         };
       };
       409: components["responses"]["Conflict"];
