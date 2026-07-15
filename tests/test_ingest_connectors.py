@@ -85,6 +85,47 @@ def test_managed_source_fails_loudly_on_a_missing_registered_file(tmp_path: Path
         list(read_text_documents(tmp_path, stash))
 
 
+def test_managed_source_rejects_untrusted_traversal_file_names(tmp_path: Path) -> None:
+    """A managed source's registered names are UNTRUSTED — a text source's
+    metadata['files'] is stored as-is by the sources API — so a name with a path
+    separator / '..' / absolute path is REFUSED before any file read. WHY: the
+    connector joins each name to a filesystem root; a name like '../secret.md' or
+    '/etc/passwd' would read OUTSIDE the source root (a build ingesting unrelated
+    local files). The guard must fire at the door, never open the escaping path."""
+    root = tmp_path / "corpus"
+    root.mkdir()
+    (root / "ok.txt").write_text("fine", encoding="utf-8")
+    # a real sibling OUTSIDE `root` but inside the isolated tmp_path (never the
+    # shared pytest tmp parent) that '../secret.txt' would target if unguarded
+    (tmp_path / "secret.txt").write_text("SECRET", encoding="utf-8")
+    # 'a\\b.txt' carries a literal backslash: on POSIX (the deployment) it is a
+    # legal filename char that Path treats as NON-separator, so only the explicit
+    # "\\" in name clause rejects it — the Windows-separator branch, exercised here.
+    for bad in ("../secret.txt", "sub/ok.txt", "/etc/passwd", "..", ".", "a\\b.txt"):
+        stash: dict[str, dict[str, Any]] = {bad: {"context": {}}, "ok.txt": {"context": {}}}
+        with pytest.raises(ValueError, match="bare in-root|outside the source root"):
+            [p.raw for p in read_text_documents(root, stash)]
+
+
+def test_managed_source_refuses_a_symlink_escaping_the_root(tmp_path: Path) -> None:
+    """Defense in depth: even a BARE in-root name must not read outside root via a
+    symlink. The connector resolves the path and refuses one whose real parent is
+    not the source root, so a symlink planted in the corpus pointing at an external
+    secret cannot leak into a build. WHY: the name check alone would pass a bare
+    'link.txt'; the resolve()-under-root backstop is what closes the symlink vector."""
+    root = tmp_path / "corpus"
+    root.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET", encoding="utf-8")  # outside root
+    link = root / "link.txt"
+    try:
+        link.symlink_to(secret)  # a bare in-root NAME whose target escapes root
+    except OSError:  # pragma: no cover - Windows without the symlink privilege
+        pytest.skip("symlink creation not permitted on this platform")
+    with pytest.raises(ValueError, match="outside the source root"):
+        list(read_text_documents(root, {"link.txt": {"context": {}}}))
+
+
 def test_csv_rows_carry_citable_identity_and_canonical_content(tmp_path: Path) -> None:
     """§27.2 row refs cite table + pk, so both are minted at ingest; raw is
     canonical JSON (sorted keys) so a re-export with reordered columns does

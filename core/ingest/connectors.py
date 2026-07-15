@@ -71,7 +71,10 @@ def read_text_documents(
     SOURCE, so (a) an on-disk file NOT registered — an orphan left by a failed /
     rolled-back upload — is never ingested with fallback metadata, and (b) a
     registered file MISSING from disk fails LOUDLY (the SoR says the upload was
-    accepted; silently ingesting fewer documents would corrupt results). An
+    accepted; silently ingesting fewer documents would corrupt results). The keys
+    are UNTRUSTED (a source's ``metadata['files']`` is stored as-is), so each is
+    validated to a bare in-root filename before it is joined to ``root`` — a name
+    with a path separator / dot segment / absolute path is refused, never read. An
     EMPTY/absent stash is a plain directory source: every accepted file under the
     tree is read, each falling back to the connector-derived ``{"filename": ...}``
     — the original behavior for a non-upload source or a file placed on disk
@@ -81,9 +84,30 @@ def read_text_documents(
         raise NotADirectoryError(f"document source root {root} is not a directory")
     stash = metadata_by_filename or {}
     if stash:
+        base = root.resolve()
         # Managed source: iterate the REGISTERED list (sorted), not the directory.
         for name in sorted(stash):
+            # The registered names are UNTRUSTED: a text source's metadata['files']
+            # is stored as-is by the sources API, so a key like '../other/secret.md'
+            # or an absolute '/etc/passwd' would make `root / name` read OUTSIDE the
+            # source root (a build ingesting unrelated local files). Require a bare
+            # in-root filename — no path separators, '.', '..', or absolute paths —
+            # then confirm the RESOLVED path is a DIRECT child of root (a symlink
+            # backstop). An unsafe name is a config error at the door, never a read
+            # outside the root. (Uploads mint UUID-hex stored names, so this only
+            # ever rejects a hand-registered malicious/malformed source.)
+            if "\\" in name or name in {"", ".", ".."} or name != Path(name).name:
+                raise ValueError(
+                    f"registered upload file name {name!r} is not a bare in-root filename "
+                    "(no path separators, '.', '..', or absolute paths) — it would read "
+                    "outside the source root"
+                )
             path = root / name
+            if path.resolve().parent != base:
+                raise ValueError(
+                    f"registered upload file name {name!r} resolves outside the source "
+                    f"root {root} (a symlink escaping the corpus)"
+                )
             suffix = path.suffix.lower()
             if not path.is_file():
                 raise FileNotFoundError(
