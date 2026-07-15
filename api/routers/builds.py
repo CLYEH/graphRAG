@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, Query, Request
@@ -53,6 +54,8 @@ from core.builds.lifecycle import (
     get_build_info,
     list_builds_page,
 )
+from core.config import get_settings
+from core.eval.idempotency import eval_inputs_fingerprint
 from core.registry import (
     JobConflictError,
     ProjectNotFoundError,
@@ -268,7 +271,14 @@ async def run_build_eval_endpoint(
     (the class-12 window), 202 + the job envelope, watchable via
     ``GET /jobs/{id}/events``. The build is named in the path (no request body);
     a bad/unready build is a REFUSAL the eval job records, not a synchronous
-    gate — the CLI path refuses the same way."""
+    gate — the CLI path refuses the same way.
+
+    Idempotency is per (build, golden-set fingerprint) per the frozen contract: the
+    build is in the path, and the golden set / query policy content is folded into
+    the request hash (``eval_inputs_fingerprint``), so reusing an ``Idempotency-Key``
+    after the golden set changes within the TTL does NOT replay a run scored against
+    the stale inputs — a changed fingerprint is the §27 key-reused-with-a-different-
+    request conflict (client uses a fresh key), never a silent stale replay."""
 
     async def produce() -> tuple[int, dict[str, Any]]:
         try:
@@ -286,7 +296,14 @@ async def run_build_eval_endpoint(
             key=idempotency_key,
             project=project,
             endpoint="runBuildEval",
-            req_hash=request_hash("POST", request.url.path, await request.body()),
+            # per (build, golden-set fingerprint): the build_id is in request.url.path;
+            # the golden set + query policy content is the "body" so a changed golden
+            # set flips the hash (no stale replay). The real request body is empty.
+            req_hash=request_hash(
+                "POST",
+                request.url.path,
+                eval_inputs_fingerprint(Path(get_settings().projects_dir), project).encode(),
+            ),
             produce=produce,
         )
         return JSONResponse(status_code=status, content=resp)

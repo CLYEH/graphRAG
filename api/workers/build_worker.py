@@ -128,6 +128,7 @@ async def run_eval_task(
     project out of every future job via ``create_job_exclusive``. The caller
     re-runs — eval is idempotent (it just re-writes ``builds.eval``)."""
     from core.eval.golden import GoldenError, load_golden
+    from core.eval.inputs import eval_input_paths
     from core.eval.runner import models_needed, run_eval
     from core.llm.factory import LLMNotConfiguredError
     from core.mcp.policy import PolicyError, load_query_policy
@@ -160,8 +161,9 @@ async def run_eval_task(
                 await set_progress(conn, eval_job, status="cancelled", finished_at=sa.func.now())
                 return "cancelled"
         try:
-            golden = load_golden(root / "eval" / "golden.yaml")
-            policy = load_query_policy(root / "config.yaml")
+            golden_path, policy_path = eval_input_paths(root)
+            golden = load_golden(golden_path)
+            policy = load_query_policy(policy_path)
             needs_embedder, needs_llm = models_needed(golden, policy)
             embedder = ctx["embedder"] if needs_embedder else None
             llm = ctx["llm"] if needs_llm else None
