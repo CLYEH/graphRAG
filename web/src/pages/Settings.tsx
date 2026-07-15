@@ -3,6 +3,7 @@ import { useState } from "react";
 import {
   DEFAULT_QUERY_POLICY,
   chunkingFromConfig,
+  chunkingMalformed,
   ontologyFromConfig,
   policyFromConfig,
   useProject,
@@ -286,6 +287,14 @@ function OntologySection({ project, config, locked }: SectionProps) {
 
 function ChunkingSection({ project, config, locked }: SectionProps) {
   const configured = chunkingFromConfig(config);
+  // A present-but-malformed block (typo'd key, null, non-integer leaf) is
+  // rejected at the next build's config load, yet chunkingFromConfig salvages
+  // it to a clean pair. Enabling the save with BOTH fields empty lets that
+  // salvage be persisted with no dummy knob edit — the sibling of Clean's
+  // always-available save, so a build-blocking config is repairable from here
+  // (Codex #79 R8). A merely bad PAIR is config-load VALID, so it is NOT
+  // malformed: pairError guides that edit instead.
+  const malformed = chunkingMalformed(config);
   const save = useSaveChunking(project);
   const [maxCharsText, setMaxCharsText] = useState("");
   const [overlapText, setOverlapText] = useState("");
@@ -355,6 +364,12 @@ function ChunkingSection({ project, config, locked }: SectionProps) {
           onChange={(e) => setOverlapText(e.target.value)}
         />
       </label>
+      {malformed && (
+        <p className="settings__line settings__line--notice">
+          此專案目前的切塊設定不符規範(欄位名稱錯誤、含未知欄位、或數值不是整數),建置會失敗。
+          上方顯示的是依現有內容整理後的版本,直接儲存即可修正,不必更動任何欄位。
+        </p>
+      )}
       {pairError !== null && <p className="settings__line settings__line--error">{pairError}</p>}
       <div className="settings__actions">
         <button
@@ -363,7 +378,7 @@ function ChunkingSection({ project, config, locked }: SectionProps) {
             locked ||
             save.isPending ||
             pairError !== null ||
-            (maxChars === undefined && overlap === undefined)
+            (!malformed && maxChars === undefined && overlap === undefined)
           }
           onClick={runSave}
         >

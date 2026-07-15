@@ -533,6 +533,65 @@ describe("Settings — query policy", () => {
   });
 });
 
+describe("Settings — chunking", () => {
+  it("REPAIRS a malformed chunking block WITHOUT a dummy knob edit — the salvage is unsaved state", async () => {
+    // Codex #79 R8 (the chunking sibling of the ontology R4 / policy R1 brick):
+    // an unknown-key block ({max_chars, extra}) is rejected by the next build's
+    // _load_chunking, yet the section renders the salvaged pair and — before
+    // this fix — kept the only save disabled while both inputs were empty, so a
+    // build-blocking config looked clean and unrepairable. The malformed block
+    // is itself unsaved state: the notice shows, the save enables with no edit,
+    // and it writes the salvaged {max_chars, overlap} (the valid max_chars=500
+    // survives, the junk key drops, overlap defaults). Predicate parity with the
+    // real loader is pinned separately (chunkingValidityParity).
+    vi.spyOn(api, "GET").mockResolvedValue(
+      projectBody({
+        chunking: { max_chars: 500, extra: 1 },
+        resolution: { auto_merge_threshold: 0.92 },
+      }) as never,
+    );
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    await screen.findByText(/切塊設定不符規範/);
+    const saveBtn = screen.getByRole("button", { name: "儲存 500/200 到專案設定" });
+    expect(saveBtn).toBeEnabled(); // no edit needed — the repair IS the save
+    fireEvent.click(saveBtn);
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    const config = patchedConfig(patch);
+    expect(config["chunking"]).toEqual({ max_chars: 500, overlap: 200 }); // junk key gone
+    expect(config["resolution"]).toEqual({ auto_merge_threshold: 0.92 }); // sibling survives
+  });
+
+  it("repairs a null chunking block by writing the engine defaults", async () => {
+    // `null` is malformed to _load_chunking (explicit null → rejected), and its
+    // per-field salvage is the engine defaults — the repair must be one click.
+    vi.spyOn(api, "GET").mockResolvedValue(projectBody({ chunking: null }) as never);
+    const patch = vi.spyOn(api, "PATCH").mockResolvedValue(projectBody() as never);
+    renderSettings();
+
+    await screen.findByText(/切塊設定不符規範/);
+    fireEvent.click(screen.getByRole("button", { name: "儲存 1200/200 到專案設定" }));
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    expect(patchedConfig(patch)["chunking"]).toEqual({ max_chars: 1200, overlap: 200 });
+  });
+
+  it("leaves a VALID chunking block alone — no notice, save stays disabled without an edit", async () => {
+    // A merely-unusual-but-loadable block (a bad PAIR is config-load valid;
+    // the clean stage catches it) must NOT be flagged malformed, or every such
+    // project would show a false repair prompt. The pairError guides the edit.
+    vi.spyOn(api, "GET").mockResolvedValue(
+      projectBody({ chunking: { max_chars: 100, overlap: 200 } }) as never,
+    );
+    renderSettings();
+
+    await screen.findByText(/重疊字元數必須滿足/); // pairError, not the malformed notice
+    expect(screen.queryByText(/切塊設定不符規範/)).toBeNull();
+  });
+});
+
 describe("Settings — drafts survive sibling saves", () => {
   it("a dirty ontology draft outlives another section's save-and-refetch", async () => {
     // The deliberate divergence from Clean.tsx: this page must NOT unmount

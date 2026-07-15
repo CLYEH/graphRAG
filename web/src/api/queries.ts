@@ -660,6 +660,47 @@ export function chunkingFromConfig(config: Record<string, unknown>): {
   };
 }
 
+/** Mirror of the SERVER's verdict on whether a PRESENT chunking block would
+ *  load (core/builds/config.py _load_chunking): object-only, keys ⊆
+ *  {max_chars, overlap}, present leaves are integers (bool/float/string
+ *  rejected). The pair relation (0 ≤ overlap < max_chars) is deliberately NOT
+ *  checked here — the build defers it to the clean stage (which the form's
+ *  pairError already surfaces), so a bad pair is config-load VALID and needs
+ *  an operator edit, not a one-click repair. A config-load-malformed block
+ *  (a typo'd key, null, a non-integer leaf) whose salvage is a clean pair is
+ *  what this flags for the no-edit repair (Codex #79 R8). Pinned to the real
+ *  loader by tests/fixtures/chunking_block_validity.json. */
+export function isValidChunkingBlock(block: unknown): boolean {
+  if (!isRecord(block)) return false; // _mapping raises on a non-object
+  for (const k of Object.keys(block)) if (k !== "max_chars" && k !== "overlap") return false;
+  for (const k of ["max_chars", "overlap"]) {
+    if (k in block) {
+      const v = block[k];
+      // _int (bool is typeof "boolean"; a non-whole float fails Number.isInteger)
+      // IRREDUCIBLE GAP: a WHOLE-number JSON float (500.0) parses to 500 here —
+      // JS has no int/float distinction post-parse — so this mirror accepts it,
+      // while the server's _int rejects the Python float. Unreachable from the
+      // Settings/Clean writers (they emit real integers) and only a hand-written
+      // `500.0` trips it. PATCH does NOT validate config today (that is the whole
+      // silent-brick premise), so the only place that COULD close this residue is
+      // a future server-side PATCH validator; no such guard exists now. Left
+      // uncovered on purpose; see the corpus.
+      if (typeof v !== "number" || !Number.isInteger(v)) return false;
+    }
+  }
+  return true;
+}
+
+/** True when a PRESENT chunking block would be rejected at build config load
+ *  — the form treats it as repairable (Codex #79 R8, the chunking sibling of
+ *  the ontology R4). An absent block is the legal default state, not malformed. */
+export function chunkingMalformed(config: Record<string, unknown>): boolean {
+  return (
+    Object.prototype.hasOwnProperty.call(config, "chunking") &&
+    !isValidChunkingBlock(config["chunking"])
+  );
+}
+
 /** The single project — FE2 needs the full config object to spread on save. */
 export function useProject(project: string | undefined) {
   return useQuery({

@@ -1,0 +1,26 @@
+{
+  "description": "Parity corpus for the chunking-block validity predicate (Codex #79 R8). Two independent gates read this same file: the server's load_build_config (tests/test_chunking_block_validity_parity.py — the REAL loader: core/builds/config.py _load_chunking) and the Console's isValidChunkingBlock (web/src/api/chunkingValidityParity.test.ts — the settings 'is this block repairable-clean or does it need a repair save' check). When they drift, a hand-written chunking block the server rejects looks clean in the settings form, its salvaged {max_chars, overlap} is never written, and every build stays blocked (the silent brick this corpus prevents — the chunking sibling of the ontology R4 / query_policy R2 bricks). base is a VALID chunking block; cases are base + set/unset mutations (dotted paths) or a whole-block replace. Only the CHUNKING key's value is under test — the parity harnesses wrap each block as {chunking: <block>}, and the absent-key (legal engine-default) state is not a case here. NOTE the one representation gap this corpus deliberately avoids: a WHOLE-number JSON float (max_chars: 500.0) parses to an int-valued JS number in the browser (no int/float distinction post-JSON.parse) so isValidChunkingBlock accepts it, while the server's _int rejects the Python float — testing it would be a false parity failure over an irreducible client-side limit. Non-whole floats (500.5) DO agree (both reject) and ARE covered. The pair relation 0 <= overlap < max_chars is NOT a config-load rule (the build defers it to the clean stage), so a bad pair is VALID here.",
+  "base": {
+    "max_chars": 1200,
+    "overlap": 200
+  },
+  "cases": [
+    { "name": "base", "valid": true },
+    { "name": "max-chars-only", "valid": true, "unset": ["overlap"] },
+    { "name": "overlap-only", "valid": true, "unset": ["max_chars"] },
+    { "name": "empty-block", "valid": true, "replace": {} },
+    { "name": "bad-pair-is-config-load-valid", "valid": true, "set": { "max_chars": 100, "overlap": 200 } },
+    { "name": "zero-max-chars-is-config-load-valid", "valid": true, "set": { "max_chars": 0 } },
+    { "name": "unknown-key-typo", "valid": false, "set": { "maxchars": 500 } },
+    { "name": "unknown-extra-key", "valid": false, "set": { "stride": 10 } },
+    { "name": "max-chars-string", "valid": false, "set": { "max_chars": "500" } },
+    { "name": "max-chars-float", "valid": false, "set": { "max_chars": 500.5 } },
+    { "name": "max-chars-bool", "valid": false, "set": { "max_chars": true } },
+    { "name": "overlap-string", "valid": false, "set": { "overlap": "200" } },
+    { "name": "overlap-float", "valid": false, "set": { "overlap": 200.5 } },
+    { "name": "overlap-null", "valid": false, "set": { "overlap": null } },
+    { "name": "block-null", "valid": false, "replace": null },
+    { "name": "block-array", "valid": false, "replace": [] },
+    { "name": "block-scalar", "valid": false, "replace": "chunking" }
+  ]
+}
