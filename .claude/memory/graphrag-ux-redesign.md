@@ -48,3 +48,16 @@ missing-score 專屬 CLI 提示(`eval --build <id> -- <project>`,shell 三層安
 首輪 FAIL(oracle 未蓋的 3 頁全漏 UUID)——教訓入 [[graphrag-loop-paused-pr5]]
 class 22(翻譯即斷言/oracle 閉合路由表)。下一個:UXB1 設定頁表單。
 
+**UXB1 ✅ merged(PR #79,2026-07-15,cd2bf4e)——Phase B 完成**:設定頁上線——
+ontology/chunking/query_policy 三塊 config 做成表單、蓋在既有 PATCH 上。
+**10 輪 Codex 全 P2(UXA 之後最貴的 FE 任務)**:主病根=PATCH 對 config **什麼都不驗**,
+每個子塊各自晚炸(build config-load / query 400),表單的 client 有效性鏡像是唯一飛行前
+守衛——手寫/畸形塊 save「成功」而 build/query 持續拒=**靜默磚**。三塊各一輪硬化
+(policy R1/R2、ontology R4、chunking R8):client 鏡像 pin 到真 validator(雙 gate 共用
+corpus)、missing/malformed=未存狀態故修復免 dummy edit、salvage 不得產 validator 拒的值、
+未動欄位從 fresh read 導出(class 17)。R9=跨專案抽屜滲漏(`key={project}` remount)、
+R10=同頁併發存丟更新(`useIsMutating` 頁級鎖;跨寫者仍是版本 token 缺口 DR-002)。
+教訓入 [[graphrag-loop-paused-pr5]] class 23。下一站:Phase C UXC1——契約 v1.2
+(eval+upload 端點,DR-002 bump 已核准,§26 記錄隨 PR 落地),改凍結契約=先確認 owner
+仍要這條路後開工。
+
