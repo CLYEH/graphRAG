@@ -754,8 +754,19 @@ def test_upload_endpoint_contract(spec: dict[str, Any]) -> None:
     data = _deref(spec, cast(dict[str, Any], result["properties"]["data"]))
     assert set(data["required"]) == {"source_id", "files"}
     uploaded = _deref(spec, cast(dict[str, Any], data["properties"]["files"]["items"]))
-    assert set(uploaded["required"]) == {"filename", "status"}
-    assert set(uploaded["properties"]["status"]["enum"]) == {"accepted", "rejected"}
+    variants = [_deref(spec, cast(dict[str, Any], v)) for v in uploaded["oneOf"]]
+    by_status = {v["properties"]["status"]["enum"][0]: v for v in variants}
+    assert set(by_status) == {"accepted", "rejected"}
+    # a rejected file MUST carry a non-empty reason and no uri — the "stated
+    # refusal, never a silent drop" guarantee is structural, not optional (Codex
+    # PR#80 P2). The accepted variant carries the canonical uri and forbids reason.
+    rejected = by_status["rejected"]
+    assert "reason" in rejected["required"]
+    assert rejected["properties"]["reason"]["minLength"] == 1
+    assert rejected["properties"]["document_uri"] is False
+    accepted = by_status["accepted"]
+    assert "document_uri" in accepted["required"]
+    assert accepted["properties"]["reason"] is False
 
 
 def test_document_metadata_envelope_shape(spec: dict[str, Any]) -> None:

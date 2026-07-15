@@ -101,9 +101,11 @@ export interface paths {
      *     paths — each file is sanitized to a generated name, the original kept as
      *     metadata. Optional per-file document metadata (`context`/`governance`
      *     only — `system` is stamped server-side, DR-010 rule 1) may accompany the
-     *     upload, keyed by the submitted filename. Files are accepted or rejected
-     *     individually — a rejected extension or oversized single file is a STATED
-     *     per-file refusal, never a silent drop. The whole request is refused with
+     *     upload, keyed by the submitted filename (which MUST be unique within a
+     *     request — a duplicate submitted filename is refused with `400`, keeping the
+     *     metadata key unambiguous). Files are accepted or rejected individually — a
+     *     rejected extension or oversized single file is a STATED per-file refusal
+     *     (with a reason), never a silent drop. The whole request is refused with
      *     `415` when the body is not `multipart/form-data` and `413` when its total
      *     size exceeds the configured limit.
      */
@@ -957,25 +959,44 @@ export interface components {
       context?: components["schemas"]["DocumentMetadataContext"];
       governance?: components["schemas"]["DocumentMetadataGovernance"];
     };
-    /**
-     * @description Per-file outcome of an upload — an honest manifest: a rejected file is a
-     *     STATED refusal with a reason, never a silent drop (DR-010).
-     */
-    UploadedFile: {
-      /**
-       * @description Server-sanitized stored name (client filenames are never used as
-       *     paths); echoes the submitted name for a rejected file.
-       */
+    /** @description An accepted file — registered into the managed source with a canonical uri. */
+    UploadedFileAccepted: {
+      /** @description Server-sanitized stored name (client filenames are never used as paths). */
       filename: string;
       /** @description The filename as submitted; kept as document metadata. */
       original_filename?: string | null;
       /** @enum {string} */
-      status: "accepted" | "rejected";
-      /** @description Why a file was rejected (e.g. extension not allowlisted); null when accepted. */
-      reason?: string | null;
-      /** @description Canonical file:// uri the managed source points at (BA9 rules); null when rejected. */
-      document_uri?: string | null;
+      status: "accepted";
+      /** @description Canonical file:// uri the managed source points at (BA9 rules). */
+      document_uri: string;
+      reason?: never;
     };
+    /**
+     * @description A rejected file — a STATED refusal (never a silent drop, DR-010): `reason`
+     *     is required and non-empty, so a client can always explain why a file was
+     *     not stored.
+     */
+    UploadedFileRejected: {
+      /** @description Echoes the submitted name of the rejected file. */
+      filename: string;
+      /** @description The filename as submitted. */
+      original_filename?: string | null;
+      /** @enum {string} */
+      status: "rejected";
+      /** @description Why the file was rejected (e.g. extension not allowlisted, single-file size limit). */
+      reason: string;
+      document_uri?: never;
+    };
+    /**
+     * @description Per-file outcome — exactly one of accepted (carries the canonical uri, no
+     *     reason) or rejected (carries a non-empty reason, no uri). Each concrete
+     *     variant forbids the other's discriminating field (`reason: false` /
+     *     `document_uri: false`), so a rejected file WITHOUT a reason — a silent drop
+     *     — is structurally unrepresentable (DR-010; the CleanPreviewRequest oneOf
+     *     pattern makes codegen exact).
+     */
+    UploadedFile:
+      components["schemas"]["UploadedFileAccepted"] | components["schemas"]["UploadedFileRejected"];
     UploadResult: {
       /**
        * Format: uuid
@@ -1854,6 +1875,10 @@ export interface operations {
            * @description Optional document metadata keyed by each file's submitted
            *     filename → its DocumentMetadataInput (context/governance only;
            *     the system namespace is stamped server-side and rejected here).
+           *     Submitted filenames MUST be unique within a request — the
+           *     filename is both this metadata key and the managed-corpus
+           *     identity — so a request containing duplicate submitted filenames
+           *     is refused (400); the key is therefore never ambiguous.
            */
           metadata?: {
             [key: string]: components["schemas"]["DocumentMetadataInput"];
