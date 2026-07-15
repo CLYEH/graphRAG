@@ -62,11 +62,13 @@ _FROZEN_PATHS = frozenset(
         "/projects/{project}",
         "/projects/{project}/sources",
         "/projects/{project}/ingest",
+        "/projects/{project}/uploads",
         "/projects/{project}/build",
         "/projects/{project}/builds",
         "/projects/{project}/builds/{build_id}",
         "/projects/{project}/builds/{build_id}/activate",
         "/projects/{project}/builds/{build_id}/rollback",
+        "/projects/{project}/builds/{build_id}/eval",
         "/jobs/{job_id}",
         "/jobs/{job_id}/cancel",
         "/jobs/{job_id}/events",
@@ -531,8 +533,11 @@ def test_contract_is_versioned(spec: dict[str, Any]) -> None:
 
     1.0 → 1.1 (2026-07-13, DESIGN §26 DR-009): added POST
     /projects/{project}/clean/preview — the §10.2 抽樣預覽 endpoint.
+    1.1 → 1.2 (2026-07-15, DESIGN §26 DR-010): added POST
+    /projects/{project}/builds/{build_id}/eval + POST /projects/{project}/uploads
+    and the document metadata envelope.
     """
-    assert spec["info"]["version"] == "1.1"
+    assert spec["info"]["version"] == "1.2"
 
 
 def test_frozen_endpoint_surface(spec: dict[str, Any]) -> None:
@@ -635,7 +640,9 @@ def test_write_endpoints_accept_idempotency_key(spec: dict[str, Any]) -> None:
         writes.add(path)
         assert "IdempotencyKey" in refs, path
         assert "409" in op["responses"], path
-    assert len(writes) == 10  # create/source/ingest/build/activate/rollback/cancel + 3 reviews
+    # v1.2 (DR-010) adds upload + build-eval writes:
+    # create/source/ingest/upload/build/activate/rollback/eval/cancel + 3 reviews.
+    assert len(writes) == 12
 
 
 def test_sse_job_event_contract(spec: dict[str, Any]) -> None:
@@ -706,3 +713,91 @@ def test_operation_ids_are_unique(spec: dict[str, Any]) -> None:
     ids = [op["operationId"] for _, _, op in _operations(spec)]
     assert len(ids) == len(set(ids))
     assert all(ids)
+
+
+def test_build_eval_endpoint_contract(spec: dict[str, Any]) -> None:
+    """v1.2/DR-010: a Console-triggered eval is an async job over a NAMED build —
+    202 + the job envelope (SSE-watchable), Idempotency-Key + 409, and NO request
+    body (the golden set is the project's configured one, the build is in the path).
+    Without this endpoint the eval that activation gating reads is CLI-only."""
+    op = spec["paths"]["/projects/{project}/builds/{build_id}/eval"]["post"]
+    assert op["operationId"] == "runBuildEval"
+    assert "requestBody" not in op
+    assert _param_refs(op) == {"IdempotencyKey"}
+    assert "409" in op["responses"]
+    accepted = _json_body_schema(spec, cast(dict[str, Any], op["responses"]["202"]))
+    assert accepted is not None and set(accepted["required"]) >= {"data", "meta"}
+    data = _deref(spec, cast(dict[str, Any], accepted["properties"]["data"]))
+    assert set(data["required"]) >= {"job_id", "status"}
+
+
+def test_upload_endpoint_contract(spec: dict[str, Any]) -> None:
+    """v1.2/DR-010: upload is a multipart write that registers/updates a managed
+    source and returns an honest per-file manifest. Request-level policy breaches
+    are loud (413 total-size, 415 wrong media type); a rejected file is a STATED
+    refusal, never a silent drop. Per-file metadata is context/governance ONLY —
+    the system namespace is not client-writable (rule 1/4)."""
+    op = spec["paths"]["/projects/{project}/uploads"]["post"]
+    assert op["operationId"] == "uploadDocuments"
+    assert _param_refs(op) == {"IdempotencyKey"}
+    for status in ("409", "413", "415"):
+        assert status in op["responses"], status
+    body = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+    assert "files" in body["required"]
+    meta_input = _deref(
+        spec, cast(dict[str, Any], body["properties"]["metadata"]["additionalProperties"])
+    )
+    assert meta_input["additionalProperties"] is False
+    assert set(meta_input["properties"]) == {"context", "governance"}
+    result = _json_body_schema(spec, cast(dict[str, Any], op["responses"]["201"]))
+    assert result is not None and set(result["required"]) >= {"data", "meta"}
+    data = _deref(spec, cast(dict[str, Any], result["properties"]["data"]))
+    assert set(data["required"]) == {"source_id", "files"}
+    uploaded = _deref(spec, cast(dict[str, Any], data["properties"]["files"]["items"]))
+    variants = [_deref(spec, cast(dict[str, Any], v)) for v in uploaded["oneOf"]]
+    by_status = {v["properties"]["status"]["enum"][0]: v for v in variants}
+    assert set(by_status) == {"accepted", "rejected"}
+    # a rejected file MUST carry a non-empty reason and no uri — the "stated
+    # refusal, never a silent drop" guarantee is structural, not optional (Codex
+    # PR#80 P2). The accepted variant carries the canonical uri and forbids reason.
+    rejected = by_status["rejected"]
+    assert "reason" in rejected["required"]
+    assert rejected["properties"]["reason"]["minLength"] == 1
+    assert rejected["properties"]["document_uri"] is False
+    assert rejected["properties"]["filename"] is False  # nothing stored for a reject
+    accepted = by_status["accepted"]
+    assert "document_uri" in accepted["required"]
+    assert accepted["properties"]["reason"] is False
+    # the submitted filename is the client's matching key back to its selection and
+    # to the (filename-keyed) upload metadata — required + non-null on BOTH variants
+    # so every manifest row is correlatable (Codex PR#80)
+    for variant in (accepted, rejected):
+        assert "original_filename" in variant["required"]
+        assert variant["properties"]["original_filename"]["type"] == "string"
+    # the manifest is non-empty for a non-empty upload — no silent all-drop (Codex PR#80)
+    assert data["properties"]["files"]["minItems"] == 1
+
+
+def test_document_metadata_envelope_shape(spec: dict[str, Any]) -> None:
+    """v1.2/DR-010: the metadata envelope has three namespaces with fixed roles —
+    system (server-owned), context (project-defined), governance (exposure-gated).
+    The client-facing input excludes system/schema_version STRUCTURALLY, so human
+    input can never overwrite or forge connector/system fields (rule 1/4); context
+    is a stable shape (not a global field enum) so it stays domain-agnostic."""
+    schemas = spec["components"]["schemas"]
+    envelope = schemas["DocumentMetadataEnvelope"]
+    assert set(envelope["required"]) == {"schema_version", "system", "context", "governance"}
+    context = schemas["DocumentMetadataContext"]
+    assert context["additionalProperties"] is False
+    assert context["properties"]["attributes"]["additionalProperties"] is True
+    metadata_input = schemas["DocumentMetadataInput"]
+    assert metadata_input["additionalProperties"] is False
+    assert "system" not in metadata_input["properties"]
+    assert "schema_version" not in metadata_input["properties"]
+    assert set(metadata_input["properties"]) == {"context", "governance"}
+    # the envelope is load-bearing, not a dead type: the accepted-upload response
+    # carries the STORED envelope, so the server-stamped system/schema_version
+    # can't be silently dropped (Codex PR#80 P1). The full envelope requires them.
+    accepted = schemas["UploadedFileAccepted"]
+    assert "metadata" in accepted["required"]
+    assert accepted["properties"]["metadata"]["$ref"].endswith("/DocumentMetadataEnvelope")
