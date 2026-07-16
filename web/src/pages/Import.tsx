@@ -43,14 +43,17 @@ function hasOntology(config: Project["config"] | undefined): boolean {
 // SUPPORTED_SOURCE_KINDS + core/ingest/connectors.py): "text" reads a file://
 // DIRECTORY of .txt/.md files (read_text_documents raises NotADirectoryError on a
 // single file); "structured" reads a file:// CSV FILE and requires table +
-// pk_column in metadata. Both require a file:// uri — the only wired scheme
+// pk_column in metadata; "xlsx" (SRC1) reads a file:// WORKBOOK and requires the
+// column mapping (title_column + body_column; optional id_column/extra_columns/
+// label) in metadata — its rows render to per-row TEXT documents, so it is
+// ontology-gated like "text". All require a file:// uri — the only wired scheme
 // (_local_path rejects others). The store/API accept any kind/uri string, but
 // resolve_source fails the build loud otherwise, so the UI offers only these kinds,
-// collects the structured metadata, and blocks a non-file:// uri — never letting
+// collects the per-kind metadata, and blocks a non-file:// uri — never letting
 // the operator register a source whose build is guaranteed to fail. The contract's
 // Source.kind doc lists file/directory/url/database as illustrative connector
 // kinds, but those have no C2 connector yet (Codex #70).
-const SOURCE_KINDS = ["text", "structured"] as const;
+const SOURCE_KINDS = ["text", "structured", "xlsx"] as const;
 type SourceKind = (typeof SOURCE_KINDS)[number];
 
 // Whether a uri is a canonical file:/// path — the exact form the backend reads.
@@ -178,7 +181,7 @@ export function isCanonicalFileUri(uri: string): boolean {
 // breaks EVERY build, regardless of ontology, so the run gate checks the whole
 // loaded list.
 function isResolvableSource(s: Source): boolean {
-  if (s.kind !== "text" && s.kind !== "structured") return false;
+  if (s.kind !== "text" && s.kind !== "structured" && s.kind !== "xlsx") return false;
   // (The add form trims before POST, so only sources registered outside the form can
   // carry edge whitespace — but they can, so the stored uri is checked as stored.)
   if (!isCanonicalFileUri(s.uri)) return false;
@@ -187,6 +190,19 @@ function isResolvableSource(s: Source): boolean {
     const pk = s.metadata?.pk_column;
     if (typeof table !== "string" || table.trim() === "") return false;
     if (typeof pk !== "string" || pk.trim() === "") return false;
+  }
+  if (s.kind === "xlsx") {
+    // mirror of _xlsx_required (core/builds/sources.py): the mapping's two
+    // required columns. The OPTIONAL keys are deliberately not mirrored: a
+    // present-but-malformed id_column/extra_columns/label (only reachable via
+    // CLI/API registration) still fails the build loud server-side — this
+    // gate mirrors what the FORM can produce, and over-mirroring every
+    // optional shape would fork the validator (class-5 tax) for a path the
+    // SoR already refuses honestly.
+    const title = s.metadata?.title_column;
+    const body = s.metadata?.body_column;
+    if (typeof title !== "string" || title.trim() === "") return false;
+    if (typeof body !== "string" || body.trim() === "") return false;
   }
   return true;
 }
@@ -270,6 +286,11 @@ function Sources({ project }: { project: string }) {
   const [kind, setKind] = useState<SourceKind>("text");
   const [table, setTable] = useState("");
   const [pkColumn, setPkColumn] = useState("");
+  const [titleColumn, setTitleColumn] = useState("");
+  const [bodyColumn, setBodyColumn] = useState("");
+  const [idColumn, setIdColumn] = useState("");
+  const [extraColumns, setExtraColumns] = useState("");
+  const [rowLabel, setRowLabel] = useState("");
   const sources = useSources(project);
   const add = useAddSource(project);
 
@@ -280,23 +301,48 @@ function Sources({ project }: { project: string }) {
   const attemptKey = useRef(crypto.randomUUID());
   useEffect(() => {
     attemptKey.current = crypto.randomUUID();
-  }, [uri, kind, table, pkColumn]);
+  }, [uri, kind, table, pkColumn, titleColumn, bodyColumn, idColumn, extraColumns, rowLabel]);
 
-  // A structured source needs table + pk_column or resolve_source fails the build,
-  // so gate the submit on them exactly as read_csv_rows requires.
+  // A structured source needs table + pk_column, an xlsx source needs its two
+  // required mapping columns — or resolve_source fails the build, so gate the
+  // submit exactly as the connector requires.
   const structured = kind === "structured";
-  const metaReady = !structured || (table.trim() !== "" && pkColumn.trim() !== "");
+  const xlsx = kind === "xlsx";
+  const metaReady = structured
+    ? table.trim() !== "" && pkColumn.trim() !== ""
+    : xlsx
+      ? titleColumn.trim() !== "" && bodyColumn.trim() !== ""
+      : true;
   // The only wired resolver is file://; anything else (https://, a bare path) is a
   // guaranteed build failure, so refuse it at the source rather than POST it.
   const badScheme = uri.trim() !== "" && !isFileUri(uri.trim());
   const canAdd = uri.trim() !== "" && !badScheme && metaReady && !add.isPending;
+
+  function xlsxMetadata(): Record<string, unknown> {
+    const out: Record<string, unknown> = {
+      title_column: titleColumn.trim(),
+      body_column: bodyColumn.trim(),
+    };
+    if (idColumn.trim()) out.id_column = idColumn.trim();
+    const extras = extraColumns
+      .split(",")
+      .map((c) => c.trim())
+      .filter((c) => c !== "");
+    if (extras.length > 0) out.extra_columns = extras;
+    if (rowLabel.trim()) out.label = rowLabel.trim();
+    return out;
+  }
 
   function submit() {
     add.mutate(
       {
         uri: uri.trim(),
         kind,
-        metadata: structured ? { table: table.trim(), pk_column: pkColumn.trim() } : undefined,
+        metadata: structured
+          ? { table: table.trim(), pk_column: pkColumn.trim() }
+          : xlsx
+            ? xlsxMetadata()
+            : undefined,
         idempotencyKey: attemptKey.current,
       },
       {
@@ -304,6 +350,11 @@ function Sources({ project }: { project: string }) {
           setUri("");
           setTable("");
           setPkColumn("");
+          setTitleColumn("");
+          setBodyColumn("");
+          setIdColumn("");
+          setExtraColumns("");
+          setRowLabel("");
         },
       },
     );
@@ -315,7 +366,8 @@ function Sources({ project }: { project: string }) {
       <p className="runs__muted">
         來源是伺服器本機的 <code>file:///</code> 路徑(例:
         <code>file:///C:/data/corpus</code>):<b>text</b> 讀整個資料夾的
-        <code>.txt</code>/<code>.md</code>;<b>structured</b> 讀單一 CSV 檔。
+        <code>.txt</code>/<code>.md</code>;<b>structured</b> 讀單一 CSV 檔;<b>xlsx</b>{" "}
+        讀單一試算表——每列渲染成一份文字文件,欄位對應(哪一欄是標題/內文)填在下方。
       </p>
       <form
         className="npf__form"
@@ -358,6 +410,50 @@ function Sources({ project }: { project: string }) {
                 value={pkColumn}
                 onChange={(e) => setPkColumn(e.target.value)}
                 placeholder="id"
+              />
+            </label>
+          </>
+        )}
+        {xlsx && (
+          <>
+            <label className="npf__field">
+              title_column(必填)
+              <input
+                value={titleColumn}
+                onChange={(e) => setTitleColumn(e.target.value)}
+                placeholder="標題"
+              />
+            </label>
+            <label className="npf__field">
+              body_column(必填)
+              <input
+                value={bodyColumn}
+                onChange={(e) => setBodyColumn(e.target.value)}
+                placeholder="內容詳情"
+              />
+            </label>
+            <label className="npf__field">
+              id_column
+              <input
+                value={idColumn}
+                onChange={(e) => setIdColumn(e.target.value)}
+                placeholder="編號"
+              />
+            </label>
+            <label className="npf__field">
+              extra_columns(逗號分隔)
+              <input
+                value={extraColumns}
+                onChange={(e) => setExtraColumns(e.target.value)}
+                placeholder="位置, 分類"
+              />
+            </label>
+            <label className="npf__field">
+              label
+              <input
+                value={rowLabel}
+                onChange={(e) => setRowLabel(e.target.value)}
+                placeholder="導覽"
               />
             </label>
           </>
@@ -689,7 +785,9 @@ function RunPipeline({
   // previous list in `data` during the post-add invalidation refetch, so a gate
   // that only checks presence decides on stale data in exactly the window where
   // the just-added text source dooms the build (a bind-time-vs-invariant TOCTOU).
-  const hasTextSource = (sources.data ?? []).some((s) => s.kind === "text");
+  // xlsx rows render to per-row TEXT documents (SRC1), so they hit the same
+  // OntologyRequiredError as a text directory — both kinds arm the gate
+  const hasTextSource = (sources.data ?? []).some((s) => s.kind === "text" || s.kind === "xlsx");
   const ontologyBlocked = ontologyMissing && hasTextSource;
   // One unresolvable source (unwired kind / non-file scheme / missing structured
   // metadata — e.g. registered via CLI/API) fails every build at ingest. A

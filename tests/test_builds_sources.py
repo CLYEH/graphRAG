@@ -353,3 +353,94 @@ def test_structured_non_string_or_blank_meta_fails_loud(tmp_path: Path) -> None:
                 _source(csv.as_uri(), kind="structured", metadata={"table": "t", "pk_column": 1})
             )
         )
+
+
+# ---- xlsx dispatch (SRC1) ----------------------------------------------------
+
+
+def _write_xlsx(path: Path, header: list[Any], rows: list[list[Any]]) -> Path:
+    import openpyxl
+    from openpyxl.worksheet.worksheet import Worksheet
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    assert isinstance(ws, Worksheet)
+    ws.append(header)
+    for row in rows:
+        ws.append(row)
+    wb.save(path)
+    return path
+
+
+def test_xlsx_source_yields_a_text_payload_per_row(tmp_path: Path) -> None:
+    # WHY: the column mapping lives on the SOURCE (metadata), never in the
+    # connector — resolve_source threads it through, and the rows come out as
+    # per-row TEXT documents (the pilot-validated render), so they enter the
+    # ordinary chunk+LLM pipeline and the ontology gate like any text source.
+    book = _write_xlsx(
+        tmp_path / "guide.xlsx",
+        ["編號", "標題", "內容詳情", "位置"],
+        [[1, "深海探索廳", "介紹深潛器。", "B1"]],
+    )
+    payloads = list(
+        resolve_source(
+            _source(
+                book.as_uri(),
+                kind="xlsx",
+                metadata={
+                    "title_column": "標題",
+                    "body_column": "內容詳情",
+                    "id_column": "編號",
+                    "extra_columns": ["位置"],
+                    "label": "導覽",
+                },
+            )
+        )
+    )
+    assert len(payloads) == 1
+    assert payloads[0].mime == "text/plain"
+    assert payloads[0].source_uri.endswith("#row=1")
+    assert payloads[0].raw == "【導覽】深海探索廳\n位置:B1\n\n介紹深潛器。\n"
+
+
+def test_xlsx_missing_or_malformed_mapping_fails_loud(tmp_path: Path) -> None:
+    # WHY: a mapping gap is a deterministic build failure — refuse at resolve
+    # time naming the key; and a PRESENT-but-wrong-typed optional key must
+    # never be silently dropped (the operator declared it for a reason).
+    book = _write_xlsx(tmp_path / "g.xlsx", ["標題", "內容詳情"], [["甲", "內文"]])
+    with pytest.raises(SourceResolutionError, match="'title_column'"):
+        list(
+            resolve_source(
+                _source(book.as_uri(), kind="xlsx", metadata={"body_column": "內容詳情"})
+            )
+        )
+    with pytest.raises(SourceResolutionError, match="'body_column'"):
+        list(resolve_source(_source(book.as_uri(), kind="xlsx", metadata={"title_column": "標題"})))
+    with pytest.raises(SourceResolutionError, match="'extra_columns'"):
+        list(
+            resolve_source(
+                _source(
+                    book.as_uri(),
+                    kind="xlsx",
+                    metadata={
+                        "title_column": "標題",
+                        "body_column": "內容詳情",
+                        "extra_columns": "位置",  # a bare string, not a list
+                    },
+                )
+            )
+        )
+    with pytest.raises(SourceResolutionError, match="'label'"):
+        list(
+            resolve_source(
+                _source(
+                    book.as_uri(),
+                    kind="xlsx",
+                    metadata={
+                        "title_column": "標題",
+                        "body_column": "內容詳情",
+                        "label": ["導覽"],  # present but not a string
+                    },
+                )
+            )
+        )

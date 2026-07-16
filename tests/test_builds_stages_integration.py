@@ -242,3 +242,66 @@ async def test_text_source_without_ontology_fails_the_build_at_graph(
     finally:
         await _cleanup(engine, client, session, project)
         await engine.dispose()
+
+
+async def test_xlsx_source_ingests_per_row_text_documents(
+    stores: tuple[AsyncQdrantClient, AsyncSession], tmp_path: Path
+) -> None:
+    """SRC1 end-to-end wiring proof on live stores: a registered xlsx source
+    (column mapping in its metadata) resolves, ingests ONE text document per
+    content row with a citable ``#row=`` identity — and, because the rows are
+    TEXT documents, the graph stage's ontology gate fires for an ontology-less
+    config exactly as it does for a .txt directory. The gate firing IS the
+    evidence the rows entered the text pipeline (not the structured lane)."""
+    import openpyxl
+    from openpyxl.worksheet.worksheet import Worksheet
+
+    client, session = stores
+    engine = _engine()
+    project = _proj()
+    try:
+        book = tmp_path / "guide.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        assert isinstance(ws, Worksheet)
+        ws.append(["編號", "標題(必填)", "內容詳情(必填)", "位置"])
+        ws.append([1.0, "深海探索廳", "介紹深潛器海淵一號。", "B1"])
+        ws.append([2, "海洋劇場", "球幕電影與導覽。", None])
+        ws.append([3, None, None, None])  # pre-numbered template row: skipped
+        wb.save(book)
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+            await add_source(
+                conn,
+                project,
+                uri=book.as_uri(),
+                kind="xlsx",
+                metadata={
+                    "title_column": "標題",
+                    "body_column": "內容詳情",
+                    "id_column": "編號",
+                    "extra_columns": ["位置"],
+                    "label": "導覽",
+                },
+            )
+            job = await create_job(conn, project, "build")
+
+        outcome = await run_build(engine, project, job.id, _stages_for({}, client, session))
+
+        assert outcome.status == "failed"
+        assert outcome.error is not None and "ontology" in outcome.error
+        # two content rows ingested (the template row skipped), each a TEXT
+        # document carrying its per-row citation fragment
+        async with engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    sa.select(tables.documents.c.source_uri, tables.documents.c.mime).where(
+                        tables.documents.c.project == project
+                    )
+                )
+            ).all()
+        assert sorted(uri.rsplit("#", 1)[1] for uri, _ in rows) == ["row=1", "row=2"]
+        assert all(mime == "text/plain" for _, mime in rows)
+    finally:
+        await _cleanup(engine, client, session, project)
+        await engine.dispose()
