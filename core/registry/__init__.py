@@ -19,6 +19,7 @@ from core.registry.jobs import (
     find_unenqueued_jobs,
     get_job,
     get_job_at,
+    holds_lease,
     is_active_status,
     is_cancel_requested,
     lock_job,
@@ -26,6 +27,7 @@ from core.registry.jobs import (
     set_progress,
 )
 from core.registry.store import (
+    MANAGED_FILES_KEY,
     Project,
     ProjectExistsError,
     ProjectHasActiveJobsError,
@@ -43,6 +45,7 @@ from core.registry.store import (
 )
 
 __all__ = [
+    "MANAGED_FILES_KEY",
     "Job",
     "JobConflictError",
     "JobNotFoundError",
@@ -64,6 +67,7 @@ __all__ = [
     "get_job",
     "get_job_at",
     "get_project",
+    "holds_lease",
     "is_active_status",
     "is_cancel_requested",
     "list_projects",

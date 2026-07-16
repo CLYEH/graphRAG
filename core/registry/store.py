@@ -147,6 +147,16 @@ _SOURCE_COLS = (
     tables.sources.c.added_at,
 )
 
+#: Reserved, SERVER-OWNED key under which an upload stashes its per-file DR-010
+#: envelopes on the ONE managed text source (keyed by stored filename). Its PRESENCE
+#: marks the source managed (its registered file list is authoritative — see
+#: ``core.builds.sources._files_metadata`` / ``read_text_documents``). A dunder name
+#: so it can't collide with a NON-upload text source's free-form ``metadata`` (which
+#: the sources API stores verbatim): a plain source with a top-level ``files`` key is
+#: legitimate project metadata and must still scan its directory, not be misread as an
+#: upload manifest. Shared by the writer here and the build-time reader.
+MANAGED_FILES_KEY = "__managed_files__"
+
 
 async def create_project(
     conn: AsyncConnection,
@@ -349,7 +359,7 @@ async def upsert_managed_source(
     The upload endpoint drops files into a per-project managed corpus directory
     and calls this to point a single ``file://`` source at that directory,
     stashing each accepted file's stored metadata envelope under
-    ``metadata["files"][<stored filename>]``. The ingest connector threads that
+    ``metadata[MANAGED_FILES_KEY][<stored filename>]``. The ingest connector threads that
     envelope onto ``documents.metadata`` at build time (capture → persist), so
     this stash is the capture-to-build bridge, not the long-term home. Repeated
     uploads MERGE into the same source (by ``(project, uri)``) rather than mint a
@@ -382,7 +392,9 @@ async def upsert_managed_source(
         row = (
             await conn.execute(
                 tables.sources.insert()
-                .values(project=project, kind=kind, uri=uri, metadata={"files": dict(files)})
+                .values(
+                    project=project, kind=kind, uri=uri, metadata={MANAGED_FILES_KEY: dict(files)}
+                )
                 .returning(*_SOURCE_COLS)
             )
         ).one()
@@ -394,21 +406,21 @@ async def upsert_managed_source(
     # directory-scans the corpus and persists FALLBACK metadata, and a non-text row
     # fails the build in resolve_source. So merge the files of all matching rows with
     # the new ones (union) and rewrite EVERY matching row to the one canonical
-    # managed-text shape — kind=text, metadata={"files": …}, exactly what a fresh
-    # insert writes. Non-files metadata on a stale row is dropped: it is inert for
-    # the text connector and this IS the canonical managed form. (Malformed prior
+    # managed-text shape — kind=text, metadata={MANAGED_FILES_KEY: …}, exactly what a
+    # fresh insert writes. Non-managed metadata on a stale row is dropped: it is inert
+    # for the text connector and this IS the canonical managed form. (Malformed prior
     # entries are NOT filtered here — _files_metadata raises on them at read time,
     # loud, rather than this silently dropping them.)
     merged_files: dict[str, dict[str, Any]] = {}
     for existing in existing_rows:
-        prior = Source(*existing).metadata.get("files")
+        prior = Source(*existing).metadata.get(MANAGED_FILES_KEY)
         if isinstance(prior, dict):
             merged_files.update(prior)
     merged_files.update(files)
     await conn.execute(
         tables.sources.update()
         .where(tables.sources.c.project == project, tables.sources.c.uri == uri)
-        .values(kind=kind, metadata={"files": merged_files})
+        .values(kind=kind, metadata={MANAGED_FILES_KEY: merged_files})
     )
     # return the canonical (oldest) row, re-read to reflect the coalescing update
     canonical_id = Source(*existing_rows[0]).id

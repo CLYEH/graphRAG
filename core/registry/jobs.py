@@ -355,6 +355,25 @@ async def release_lease(conn: AsyncConnection, job_id: uuid.UUID, owner: str) ->
     )
 
 
+async def holds_lease(conn: AsyncConnection, job_id: uuid.UUID, owner: str) -> bool:
+    """Whether ``owner`` STILL holds the job's execution lease. Matches on
+    ``lease_owner`` only, NOT expiry: an expired-but-unreclaimed lease is still
+    ours (only a RECLAIM — a replacement's ``acquire_lease`` — reassigns
+    ``lease_owner`` and hands execution away). This is the finalize guard: a worker
+    whose heartbeat lapsed long enough for the reaper to hand off to a replacement
+    must not write its now-stale eval result over the new holder's. Read it under
+    the job row lock (``lock_job``) so a concurrent ``acquire_lease`` serializes
+    behind it (class-10: the decisive check lives under the write's row lock)."""
+    held = (
+        await conn.execute(
+            sa.select(tables.jobs.c.id).where(
+                tables.jobs.c.id == job_id, tables.jobs.c.lease_owner == owner
+            )
+        )
+    ).one_or_none()
+    return held is not None
+
+
 async def find_reapable_jobs(
     conn: AsyncConnection,
 ) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:

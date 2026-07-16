@@ -22,6 +22,7 @@ from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
 from core.registry import (
+    MANAGED_FILES_KEY,
     ProjectExistsError,
     ProjectHasBuildsError,
     ProjectNotFoundError,
@@ -192,7 +193,7 @@ async def test_upsert_managed_source_forces_kind_text_on_a_reused_row(migrated: 
             )
             assert reused.id == stale.id  # same row reused (by project, uri), not a new one
             assert reused.kind == "text"  # kind FORCED to the managed kind
-            assert reused.metadata["files"] == {"a.txt": {"context": {"title": "A"}}}
+            assert reused.metadata[MANAGED_FILES_KEY] == {"a.txt": {"context": {"title": "A"}}}
             await trans.rollback()
     finally:
         await engine.dispose()
@@ -227,7 +228,9 @@ async def test_upsert_managed_source_coalesces_all_duplicate_rows(migrated: None
             # ...and BOTH are now canonical managed-text carrying the files stash —
             # no stale fileless/non-text row is left for the build to trip over
             assert all(s.kind == "text" for s in managed)
-            assert all(s.metadata.get("files") == {"a.txt": {"context": {}}} for s in managed)
+            assert all(
+                s.metadata.get(MANAGED_FILES_KEY) == {"a.txt": {"context": {}}} for s in managed
+            )
             await trans.rollback()
     finally:
         await engine.dispose()

@@ -41,7 +41,7 @@ from typing import Any
 import sqlalchemy as sa
 from arq import cron
 from arq.connections import ArqRedis, RedisSettings
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from core.builds.config import BuildConfigError, load_build_config
@@ -56,6 +56,7 @@ from core.registry import (
     find_reapable_jobs,
     find_unenqueued_jobs,
     get_project,
+    holds_lease,
     is_active_status,
     is_cancel_requested,
     lock_job,
@@ -205,23 +206,24 @@ async def run_eval_task(
                     policy,
                     persist=False,
                 )
-        except Exception as exc:  # noqa: BLE001 — the eval boundary, mirroring run_build's stage boundary: ANY error once 'running' (a refusal like a vanished build / unconfigured model, OR a store outage) must terminalize the jobs row, never leave it 'running'+unleased for no sweep to recover. (CancelledError is BaseException → still propagates, same job_timeout mitigation as run_build.)
-            await _fail_job(engine, eval_job, exc)
-            return "failed"
-        # Finalize honoring a cancel that arrived DURING the run, mirroring run_build's
-        # terminalize (orchestrator §5): LOCK the job row FOR UPDATE, THEN read
-        # cancel_requested UNDER the lock — the lock is the cancellation cutoff. A
-        # cancel committed before it (incl. one accepted mid-eval) is honored; one
-        # racing in after blocks on the lock and, finding a terminal job, is cleanly
-        # rejected by request_cancel's status-guarded UPDATE (no 'accepted but
-        # ignored' limbo). The class-10 TOCTOU lesson: the decisive read belongs
-        # under the write's row lock, never a prior unlocked SELECT. builds.eval is
-        # committed HERE, only when NOT cancelled and in the SAME txn — so the §20 gate
-        # (which locks the build row) never observes a report a cancel is withholding,
-        # and no report is ever written for a cancelled eval (no revert window).
+        except Exception as exc:  # noqa: BLE001 — the eval boundary, mirroring run_build's stage boundary: ANY error once 'running' (a refusal like a vanished build / unconfigured model, OR a store outage) must terminalize the jobs row, never leave it 'running'+unleased for no sweep to recover. (CancelledError is BaseException → still propagates, same job_timeout mitigation as run_build.) run_eval can be LONG (LLM calls), so the lease can lapse here and the reaper hand off to a replacement — _fail_eval terminalizes ONLY if we still lead, never overwriting the new holder's result with this stale worker's 'failed'.
+            return await _fail_eval(engine, eval_job, ctx["owner"], exc)
+        # Finalize honoring BOTH a cancel that arrived DURING the run AND a lease
+        # handoff to a replacement, mirroring run_build's terminalize (orchestrator §5):
+        # LOCK the job row FOR UPDATE, then under that lock verify this worker still
+        # LEADS — the job is live AND we still own the lease (_eval_leads). run_eval can
+        # be long, so a heartbeat-starved lapse can let the reaper hand execution to a
+        # replacement that terminalizes the job; a stale worker persisting anyway would
+        # overwrite the new holder's builds.eval/status (or hide its failure) with stale
+        # inputs. If we no longer lead → a benign no-op (None), the replacement is
+        # authoritative. Otherwise read cancel_requested UNDER the same lock (the class-10
+        # cutoff — a cancel racing the finalize blocks on the lock and is cleanly rejected
+        # by request_cancel's status-guard) and commit builds.eval ONLY when not cancelled
+        # and in the SAME txn, so the §20 gate never observes a withheld/stale report.
         try:
             async with engine.begin() as conn:
-                await lock_job(conn, eval_job)  # FOR UPDATE — the cancel cutoff
+                if not await _eval_leads(conn, eval_job, ctx["owner"]):
+                    return None
                 cancelled = await is_cancel_requested(conn, eval_job)
                 if not cancelled:
                     await persist_build_eval(conn, report)
@@ -229,9 +231,8 @@ async def run_eval_task(
                 await set_progress(
                     conn, eval_job, status=status, progress=1.0, finished_at=sa.func.now()
                 )
-        except Exception as exc:  # noqa: BLE001 — a persist/finalize failure (e.g. the build pruned mid-eval → LookupError from persist_build_eval, or a store blip) must terminalize the job, never leave it 'running'+unleased. The begin() rolled back (no half report, no finalized job); _fail_job records it in its own txn. Mirrors the eval boundary above.
-            await _fail_job(engine, eval_job, exc)
-            return "failed"
+        except Exception as exc:  # noqa: BLE001 — a persist/finalize failure (e.g. the build pruned mid-eval → LookupError from persist_build_eval, or a store blip) must terminalize the job, never leave it 'running'+unleased. The begin() rolled back (no half report, no finalized job); _fail_eval records it in its own txn, again only if we still lead. Mirrors the eval boundary above.
+            return await _fail_eval(engine, eval_job, ctx["owner"], exc)
         return status
 
 
@@ -426,25 +427,62 @@ async def run_build_task(ctx: dict[str, Any], project: str, job_id: str) -> str 
         return outcome.status
 
 
+def _failure_error(exc: Exception) -> dict[str, Any]:
+    """The FULL frozen Error shape (§27.2) for a worker-side terminal failure. §27.2
+    requires request_id; no HTTP request exists here, so the fresh id names this
+    failure record."""
+    return {
+        "code": "INTERNAL",
+        "message": str(exc),
+        "details": None,
+        "request_id": str(uuid.uuid4()),
+    }
+
+
 async def _fail_job(engine: AsyncEngine, job_id: uuid.UUID, exc: Exception) -> None:
     """Record a preflight failure on the durable jobs row (its own committed
     transaction), so a build that never reached the orchestrator still terminates
-    the job instead of leaving it queued."""
+    the job instead of leaving it queued. Used for failures BEFORE the 'running'
+    mark, where this worker just acquired the lease and no replacement can exist —
+    so it is unconditional (the eval RUN/finalize failures use _fail_eval, which is
+    lease-guarded, because the lease can lapse across their long window)."""
     async with engine.begin() as conn:
         await set_progress(
-            conn,
-            job_id,
-            status="failed",
-            finished_at=sa.func.now(),
-            # the FULL frozen Error shape (§27.2 requires request_id; no HTTP
-            # request exists here, so the id names this failure record)
-            error={
-                "code": "INTERNAL",
-                "message": str(exc),
-                "details": None,
-                "request_id": str(uuid.uuid4()),
-            },
+            conn, job_id, status="failed", finished_at=sa.func.now(), error=_failure_error(exc)
         )
+
+
+async def _eval_leads(conn: AsyncConnection, eval_job: uuid.UUID, owner: str) -> bool:
+    """Under the job row lock (the write cutoff), whether THIS worker still LEADS the
+    eval: the job is still live AND we still own its execution lease. A heartbeat lapse
+    can let the reaper hand execution to a replacement; a stale worker that writes
+    anyway would clobber the new holder's builds.eval/status. lock_job (FOR UPDATE)
+    serializes a concurrent acquire_lease behind it (class-10: the decisive read lives
+    under the write's row lock, never a prior unlocked SELECT)."""
+    job = await lock_job(conn, eval_job)
+    return (
+        job is not None
+        and is_active_status(job.status)
+        and await holds_lease(conn, eval_job, owner)
+    )
+
+
+async def _fail_eval(
+    engine: AsyncEngine, eval_job: uuid.UUID, owner: str, exc: Exception
+) -> str | None:
+    """Terminalize a failed eval 'failed' as _fail_job does, but ONLY if this worker
+    still LEADS (live + lease-owning), re-checked under the job row lock. run_eval and
+    the finalize span a long window in which the lease can lapse and the reaper hand
+    off to a replacement; a stale worker must not overwrite the replacement's result or
+    hide its failure with this worker's 'failed'. Returns 'failed' if it recorded the
+    failure, or None (a benign no-op) if a replacement had taken over."""
+    async with engine.begin() as conn:
+        if not await _eval_leads(conn, eval_job, owner):
+            return None
+        await set_progress(
+            conn, eval_job, status="failed", finished_at=sa.func.now(), error=_failure_error(exc)
+        )
+    return "failed"
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:

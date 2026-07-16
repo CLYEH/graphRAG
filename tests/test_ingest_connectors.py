@@ -100,7 +100,7 @@ def test_managed_source_fails_loudly_on_a_missing_registered_file(tmp_path: Path
 
 def test_managed_source_rejects_untrusted_traversal_file_names(tmp_path: Path) -> None:
     """A managed source's registered names are UNTRUSTED — a text source's
-    metadata['files'] is stored as-is by the sources API — so a name with a path
+    managed-file stash is stored as-is by the sources API — so a name with a path
     separator / '..' / absolute path is REFUSED before any file read. WHY: the
     connector joins each name to a filesystem root; a name like '../secret.md' or
     '/etc/passwd' would read OUTSIDE the source root (a build ingesting unrelated

@@ -32,7 +32,7 @@ from urllib.parse import unquote, unquote_to_bytes, urlparse
 from urllib.request import url2pathname
 
 from core.ingest.connectors import DocumentPayload, read_csv_rows, read_text_documents
-from core.registry.store import Source
+from core.registry.store import MANAGED_FILES_KEY, Source
 
 #: Source kinds this task wires to a C2 connector. The ``sources`` table/API
 #: accept any kind string; a build over a kind absent from this tuple fails loud
@@ -242,30 +242,35 @@ def _local_path(source: Source) -> Path:
 
 def _files_metadata(source: Source) -> dict[str, dict[str, Any]] | None:
     """The per-file metadata envelopes an upload stashed on a managed text source
-    (``metadata["files"]``, keyed by stored filename — see
+    (``metadata[MANAGED_FILES_KEY]``, keyed by stored filename — see
     :func:`core.registry.store.upsert_managed_source`), or None for a source with
     no such stash (a non-upload text source, scanned as a plain directory).
 
-    The PRESENCE of a ``files`` key marks the source MANAGED (its registered file
-    list is authoritative — see :func:`~core.ingest.connectors.read_text_documents`);
-    its ABSENCE is a plain (non-upload) text source, scanned as a directory. So the
-    two are distinguished by key presence, NOT by the value's truthiness: a present
-    ``files`` whose value is malformed — not a dict (``[]``, ``null``, a string), or
-    a dict with a non-object entry — is rejected LOUD. Returning None for a malformed
-    value would send ``resolve_source`` down the unmanaged directory-scan path,
+    The PRESENCE of the reserved ``MANAGED_FILES_KEY`` marks the source MANAGED (its
+    registered file list is authoritative — see
+    :func:`~core.ingest.connectors.read_text_documents`); its ABSENCE is a plain
+    (non-upload) text source, scanned as a directory. The key is a reserved,
+    server-owned dunder precisely so a NON-upload source's free-form ``metadata`` — the
+    sources API stores it verbatim — cannot masquerade as managed state: a plain source
+    with a top-level ``files`` key (e.g. ``{"files": {"count": 2}}``) is legitimate
+    project metadata and still scans its directory, never misread as an upload manifest.
+    The two are distinguished by key presence, NOT the value's truthiness: a present
+    ``MANAGED_FILES_KEY`` whose value is malformed — not a dict (``[]``, ``null``, a
+    string), or a dict with a non-object entry — is rejected LOUD. Returning None for a
+    malformed value would send ``resolve_source`` down the unmanaged directory-scan path,
     ingesting unregistered orphan files the managed list was supposed to exclude.
     Threaded into the text connector so each document carries its DR-010 envelope
     onto ``documents.metadata``.
     """
-    if "files" not in source.metadata:
+    if MANAGED_FILES_KEY not in source.metadata:
         return None  # no managed-file stash: a plain (non-upload) text source
-    files = source.metadata["files"]
+    files = source.metadata[MANAGED_FILES_KEY]
     if not isinstance(files, dict):
         raise SourceResolutionError(
-            f"managed source {source.id} has a non-object 'files' metadata value "
-            f"({type(files).__name__}) — a present 'files' key marks the source managed, "
-            "so a non-object value is malformed and fails loud rather than silently "
-            "degrading the source to an unmanaged directory scan"
+            f"managed source {source.id} has a non-object {MANAGED_FILES_KEY!r} metadata "
+            f"value ({type(files).__name__}) — a present key marks the source managed, so "
+            "a non-object value is malformed and fails loud rather than silently degrading "
+            "the source to an unmanaged directory scan"
         )
     validated: dict[str, dict[str, Any]] = {}
     for name, env in files.items():

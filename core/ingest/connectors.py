@@ -75,7 +75,7 @@ def read_text_documents(
     corrupt results). Presence, not truthiness, is the managed signal: an empty map
     ingests NOTHING (an empty authoritative list), never a directory scan — a
     managed source must not silently degrade to reading unregistered files. The
-    keys are UNTRUSTED (a source's ``metadata['files']`` is stored as-is), so each
+    keys are UNTRUSTED (a source's managed-file stash is stored as-is), so each
     is validated to a bare in-root filename before it is joined to ``root`` — a
     name with a path separator / dot segment / absolute path is refused, never
     read. An ABSENT (None) stash is a plain directory source: every accepted file
@@ -89,7 +89,7 @@ def read_text_documents(
         base = root.resolve()
         # Managed source: iterate the REGISTERED list (sorted), not the directory.
         for name in sorted(metadata_by_filename):
-            # The registered names are UNTRUSTED: a text source's metadata['files']
+            # The registered names are UNTRUSTED: a text source's managed-file stash
             # is stored as-is by the sources API, so a key like '../other/secret.md'
             # or an absolute '/etc/passwd' would make `root / name` read OUTSIDE the
             # source root (a build ingesting unrelated local files). Require a bare

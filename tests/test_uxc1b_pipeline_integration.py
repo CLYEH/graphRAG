@@ -44,7 +44,7 @@ from core.mcp.policy import load_query_policy
 from core.metadata.schema import load_metadata_exposure
 from core.query.metadata_enrich import enrich_response_metadata
 from core.query.semantic import semantic_search
-from core.registry import create_project, list_sources
+from core.registry import MANAGED_FILES_KEY, create_project, list_sources
 from core.stores.graph import BuildScopedGraphProjector, graph_driver
 from core.stores.repo import BuildScopedRepo, BuildScopedWriter
 from core.stores.tables import builds, documents, idempotency_keys, projects, sources
@@ -355,7 +355,7 @@ async def test_repeated_uploads_merge_into_one_canonical_source(
             ]
         assert len(managed) == 1  # ONE canonical source for the project's corpus
         # both uploads' files are stashed on it, keyed by their stored names
-        files = managed[0].metadata["files"]
+        files = managed[0].metadata[MANAGED_FILES_KEY]
         assert len(files) == 2
         originals = {env["system"]["original_filename"] for env in files.values()}
         assert originals == {"a.txt", "b.txt"}

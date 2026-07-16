@@ -59,8 +59,14 @@ async def _capture_passthrough(conn: Any, job_id: uuid.UUID, live: Any) -> Any:
 async def _lock_active(conn: Any, job_id: uuid.UUID) -> Any:
     # lock_job stand-in for the eval task's pre-start terminal-job guard: a LIVE
     # (running) job, so the guard proceeds instead of no-opping. The eval task also
-    # calls lock_job at finalize (return unused there), so this is safe for both.
+    # calls lock_job at finalize (via _eval_leads), so this is safe for both.
     return SimpleNamespace(status="running")
+
+
+async def _holds_lease_yes(conn: Any, job_id: uuid.UUID, owner: str) -> bool:
+    # holds_lease stand-in: this worker still OWNS the lease, so the eval finalize /
+    # failure guard (_eval_leads) proceeds to write instead of no-opping to a peer.
+    return True
 
 
 def _fake_lease(calls: dict[str, Any] | None = None, *, acquired: bool = True) -> Any:
@@ -329,6 +335,7 @@ async def test_run_eval_task_terminalizes_on_store_error_never_strands_running(
     monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "set_progress", _set_progress)
     monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
     monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
@@ -535,6 +542,7 @@ async def test_run_eval_task_cancel_during_run_finalizes_cancelled(
     monkeypatch.setattr(bw, "set_progress", _set_progress)
     monkeypatch.setattr(bw, "is_cancel_requested", _cancel_on_finalize)
     monkeypatch.setattr(bw, "lock_job", _lock_job)
+    monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
@@ -594,6 +602,7 @@ async def test_run_eval_task_cancelled_eval_never_persists_the_report(
     monkeypatch.setattr(bw, "set_progress", _noop_progress)
     monkeypatch.setattr(bw, "is_cancel_requested", _cancel_on_finalize)
     monkeypatch.setattr(bw, "lock_job", _noop_lock)
+    monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
@@ -633,6 +642,7 @@ async def test_run_eval_task_completed_eval_persists_the_report_in_finalize(
     monkeypatch.setattr(bw, "set_progress", _noop_progress)
     monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
     monkeypatch.setattr(bw, "lock_job", _noop_lock)
+    monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
@@ -644,6 +654,59 @@ async def test_run_eval_task_completed_eval_persists_the_report_in_finalize(
 
     assert result == "done"
     assert persisted == ["REPORT"]  # the computed report is written exactly once
+
+
+async def test_run_eval_task_stale_worker_does_not_overwrite_after_lease_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 21): the lease is a LIVENESS layer — if this worker's heartbeat lapses,
+    # the reaper hands execution to a replacement (its acquire_lease reassigns
+    # lease_owner). This now-stale worker can still reach the finalize; ignoring
+    # lock_job's result it would persist its report and mark the job terminal,
+    # OVERWRITING the replacement's builds.eval/status (or hiding its failure). The
+    # finalize re-checks UNDER the row lock that we still OWN the lease (_eval_leads); a
+    # reclaimed worker (holds_lease False) does a benign no-op (None) — no persist, no
+    # terminal write. Revert-probe: drop the ownership check and the stale report
+    # overwrites builds.eval and marks the job done.
+    statuses: list[str] = []
+    persisted: list[Any] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        if "status" in fields:
+            statuses.append(fields["status"])
+
+    async def _lock_running(conn: Any, job_id: uuid.UUID) -> Any:
+        return SimpleNamespace(status="running")  # the job the replacement is running
+
+    async def _lease_reclaimed(conn: Any, job_id: uuid.UUID, owner: str) -> bool:
+        return False  # our lease was reclaimed by the replacement — we no longer lead
+
+    async def _never_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    async def _persist(conn: Any, report: Any) -> None:
+        persisted.append(report)  # must NOT overwrite the replacement's builds.eval
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        return "REPORT"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_running)
+    monkeypatch.setattr(bw, "holds_lease", _lease_reclaimed)
+    monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result is None  # benign no-op — the replacement is authoritative
+    assert persisted == []  # the stale report NEVER overwrites builds.eval
+    assert statuses == ["running"]  # ran, but wrote NO terminal status (done/failed/cancelled)
 
 
 async def test_enqueue_build_uses_job_id_dedup() -> None:
