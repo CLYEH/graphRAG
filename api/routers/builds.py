@@ -61,6 +61,7 @@ from core.registry import (
     ProjectNotFoundError,
     create_job_exclusive,
     get_project,
+    set_eval_inputs_fingerprint,
 )
 
 router = APIRouter(tags=["builds"])
@@ -280,11 +281,22 @@ async def run_build_eval_endpoint(
     the stale inputs — a changed fingerprint is the §27 key-reused-with-a-different-
     request conflict (client uses a fresh key), never a silent stale replay."""
 
+    # Fingerprint the eval inputs ONCE at accept, then use it for BOTH the idempotency
+    # hash AND the job's pin. The worker re-fingerprints the live inputs at dispatch and
+    # fails loud on drift (build_worker), so a job created here never scores golden/policy
+    # bytes edited between this 202 and dispatch — the report always matches the accepted,
+    # idempotency-keyed inputs. (Computed before produce so it exists for both paths; on
+    # an idempotent REPLAY produce is skipped and no new job is pinned — correct, the
+    # first accept's job carries it.)
+    fingerprint = eval_inputs_fingerprint(Path(get_settings().projects_dir), project)
+
     async def produce() -> tuple[int, dict[str, Any]]:
         try:
             job = await create_job_exclusive(conn, project, EVAL_JOB_KIND, build_id=build_id)
         except (ProjectNotFoundError, JobConflictError) as exc:
             raise translate_registry_error(exc) from exc
+        # pin the accept-time fingerprint in the SAME txn as the job insert (atomic)
+        await set_eval_inputs_fingerprint(conn, job.id, fingerprint)
         # queue touched HERE only — a §27 replay or a 409 must be served even
         # with Redis unreachable (the Queue dep is a lazy handle), same as _trigger
         await enqueue_eval(await get_redis(), project, job.id, build_id)
@@ -308,9 +320,7 @@ async def run_build_eval_endpoint(
             req_hash=request_hash(
                 "POST",
                 request.url.path,
-                eval_inputs_fingerprint(Path(get_settings().projects_dir), project).encode()
-                + b"\0"
-                + await request.body(),
+                fingerprint.encode() + b"\0" + await request.body(),
             ),
             produce=produce,
         )

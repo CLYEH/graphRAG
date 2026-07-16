@@ -55,6 +55,7 @@ from core.registry import (
     capture_config_snapshot,
     find_reapable_jobs,
     find_unenqueued_jobs,
+    get_eval_inputs_fingerprint,
     get_project,
     holds_lease,
     is_active_status,
@@ -130,6 +131,7 @@ async def run_eval_task(
     project out of every future job via ``create_job_exclusive``. The caller
     re-runs — eval is idempotent (it just re-writes ``builds.eval``)."""
     from core.eval.golden import load_golden
+    from core.eval.idempotency import eval_inputs_fingerprint
     from core.eval.inputs import eval_input_paths
     from core.eval.runner import models_needed, persist_build_eval, run_eval
     from core.mcp.policy import load_query_policy
@@ -178,6 +180,25 @@ async def run_eval_task(
                 await set_progress(conn, eval_job, status="cancelled", finished_at=sa.func.now())
                 return "cancelled"
         try:
+            # Drift guard (UXC1b): the endpoint pinned the ACCEPT-time fingerprint of the
+            # golden set + query policy on the job. If a user edited either between the 202
+            # and this dispatch, scoring the new bytes would return a report for inputs the
+            # client never accepted — the idempotency key is scoped to the OLD fingerprint.
+            # Re-fingerprint the live inputs and fail loud on a mismatch (a stated failure
+            # the client re-triggers). A job with NO pin (created before the pin existed)
+            # skips the check. This runs inside preflight so a mismatch terminalizes the
+            # job like any other deterministic refusal, never strands it.
+            async with engine.connect() as conn:
+                pinned_fingerprint = await get_eval_inputs_fingerprint(conn, eval_job)
+            if pinned_fingerprint is not None:
+                live_fingerprint = eval_inputs_fingerprint(
+                    Path(get_settings().projects_dir), project
+                )
+                if live_fingerprint != pinned_fingerprint:
+                    raise ValueError(
+                        "eval inputs (golden set / query policy) changed since this eval "
+                        "was accepted; re-trigger it so the report scores the intended inputs"
+                    )
             golden_path, policy_path = eval_input_paths(root)
             golden = load_golden(golden_path)
             policy = load_query_policy(policy_path)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +20,8 @@ from fastapi.testclient import TestClient
 
 from api.app import create_app
 from api.deps import arq_redis_provider, db_conn
+from core.config import get_settings
+from core.eval.idempotency import eval_inputs_fingerprint
 from core.registry import JobConflictError, ProjectNotFoundError
 
 pytestmark = pytest.mark.contract
@@ -47,15 +50,24 @@ def client() -> Iterator[TestClient]:
 
 
 def _created_job(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Stub create_job_exclusive to return a queued job, capturing its kwargs."""
+    """Stub create_job_exclusive to return a queued job, capturing its kwargs; also stub
+    the eval-inputs-fingerprint pin (a no-op on the fake conn), capturing the job id it
+    pinned and the fingerprint value (UXC1b triage 27)."""
     captured: dict[str, Any] = {}
+    job_id = uuid.uuid4()
+    captured["job_id_created"] = job_id
 
     async def fake_create(conn: Any, project: str, kind: str, *, build_id: Any = None) -> Any:
         captured["kind"] = kind
         captured["build_id"] = build_id
-        return SimpleNamespace(id=uuid.uuid4(), status="queued")
+        return SimpleNamespace(id=job_id, status="queued")
+
+    async def fake_pin(conn: Any, jid: Any, fingerprint: str) -> None:
+        captured["pinned_job_id"] = jid
+        captured["pinned_fingerprint"] = fingerprint
 
     monkeypatch.setattr("api.routers.builds.create_job_exclusive", fake_create)
+    monkeypatch.setattr("api.routers.builds.set_eval_inputs_fingerprint", fake_pin)
     return captured
 
 
@@ -96,6 +108,23 @@ def test_eval_records_kind_and_target_build(
     # ...and THAT build is what the worker is handed (the correlation that makes
     # the score land on the right build's eval column)
     assert enqueued["build_id"] == _BUILD
+
+
+def test_eval_pins_the_accept_time_inputs_fingerprint(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (triage 27): the endpoint pins the ACCEPT-time golden+policy fingerprint on the
+    # created job so the worker can fail loud if the inputs drift before dispatch (else it
+    # would score bytes the client never accepted, under the accepted idempotency key). Pin
+    # that the pin targets the created job AND carries exactly the accept-time fingerprint
+    # (the same value folded into the idempotency hash).
+    created = _created_job(monkeypatch)
+    _capture_enqueue(monkeypatch)
+    resp = client.post(_URL)
+    assert resp.status_code == 202
+    assert created["pinned_job_id"] == created["job_id_created"]
+    expected = eval_inputs_fingerprint(Path(get_settings().projects_dir), "demo")
+    assert created["pinned_fingerprint"] == expected
 
 
 def test_eval_overlapping_job_is_409(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

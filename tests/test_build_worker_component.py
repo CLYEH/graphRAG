@@ -69,6 +69,12 @@ async def _holds_lease_yes(conn: Any, job_id: uuid.UUID, owner: str) -> bool:
     return True
 
 
+async def _no_fingerprint_pin(conn: Any, job_id: uuid.UUID) -> None:
+    # get_eval_inputs_fingerprint stand-in: NO accept-time pin (a pre-pin job), so the
+    # eval task's input-drift guard is skipped — isolates a test from that check.
+    return None
+
+
 def _fake_lease(calls: dict[str, Any] | None = None, *, acquired: bool = True) -> Any:
     # stand-in for job_lease: records (job_id, owner) and yields `acquired`.
     @asynccontextmanager
@@ -338,6 +344,7 @@ async def test_run_eval_task_terminalizes_on_store_error_never_strands_running(
     monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
     monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
@@ -384,6 +391,7 @@ async def test_run_eval_task_terminalizes_on_a_preflight_loader_error(
     monkeypatch.setattr(bw, "lock_job", _lock_active)
     monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", _boom_load)
 
     ctx = {"engine": _FakeEngine(), "neo4j": _FakeNeo4j(), "owner": "worker-abc"}
@@ -391,6 +399,56 @@ async def test_run_eval_task_terminalizes_on_a_preflight_loader_error(
 
     assert result == "failed"  # terminal, never left 'queued' for the sweep to loop
     assert statuses == ["failed"]  # failed at preflight, before any 'running' mark
+
+
+async def test_run_eval_task_fails_loud_when_eval_inputs_drifted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 27): the endpoint pins the ACCEPT-time golden+policy fingerprint on the
+    # job. If a user edits those between the 202 and dispatch, the worker must NOT score
+    # the new bytes (the idempotency key is scoped to the OLD fingerprint) — it re-
+    # fingerprints the live inputs in preflight and, on a mismatch, terminalizes the job
+    # 'failed' BEFORE running (no run_eval, no dangling 'running'). Revert-probe: drop the
+    # drift guard and preflight passes, so run_eval fires on the drifted inputs (ran['n']
+    # → 1) — the exact harm, scoring bytes the client never accepted.
+    statuses: list[str] = []
+    ran = {"n": 0}
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _pinned(conn: Any, job_id: uuid.UUID) -> str:
+        return "accepted-fingerprint"  # what the endpoint pinned at accept time
+
+    async def _not_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        ran["n"] += 1  # must NOT run — the inputs drifted from what was accepted
+        return "REPORT"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _pinned)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    # the LIVE inputs now fingerprint DIFFERENTLY than what was accepted (an edit)
+    monkeypatch.setattr(
+        "core.eval.idempotency.eval_inputs_fingerprint", lambda pd, proj: "live-DIFFERENT"
+    )
+    # mocked so that WITHOUT the drift guard preflight passes and run_eval fires on the
+    # drifted inputs (the revert path this probe guards against)
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "failed"  # terminalized, never scored the drifted inputs
+    assert ran["n"] == 0  # run_eval never called
+    assert statuses == ["failed"]  # failed at preflight, BEFORE the 'running' mark
 
 
 async def test_run_eval_task_rejects_project_name_escaping_projects_dir(
@@ -413,6 +471,7 @@ async def test_run_eval_task_rejects_project_name_escaping_projects_dir(
     monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "set_progress", _set_progress)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", _load_golden)
 
     ctx = {"engine": _FakeEngine(), "neo4j": _FakeNeo4j(), "owner": "worker-abc"}
@@ -447,6 +506,7 @@ async def test_run_eval_task_honors_cancellation_before_starting(
     monkeypatch.setattr(bw, "lock_job", _lock_active)
     monkeypatch.setattr(bw, "is_cancel_requested", _cancelled)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", _load_golden)
 
     ctx = {"engine": _FakeEngine(), "neo4j": _FakeNeo4j(), "owner": "worker-abc"}
@@ -496,6 +556,7 @@ async def test_run_eval_task_noops_when_job_already_terminal(
     monkeypatch.setattr(bw, "lock_job", _lock_terminal)
     monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", _load_golden)
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
@@ -544,6 +605,7 @@ async def test_run_eval_task_cancel_during_run_finalizes_cancelled(
     monkeypatch.setattr(bw, "lock_job", _lock_job)
     monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
@@ -604,6 +666,7 @@ async def test_run_eval_task_cancelled_eval_never_persists_the_report(
     monkeypatch.setattr(bw, "lock_job", _noop_lock)
     monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
@@ -644,6 +707,7 @@ async def test_run_eval_task_completed_eval_persists_the_report_in_finalize(
     monkeypatch.setattr(bw, "lock_job", _noop_lock)
     monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
@@ -696,6 +760,7 @@ async def test_run_eval_task_stale_worker_does_not_overwrite_after_lease_handoff
     monkeypatch.setattr(bw, "holds_lease", _lease_reclaimed)
     monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))

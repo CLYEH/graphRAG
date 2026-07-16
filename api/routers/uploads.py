@@ -416,6 +416,15 @@ def _validate_file(
         return f"extension {suffix or '(none)'!r} is not allowlisted (allowed: {allowed})", None
     if len(content) > settings.upload_max_file_bytes:
         return f"file exceeds the {settings.upload_max_file_bytes}-byte single-file limit", None
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # The managed text connector reads every accepted file with
+        # read_text(encoding="utf-8"), so a non-UTF-8 .txt/.md would raise and fail
+        # EVERY build over this upload at ingest. Reject it HERE as a STATED per-file
+        # manifest row (at capture), not a build-time crash — the allowlisted suffixes
+        # are all UTF-8 text formats, so undecodable bytes are a per-file refusal.
+        return f"file is not valid UTF-8 text (cannot decode at byte {exc.start})", None
     parsed: DocumentMetadataInput | None = None
     context_to_check: dict[str, Any] = {}
     # A filename PRESENT in the metadata map (even as an explicit null) is validated;

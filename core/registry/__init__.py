@@ -17,6 +17,7 @@ from core.registry.jobs import (
     create_job_exclusive,
     find_reapable_jobs,
     find_unenqueued_jobs,
+    get_eval_inputs_fingerprint,
     get_job,
     get_job_at,
     holds_lease,
@@ -24,6 +25,7 @@ from core.registry.jobs import (
     is_cancel_requested,
     lock_job,
     request_cancel,
+    set_eval_inputs_fingerprint,
     set_progress,
 )
 from core.registry.store import (
@@ -64,6 +66,7 @@ __all__ = [
     "delete_project",
     "find_reapable_jobs",
     "find_unenqueued_jobs",
+    "get_eval_inputs_fingerprint",
     "get_job",
     "get_job_at",
     "get_project",
@@ -74,6 +77,7 @@ __all__ = [
     "list_sources",
     "lock_job",
     "request_cancel",
+    "set_eval_inputs_fingerprint",
     "set_progress",
     "update_project",
     "upsert_managed_source",

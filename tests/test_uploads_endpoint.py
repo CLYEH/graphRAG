@@ -241,6 +241,31 @@ def test_oversized_single_file_is_rejected_not_413(
     assert resp.json()["data"]["source_id"] is None  # nothing accepted → no source
 
 
+def test_non_utf8_file_is_rejected_not_accepted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY (triage 28): the managed text connector reads every accepted file with
+    # read_text(encoding="utf-8"), so a non-UTF-8 .txt/.md would raise and fail EVERY
+    # build over this upload at ingest. It must be a STATED per-file rejection AT
+    # CAPTURE (a rejected manifest row), never accepted to crash a later build — and a
+    # valid sibling in the same batch stays accepted (per-file, not whole-request).
+    _project(monkeypatch)
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    resp = client.post(
+        _URL,
+        files=[
+            ("files", ("bad.txt", b"\xff\xfenot utf-8", "text/plain")),
+            ("files", ("good.txt", b"clean text", "text/plain")),
+        ],
+    )
+    assert resp.status_code == 201  # per-file reject, not a whole-request failure
+    rows = {r["original_filename"]: r for r in resp.json()["data"]["files"]}
+    assert rows["bad.txt"]["status"] == "rejected"
+    assert "UTF-8" in rows["bad.txt"]["reason"]
+    assert rows["good.txt"]["status"] == "accepted"  # the decodable sibling is unaffected
+
+
 # --- metadata (server-owned system, project-typed attributes) ----------------
 
 

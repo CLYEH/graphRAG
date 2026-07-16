@@ -45,10 +45,11 @@ def test_jobs_columns_cover_the_contract_job_shape() -> None:
         "created_at",
         "finished_at",
         # internal, not part of the frozen Job contract (like cancel_requested):
-        # the BA2d execution lease + the BA2d-2 config pin.
+        # the BA2d execution lease + the BA2d-2 config pin + the UXC1b eval-inputs pin.
         "lease_owner",
         "lease_expires_at",
         "config_snapshot",
+        "eval_inputs_fingerprint",
     }
     assert jobs.c.id.primary_key
     # scoping / lifecycle-init columns are never null

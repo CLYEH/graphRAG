@@ -286,6 +286,31 @@ async def is_cancel_requested(conn: AsyncConnection, job_id: uuid.UUID) -> bool:
     )
 
 
+async def set_eval_inputs_fingerprint(
+    conn: AsyncConnection, job_id: uuid.UUID, fingerprint: str
+) -> None:
+    """Pin the ACCEPT-time eval-inputs (golden set + query policy) fingerprint on the
+    job (UXC1b). Called in the SAME txn as the eval job's creation, so the pin is atomic
+    with the insert. The worker re-fingerprints the live inputs at dispatch and fails
+    loud on drift, so a job never scores bytes the client never accepted."""
+    await conn.execute(
+        tables.jobs.update()
+        .where(tables.jobs.c.id == job_id)
+        .values(eval_inputs_fingerprint=fingerprint)
+    )
+
+
+async def get_eval_inputs_fingerprint(conn: AsyncConnection, job_id: uuid.UUID) -> str | None:
+    """The accept-time eval-inputs fingerprint pinned on the job, or None — a non-eval
+    job, or an eval job created before the pin existed (the worker skips the drift check
+    when it is None)."""
+    return (
+        await conn.execute(
+            sa.select(tables.jobs.c.eval_inputs_fingerprint).where(tables.jobs.c.id == job_id)
+        )
+    ).scalar_one_or_none()
+
+
 # ── Execution lease (BA2d) ──────────────────────────────────────────────────
 # run_build's FOR UPDATE lock serializes build CREATION but releases at the
 # resolution commit; these give EXECUTION mutual-exclusion so two dispatches of
