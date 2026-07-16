@@ -720,6 +720,58 @@ describe("Import 上傳 (UXC2b)", () => {
     });
   });
 
+  it("rotates the idempotency key when metadata is edited between attempts", async () => {
+    // the server folds the metadata content into the idempotency fingerprint:
+    // a lost-response retry of an EDITED batch under the old key would 409
+    // IDEMPOTENCY_CONFLICT instead of submitting the correction — an edit
+    // mints a fresh key (the source form's discipline), while an unchanged
+    // retry keeps it (pinned by the FormData test above)
+    const proj = {
+      ...project("acme"),
+      config: {
+        metadata_schema: {
+          attributes: { location: { type: "string", required: true } },
+        },
+      },
+    };
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      Promise.resolve(
+        path === "/projects"
+          ? { data: { data: [proj], meta: META }, error: undefined }
+          : { data: { data: [], meta: META }, error: undefined },
+      )) as never);
+    const post = vi
+      .spyOn(api, "POST")
+      .mockResolvedValueOnce({
+        data: undefined,
+        error: { error: { code: "STORE_UNAVAILABLE", message: "down", details: null } },
+      } as never)
+      .mockResolvedValue({
+        data: { data: { source_id: null, files: [acceptedRow("a.txt")] }, meta: META },
+        error: undefined,
+      } as never);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "a.txt")]);
+    expect(await screen.findByText(/這個專案要求每個檔案填寫下列欄位/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/location/), { target: { value: "打錯的展廳" } });
+    await clickUpload();
+    await screen.findByText(/上傳失敗:down/);
+
+    // correct the value, retry — the request content changed, so must the key
+    fireEvent.change(screen.getByLabelText(/location/), { target: { value: "深海探索廳" } });
+    await clickUpload();
+
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+    type Call = [string, { params: { header: { "Idempotency-Key": string } } }];
+    const [, first] = post.mock.calls[0] as Call;
+    const [, second] = post.mock.calls[1] as Call;
+    expect(second.params.header["Idempotency-Key"]).not.toBe(
+      first.params.header["Idempotency-Key"],
+    );
+  });
+
   it("omits a BLANK required field so the server's own refusal stays the verdict", async () => {
     // an empty string is server-legal for a required string (presence is the
     // rule), so a client non-blank gate would over-block; omitting the blank

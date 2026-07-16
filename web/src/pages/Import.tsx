@@ -479,6 +479,16 @@ function UploadSection({
   const [attrValues, setAttrValues] = useState<Record<string, string | boolean>>({});
   const attemptKey = useRef(crypto.randomUUID());
 
+  // ANY edit mints a fresh key (the source form's field-change discipline):
+  // the server hashes the metadata content into the idempotency fingerprint,
+  // so retrying an edited batch under the OLD key would 409
+  // IDEMPOTENCY_CONFLICT instead of submitting the correction — only an
+  // UNCHANGED retry may replay (Codex #83 triage 3). Extra mints (mount, the
+  // pick() reset) are harmless: freshness only matters at submit.
+  useEffect(() => {
+    attemptKey.current = crypto.randomUUID();
+  }, [attrValues]);
+
   function pick(files: FileList | null) {
     if (!files || files.length === 0) return;
     setPicked(Array.from(files));
