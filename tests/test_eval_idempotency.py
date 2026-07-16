@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from core.eval.idempotency import eval_inputs_fingerprint
 
 
@@ -58,6 +60,45 @@ def test_adding_a_missing_input_flips_the_fingerprint(tmp_path: Path) -> None:
     absent = eval_inputs_fingerprint(tmp_path, "demo")
     (proj / "eval" / "golden.yaml").write_text("cases: []", encoding="utf-8")
     assert eval_inputs_fingerprint(tmp_path, "demo") != absent
+
+
+def test_unreadable_input_does_not_abort_acceptance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why: the fingerprint is computed in the API BEFORE the eval job exists (when an
+    Idempotency-Key is present). A present-but-unreadable golden set must NOT propagate
+    — else the idempotent request 500s and creates NO watchable job, bypassing the
+    worker preflight that terminalizes eval-input errors as a failed job. BOTH sibling
+    filesystem calls in the hash loop can raise ``PermissionError`` on bad perms and
+    both must fold to the SAME stable sentinel: ``read_bytes`` (the file itself) AND
+    ``is_file`` (a non-searchable parent dir — is_file re-raises everything but
+    not-found). So acceptance still succeeds and the JOB stays the sole loud path."""
+    _project(tmp_path)
+    readable = eval_inputs_fingerprint(tmp_path, "demo")
+
+    def fingerprint_when(method: str) -> str:
+        """Fingerprint with ``Path.<method>`` raising PermissionError on golden.yaml."""
+        real = getattr(Path, method)
+
+        def boom(self: Path, *args: object, **kwargs: object) -> object:
+            if self.name == "golden.yaml":
+                raise PermissionError(self.name)  # OSError subclass
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, method, boom)
+        try:
+            return eval_inputs_fingerprint(tmp_path, "demo")  # must not raise
+        finally:
+            monkeypatch.setattr(Path, method, real)
+
+    read_fail = fingerprint_when("read_bytes")  # the file present but unreadable
+    stat_fail = fingerprint_when("is_file")  # a parent dir non-searchable
+    assert read_fail == stat_fail  # both siblings fold to the SAME sentinel state
+    assert read_fail == fingerprint_when("read_bytes")  # stable → an Idem-Key replays
+    assert read_fail != readable  # sentinel ≠ the file's real bytes
+    # …and distinct from a MISSING golden set (unreadable ≠ absent → empty bytes).
+    (tmp_path / "demo" / "eval" / "golden.yaml").unlink()
+    assert read_fail != eval_inputs_fingerprint(tmp_path, "demo")
 
 
 def test_unsafe_project_name_folds_to_a_stable_sentinel(tmp_path: Path) -> None:
