@@ -124,3 +124,13 @@ component、欄位編輯重鑄鍵在上方表單)+ config-driven 變體沒枚舉
 專案=保證被拒死路)。詳 [[graphrag-loop-paused-pr5]] #83 條。真瀏覽器 QA:museum
 真實上傳 .txt 落盤+.exe 逐字拒因。**下一站:UXC2c 檢索改名+全流程 e2e(Phase C 收尾)。**
 
+**UXC2c ✅ merged(PR #84,2026-07-17,a1b79c0)——Track 4 全數完成**:「問答測試」→
+「檢索測試」、nav「問答」→「檢索」(Playground 面;Settings「問答安全」=刻意邊界,
+含 Settings.tsx:101「下一次問答」一句,待 owner 決定是否延伸);capstone e2e=完整
+無終端機旅程(建專案→上傳→設定 ontology→建置→評測→上線→檢索,world-state stub,
+旗標掛在 job 被觀測到終態的邊界上)。2 輪 Codex 各 1 P3:1 修(class-26 精煉:世界
+旗標掛觀測邊界非觸發點)、1 以執行證據 decline(playwright glob 語意——讀源碼+實測
+regex,詳 [[graphrag-loop-paused-pr5]] #84)。**Console UX 翻新(UXA1-3/UXB1/UXC1a-b/
+UXC2a-c)九項全 merge;下一步=Track 5(SRC1 xlsx connector 為首個非 ⚠️ 項;CFG1/SRC2
+待 owner 確認)。**
+
