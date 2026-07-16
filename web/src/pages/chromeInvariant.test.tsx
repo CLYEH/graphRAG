@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Overview } from "./Overview";
 import { ProjectHealth } from "./ProjectHealth";
 import { JobsDashboard } from "./JobsDashboard";
+import { Quality } from "./Quality";
 import { ReviewQueue } from "./ReviewQueue";
 import { Inspect } from "./Inspect";
 import { Clean } from "./Clean";
@@ -104,14 +105,41 @@ function stubWorld() {
           },
         ]);
       case "/projects/{project}/builds":
+        // the eval block is deliberately uuid/hex-laden (build_id, fingerprint):
+        // the 品質 page must confine the raw block to its 進階 fold and render
+        // the verdicts as words
         return ok([
           build({
             id: B1,
             status: "active",
-            eval: { score: 1 },
+            eval: {
+              build_id: B1,
+              score: 1,
+              passed: 1,
+              failed: 0,
+              fingerprint: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+              metrics: {},
+              cases: [{ question: "海祭是哪一族的祭儀?", mode: "hybrid", score: 1, passed: true }],
+            },
             activated_at: "2026-07-13T16:35:46Z",
           }),
         ]);
+      case "/jobs/{job_id}":
+        // the accepted eval job's snapshot (the 品質 sweep clicks 開始評測):
+        // uuid-laden ids must stay in attributes, status renders as words
+        return ok({
+          job_id: "0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f",
+          status: "running",
+          kind: "eval",
+          project: "acme",
+          build_id: B1,
+          step: null,
+          progress: 0.5,
+          message: null,
+          error: null,
+          created_at: "2026-07-01T00:00:00Z",
+          finished_at: null,
+        });
       case "/projects/{project}/merge-candidates":
         // build_id + entity ids ALIGN with the subgraph stub: a mismatched
         // build would (correctly) trip the review page's scope freeze, and
@@ -399,6 +427,26 @@ describe("chrome invariant — no raw ids or store vocabulary outside folds", ()
     await waitFor(() => expect(runBtn).toBeEnabled());
     fireEvent.click(runBtn);
     await screen.findByText(/建置已排入佇列/);
+    assertChromeClean(container);
+  });
+
+  it("品質 (Quality) — verdicts as words, raw eval block confined to its fold, incl. a live job", async () => {
+    stubWorld();
+    vi.spyOn(api, "POST").mockResolvedValue({
+      data: {
+        data: { job_id: "0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f", status: "queued" },
+        meta: META,
+      },
+      error: undefined,
+    } as never);
+    const { container } = renderPage(<Quality />, "quality");
+    // the per-case table (from the uuid-laden eval block) renders as words
+    await screen.findByText("海祭是哪一族的祭儀?");
+    // run an eval so the accepted-job progress chrome is under the sweep too
+    const runBtn = screen.getByRole("button", { name: "開始評測" });
+    await waitFor(() => expect(runBtn).toBeEnabled());
+    fireEvent.click(runBtn);
+    await screen.findByText("評測中");
     assertChromeClean(container);
   });
 

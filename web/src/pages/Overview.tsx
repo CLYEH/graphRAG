@@ -26,10 +26,9 @@ import type { Build } from "../api/queries";
 //   locks while the mutation is in flight OR while builds/health are being
 //   (re)fetched — the target row may be about to change. Two-step confirm
 //   (activation swaps what every reader sees). The §14 preflight verdict is
-//   the SERVER's: its 400 renders verbatim, plus plain guidance and a
-//   copyable CLI eval command when the missing piece is scores (eval has no
-//   API endpoint until UXC1 — the checklist hands you the command instead of
-//   a dead end).
+//   the SERVER's: its 400 renders verbatim, plus plain guidance and a link
+//   to the 品質 page when the missing piece is scores (the eval endpoint
+//   exists since UXC1b — the page replaced the interim CLI hand-off).
 // - The activation target is captured AT CLICK (id shown in the confirm); if
 //   the world moved meanwhile the server refuses and the message shows — the
 //   UI never pre-empts §14.
@@ -39,7 +38,7 @@ import type { Build } from "../api/queries";
 //   arbitrary older version (Codex #77).
 // - Activation is NOT once-only onboarding: an active project that finishes a
 //   newer evaluated ready build gets an UPDATE card with the same activate
-//   control (eval-gated: without scores it hands over the CLI command) —
+//   control (eval-gated: without scores it links to the 品質 page) —
 //   otherwise the Console's only activate path disappears after first launch
 //   (Codex #77).
 export function Overview() {
@@ -61,17 +60,6 @@ export function Overview() {
       <OverviewBody project={project} />
     </section>
   );
-}
-
-/** Shell-quotes a value for the copyable CLI hints: the contract only bans
- *  "/" and "."/".." in project keys, so spaces and metacharacters are legal —
- *  pasted unquoted, `my corpus` parses as two arguments (Codex #77 R2). The
- *  hints ALSO order the command as `eval --build <id> -- <project>`: quoting
- *  cannot save a leading-dash key (the shell strips quotes before argv and
- *  argparse reads `-foo` as an option), but everything after `--` is
- *  positional (Codex #77 R3, verified against cli/main.py). */
-function shellQuote(v: string): string {
-  return /^[A-Za-z0-9_.-]+$/.test(v) ? v : '"' + v.replace(/([\\"$`])/g, "\\$1") + '"';
 }
 
 const BUILT_STATUSES = new Set(["ready", "active", "archived"]);
@@ -158,11 +146,9 @@ function OverviewBody({ project }: { project: string }) {
               confirmText="上線後,所有頁面與查詢立即改讀新版本(目前版本自動下線)。確定?"
             />
           ) : (
-            <p className="overview__cli">
-              新版本還沒有評測分數(沒有分數的版本不能上線)——先在終端機執行:
-              <code>
-                uv run python -m cli.main eval --build {updateCandidate.id} -- {shellQuote(project)}
-              </code>
+            <p className="overview__stephint">
+              新版本還沒有評測分數(沒有分數的版本不能上線)——
+              <Link to="../quality">去評測</Link>
             </p>
           )}
         </div>
@@ -198,16 +184,7 @@ function OverviewBody({ project }: { project: string }) {
           active={step2 && !step3}
           title="檢查品質(評測)"
           hint="用評測題組確認檢索品質——沒有分數的版本不能上線"
-          action={
-            candidate ? (
-              <span className="overview__cli">
-                目前評測要在終端機執行:
-                <code>
-                  uv run python -m cli.main eval --build {candidate.id} -- {shellQuote(project)}
-                </code>
-              </span>
-            ) : null
-          }
+          action={<Link to="../quality">去評測</Link>}
         />
         <ActivateStep
           project={project}
@@ -265,9 +242,10 @@ function formatTime(iso: string): string {
 }
 
 // The activate control: button → two-step confirm → mutation, with the §14
-// refusal rendered verbatim plus the CLI eval hint when it names missing
-// scores. Shared by step ④ (onboarding) and the update card (a newer ready
-// build on an already-active project) — one write path, one gate discipline.
+// refusal rendered verbatim plus a link to the 品質 page when it names
+// missing scores. Shared by step ④ (onboarding) and the update card (a newer
+// ready build on an already-active project) — one write path, one gate
+// discipline.
 function ActivateControl({
   project,
   candidate,
@@ -326,11 +304,8 @@ function ActivateControl({
             {activate.error instanceof Error ? activate.error.message : "unknown error"}
           </p>
           {/candidate build has no eval score/.test(String(activate.error?.message ?? "")) && (
-            <p className="overview__cli">
-              這個版本還沒有評測分數——先在終端機執行:
-              <code>
-                uv run python -m cli.main eval --build {candidate.id} -- {shellQuote(project)}
-              </code>
+            <p className="overview__stephint">
+              這個版本還沒有評測分數——<Link to="../quality">去評測</Link>
             </p>
           )}
         </div>

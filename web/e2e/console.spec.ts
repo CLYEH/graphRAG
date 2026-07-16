@@ -100,6 +100,7 @@ test("console shell loads with the project switcher and section nav", async ({ p
     "清洗",
     "圖譜",
     "審核",
+    "品質",
     "問答",
     "診斷",
     "設定",
@@ -174,6 +175,98 @@ test("the overview walks the setup checklist and activates a build", async ({ pa
   await page.getByRole("button", { name: "確定上線" }).click();
   await expect.poll(() => activatePath).toMatch(/\/builds\/[^/]+\/activate$/);
   expect(activateKey).toMatch(/[0-9a-f-]{36}/);
+});
+
+test("the quality section runs an eval and shows the per-case verdicts", async ({ page }) => {
+  await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  const readyBuild = {
+    id: "b1111111-aaaa-4aaa-8aaa-000000000001",
+    project: "acme",
+    status: "ready",
+    config_hash: null,
+    source_hash: null,
+    started_at: "2026-07-01T00:00:00Z",
+    finished_at: "2026-07-01T00:05:00Z",
+    activated_at: null,
+    metrics: null,
+    eval: null as unknown,
+  };
+  const evaluatedBuild = {
+    ...readyBuild,
+    eval: {
+      build_id: readyBuild.id,
+      score: 0.66,
+      passed: 1,
+      failed: 1,
+      fingerprint: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      metrics: {},
+      cases: [
+        { question: "海祭是哪一族的祭儀?", mode: "hybrid", score: 0.92, passed: true },
+        { question: "區域探索廳在幾樓?", mode: "sql", score: 0.4, passed: false },
+      ],
+    },
+  };
+  // the report exists only AFTER the eval job ran: the builds read serves the
+  // unevaluated build until the eval POST is accepted, then the evaluated one
+  // (the page's terminal-job invalidation is what triggers the refetch)
+  let evalAccepted = false;
+  await page.route("**/projects/*/builds?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: [evalAccepted ? evaluatedBuild : readyBuild], meta: META }),
+    }),
+  );
+  let evalPath = "";
+  let evalKey = "";
+  await page.route("**/builds/*/eval", (route) => {
+    evalPath = new URL(route.request().url()).pathname;
+    evalKey = route.request().headers()["idempotency-key"] ?? "";
+    evalAccepted = true;
+    return route.fulfill(jobAcceptedResponse());
+  });
+  await page.route("**/jobs/*/events", (route) =>
+    route.fulfill({ status: 200, contentType: "text/event-stream", body: "" }),
+  );
+  await page.route("**/jobs/*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          job_id: "0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f",
+          status: "done",
+          kind: "eval",
+          project: "acme",
+          build_id: readyBuild.id,
+          step: null,
+          progress: 1,
+          message: null,
+          error: null,
+          created_at: "2026-07-01T00:00:00Z",
+          finished_at: "2026-07-01T00:01:00Z",
+        },
+        meta: META,
+      }),
+    }),
+  );
+  await page.goto("/");
+
+  await page.getByRole("link", { name: "品質", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "品質(評測)" })).toBeVisible();
+  await expect(page.getByText("此版本還沒有評測結果。")).toBeVisible();
+
+  await page.getByRole("button", { name: "開始評測" }).click();
+  await expect.poll(() => evalPath).toMatch(/\/builds\/[^/]+\/eval$/);
+  expect(evalKey).toMatch(/[0-9a-f-]{36}/);
+
+  // the terminal job invalidates the builds read → the per-case verdicts render
+  // (role-scoped: the raw JSON fold also carries the question text)
+  await expect(page.getByRole("cell", { name: "海祭是哪一族的祭儀?" })).toBeVisible();
+  await expect(page.getByText("通過", { exact: true })).toBeVisible();
+  await expect(page.getByText("未過", { exact: true })).toBeVisible();
+  await expect(page.getByText(/總分:0\.66/)).toBeVisible();
 });
 
 function mergeCandidatesResponse() {
