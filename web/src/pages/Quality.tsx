@@ -258,6 +258,13 @@ function QualityBody({ project }: { project: string }) {
   const blocked = runEval.isPending || evalInFlight || builds.isFetching;
 
   function onRun(target: Build) {
+    // PIN the target as the explicit pick: an IMPLICIT default selection
+    // (pickedId null → newest ready) would re-derive on the terminal builds
+    // refetch, and a newer ready build landing mid-run would silently swap
+    // the results scope away from the build this job actually evaluated
+    // (Codex #82). The class-17 fallback still covers a pinned build that
+    // later VANISHES from the evaluable set.
+    setPickedId(target.id);
     if (runKey.current === null || runKey.current.build !== target.id)
       runKey.current = { build: target.id, key: crypto.randomUUID() };
     runEval.mutate(

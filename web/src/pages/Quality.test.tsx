@@ -364,6 +364,53 @@ describe("Quality (品質/評測)", () => {
     expect(screen.queryByRole("button", { name: "開始評測" })).not.toBeInTheDocument();
   });
 
+  it("pins the evaluated build: a newer ready build landing mid-run must not steal the scope", async () => {
+    // running from the IMPLICIT default selection must pin the target: the
+    // terminal builds refetch re-derives the default, and a newer ready build
+    // that landed mid-run would otherwise become `selected` — the results
+    // section would show THAT build's "no eval yet" instead of the just-
+    // computed report (Codex #82). Revert-probe: drop the onRun pin and the
+    // table below never renders.
+    const evaluated = build({
+      id: READY_ID,
+      status: "ready",
+      eval: null,
+      started_at: "2026-07-01T00:00:00Z",
+    });
+    const evaluatedWithReport = build({
+      id: READY_ID,
+      status: "ready",
+      eval: evalBlock(),
+      started_at: "2026-07-01T00:00:00Z",
+    });
+    const newerMidRun = build({
+      id: ACTIVE_ID,
+      status: "ready",
+      eval: null,
+      started_at: "2026-07-02T00:00:00Z",
+    });
+    stubQualityWorld({
+      buildPages: [[evaluated], [evaluatedWithReport, newerMidRun]],
+      jobSnapshot: job({
+        job_id: JOB_ID,
+        status: "done",
+        kind: "eval",
+        build_id: READY_ID,
+        progress: 1,
+      }),
+    });
+    stubEvalAccepted();
+    renderQuality();
+
+    // run from the DEFAULT selection (no explicit pick)
+    fireEvent.click(await screen.findByRole("button", { name: "開始評測" }));
+
+    // the terminal refetch serves a NEWER ready build — the scope must stay
+    // on the evaluated one and render its fresh report
+    expect(await screen.findByText("海祭是哪一族的祭儀?")).toBeInTheDocument();
+    expect((screen.getByLabelText("選擇版本") as HTMLSelectElement).value).toBe(READY_ID);
+  });
+
   it("falls back to the default target when the picked build leaves the evaluable set", async () => {
     // the selection DERIVES from (picked id, builds) each render — a picked
     // build archived by a refetch must not linger as a stale scope (class 17)
