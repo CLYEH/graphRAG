@@ -392,9 +392,16 @@ async def run_eval(
     build_id: uuid.UUID,
     golden: GoldenSet,
     policy: QueryPolicy,
+    *,
+    persist: bool = True,
 ) -> EvalReport:
-    """Score ``build_id`` (ready or active) against the golden set and write
-    the report to ``builds.eval`` (the schema's dedicated column)."""
+    """Score ``build_id`` (ready or active) against the golden set and (by default)
+    write the report to ``builds.eval`` (the schema's dedicated column).
+
+    ``persist=False`` computes and RETURNS the report WITHOUT writing it: the async
+    eval worker commits ``builds.eval`` itself INSIDE its finalize transaction, under
+    the job's cancellation cutoff, so a cancelled eval never commits a report the §20
+    activation gate could read (the CLI keeps ``persist=True`` — no cancel there)."""
     binding = await resolve_eval_binding(conn, project, build_id)
     await conn.rollback()  # loaned-clean for the sql reader (C6b)
     # None model clients are legal when no case's mode calls them
@@ -452,53 +459,32 @@ async def run_eval(
         fingerprint=eval_fingerprint(golden, policy, _model_identity()),
     )
 
-    await conn.rollback()  # end any read txn before OUR write txn
-    async with conn.begin():
-        stored = await conn.execute(
-            tables.builds.update()
-            .where(tables.builds.c.id == build_id)
-            # the schema's DEDICATED eval column (§4) — not an ad-hoc nest
-            # under metrics: every reader that follows the schema (gate,
-            # Health, API) finds the report in one canonical place
-            .values(eval=sa.cast(report.to_eval_payload(), postgresql.JSONB))
-        )
-        if stored.rowcount != 1:
-            # the binding was valid at resolve time, but a concurrent prune
-            # can delete a ready build before this persist — a report the
-            # gate can never read must not print as success (bind-time
-            # check ≠ invariant)
-            raise LookupError(
-                f"build {build_id} disappeared before the eval report could be "
-                "stored (pruned concurrently?) — nothing persisted"
-            )
+    if persist:
+        await conn.rollback()  # end any read txn before OUR write txn
+        async with conn.begin():
+            await persist_build_eval(conn, report)
     return report
 
 
-async def read_build_eval(conn: AsyncConnection, build_id: uuid.UUID) -> dict[str, Any] | None:
-    """The build's currently-stored ``builds.eval`` report (or None). Captured BEFORE
-    an async eval run so a cancelled run can restore it: ``run_eval`` commits the report
-    before the worker's finalize cancel-check, and the activation gate reads ``builds.eval``
-    without consulting the eval job, so a cancelled eval must not leave its report there."""
-    row = (
-        await conn.execute(sa.select(tables.builds.c.eval).where(tables.builds.c.id == build_id))
-    ).one_or_none()
-    return row.eval if row is not None else None
+async def persist_build_eval(conn: AsyncConnection, report: EvalReport) -> None:
+    """Write ``report`` to ``builds.eval`` — the CALLER owns the transaction. The §14
+    preflight gate + Health (§19) read this DEDICATED column (§4), so it is the ONE
+    canonical eval write (not an ad-hoc nest under metrics). The async worker calls this
+    INSIDE its finalize txn, so the write is atomic with — and gated by — the
+    cancellation cutoff: a cancelled eval never commits a report, and a build being
+    activated locks the same row, so the §20 gate never observes a report a concurrent
+    cancel is about to withhold.
 
-
-async def restore_build_eval(
-    conn: AsyncConnection, build_id: uuid.UUID, prior: dict[str, Any] | None
-) -> None:
-    """Revert ``builds.eval`` to a captured ``prior`` value — the cancel path's undo of
-    ``run_eval``'s write, so a cancelled eval is a true no-op on the gate-read column
-    (a prior report is restored; no prior → back to SQL NULL). A build pruned mid-run
-    matches zero rows, which is fine: there is nothing left to gate.
-
-    ``sa.null()`` (not Python ``None``) for the absent case: JSONB's
-    ``should_evaluate_none`` is True, so ``eval=None`` would persist the JSON ``'null'``
-    LITERAL — a third representation distinct from a fresh build's SQL NULL, which
-    ``builds.eval IS NULL`` readers (§19 Health) would then miscount."""
-    await conn.execute(
+    Raises ``LookupError`` if the build vanished (a concurrent prune can delete a ready
+    build before this persist) — a report the gate can never read must not print as
+    success (bind-time check ≠ invariant)."""
+    stored = await conn.execute(
         tables.builds.update()
-        .where(tables.builds.c.id == build_id)
-        .values(eval=sa.null() if prior is None else sa.cast(prior, postgresql.JSONB))
+        .where(tables.builds.c.id == report.build_id)
+        .values(eval=sa.cast(report.to_eval_payload(), postgresql.JSONB))
     )
+    if stored.rowcount != 1:
+        raise LookupError(
+            f"build {report.build_id} disappeared before the eval report could be "
+            "stored (pruned concurrently?) — nothing persisted"
+        )

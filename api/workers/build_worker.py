@@ -129,7 +129,7 @@ async def run_eval_task(
     re-runs — eval is idempotent (it just re-writes ``builds.eval``)."""
     from core.eval.golden import load_golden
     from core.eval.inputs import eval_input_paths
-    from core.eval.runner import models_needed, read_build_eval, restore_build_eval, run_eval
+    from core.eval.runner import models_needed, persist_build_eval, run_eval
     from core.mcp.policy import load_query_policy
 
     engine = ctx["engine"]
@@ -170,15 +170,13 @@ async def run_eval_task(
             await _fail_job(engine, eval_job, exc)
             return "failed"
         async with engine.begin() as conn:
-            # capture builds.eval BEFORE the run: run_eval commits the new report before
-            # the finalize cancel-check below, and the activation gate reads builds.eval
-            # without consulting the eval job, so a cancel must restore this prior value
-            # (§20 gate must never be satisfied by a cancelled eval's report).
-            prior_eval = await read_build_eval(conn, target_build)
             await set_progress(conn, eval_job, status="running", progress=0.0)
         try:
+            # persist=False: run_eval COMPUTES the report but does NOT write builds.eval.
+            # The worker commits it below, inside the finalize txn under the cancel
+            # cutoff, so a cancelled eval never commits a report the §20 gate could read.
             async with engine.connect() as conn, ctx["neo4j"].session() as session:
-                await run_eval(
+                report = await run_eval(
                     conn,
                     ctx["qdrant"],
                     session,
@@ -188,6 +186,7 @@ async def run_eval_task(
                     target_build,
                     golden,
                     policy,
+                    persist=False,
                 )
         except Exception as exc:  # noqa: BLE001 — the eval boundary, mirroring run_build's stage boundary: ANY error once 'running' (a refusal like a vanished build / unconfigured model, OR a store outage) must terminalize the jobs row, never leave it 'running'+unleased for no sweep to recover. (CancelledError is BaseException → still propagates, same job_timeout mitigation as run_build.)
             await _fail_job(engine, eval_job, exc)
@@ -199,20 +198,23 @@ async def run_eval_task(
         # racing in after blocks on the lock and, finding a terminal job, is cleanly
         # rejected by request_cancel's status-guarded UPDATE (no 'accepted but
         # ignored' limbo). The class-10 TOCTOU lesson: the decisive read belongs
-        # under the write's row lock, never a prior unlocked SELECT.
-        async with engine.begin() as conn:
-            await lock_job(conn, eval_job)  # FOR UPDATE — the cancel cutoff
-            cancelled = await is_cancel_requested(conn, eval_job)
-            if cancelled:
-                # run_eval already committed the report; a cancelled eval must be a
-                # true no-op on the gate-read column, so revert builds.eval to its
-                # pre-run value in the SAME txn that marks the job cancelled (mirrors
-                # run_build: a cancelled build never becomes gate-eligible).
-                await restore_build_eval(conn, target_build, prior_eval)
-            status = "cancelled" if cancelled else "done"
-            await set_progress(
-                conn, eval_job, status=status, progress=1.0, finished_at=sa.func.now()
-            )
+        # under the write's row lock, never a prior unlocked SELECT. builds.eval is
+        # committed HERE, only when NOT cancelled and in the SAME txn — so the §20 gate
+        # (which locks the build row) never observes a report a cancel is withholding,
+        # and no report is ever written for a cancelled eval (no revert window).
+        try:
+            async with engine.begin() as conn:
+                await lock_job(conn, eval_job)  # FOR UPDATE — the cancel cutoff
+                cancelled = await is_cancel_requested(conn, eval_job)
+                if not cancelled:
+                    await persist_build_eval(conn, report)
+                status = "cancelled" if cancelled else "done"
+                await set_progress(
+                    conn, eval_job, status=status, progress=1.0, finished_at=sa.func.now()
+                )
+        except Exception as exc:  # noqa: BLE001 — a persist/finalize failure (e.g. the build pruned mid-eval → LookupError from persist_build_eval, or a store blip) must terminalize the job, never leave it 'running'+unleased. The begin() rolled back (no half report, no finalized job); _fail_job records it in its own txn. Mirrors the eval boundary above.
+            await _fail_job(engine, eval_job, exc)
+            return "failed"
         return status
 
 
