@@ -530,3 +530,53 @@ async def test_a_crashed_holders_expired_lease_does_not_block_a_new_dispatch(
         assert await _lease_owner(engine, job_id) is None  # released on completion
     finally:
         await _cleanup(engine, project)
+
+
+async def test_timeout_cancellation_mid_build_leaves_the_lease_held(migrated: None) -> None:
+    # WHY (triage 31): arq's job_timeout cancels a mid-run dispatch with
+    # asyncio.CancelledError AFTER run_build has marked the row 'running'. Over REAL
+    # Postgres + a REAL asyncio cancellation (not a synthetic raise), the lease must be
+    # left HELD — so the row is 'running'+held+lapsing, exactly find_reapable_jobs's
+    # reclaimable set — never 'running'+unleased, which NO sweep recovers and which would
+    # block the project via create_job_exclusive until manual DB repair.
+    engine = _engine()
+    project = _proj()
+    parked = asyncio.Event()
+    hang = asyncio.Event()  # never set → the stage parks until the cancellation hits it
+    try:
+        job_id = await _make_job(engine, project)
+
+        async def _parking_ingest(
+            conn: AsyncConnection, project: str, build_id: uuid.UUID
+        ) -> StageResult:
+            parked.set()  # the lease is held and run_build has marked the job 'running'
+            await hang.wait()
+            return StageResult()
+
+        task = asyncio.create_task(
+            run_build_leased(
+                engine,
+                project,
+                job_id,
+                _noop_stages(ingest=_parking_ingest),
+                owner="A",
+                step_failure_ratio=0.0,
+            )
+        )
+        await parked.wait()
+        # precondition: 'running' + held BEFORE the timeout fires
+        assert (await _job_row(engine, job_id)).status == "running"
+        assert await _lease_owner(engine, job_id) == "A"
+
+        # the job_timeout fires: cancel the dispatch mid-'running' (never swallowed)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # the lease was NOT released — 'running' + STILL held, so it lapses into the
+        # reaper's reclaimable set instead of stranding 'running'+unleased.
+        assert await _lease_owner(engine, job_id) == "A"
+        assert (await _job_row(engine, job_id)).status == "running"
+    finally:
+        hang.set()  # never leave the stage parked if an assert failed
+        await _cleanup(engine, project)
