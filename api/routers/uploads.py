@@ -105,7 +105,22 @@ async def upload_documents_endpoint(
         )
 
     form = await request.form()
-    files = [part for part in form.getlist("files") if isinstance(part, UploadFile)]
+    # The contract types `files` as an array of BINARY parts. Starlette parses a part
+    # named `files` that carries no filename (a text form field) as a str, not an
+    # UploadFile — filtering those away would SILENTLY drop a submitted part (a client
+    # that mis-encodes one file as a form field loses it whenever another valid file is
+    # present). So reject any non-file `files` part as a stated whole-request 400 rather
+    # than dropping it, the same no-silent-drop capture guarantee the metadata field keeps.
+    file_parts = form.getlist("files")
+    files = [part for part in file_parts if isinstance(part, UploadFile)]
+    if len(files) != len(file_parts):
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            "every 'files' part must be an uploaded file (a binary part with a "
+            "filename), not a text form field — a non-file 'files' part would be "
+            "silently dropped",
+            details={"non_file_files_parts": len(file_parts) - len(files)},
+        )
     if not files:
         raise ApiError(
             ErrorCode.VALIDATION_ERROR,

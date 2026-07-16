@@ -56,6 +56,13 @@ async def _capture_passthrough(conn: Any, job_id: uuid.UUID, live: Any) -> Any:
     return live
 
 
+async def _lock_active(conn: Any, job_id: uuid.UUID) -> Any:
+    # lock_job stand-in for the eval task's pre-start terminal-job guard: a LIVE
+    # (running) job, so the guard proceeds instead of no-opping. The eval task also
+    # calls lock_job at finalize (return unused there), so this is safe for both.
+    return SimpleNamespace(status="running")
+
+
 def _fake_lease(calls: dict[str, Any] | None = None, *, acquired: bool = True) -> Any:
     # stand-in for job_lease: records (job_id, owner) and yields `acquired`.
     @asynccontextmanager
@@ -321,6 +328,7 @@ async def test_run_eval_task_terminalizes_on_store_error_never_strands_running(
 
     monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
     monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
@@ -366,6 +374,7 @@ async def test_run_eval_task_terminalizes_on_a_preflight_loader_error(
 
     monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
     monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr("core.eval.golden.load_golden", _boom_load)
@@ -428,6 +437,7 @@ async def test_run_eval_task_honors_cancellation_before_starting(
 
     monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
     monkeypatch.setattr(bw, "is_cancel_requested", _cancelled)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr("core.eval.golden.load_golden", _load_golden)
@@ -438,6 +448,57 @@ async def test_run_eval_task_honors_cancellation_before_starting(
     assert result == "cancelled"
     assert loaded == []  # no eval work started
     assert statuses == ["cancelled"]  # terminalized before the 'running' mark
+
+
+async def test_run_eval_task_noops_when_job_already_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 19): the execution lease is status-BLIND, so a stale-lease reaper
+    # race can hand a worker a row that is ALREADY terminal — the reaper enqueued a
+    # replacement while the original was only STARVED, then the original finished
+    # (status → done) and released its lease, which this replacement then acquired.
+    # Re-running would reopen the finished eval and OVERWRITE builds.eval (the §20
+    # gate's input). The pre-start guard LOCKs the row and, finding it no longer
+    # queued/running, does NO work: no 'running' mark, no preflight, no run_eval, no
+    # persist — a benign no-op (None), mirroring run_build's BuildNotResumableError.
+    # Revert-probe: drop the guard and the job is re-marked running and re-persisted.
+    events: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        events.append(f"status={fields.get('status')}")
+
+    async def _lock_terminal(conn: Any, job_id: uuid.UUID) -> Any:
+        return SimpleNamespace(status="done")  # already finished by the original worker
+
+    async def _never_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False  # isolate the terminal-status guard from the cancel path
+
+    def _load_golden(path: Any) -> Any:
+        events.append("load_golden")  # must NOT run for a terminal job
+        return "GOLDEN"
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        events.append("run_eval")  # must NOT run
+        return "REPORT"
+
+    async def _persist(conn: Any, report: Any) -> None:
+        events.append("persist")  # must NOT overwrite builds.eval
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_terminal)
+    monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr("core.eval.golden.load_golden", _load_golden)
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result is None  # benign no-op, not a re-run
+    assert events == []  # nothing happened: no running mark, no preflight, no run, no persist
 
 
 async def test_run_eval_task_cancel_during_run_finalizes_cancelled(
@@ -460,9 +521,9 @@ async def test_run_eval_task_cancel_during_run_finalizes_cancelled(
         events.append(f"cancel_read#{checks['n']}")
         return checks["n"] > 1  # False at the pre-start check, True at finalize
 
-    async def _lock_job(conn: Any, job_id: uuid.UUID) -> None:
-        events.append("lock")  # the FOR UPDATE cutoff — must precede the finalize read
-        return None
+    async def _lock_job(conn: Any, job_id: uuid.UUID) -> Any:
+        events.append("lock")  # the FOR UPDATE cutoff — pre-start guard AND finalize read
+        return SimpleNamespace(status="running")  # live job → both guards proceed
 
     async def _run_eval(*a: Any, **k: Any) -> None:
         return None
@@ -493,11 +554,12 @@ async def test_run_eval_task_cancel_during_run_finalizes_cancelled(
 
     assert result == "cancelled"
     assert statuses == ["running", "cancelled"]  # ran, then cancelled at finalize
-    # the finalize acquires the row lock BEFORE its cancel read (#2): a cancel racing the
-    # finalize is decided under the lock, never lost to an unlocked read. And a cancelled
-    # eval NEVER persists builds.eval (no "persist") — the report is withheld, so no
-    # window and nothing for the §20 gate to read.
-    assert events == ["cancel_read#1", "lock", "cancel_read#2"]
+    # BOTH the pre-start guard and the finalize acquire the row lock BEFORE their cancel
+    # read: a cancel is always decided under the lock, never lost to an unlocked read. The
+    # pre-start read (#1) is False (still running), the finalize read (#2) True. And a
+    # cancelled eval NEVER persists builds.eval (no "persist") — the report is withheld,
+    # so no window and nothing for the §20 gate to read.
+    assert events == ["lock", "cancel_read#1", "lock", "cancel_read#2"]
 
 
 async def test_run_eval_task_cancelled_eval_never_persists_the_report(
@@ -515,8 +577,8 @@ async def test_run_eval_task_cancelled_eval_never_persists_the_report(
     async def _noop_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
         pass
 
-    async def _noop_lock(conn: Any, job_id: uuid.UUID) -> None:
-        return None
+    async def _noop_lock(conn: Any, job_id: uuid.UUID) -> Any:
+        return SimpleNamespace(status="running")  # live job → the pre-start guard proceeds
 
     async def _cancel_on_finalize(conn: Any, job_id: uuid.UUID) -> bool:
         checks["n"] += 1
@@ -555,8 +617,8 @@ async def test_run_eval_task_completed_eval_persists_the_report_in_finalize(
     async def _noop_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
         pass
 
-    async def _noop_lock(conn: Any, job_id: uuid.UUID) -> None:
-        return None
+    async def _noop_lock(conn: Any, job_id: uuid.UUID) -> Any:
+        return SimpleNamespace(status="running")  # live job → the pre-start guard proceeds
 
     async def _never_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
         return False

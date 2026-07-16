@@ -56,6 +56,7 @@ from core.registry import (
     find_reapable_jobs,
     find_unenqueued_jobs,
     get_project,
+    is_active_status,
     is_cancel_requested,
     lock_job,
     set_progress,
@@ -151,11 +152,27 @@ async def run_eval_task(
                 ValueError(f"project {project!r} is not a valid projects-dir path component"),
             )
             return "failed"
-        # Cancellation checkpoint BEFORE starting work: /jobs/{id}/cancel flags
-        # cancel_requested cooperatively (like a build's between-stage checks), so
-        # an eval accepted for cancellation must not run to completion and report
-        # success — terminalize it 'cancelled' and do no work.
+        # Terminal-job + cancellation checkpoint BEFORE starting work, from ONE locked
+        # read. Acquiring the execution lease means "no LIVE peer" — but the lease is
+        # status-blind, so a stale-lease reaper race can hand this row over already
+        # terminal: it enqueues a replacement while the original worker is only STARVED,
+        # then the original finishes (status → done/failed/cancelled) and RELEASES its
+        # lease, so this replacement acquires the now-terminal row. Re-running would
+        # reopen a finished eval and OVERWRITE builds.eval (the §20 gate's input) with a
+        # second computation. So LOCK the row (the same FOR UPDATE the finalize/reaper
+        # use — class-10: the decisive read belongs under the write's lock, never a
+        # prior unlocked SELECT) and, if it is no longer queued/running, do no work: a
+        # benign no-op mirroring run_build's BuildNotResumableError. None also covers the
+        # project being deleted out from under us — equally nothing to do.
         async with engine.begin() as conn:
+            job = await lock_job(conn, eval_job)
+            if job is None or not is_active_status(job.status):
+                return None
+            # Cancellation checkpoint under the SAME lock (mirrors the finalize's
+            # lock_job → is_cancel_requested): /jobs/{id}/cancel flags cancel_requested
+            # cooperatively (like a build's between-stage checks), so an eval accepted
+            # for cancellation must not run to completion and report success —
+            # terminalize it 'cancelled' and do no work.
             if await is_cancel_requested(conn, eval_job):
                 await set_progress(conn, eval_job, status="cancelled", finished_at=sa.func.now())
                 return "cancelled"

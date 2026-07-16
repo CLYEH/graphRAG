@@ -116,6 +116,32 @@ def test_no_files_is_400(
     assert "at least one file part" in resp.json()["error"]["message"]
 
 
+def test_non_file_files_part_is_400_not_silently_dropped(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY: the contract types `files` as an array of BINARY parts. A part named `files`
+    # with no filename is parsed as a text field (str), not an UploadFile. Filtering it
+    # away would SILENTLY drop a submitted part whenever a valid file is also present —
+    # a client that mis-encodes one file as a form field loses it with no manifest row.
+    # It must be a STATED whole-request 400, never a silent one-of-N drop (the same
+    # no-silent-drop guarantee the endpoint keeps for every submitted part).
+    _project(monkeypatch)
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    # httpx `data=` emits a second part named `files` as a text field (no filename),
+    # alongside the real binary file part — exactly the mis-encoded-file shape.
+    resp = client.post(
+        _URL,
+        files=[("files", ("real.txt", b"x", "text/plain"))],
+        data={"files": "oops-encoded-as-text"},
+    )
+    assert resp.status_code == 400  # whole-request refusal, not a 201 with the text lost
+    error = resp.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert "must be an uploaded file" in error["message"]
+    assert error["details"]["non_file_files_parts"] == 1
+
+
 def test_duplicate_filenames_is_400(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:

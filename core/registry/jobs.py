@@ -27,6 +27,14 @@ from core.stores import tables
 _ACTIVE_STATUSES = ("queued", "running")
 
 
+def is_active_status(status: str) -> bool:
+    """True while a job is still live (``queued``/``running``) — i.e. NOT terminal
+    (``done``/``failed``/``cancelled``). The public predicate over ``_ACTIVE_STATUSES``
+    so callers reason about liveness against the single source (a worker that
+    re-acquired a stale lease must not re-run an already-terminal job)."""
+    return status in _ACTIVE_STATUSES
+
+
 @dataclass(frozen=True)
 class Job:
     """A long-operation tracking row. ``id`` is the job id used in API paths;
