@@ -261,6 +261,30 @@ def test_null_per_file_metadata_entry_rejects_that_file_not_the_batch(
     assert rows["absent.txt"]["status"] == "accepted"  # absent stays accepted
 
 
+def test_non_finite_metadata_constant_is_400_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY: json.loads accepts the non-standard constants NaN/Infinity/-Infinity by
+    # default; a non-finite float would pass a `number` attribute or the open governance
+    # bag and then 500 downstream (Postgres JSONB refuses non-finite). A malformed upload
+    # must be the documented 400 at parse time, never a 500 — parse_constant rejects it.
+    _project(monkeypatch)
+    _settings(monkeypatch, tmp_path)
+    for raw in (
+        '{"doc.txt": {"context": {"attributes": {"year": NaN}}}}',
+        '{"doc.txt": {"governance": {"score": Infinity}}}',
+    ):
+        resp = client.post(
+            _URL,
+            files=[("files", ("doc.txt", b"x", "text/plain"))],
+            data={"metadata": raw},
+        )
+        assert resp.status_code == 400, raw
+        error = resp.json()["error"]
+        assert error["code"] == "VALIDATION_ERROR"
+        assert "non-finite" in error["message"]
+
+
 def test_valid_metadata_is_stamped_into_the_envelope(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:

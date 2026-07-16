@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -218,6 +218,13 @@ def _corpus_dir(settings: Any, project: str) -> Path:
     return root
 
 
+def _reject_non_finite_constant(value: str) -> NoReturn:
+    """``json.loads(parse_constant=…)`` hook: fired only for ``NaN``/``Infinity``/
+    ``-Infinity``. Raising here rejects them at parse time (the caller maps it to a
+    400) instead of letting a non-finite float reach Postgres JSONB and 500."""
+    raise ValueError(f"non-finite constant {value!r} is not allowed")
+
+
 def _parse_metadata_field(raw: Any, submitted_names: set[str]) -> dict[str, Any]:
     """Parse the optional ``metadata`` form field (a JSON object keyed by
     submitted filename). A key that names no submitted file is a client error
@@ -230,8 +237,14 @@ def _parse_metadata_field(raw: Any, submitted_names: set[str]) -> dict[str, Any]
             ErrorCode.VALIDATION_ERROR, "the 'metadata' form field must be a JSON string"
         )
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        # parse_constant rejects the non-standard constants json.loads accepts by
+        # default (NaN/Infinity/-Infinity). A non-finite float would otherwise pass a
+        # `number` attribute or the open governance bag and 500 downstream (Postgres
+        # JSONB refuses non-finite), turning a malformed upload into a 500 instead of
+        # the documented 400 — RFC 8259 JSON has no non-finite numbers. JSONDecodeError
+        # is a ValueError, so one except covers both malformed JSON and this reject.
+        parsed = json.loads(raw, parse_constant=_reject_non_finite_constant)
+    except ValueError as exc:
         raise ApiError(
             ErrorCode.VALIDATION_ERROR, f"the 'metadata' field is not valid JSON: {exc}"
         ) from exc
