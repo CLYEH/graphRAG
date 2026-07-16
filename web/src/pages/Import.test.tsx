@@ -580,3 +580,206 @@ describe("Import", () => {
     expect(get).not.toHaveBeenCalledWith("/projects/{project}/sources", expect.anything());
   });
 });
+
+// ---- UXC2b 上傳檔案 -----------------------------------------------------------
+
+function acceptedRow(name: string) {
+  return {
+    filename: "deadbeefcafe0000.txt",
+    original_filename: name,
+    status: "accepted",
+    document_uri: "file:///C:/data/uploads/acme/deadbeefcafe0000.txt",
+    metadata: {
+      schema_version: "1.2",
+      system: { connector: "upload", original_filename: name },
+      context: {},
+      governance: {},
+    },
+  };
+}
+
+function rejectedRow(name: string, reason: string) {
+  return { original_filename: name, status: "rejected", reason };
+}
+
+function stubUpload(files: unknown[]) {
+  return vi.spyOn(api, "POST").mockResolvedValue({
+    data: {
+      data: { source_id: "50000000-0000-0000-0000-000000000000", files },
+      meta: META,
+    },
+    error: undefined,
+  } as never);
+}
+
+function pickFiles(files: File[]) {
+  const input = screen.getByLabelText("選擇檔案") as HTMLInputElement;
+  fireEvent.change(input, { target: { files } });
+}
+
+describe("Import 上傳 (UXC2b)", () => {
+  it("uploads the batch as real FormData with a per-attempt Idempotency-Key reused on retry", async () => {
+    // the wire: files ride a FormData under repeated "files" parts (the
+    // compiled type says string[] — the runtime shape is the contract's);
+    // the key is minted per SELECTION and reused across retries of the same
+    // batch, so a lost 201 replays the stored manifest instead of writing the
+    // corpus twice
+    stubSources([]);
+    const post = vi
+      .spyOn(api, "POST")
+      .mockResolvedValueOnce({
+        data: undefined,
+        error: { error: { code: "STORE_UNAVAILABLE", message: "down", details: null } },
+      } as never)
+      .mockResolvedValue({
+        data: {
+          data: { source_id: null, files: [acceptedRow("a.txt"), acceptedRow("b.md")] },
+          meta: META,
+        },
+        error: undefined,
+      } as never);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([
+      new File(["hello"], "a.txt", { type: "text/plain" }),
+      new File(["world"], "b.md", { type: "text/markdown" }),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+    await screen.findByText(/上傳失敗:down/);
+    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+
+    type Call = [string, { params: { header: { "Idempotency-Key": string } }; body: unknown }];
+    const [path, first] = post.mock.calls[0] as Call;
+    const [, second] = post.mock.calls[1] as Call;
+    expect(path).toBe("/projects/{project}/uploads");
+    expect(first.body).toBeInstanceOf(FormData);
+    expect((first.body as FormData).getAll("files").map((f) => (f as File).name)).toEqual([
+      "a.txt",
+      "b.md",
+    ]);
+    expect(first.params.header["Idempotency-Key"]).toMatch(/[0-9a-f-]{36}/);
+    expect(second.params.header["Idempotency-Key"]).toBe(first.params.header["Idempotency-Key"]);
+  });
+
+  it("renders the per-file manifest honestly: verdict words, verbatim reason, no bare stored ids", async () => {
+    // a refused extension is a STATED refusal row beside the accepted ones —
+    // never a silent drop; the stored corpus name/uri are identifiers and live
+    // on hover only (chrome shows the operator's own filename)
+    stubSources([]);
+    stubUpload([
+      acceptedRow("guide.txt"),
+      rejectedRow("virus.exe", "extension '.exe' is not allowlisted (txt, md)"),
+    ]);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "guide.txt"), new File(["y"], "virus.exe")]);
+    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+
+    expect(await screen.findByText(/接受 1 檔 · 退回 1 檔/)).toBeInTheDocument();
+    expect(screen.getByText("已接受")).toBeInTheDocument();
+    expect(screen.getByText("已退回")).toBeInTheDocument();
+    expect(screen.getByText("guide.txt")).toBeInTheDocument();
+    expect(screen.getByText("virus.exe")).toBeInTheDocument();
+    expect(screen.getByText(/extension '\.exe' is not allowlisted/)).toBeInTheDocument();
+    // stored identifiers never appear as text — hover title only
+    expect(screen.queryByText(/deadbeefcafe0000/)).not.toBeInTheDocument();
+    expect(screen.getByText("guide.txt")).toHaveAttribute(
+      "title",
+      expect.stringContaining("file:///"),
+    );
+  });
+
+  it("refreshes the sources list from the WORLD the upload actually changed", async () => {
+    // the accepted files register the project's managed corpus source — it
+    // must appear in the list above without a manual refresh. The stub models
+    // WORLD STATE (the source exists only after the POST landed), never a
+    // call count — a premature refetch must not be handed the "after" world
+    // (class 26).
+    let uploaded = false;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      Promise.resolve(
+        path === "/projects"
+          ? { data: { data: [project("acme")], meta: META }, error: undefined }
+          : {
+              data: {
+                data: uploaded
+                  ? [source({ uri: "file:///C:/data/uploads/acme", kind: "text" })]
+                  : [],
+                meta: META,
+              },
+              error: undefined,
+            },
+      )) as never);
+    vi.spyOn(api, "POST").mockImplementation((() => {
+      uploaded = true;
+      return Promise.resolve({
+        data: {
+          data: {
+            source_id: "50000000-0000-0000-0000-000000000000",
+            files: [acceptedRow("a.txt")],
+          },
+          meta: META,
+        },
+        error: undefined,
+      });
+    }) as never);
+    renderImport(projectRoute("acme", "import"));
+    expect(await screen.findByText("No sources registered yet.")).toBeInTheDocument();
+
+    pickFiles([new File(["x"], "a.txt")]);
+    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+
+    expect(await screen.findByText("file:///C:/data/uploads/acme")).toBeInTheDocument();
+  });
+
+  it("gates the upload on a selection and accepts a drag-drop batch", async () => {
+    stubSources([]);
+    stubUpload([acceptedRow("dropped.txt")]);
+    const { container } = renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    const button = screen.getByRole("button", { name: "上傳" });
+    expect(button).toBeDisabled();
+
+    const dropzone = container.querySelector(".import__dropzone") as HTMLElement;
+    fireEvent.drop(dropzone, {
+      dataTransfer: { files: [new File(["x"], "dropped.txt")] },
+    });
+    expect(screen.getByText("dropped.txt")).toBeInTheDocument();
+    expect(button).toBeEnabled();
+  });
+
+  it("a new selection clears the previous batch's verdicts", async () => {
+    // verdicts belong to the batch that produced them: a stale manifest
+    // sitting beside a NEW selection would read as that selection's result
+    stubSources([]);
+    stubUpload([acceptedRow("first.txt")]);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "first.txt")]);
+    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+    expect(await screen.findByText(/接受 1 檔/)).toBeInTheDocument();
+
+    pickFiles([new File(["y"], "second.txt")]);
+    expect(screen.queryByText(/接受 1 檔/)).not.toBeInTheDocument();
+    expect(screen.queryByText("已接受")).not.toBeInTheDocument();
+  });
+
+  it("surfaces a whole-request refusal verbatim (413/415/400 family)", async () => {
+    stubSources([]);
+    stubPostError("VALIDATION_ERROR", "upload exceeds the total size limit (50000000 bytes)");
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "huge.txt")]);
+    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+
+    expect(
+      await screen.findByText(/上傳失敗:upload exceeds the total size limit/),
+    ).toBeInTheDocument();
+  });
+});

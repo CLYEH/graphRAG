@@ -442,6 +442,41 @@ export function useAddSource(project: string) {
   });
 }
 
+export type UploadResult = components["schemas"]["UploadResult"];
+
+// Uploads document files into the project's managed corpus (UXC2b, over the
+// contract-v1.2 upload endpoint): multipart files → a 201 with a PER-FILE
+// accepted/rejected manifest — a refused extension/oversize/undecodable file is
+// a STATED refusal row (with the server's reason), never a silent drop and
+// never an HTTP error; whole-request refusals (415 not-multipart / 413 total
+// size / 400 malformed / 409 idempotency conflict) throw with the server's
+// message verbatim. The body is a real FormData: openapi-fetch's default
+// serializer passes FormData through untouched and omits Content-Type so the
+// browser sets the multipart boundary. The CAST below is the UXC1a codegen
+// follow-up landing where TASKS.md UXC2b put it: `format: binary` compiles to
+// `files: string[]` (openapi-typescript cannot express browser File objects),
+// so the contract-correct FormData cannot satisfy the generated TYPE — the
+// cast is confined to this one seam and the runtime shape is exactly what the
+// contract freezes. On success the sources read is invalidated: accepted
+// files register/update the project's ONE managed corpus source, which must
+// appear in the existing list without a manual refresh.
+export function useUploadDocuments(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ files, idempotencyKey }: { files: File[]; idempotencyKey: string }) => {
+      const form = new FormData();
+      for (const f of files) form.append("files", f);
+      const { data, error } = await api.POST("/projects/{project}/uploads", {
+        params: { path: { project }, header: { "Idempotency-Key": idempotencyKey } },
+        body: form as unknown as { files: string[] },
+      });
+      if (error) throw new Error(error.error.message);
+      return data.data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["sources", project] }),
+  });
+}
+
 export type TriggerKind = "ingest" | "build";
 
 // Triggers a pipeline run (both kinds run the full pipeline; the kind rides the

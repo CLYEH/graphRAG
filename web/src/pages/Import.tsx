@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 
-import { useAddSource, useProjects, useSources, useTrigger } from "../api/queries";
+import {
+  useAddSource,
+  useProjects,
+  useSources,
+  useTrigger,
+  useUploadDocuments,
+} from "../api/queries";
 import { isPathAddressable, useActiveProject } from "../project/projectRoute";
 import { JobProgress } from "../components/JobProgress";
 import { NewProjectForm } from "../components/NewProjectForm";
@@ -186,10 +192,11 @@ function isResolvableSource(s: Source): boolean {
 }
 
 // FE1 Import (DESIGN §5/§15): register sources into the active project by URI/
-// connector, then trigger ingest (stage 1) or a full build and watch the job live.
-// Byte upload is deliberately out of scope — the frozen contract models a source as
-// a uri reference, not an uploaded file (owner scope decision 2026-07-12). Same
-// project-addressability guards as the other pages.
+// connector, upload document files into the managed corpus (UXC2b — contract
+// v1.2's upload endpoint superseded the 2026-07-12 "no byte upload" scope
+// decision; owner approved the upload track 2026-07-14), then trigger ingest
+// (stage 1) or a full build and watch the job live. Same project-addressability
+// guards as the other pages.
 export function Import() {
   const project = useActiveProject();
   const projects = useProjects();
@@ -225,6 +232,7 @@ export function Import() {
         目前專案:<code>{project}</code>
       </p>
       <Sources project={project} />
+      <UploadSection project={project} />
       <RunPipeline
         project={project}
         ontologyMissing={ontologyMissing}
@@ -381,6 +389,124 @@ function Sources({ project }: { project: string }) {
             </li>
           ))}
         </ul>
+      )}
+    </section>
+  );
+}
+
+// 上傳檔案 (UXC2b): drag-drop or file-pick → multipart upload → the server's
+// per-file accepted/rejected manifest rendered honestly.
+//
+// State machine (class 20/26):
+// - selection: File[] local state; empty → 上傳 disabled. Picking/dropping
+//   REPLACES the selection (one batch at a time) and RESETS the mutation so a
+//   previous batch's verdicts never sit beside a new selection as if they
+//   were about it.
+// - Idempotency-Key: one per (selection, logical attempt) — minted when the
+//   selection changes (the register-form discipline above), REUSED on a retry
+//   after a whole-request failure (a lost 201 replays the stored manifest
+//   instead of re-writing the corpus), and the post-success selection clear
+//   mints a fresh key for the next batch.
+// - The manifest is the mutation RESULT (server truth), keyed by
+//   original_filename (the row identity a human recognizes): accepted rows
+//   carry the stored corpus uri on hover ONLY (the stored filename is a hex
+//   token and source ids are uuids — chrome shows words, not identifiers);
+//   rejected rows show the server's reason verbatim (a refused extension is a
+//   STATED refusal, never a silent drop).
+// - No client-side pre-rejection: the accept attr is an affordance, the
+//   server's manifest is the verdict — a client allowlist would fork from
+//   core/ingest/connectors.py TEXT_SUFFIXES (checker/consumer split) and the
+//   endpoint already refuses per-file loudly.
+function UploadSection({ project }: { project: string }) {
+  const upload = useUploadDocuments(project);
+  const [picked, setPicked] = useState<File[]>([]);
+  const attemptKey = useRef(crypto.randomUUID());
+
+  function pick(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    setPicked(Array.from(files));
+    attemptKey.current = crypto.randomUUID();
+    upload.reset();
+  }
+
+  function submit() {
+    if (picked.length === 0 || upload.isPending) return;
+    upload.mutate(
+      { files: picked, idempotencyKey: attemptKey.current },
+      { onSuccess: () => setPicked([]) },
+    );
+  }
+
+  const manifest = upload.data?.files ?? null;
+  const accepted = manifest?.filter((f) => f.status === "accepted") ?? [];
+  const rejected = manifest?.filter((f) => f.status === "rejected") ?? [];
+
+  return (
+    <section className="import__section">
+      <h2>上傳檔案</h2>
+      <p className="runs__muted">
+        直接把 <code>.txt</code>/<code>.md</code> 檔上傳到伺服器的專案語料夾——上傳成功後,
+        對應的來源會自動出現在上面的清單裡。
+      </p>
+      <div
+        className="import__dropzone"
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => {
+          e.preventDefault();
+          pick(e.dataTransfer.files);
+        }}
+      >
+        <span>把檔案拖進來,或</span>
+        <label className="import__filepick">
+          選擇檔案
+          <input
+            type="file"
+            multiple
+            accept=".txt,.md"
+            onChange={(e) => {
+              pick(e.target.files);
+              e.target.value = "";
+            }}
+          />
+        </label>
+      </div>
+      {picked.length > 0 && (
+        <ul className="import__picked">
+          {picked.map((f, i) => (
+            <li key={`${i}:${f.name}`}>{f.name}</li>
+          ))}
+        </ul>
+      )}
+      <button type="button" onClick={submit} disabled={picked.length === 0 || upload.isPending}>
+        {upload.isPending ? "上傳中…" : "上傳"}
+      </button>
+      {upload.isError && (
+        <p className="npf__error">
+          上傳失敗:{upload.error instanceof Error ? upload.error.message : "unknown error"}
+        </p>
+      )}
+      {manifest && (
+        <div className="import__manifest">
+          <p className="import__manifestsummary">
+            接受 {accepted.length} 檔 · 退回 {rejected.length} 檔
+          </p>
+          <ul className="import__manifestrows">
+            {manifest.map((f, i) =>
+              f.status === "accepted" ? (
+                <li key={`${i}:${f.original_filename}`}>
+                  <span className="runs__badge runs__badge--ok">已接受</span>{" "}
+                  <span title={f.document_uri}>{f.original_filename}</span>
+                </li>
+              ) : (
+                <li key={`${i}:${f.original_filename}`}>
+                  <span className="runs__badge runs__badge--bad">已退回</span>{" "}
+                  <span>{f.original_filename}</span>
+                  <span className="import__reason">{f.reason}</span>
+                </li>
+              ),
+            )}
+          </ul>
+        </div>
       )}
     </section>
   );

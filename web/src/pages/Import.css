@@ -68,6 +68,69 @@
   padding: 1px 6px;
 }
 
+.import__dropzone {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  color: var(--text);
+  width: 100%;
+}
+
+.import__filepick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.import__picked {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.import__manifest {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.import__manifestsummary {
+  margin: 0;
+  color: var(--text-h);
+}
+
+.import__manifestrows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.import__manifestrows li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  overflow-wrap: anywhere;
+}
+
+.import__reason {
+  font-size: 13px;
+  color: #c0392b;
+}
+
 @media (prefers-color-scheme: dark) {
   .import__line--error {
     color: #f87171;
