@@ -131,7 +131,7 @@ async def run_eval_task(
     project out of every future job via ``create_job_exclusive``. The caller
     re-runs — eval is idempotent (it just re-writes ``builds.eval``)."""
     from core.eval.golden import load_golden
-    from core.eval.idempotency import eval_inputs_fingerprint
+    from core.eval.idempotency import read_and_fingerprint_eval_inputs
     from core.eval.inputs import eval_input_paths
     from core.eval.runner import models_needed, persist_build_eval, run_eval
     from core.mcp.policy import load_query_policy
@@ -185,23 +185,31 @@ async def run_eval_task(
             # and this dispatch, scoring the new bytes would return a report for inputs the
             # client never accepted — the idempotency key is scoped to the OLD fingerprint.
             # Re-fingerprint the live inputs and fail loud on a mismatch (a stated failure
-            # the client re-triggers). A job with NO pin (created before the pin existed)
-            # skips the check. This runs inside preflight so a mismatch terminalizes the
-            # job like any other deterministic refusal, never strands it.
+            # the client re-triggers). This runs inside preflight so a mismatch terminalizes
+            # the job like any other deterministic refusal, never strands it.
             async with engine.connect() as conn:
                 pinned_fingerprint = await get_eval_inputs_fingerprint(conn, eval_job)
+            golden_path, policy_path = eval_input_paths(root)
             if pinned_fingerprint is not None:
-                live_fingerprint = eval_inputs_fingerprint(
-                    Path(get_settings().projects_dir), project
+                # Read the inputs ONCE and both fingerprint AND parse THOSE bytes: a
+                # separate re-read for parsing would reopen a TOCTOU — an edit landing
+                # between the fingerprint and the parse would be scored under the stale
+                # pinned fingerprint, defeating the guard. (An unpinned job — created before
+                # the pin existed — has no drift guard, so nothing to keep consistent: it
+                # reads+parses normally in the else.)
+                live_fingerprint, golden_bytes, policy_bytes = read_and_fingerprint_eval_inputs(
+                    root
                 )
                 if live_fingerprint != pinned_fingerprint:
                     raise ValueError(
                         "eval inputs (golden set / query policy) changed since this eval "
                         "was accepted; re-trigger it so the report scores the intended inputs"
                     )
-            golden_path, policy_path = eval_input_paths(root)
-            golden = load_golden(golden_path)
-            policy = load_query_policy(policy_path)
+                golden = load_golden(golden_path, text=golden_bytes.decode("utf-8"))
+                policy = load_query_policy(policy_path, text=policy_bytes.decode("utf-8"))
+            else:
+                golden = load_golden(golden_path)
+                policy = load_query_policy(policy_path)
             needs_embedder, needs_llm = models_needed(golden, policy)
             embedder = ctx["embedder"] if needs_embedder else None
             llm = ctx["llm"] if needs_llm else None

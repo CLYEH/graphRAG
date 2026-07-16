@@ -57,13 +57,18 @@ def _schema_text() -> str:
     )
 
 
-def load_golden(path: Path) -> GoldenSet:
+def load_golden(path: Path, *, text: str | None = None) -> GoldenSet:
     """Load + validate one project's ``eval/golden.yaml``.
 
     The frozen schema is the gate (DR-002): schema violations raise
-    :class:`GoldenError` naming where; only then are typed cases built."""
+    :class:`GoldenError` naming where; only then are typed cases built.
+
+    ``text`` supplies the file's ALREADY-READ content (``path`` is used only for
+    error messages then): the eval worker reads golden + policy ONCE for its drift
+    fingerprint and parses THAT text here, so the check and the scored bytes can't
+    diverge (a TOCTOU re-read). Omit it and the file is read from ``path`` as usual."""
     try:
-        raw = yaml.safe_load(path.read_text("utf-8"))
+        raw = yaml.safe_load(path.read_text("utf-8") if text is None else text)
     except FileNotFoundError as exc:
         raise GoldenError(f"golden set not found: {path}") from exc
     except yaml.YAMLError as exc:

@@ -104,7 +104,7 @@ class QueryPolicy:
         )
 
 
-def load_query_policy(config_path: Path) -> QueryPolicy:
+def load_query_policy(config_path: Path, *, text: str | None = None) -> QueryPolicy:
     """Load + validate ``query_policy`` from a project's ``config.yaml``.
 
     The file loader owns only the file/YAML/presence concerns; validation and
@@ -113,9 +113,14 @@ def load_query_policy(config_path: Path) -> QueryPolicy:
     owner decision 2026-07-10: registry is the Console-side policy source,
     strict, no invented defaults; the file stays the MCP/CLI source).
     Every failure is a :class:`PolicyError` naming what broke.
+
+    ``text`` supplies the file's ALREADY-READ content (``config_path`` is used only
+    for error messages then): the eval worker reads golden + policy ONCE for its drift
+    fingerprint and parses THAT text here, so the check and the scored bytes can't
+    diverge (a TOCTOU re-read). Omit it and the file is read from ``config_path``.
     """
     try:
-        raw = yaml.safe_load(config_path.read_text("utf-8"))
+        raw = yaml.safe_load(config_path.read_text("utf-8") if text is None else text)
     except FileNotFoundError as exc:
         raise PolicyError(f"project config not found: {config_path}") from exc
     except yaml.YAMLError as exc:

@@ -528,14 +528,18 @@ async def test_run_eval_task_fails_loud_when_eval_inputs_drifted(
     monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
     monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _pinned)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
-    # the LIVE inputs now fingerprint DIFFERENTLY than what was accepted (an edit)
+    # a SINGLE read of the live inputs whose joint fingerprint DIFFERS from what was
+    # accepted (an edit since the 202). The one-read seam (triage 35) is also what closes
+    # the TOCTOU: the same bytes it fingerprints are the bytes the parse would score.
     monkeypatch.setattr(
-        "core.eval.idempotency.eval_inputs_fingerprint", lambda pd, proj: "live-DIFFERENT"
+        "core.eval.idempotency.read_and_fingerprint_eval_inputs",
+        lambda root: ("live-DIFFERENT", b"golden", b"policy"),
     )
     # mocked so that WITHOUT the drift guard preflight passes and run_eval fires on the
-    # drifted inputs (the revert path this probe guards against)
-    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
-    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    # drifted inputs (the revert path this probe guards against); **kw tolerates the
+    # worker passing the already-read text= on the pinned path.
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path, **kw: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path, **kw: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
 
@@ -544,6 +548,68 @@ async def test_run_eval_task_fails_loud_when_eval_inputs_drifted(
     assert result == "failed"  # terminalized, never scored the drifted inputs
     assert ran["n"] == 0  # run_eval never called
     assert statuses == ["failed"]  # failed at preflight, BEFORE the 'running' mark
+
+
+async def test_run_eval_task_pinned_eval_parses_the_fingerprinted_bytes_not_a_reread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 35): the drift guard is only sound if the bytes it FINGERPRINTS are the bytes
+    # it PARSES. A pinned eval reads golden+policy ONCE (read_and_fingerprint_eval_inputs) and
+    # must hand THOSE bytes to the loaders — if load_golden/load_query_policy re-opened the paths
+    # instead, an edit landing between the fingerprint and the parse would be scored under the
+    # matched-but-now-stale fingerprint, reopening the very TOCTOU the guard closes. Proof: on a
+    # MATCHING fingerprint (no drift) the loaders receive text= equal to the single read's bytes.
+    # Revert-probe: drop the text= plumbing and the loaders get text=None (a path re-read), which
+    # this asserts against.
+    seen: dict[str, str | None] = {}
+
+    async def _noop_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        pass
+
+    async def _pinned_matches(conn: Any, job_id: uuid.UUID) -> str:
+        return "MATCH"  # equals the live fingerprint below → guard passes, parse proceeds
+
+    async def _never_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        return "REPORT"
+
+    async def _persist(conn: Any, report: Any) -> None:
+        pass
+
+    def _capture_golden(path: Any, *, text: str | None = None) -> str:
+        seen["golden"] = text  # the loader must be handed the fingerprinted bytes, not re-read
+        return "GOLDEN"
+
+    def _capture_policy(path: Any, *, text: str | None = None) -> str:
+        seen["policy"] = text
+        return "POLICY"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _noop_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
+    monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _pinned_matches)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    # the ONE read: fingerprint MATCHES the pin (no drift), and carries the exact bytes the
+    # loaders must parse — the same in-memory bytes that were fingerprinted, never a path re-read.
+    monkeypatch.setattr(
+        "core.eval.idempotency.read_and_fingerprint_eval_inputs",
+        lambda root: ("MATCH", b"golden-YAML", b"policy-YAML"),
+    )
+    monkeypatch.setattr("core.eval.golden.load_golden", _capture_golden)
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", _capture_policy)
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "done"
+    # the loaders parsed the SINGLE read's bytes (decoded), never re-opened the path (text=None)
+    assert seen == {"golden": "golden-YAML", "policy": "policy-YAML"}
 
 
 async def test_run_eval_task_rejects_project_name_escaping_projects_dir(

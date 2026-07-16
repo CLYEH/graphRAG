@@ -13,7 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from core.eval.idempotency import eval_inputs_fingerprint
+from core.eval.idempotency import (
+    eval_inputs_fingerprint,
+    read_and_fingerprint_eval_inputs,
+)
 
 
 def _project(root: Path, *, golden: str = "cases: []", config: str = "policy: {}") -> None:
@@ -107,3 +110,32 @@ def test_unsafe_project_name_folds_to_a_stable_sentinel(tmp_path: Path) -> None:
     the same way). Distinct from any real project's hash, and stable across calls."""
     assert eval_inputs_fingerprint(tmp_path, "..") == "unsafe-project"
     assert eval_inputs_fingerprint(tmp_path, "..") == eval_inputs_fingerprint(tmp_path, "..")
+
+
+def test_worker_read_matches_the_accept_time_fingerprint(tmp_path: Path) -> None:
+    """The drift guard compares the PIN (built by ``eval_inputs_fingerprint`` at accept
+    time) against the worker's LIVE read (``read_and_fingerprint_eval_inputs`` at
+    dispatch). If the two hashing paths disagreed on IDENTICAL bytes, EVERY pinned eval
+    would false-fail as 'drifted' — the load-bearing parity. Also pins that the returned
+    bytes are the files' raw bytes: those exact bytes are what the worker then PARSES, so
+    the fingerprint and the score can't diverge (the TOCTOU triage 35 closes)."""
+    _project(tmp_path, golden="cases: []", config="policy: {top_k: 5}")
+    accept = eval_inputs_fingerprint(tmp_path, "demo")
+    root = tmp_path / "demo"
+    live, golden_bytes, policy_bytes = read_and_fingerprint_eval_inputs(root)
+    assert live == accept  # same content → same digest → a pinned eval reads as unchanged
+    assert golden_bytes == (root / "eval" / "golden.yaml").read_bytes()
+    assert policy_bytes == (root / "config.yaml").read_bytes()
+
+
+def test_worker_read_raises_loud_on_a_missing_input(tmp_path: Path) -> None:
+    """The accept-time fingerprint is TOLERANT (a missing/unreadable input folds to empty
+    bytes / a sentinel) because it runs in the API BEFORE any job exists — raising would
+    500 the request and create no watchable job. The worker read is the opposite: it runs
+    inside the preflight that HAS a job to terminalize, so a missing input raises OSError
+    and the preflight fails the job LOUD, never fingerprinting-then-parsing empty bytes."""
+    root = tmp_path / "demo"
+    (root / "eval").mkdir(parents=True)
+    (root / "config.yaml").write_text("policy: {}", encoding="utf-8")  # golden.yaml missing
+    with pytest.raises(OSError):
+        read_and_fingerprint_eval_inputs(root)
