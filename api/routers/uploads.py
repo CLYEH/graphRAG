@@ -33,7 +33,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile
 
-from api.deps import Conn, response_meta
+from api.deps import ConnProvider, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
@@ -65,7 +65,7 @@ _METADATA_ABSENT: Any = object()
 @router.post("/projects/{project}/uploads")
 async def upload_documents_endpoint(
     request: Request,
-    conn: Conn,
+    open_conn: ConnProvider,
     project: str,
     idempotency_key: _IdempotencyKey = None,
 ) -> JSONResponse:
@@ -220,27 +220,33 @@ async def upload_documents_endpoint(
         result = {"source_id": source_id, "files": manifest}
         return 201, success(result, **response_meta(request))
 
-    if idempotency_key:
-        status, resp = await run_idempotent(
-            conn,
-            key=idempotency_key,
-            project=project,
-            endpoint="uploadDocuments",
-            # Hash the CANONICAL request (submitted names + file bytes + parsed
-            # metadata), NOT the raw multipart body: encoders pick a fresh random
-            # boundary each time, so a faithful retry of the same files/metadata under
-            # the same Idempotency-Key would otherwise hash differently and 409
-            # IDEMPOTENCY_CONFLICT instead of replaying the first 201.
-            req_hash=request_hash(
-                "POST",
-                request.url.path,
-                await _canonical_upload_fingerprint(files, metadata_by_name),
-            ),
-            produce=produce,
-        )
-        return JSONResponse(status_code=status, content=resp)
-    status, resp = await produce()
-    return JSONResponse(status_code=status, content=jsonable_encoder(resp))
+    # DB checkout is deferred to HERE — after every header/body-shape gate (415,
+    # 413, path-safety) and the full multipart parse — so a request refused by those
+    # gates, or one still streaming a large body, never holds a pool connection (and
+    # a DB outage can't turn a header-only refusal into a 500). `produce` closes over
+    # `conn`, which is bound by this block before `produce()` is ever called.
+    async with open_conn() as conn:
+        if idempotency_key:
+            status, resp = await run_idempotent(
+                conn,
+                key=idempotency_key,
+                project=project,
+                endpoint="uploadDocuments",
+                # Hash the CANONICAL request (submitted names + file bytes + parsed
+                # metadata), NOT the raw multipart body: encoders pick a fresh random
+                # boundary each time, so a faithful retry of the same files/metadata under
+                # the same Idempotency-Key would otherwise hash differently and 409
+                # IDEMPOTENCY_CONFLICT instead of replaying the first 201.
+                req_hash=request_hash(
+                    "POST",
+                    request.url.path,
+                    await _canonical_upload_fingerprint(files, metadata_by_name),
+                ),
+                produce=produce,
+            )
+            return JSONResponse(status_code=status, content=resp)
+        status, resp = await produce()
+        return JSONResponse(status_code=status, content=jsonable_encoder(resp))
 
 
 def _reject_unsafe_corpus_path(settings: Any, project: str) -> None:

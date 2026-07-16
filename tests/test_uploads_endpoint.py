@@ -17,7 +17,8 @@ from __future__ import annotations
 import io
 import json
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,7 +27,7 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import UploadFile
 
 from api.app import create_app
-from api.deps import db_conn
+from api.deps import db_conn_provider
 from api.routers.uploads import _canonical_upload_fingerprint
 
 pytestmark = pytest.mark.contract
@@ -34,14 +35,29 @@ pytestmark = pytest.mark.contract
 _URL = "/projects/demo/uploads"
 
 
+def _fake_conn_provider(
+    on_open: Callable[[], None] | None = None,
+) -> Callable[[], Callable[[], AbstractAsyncContextManager[object]]]:
+    """A db_conn_provider override: a lazy handle whose opened context manager yields
+    a throwaway conn (the DB calls are stubbed). ``on_open`` fires when the connection
+    is actually opened, so a test can assert the checkout is deferred past preflight."""
+
+    @asynccontextmanager
+    async def _open() -> AsyncIterator[object]:
+        if on_open is not None:
+            on_open()
+        yield object()
+
+    def _provider() -> Callable[[], AbstractAsyncContextManager[object]]:
+        return _open
+
+    return _provider
+
+
 @pytest.fixture()
 def client() -> Iterator[TestClient]:
     app = create_app()
-
-    async def _conn() -> AsyncIterator[object]:
-        yield object()
-
-    app.dependency_overrides[db_conn] = _conn
+    app.dependency_overrides[db_conn_provider] = _fake_conn_provider()
     with TestClient(app) as c:
         yield c
 
@@ -106,6 +122,36 @@ def test_oversized_total_is_413(
     error = resp.json()["error"]
     assert error["code"] == "VALIDATION_ERROR"
     assert "limit" in error["message"] and error["request_id"]
+
+
+def test_db_checkout_is_deferred_until_after_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY (triage 30): the DB connection is a LAZY handle (db_conn_provider), opened
+    # only INSIDE the handler after the header/body-shape gates — so a request refused
+    # by those gates never checks out a pool slot (and a DB outage can't turn a
+    # header-only 415 into a 500, nor can slow large-body streams exhaust the pool
+    # while doing no DB work). Assert the connection opens EXACTLY on the DB-work path:
+    # never for a 415, and exactly once for an accepted upload. Revert-probe: widen the
+    # `async with open_conn()` to wrap the preflight (or restore an eager `conn: Conn`)
+    # and the 415 opens a connection too, flipping `opened` to non-zero.
+    _project(monkeypatch)
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    opened = {"n": 0}
+    app = create_app()
+    app.dependency_overrides[db_conn_provider] = _fake_conn_provider(
+        on_open=lambda: opened.__setitem__("n", opened["n"] + 1)
+    )
+    with TestClient(app) as c:
+        # a 415 (non-multipart) is refused from the content-type header alone
+        refused = c.post(_URL, json={"files": []})
+        assert refused.status_code == 415
+        assert opened["n"] == 0  # the DB was never touched for a header-only refusal
+        # an accepted upload DOES open the connection — exactly once, on the DB-work path
+        ok = c.post(_URL, files=[("files", ("a.txt", b"hello", "text/plain"))])
+        assert ok.status_code == 201
+        assert opened["n"] == 1
 
 
 def test_no_files_is_400(
