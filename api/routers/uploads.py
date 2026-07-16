@@ -51,6 +51,14 @@ _IdempotencyKey = Annotated[str | None, Header(alias="Idempotency-Key", max_leng
 #: The connector name stamped into every uploaded document's ``system`` namespace.
 _UPLOAD_CONNECTOR = "upload"
 
+#: Sentinel distinguishing a filename ABSENT from the metadata map (the file carried
+#: no per-file metadata → empty server-stamped envelope) from a filename PRESENT with
+#: an explicit ``null`` (or any non-object) value. The contract types each metadata
+#: value as a ``DocumentMetadataInput`` object, so a present-but-null entry is a STATED
+#: per-file rejection — never silently rewritten to an empty envelope (the same null
+#: strictness DocumentMetadataInput enforces on its context/governance sub-objects).
+_METADATA_ABSENT: Any = object()
+
 
 @router.post("/projects/{project}/uploads")
 async def upload_documents_endpoint(
@@ -261,7 +269,7 @@ async def _process_files(
         original = part.filename or ""
         content = await part.read()
         reason, parsed = _validate_file(
-            original, content, metadata_by_name.get(original), schema, settings
+            original, content, metadata_by_name.get(original, _METADATA_ABSENT), schema, settings
         )
         if reason is not None:
             manifest.append({"original_filename": original, "status": "rejected", "reason": reason})
@@ -315,7 +323,12 @@ def _validate_file(
         return f"file exceeds the {settings.upload_max_file_bytes}-byte single-file limit", None
     parsed: DocumentMetadataInput | None = None
     context_to_check: dict[str, Any] = {}
-    if entry is not None:
+    # A filename PRESENT in the metadata map (even as an explicit null) is validated;
+    # only a truly ABSENT one (_METADATA_ABSENT) skips to the empty-context path. So
+    # `{"doc.txt": null}` / a non-object entry hits model_validate below and is a
+    # STATED per-file rejection, not a silent empty envelope (contract: each value is
+    # a DocumentMetadataInput object).
+    if entry is not _METADATA_ABSENT:
         try:
             parsed = DocumentMetadataInput.model_validate(entry)
         except ValidationError as exc:

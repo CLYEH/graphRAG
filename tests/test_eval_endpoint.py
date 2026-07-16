@@ -114,3 +114,32 @@ def test_eval_unknown_project_is_404(client: TestClient, monkeypatch: pytest.Mon
     monkeypatch.setattr("api.routers.builds.create_job_exclusive", missing)
     resp = client.post(_URL)
     assert resp.status_code == 404
+
+
+def test_eval_folds_the_request_body_into_the_idempotency_hash(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY: the endpoint is bodyless, but FastAPI still accepts a body and the sibling
+    # bodyless endpoint (rollback) folds `await request.body()` into its idempotency
+    # hash. If eval hashed only the eval-input fingerprint, a reused Idempotency-Key
+    # with a DIFFERENT body would replay the stored job instead of raising the §27
+    # IDEMPOTENCY_CONFLICT, and the stray body would be silently ignored. So the actual
+    # request body MUST change the request hash (with the fingerprint held constant
+    # here, the body is the only thing varying — a revert-probe on the old fingerprint-
+    # only hash, under which all three hashes would collide).
+    monkeypatch.setattr("api.routers.builds.eval_inputs_fingerprint", lambda *a: "FP")
+    seen: list[str] = []
+
+    async def fake_run_idempotent(
+        conn: Any, *, req_hash: str, **kw: Any
+    ) -> tuple[int, dict[str, Any]]:
+        seen.append(req_hash)
+        return 202, {"data": {"status": "queued", "job_id": str(uuid.uuid4())}}
+
+    monkeypatch.setattr("api.routers.builds.run_idempotent", fake_run_idempotent)
+    headers = {"Idempotency-Key": "k1"}
+    client.post(_URL, headers=headers, content=b"one")
+    client.post(_URL, headers=headers, content=b"two")
+    client.post(_URL, headers=headers, content=b"one")
+    assert seen[0] != seen[1]  # a different body ⇒ a different hash (no stale replay)
+    assert seen[0] == seen[2]  # a genuine duplicate (same body) still hashes the same

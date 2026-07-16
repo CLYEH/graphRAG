@@ -234,6 +234,33 @@ def test_orphan_metadata_key_is_400(
     assert "ghost.txt" in resp.json()["error"]["message"]
 
 
+def test_null_per_file_metadata_entry_rejects_that_file_not_the_batch(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY: a metadata map value of explicit null ({"nulled.txt": null}) is PRESENT-but-
+    # null, NOT absent — the contract types each value as a DocumentMetadataInput object.
+    # It must be a STATED per-file rejection, never silently rewritten to an empty
+    # server-stamped envelope (the same null strictness DocumentMetadataInput enforces on
+    # its context/governance sub-objects). A file with NO entry at all stays accepted —
+    # absent ≠ null is exactly the distinction, so a truthiness/`.get()` collapse regresses.
+    _project(monkeypatch)  # empty schema: an absent entry is accepted, isolating the null case
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    resp = client.post(
+        _URL,
+        files=[
+            ("files", ("nulled.txt", b"x", "text/plain")),
+            ("files", ("absent.txt", b"y", "text/plain")),  # no metadata entry at all
+        ],
+        data={"metadata": json.dumps({"nulled.txt": None})},
+    )
+    assert resp.status_code == 201  # per-file reject, not a whole-request failure
+    rows = {r["original_filename"]: r for r in resp.json()["data"]["files"]}
+    assert rows["nulled.txt"]["status"] == "rejected"
+    assert "metadata is invalid" in rows["nulled.txt"]["reason"]
+    assert rows["absent.txt"]["status"] == "accepted"  # absent stays accepted
+
+
 def test_valid_metadata_is_stamped_into_the_envelope(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:

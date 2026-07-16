@@ -297,12 +297,20 @@ async def run_build_eval_endpoint(
             project=project,
             endpoint="runBuildEval",
             # per (build, golden-set fingerprint): the build_id is in request.url.path;
-            # the golden set + query policy content is the "body" so a changed golden
-            # set flips the hash (no stale replay). The real request body is empty.
+            # the golden set + query policy content is folded as the "body" so a changed
+            # golden set flips the hash (no stale replay). The ACTUAL request body is
+            # folded too — the endpoint is bodyless, but FastAPI still accepts one, and
+            # the sibling bodyless endpoints (rollback) hash await request.body(); a
+            # stray/different body on a reused key must be a §27 conflict, not a silent
+            # replay. The fingerprint (a hex digest / sentinel, never containing \0)
+            # leads, then a \0 delimiter, then the raw body — an unambiguous split, so
+            # no (fingerprint, body) pair can alias another.
             req_hash=request_hash(
                 "POST",
                 request.url.path,
-                eval_inputs_fingerprint(Path(get_settings().projects_dir), project).encode(),
+                eval_inputs_fingerprint(Path(get_settings().projects_dir), project).encode()
+                + b"\0"
+                + await request.body(),
             ),
             produce=produce,
         )
