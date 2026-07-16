@@ -126,7 +126,22 @@ async def upload_documents_endpoint(
             details={"duplicate_filenames": duplicates},
         )
 
-    metadata_by_name = _parse_metadata_field(form.get("metadata"), set(submitted_names))
+    # `metadata` is a SINGLE JSON object (contract: object, not array), unlike the
+    # repeated `files` parts. form.get() would silently keep just one of several
+    # `metadata` parts and drop the rest, so a file's supplied envelope could vanish
+    # while the file is still accepted — exactly the no-silent-drop violation this
+    # endpoint refuses. getlist surfaces the count so >1 is a stated whole-request 400.
+    metadata_parts = form.getlist("metadata")
+    if len(metadata_parts) > 1:
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            f"the 'metadata' field must appear at most once, but {len(metadata_parts)} "
+            "parts were sent — it is a single JSON object keyed by submitted filename, "
+            "so repeated parts would silently drop all but one",
+            details={"metadata_part_count": len(metadata_parts)},
+        )
+    raw_metadata = metadata_parts[0] if metadata_parts else None
+    metadata_by_name = _parse_metadata_field(raw_metadata, set(submitted_names))
 
     async def produce() -> tuple[int, dict[str, Any]]:
         # Project existence + config are read INSIDE the idempotent region so a

@@ -234,6 +234,51 @@ def test_orphan_metadata_key_is_400(
     assert "ghost.txt" in resp.json()["error"]["message"]
 
 
+def test_duplicate_metadata_parts_is_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY: the contract types `metadata` as a SINGLE object (not an array like `files`),
+    # so two `metadata` parts is malformed. form.get() would silently keep one and drop
+    # the rest — a file could then be accepted with an empty envelope because its supplied
+    # metadata sat in the ignored part, violating the endpoint's no-silent-drop capture
+    # guarantee. It must be a STATED whole-request 400, never a silent one-of-N pick.
+    # (httpx `data=` can't express a repeated key, so the multipart body is built raw.)
+    _project(monkeypatch)
+    _settings(monkeypatch, tmp_path)
+    boundary = "----graphragdupmeta"
+    body = (
+        "\r\n".join(
+            [
+                f"--{boundary}",
+                'Content-Disposition: form-data; name="files"; filename="a.txt"',
+                "Content-Type: text/plain",
+                "",
+                "body",
+                f"--{boundary}",
+                'Content-Disposition: form-data; name="metadata"',
+                "",
+                json.dumps({"a.txt": {"context": {"title": "one"}}}),
+                f"--{boundary}",
+                'Content-Disposition: form-data; name="metadata"',
+                "",
+                json.dumps({"a.txt": {"context": {"title": "two"}}}),
+                f"--{boundary}--",
+                "",
+            ]
+        )
+    ).encode()
+    resp = client.post(
+        _URL,
+        content=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    assert resp.status_code == 400  # whole-request refusal, before any per-file work
+    error = resp.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert "at most once" in error["message"]
+    assert error["details"]["metadata_part_count"] == 2
+
+
 def test_null_per_file_metadata_entry_rejects_that_file_not_the_batch(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
