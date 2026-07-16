@@ -26,6 +26,7 @@ from typing import Any
 import jsonschema
 import yaml
 
+from core.metadata.schema import MetadataExposure, load_metadata_exposure
 from core.query.policy import TextToCypher, TextToSql
 
 #: Where the frozen schema can live: a source checkout keeps contracts/ at
@@ -103,7 +104,7 @@ class QueryPolicy:
         )
 
 
-def load_query_policy(config_path: Path) -> QueryPolicy:
+def load_query_policy(config_path: Path, *, text: str | None = None) -> QueryPolicy:
     """Load + validate ``query_policy`` from a project's ``config.yaml``.
 
     The file loader owns only the file/YAML/presence concerns; validation and
@@ -112,9 +113,14 @@ def load_query_policy(config_path: Path) -> QueryPolicy:
     owner decision 2026-07-10: registry is the Console-side policy source,
     strict, no invented defaults; the file stays the MCP/CLI source).
     Every failure is a :class:`PolicyError` naming what broke.
+
+    ``text`` supplies the file's ALREADY-READ content (``config_path`` is used only
+    for error messages then): the eval worker reads golden + policy ONCE for its drift
+    fingerprint and parses THAT text here, so the check and the scored bytes can't
+    diverge (a TOCTOU re-read). Omit it and the file is read from ``config_path``.
     """
     try:
-        raw = yaml.safe_load(config_path.read_text("utf-8"))
+        raw = yaml.safe_load(config_path.read_text("utf-8") if text is None else text)
     except FileNotFoundError as exc:
         raise PolicyError(f"project config not found: {config_path}") from exc
     except yaml.YAMLError as exc:
@@ -122,6 +128,24 @@ def load_query_policy(config_path: Path) -> QueryPolicy:
     if not isinstance(raw, dict) or "query_policy" not in raw:
         raise PolicyError(f"project config {config_path} has no query_policy block")
     return query_policy_from_mapping(raw["query_policy"])
+
+
+def load_metadata_exposure_from_file(config_path: Path) -> MetadataExposure:
+    """Load the project's ``metadata_exposure`` allowlist from ``config.yaml``
+    (the MCP/CLI source, dual to the Console's ``projects.config`` — same split
+    as :func:`load_query_policy`). An absent block is the FAIL-CLOSED empty
+    allowlist (DR-010 rule 7 — nothing exposed by default); a malformed block
+    fails LOUD at server startup (:class:`~core.metadata.schema.MetadataConfigError`),
+    never half-armed mid-query."""
+    try:
+        raw = yaml.safe_load(config_path.read_text("utf-8"))
+    except FileNotFoundError:
+        return MetadataExposure(fields=())
+    except yaml.YAMLError as exc:
+        raise PolicyError(f"project config is not valid YAML: {exc}") from exc
+    if not isinstance(raw, dict):
+        return MetadataExposure(fields=())
+    return load_metadata_exposure(raw)
 
 
 def query_policy_from_mapping(document: Any) -> QueryPolicy:

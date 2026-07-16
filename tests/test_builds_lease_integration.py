@@ -355,17 +355,51 @@ async def test_find_reapable_jobs_returns_only_crashed_executions(migrated: None
         async with engine.connect() as conn:
             reapable = await find_reapable_jobs(conn)
 
-        ids = {job_id for job_id, _, _ in reapable}
+        ids = {job_id for job_id, *_ in reapable}
         assert crashed in ids  # expired held lease + running → reaped
         assert early_crash in ids  # expired held lease + still queued (pre-running crash) → reaped
         assert live not in ids  # heartbeating (expiry in the future)
         assert released not in ids  # never acquired a lease
         assert terminal not in ids  # terminal status, even with an expired lease
-        # returns (id, project, stale expiry) — the expiry is the recovery-generation
+        # returns (id, project, kind, build_id, stale expiry) — kind/build_id let the
+        # reaper re-dispatch onto the right task; the expiry is the recovery-generation
         # marker the reaper derives its dedup id from
-        row = next(r for r in reapable if r[0] == crashed)
-        assert row[1] == project
-        assert row[2] is not None
+        _id, row_project, row_kind, row_build_id, row_expiry = next(
+            r for r in reapable if r[0] == crashed
+        )
+        assert row_project == project
+        assert row_kind == "build"  # a build job → BUILD_TASK on recovery
+        assert row_build_id is None  # build/ingest jobs carry no build_id on the row
+        assert row_expiry is not None
+    finally:
+        await _cleanup(engine, project)
+
+
+async def test_find_reapable_jobs_reads_eval_kind_and_build_id(migrated: None) -> None:
+    # WHY: the reaper re-dispatches an eval onto EVAL_TASK (with its target build_id),
+    # never as a build. That branch is only correct if the SQL projection actually
+    # reads kind + build_id back from the crashed eval row — so pin it over real
+    # Postgres, not just the mocked component branch.
+    engine = _engine()
+    project = _proj()
+    target_build = uuid.uuid4()
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+            eval_job = (await create_job(conn, project, "eval", build_id=target_build)).id
+        async with engine.begin() as conn:
+            await acquire_lease(conn, eval_job, "dead", 60.0)
+        await _expire_lease(engine, eval_job, status="running")
+
+        async with engine.connect() as conn:
+            reapable = await find_reapable_jobs(conn)
+
+        row = next(r for r in reapable if r[0] == eval_job)
+        _id, row_project, row_kind, row_build_id, row_expiry = row
+        assert row_project == project
+        assert row_kind == "eval"  # → EVAL_TASK on recovery, not BUILD_TASK
+        assert row_build_id == target_build  # the eval's target, carried to re-dispatch
+        assert row_expiry is not None
     finally:
         await _cleanup(engine, project)
 
@@ -495,4 +529,54 @@ async def test_a_crashed_holders_expired_lease_does_not_block_a_new_dispatch(
         assert result is not None and result.status == "ready"  # reclaimed and ran
         assert await _lease_owner(engine, job_id) is None  # released on completion
     finally:
+        await _cleanup(engine, project)
+
+
+async def test_timeout_cancellation_mid_build_leaves_the_lease_held(migrated: None) -> None:
+    # WHY (triage 31): arq's job_timeout cancels a mid-run dispatch with
+    # asyncio.CancelledError AFTER run_build has marked the row 'running'. Over REAL
+    # Postgres + a REAL asyncio cancellation (not a synthetic raise), the lease must be
+    # left HELD — so the row is 'running'+held+lapsing, exactly find_reapable_jobs's
+    # reclaimable set — never 'running'+unleased, which NO sweep recovers and which would
+    # block the project via create_job_exclusive until manual DB repair.
+    engine = _engine()
+    project = _proj()
+    parked = asyncio.Event()
+    hang = asyncio.Event()  # never set → the stage parks until the cancellation hits it
+    try:
+        job_id = await _make_job(engine, project)
+
+        async def _parking_ingest(
+            conn: AsyncConnection, project: str, build_id: uuid.UUID
+        ) -> StageResult:
+            parked.set()  # the lease is held and run_build has marked the job 'running'
+            await hang.wait()
+            return StageResult()
+
+        task = asyncio.create_task(
+            run_build_leased(
+                engine,
+                project,
+                job_id,
+                _noop_stages(ingest=_parking_ingest),
+                owner="A",
+                step_failure_ratio=0.0,
+            )
+        )
+        await parked.wait()
+        # precondition: 'running' + held BEFORE the timeout fires
+        assert (await _job_row(engine, job_id)).status == "running"
+        assert await _lease_owner(engine, job_id) == "A"
+
+        # the job_timeout fires: cancel the dispatch mid-'running' (never swallowed)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # the lease was NOT released — 'running' + STILL held, so it lapses into the
+        # reaper's reclaimable set instead of stranding 'running'+unleased.
+        assert await _lease_owner(engine, job_id) == "A"
+        assert (await _job_row(engine, job_id)).status == "running"
+    finally:
+        hang.set()  # never leave the stage parked if an assert failed
         await _cleanup(engine, project)

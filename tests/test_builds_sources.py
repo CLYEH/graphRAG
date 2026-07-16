@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from core.builds.sources import SourceResolutionError, _local_path, resolve_source
-from core.registry.store import Source
+from core.registry.store import MANAGED_FILES_KEY, Source
 from core.stores.tables import STRUCTURED_MIME
 
 _NOW = datetime(2026, 1, 1)
@@ -43,6 +43,89 @@ def test_text_source_yields_a_payload_per_text_file(tmp_path: Path) -> None:
 
     assert {p.raw for p in payloads} == {"alpha", "# beta"}
     assert {p.mime for p in payloads} == {"text/plain", "text/markdown"}
+
+
+def test_managed_text_source_threads_envelopes_onto_payloads(tmp_path: Path) -> None:
+    """A managed text source (the reserved ``MANAGED_FILES_KEY`` present) routes each
+    stored file's DR-010 envelope onto its payload — the capture→persist path UXC1b
+    needs."""
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    payloads = list(
+        resolve_source(
+            _source(
+                tmp_path.as_uri(),
+                kind="text",
+                metadata={MANAGED_FILES_KEY: {"a.txt": {"context": {"title": "A"}}}},
+            )
+        )
+    )
+    assert [p.raw for p in payloads] == ["alpha"]
+    assert payloads[0].metadata == {"context": {"title": "A"}}
+
+
+def test_plain_text_source_with_free_form_files_key_scans_as_a_directory(
+    tmp_path: Path,
+) -> None:
+    """The managed marker is the RESERVED ``MANAGED_FILES_KEY``, NOT a bare ``files``
+    key. A non-upload text source's ``metadata`` is free-form (the sources API stores
+    it verbatim), so a top-level ``files`` key (e.g. ``{"files": {"count": 2}}``) is
+    legitimate PROJECT metadata and must still scan the directory — never be misread
+    as an upload manifest that tries to read a registered file named ``count``.
+    Revert-probe: key the managed stash on a bare ``files`` again and this scans zero
+    (or fails) instead of reading ``a.txt`` off disk."""
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    payloads = list(
+        resolve_source(_source(tmp_path.as_uri(), kind="text", metadata={"files": {"count": 2}}))
+    )
+    assert [p.raw for p in payloads] == ["alpha"]  # scanned the directory, ignored `files`
+    assert payloads[0].metadata == {"filename": "a.txt"}  # connector-derived fallback
+
+
+@pytest.mark.parametrize("bad_files", [[], None, "x", 5])
+def test_managed_text_source_rejects_a_non_object_files_value(
+    tmp_path: Path, bad_files: Any
+) -> None:
+    """A PRESENT ``MANAGED_FILES_KEY`` marks the source managed; a non-object value
+    (``[]``, ``null``, a string, a number — all storable in free-form source metadata)
+    is malformed and must fail LOUD. Returning None here would send resolve_source down
+    the unmanaged directory-scan path, ingesting unregistered orphan files. Presence
+    of the key, not the value's truthiness, is what distinguishes managed from plain."""
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    with pytest.raises(SourceResolutionError, match="non-object '__managed_files__'"):
+        list(
+            resolve_source(
+                _source(tmp_path.as_uri(), kind="text", metadata={MANAGED_FILES_KEY: bad_files})
+            )
+        )
+
+
+def test_text_source_without_a_files_key_scans_as_a_directory(tmp_path: Path) -> None:
+    """The COUNTERPART to the malformed-value rejection: an ABSENT files key is a
+    plain (non-upload) text source — scanned as a directory, not rejected. This pins
+    the present-vs-absent distinction so a future refactor can't collapse them."""
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    payloads = list(resolve_source(_source(tmp_path.as_uri(), kind="text", metadata={"other": 1})))
+    assert [p.raw for p in payloads] == ["alpha"]
+    assert payloads[0].metadata == {"filename": "a.txt"}  # connector-derived fallback
+
+
+def test_managed_text_source_rejects_a_malformed_files_entry(tmp_path: Path) -> None:
+    """A managed text source's ``metadata[MANAGED_FILES_KEY]`` maps each stored name to
+    its DR-010 envelope OBJECT. A non-object entry must fail LOUD: silently dropping it
+    (and, if every entry drops, leaving ``{}`` that the connector reads as a plain
+    directory) would scan and ingest UNREGISTERED orphan files the authoritative
+    managed list was supposed to exclude — a rejected/failed upload affecting a build."""
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    with pytest.raises(SourceResolutionError, match="non-object metadata entry"):
+        list(
+            resolve_source(
+                _source(
+                    tmp_path.as_uri(),
+                    kind="text",
+                    metadata={MANAGED_FILES_KEY: {"a.txt": "not-an-object"}},
+                )
+            )
+        )
 
 
 def test_structured_source_yields_a_payload_per_row(tmp_path: Path) -> None:

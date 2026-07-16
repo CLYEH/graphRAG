@@ -20,14 +20,14 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Annotated, Any
 
 from arq.connections import ArqRedis, RedisSettings, create_pool
 from fastapi import Depends, FastAPI, Request
 from neo4j import AsyncDriver
 from qdrant_client import AsyncQdrantClient
-from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from core.config import get_settings
 from core.llm.factory import chat_model, embedding_model
@@ -65,16 +65,51 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await engine.dispose()
 
 
+@asynccontextmanager
+async def _open_transaction(engine: AsyncEngine) -> AsyncIterator[AsyncConnection]:
+    """One transactional connection — commits on clean exit, rolls back (the
+    idempotency reservation included) on any exception. Shared by the eager
+    ``db_conn`` dependency and the lazy ``db_conn_provider`` handle so the two
+    acquire a connection with identical transaction semantics."""
+    async with engine.connect() as conn, conn.begin():
+        yield conn
+
+
 async def db_conn(request: Request) -> AsyncIterator[AsyncConnection]:
     """One transactional connection per request — commits on clean return,
     rolls back (reservation included) on any raised exception."""
-    engine = request.app.state.engine
-    async with engine.connect() as conn, conn.begin():
+    async with _open_transaction(request.app.state.engine) as conn:
         yield conn
 
 
 #: Handler signature sugar: ``conn: Conn``.
 Conn = Annotated[AsyncConnection, Depends(db_conn)]
+
+
+def db_conn_provider(
+    request: Request,
+) -> Callable[[], AbstractAsyncContextManager[AsyncConnection]]:
+    """A LAZY handle on a transactional connection — resolving the dependency does
+    no I/O and checks out no pool slot; the handler opens it with ``async with
+    open_conn() as conn`` only at the point it actually needs the DB. A request
+    rejected purely from headers/body shape (415/413), or one still streaming and
+    parsing a large multipart body, then never holds a pool connection while it does
+    no DB work — and a DB outage can't turn a header-only refusal into a 500. Same
+    shape as ``arq_redis_provider``: the connection is a cost of the DB-work path
+    only, never a precondition of the route. The opened block keeps ``db_conn``'s
+    commit-on-clean / rollback-on-error (reservation included) semantics via the
+    shared ``_open_transaction``."""
+
+    def _open() -> AbstractAsyncContextManager[AsyncConnection]:
+        return _open_transaction(request.app.state.engine)
+
+    return _open
+
+
+#: Handler signature sugar: ``open_conn: ConnProvider`` — ``async with open_conn() as conn``.
+ConnProvider = Annotated[
+    Callable[[], AbstractAsyncContextManager[AsyncConnection]], Depends(db_conn_provider)
+]
 
 
 async def arq_redis(request: Request) -> ArqRedis:

@@ -25,13 +25,16 @@ scheme is required rather than guessed.
 from __future__ import annotations
 
 import re
+import uuid
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, unquote_to_bytes, urlparse
 from urllib.request import url2pathname
 
 from core.ingest.connectors import DocumentPayload, read_csv_rows, read_text_documents
-from core.registry.store import Source
+from core.registry.store import MANAGED_FILES_KEY, Source
 
 #: Source kinds this task wires to a C2 connector. The ``sources`` table/API
 #: accept any kind string; a build over a kind absent from this tuple fails loud
@@ -239,6 +242,73 @@ def _local_path(source: Source) -> Path:
     return resolved
 
 
+def ensure_resolvable_file_uri(uri: str) -> None:
+    """Raise :class:`SourceResolutionError` unless ``uri`` is a canonical, resolvable
+    ``file://`` uri — the SAME rules :func:`resolve_source` applies to a managed source
+    at ingest (delegated to :func:`_local_path`, whose result is discarded here). The
+    upload endpoint calls this on the corpus uri it is about to register, so a project
+    name that IS a safe path component but whose ``as_uri()`` encodes to a form no build
+    can resolve — e.g. ``foo:bar`` → ``%3A`` (drive separator), ``foo|bar`` → ``|`` — is
+    rejected at capture, not accepted into a source every later build then fails to
+    resolve. The probe carries sentinel id/added_at (never surfaced: the caller catches
+    and re-raises its own error) since only the uri is under test."""
+    _local_path(
+        Source(
+            id=uuid.UUID(int=0),
+            project="",
+            kind="text",
+            uri=uri,
+            metadata={},
+            added_at=datetime.min,
+        )
+    )
+
+
+def _files_metadata(source: Source) -> dict[str, dict[str, Any]] | None:
+    """The per-file metadata envelopes an upload stashed on a managed text source
+    (``metadata[MANAGED_FILES_KEY]``, keyed by stored filename — see
+    :func:`core.registry.store.upsert_managed_source`), or None for a source with
+    no such stash (a non-upload text source, scanned as a plain directory).
+
+    The PRESENCE of the reserved ``MANAGED_FILES_KEY`` marks the source MANAGED (its
+    registered file list is authoritative — see
+    :func:`~core.ingest.connectors.read_text_documents`); its ABSENCE is a plain
+    (non-upload) text source, scanned as a directory. The key is a reserved,
+    server-owned dunder precisely so a NON-upload source's free-form ``metadata`` — the
+    sources API stores it verbatim — cannot masquerade as managed state: a plain source
+    with a top-level ``files`` key (e.g. ``{"files": {"count": 2}}``) is legitimate
+    project metadata and still scans its directory, never misread as an upload manifest.
+    The two are distinguished by key presence, NOT the value's truthiness: a present
+    ``MANAGED_FILES_KEY`` whose value is malformed — not a dict (``[]``, ``null``, a
+    string), or a dict with a non-object entry — is rejected LOUD. Returning None for a
+    malformed value would send ``resolve_source`` down the unmanaged directory-scan path,
+    ingesting unregistered orphan files the managed list was supposed to exclude.
+    Threaded into the text connector so each document carries its DR-010 envelope
+    onto ``documents.metadata``.
+    """
+    if MANAGED_FILES_KEY not in source.metadata:
+        return None  # no managed-file stash: a plain (non-upload) text source
+    files = source.metadata[MANAGED_FILES_KEY]
+    if not isinstance(files, dict):
+        raise SourceResolutionError(
+            f"managed source {source.id} has a non-object {MANAGED_FILES_KEY!r} metadata "
+            f"value ({type(files).__name__}) — a present key marks the source managed, so "
+            "a non-object value is malformed and fails loud rather than silently degrading "
+            "the source to an unmanaged directory scan"
+        )
+    validated: dict[str, dict[str, Any]] = {}
+    for name, env in files.items():
+        if not isinstance(env, dict):
+            raise SourceResolutionError(
+                f"managed source {source.id} file {name!r} has a non-object metadata "
+                f"entry {type(env).__name__} — the managed file list maps each stored "
+                "name to its DR-010 envelope object; a malformed entry fails loud rather "
+                "than silently degrading the source to an unmanaged directory scan"
+            )
+        validated[name] = env
+    return validated
+
+
 def _required_meta(source: Source, key: str) -> str:
     """A required non-empty string from a structured source's metadata."""
     value = source.metadata.get(key)
@@ -259,7 +329,7 @@ def resolve_source(source: Source) -> Iterator[DocumentPayload]:
     surface loud when the ingest stage iterates the stream.
     """
     if source.kind == "text":
-        return read_text_documents(_local_path(source))
+        return read_text_documents(_local_path(source), _files_metadata(source))
     if source.kind == "structured":
         return read_csv_rows(
             _local_path(source),

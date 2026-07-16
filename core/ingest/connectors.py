@@ -21,7 +21,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -52,7 +52,9 @@ def content_hash(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def read_text_documents(root: Path) -> Iterator[DocumentPayload]:
+def read_text_documents(
+    root: Path, metadata_by_filename: Mapping[str, dict[str, Any]] | None = None
+) -> Iterator[DocumentPayload]:
     """Yield one payload per accepted text file under ``root`` (recursive).
 
     Deterministic order (sorted paths) so two runs over the same tree produce
@@ -60,9 +62,73 @@ def read_text_documents(root: Path) -> Iterator[DocumentPayload]:
     with unaccepted suffixes are silently not SELECTED (they are out of scope
     by definition, not failed items); an accepted file that cannot be decoded
     raises — a corrupt source is a loud failure, not a skipped item.
+
+    ``metadata_by_filename`` carries the DR-010 metadata envelope captured at
+    upload time, keyed by the file's stored (on-disk) name — the managed-source
+    stash the ingest connector threads onto ``documents.metadata`` (UXC1b
+    capture → persist). When it is PRESENT (not None — even an empty map) the
+    source is a MANAGED one whose registered file list is AUTHORITATIVE in BOTH
+    directions: it is the ITERATION SOURCE, so (a) an on-disk file NOT registered —
+    an orphan left by a failed / rolled-back upload — is never ingested with
+    fallback metadata, and (b) a registered file MISSING from disk fails LOUDLY
+    (the SoR says the upload was accepted; silently ingesting fewer documents would
+    corrupt results). Presence, not truthiness, is the managed signal: an empty map
+    ingests NOTHING (an empty authoritative list), never a directory scan — a
+    managed source must not silently degrade to reading unregistered files. The
+    keys are UNTRUSTED (a source's managed-file stash is stored as-is), so each
+    is validated to a bare in-root filename before it is joined to ``root`` — a
+    name with a path separator / dot segment / absolute path is refused, never
+    read. An ABSENT (None) stash is a plain directory source: every accepted file
+    under the tree is read, each falling back to the connector-derived
+    ``{"filename": ...}`` — the original behavior for a non-upload source or a file
+    placed on disk directly.
     """
     if not root.is_dir():
         raise NotADirectoryError(f"document source root {root} is not a directory")
+    if metadata_by_filename is not None:
+        base = root.resolve()
+        # Managed source: iterate the REGISTERED list (sorted), not the directory.
+        for name in sorted(metadata_by_filename):
+            # The registered names are UNTRUSTED: a text source's managed-file stash
+            # is stored as-is by the sources API, so a key like '../other/secret.md'
+            # or an absolute '/etc/passwd' would make `root / name` read OUTSIDE the
+            # source root (a build ingesting unrelated local files). Require a bare
+            # in-root filename — no path separators, '.', '..', or absolute paths —
+            # then confirm the RESOLVED path is a DIRECT child of root (a symlink
+            # backstop). An unsafe name is a config error at the door, never a read
+            # outside the root. (Uploads mint UUID-hex stored names, so this only
+            # ever rejects a hand-registered malicious/malformed source.)
+            if "\\" in name or name in {"", ".", ".."} or name != Path(name).name:
+                raise ValueError(
+                    f"registered upload file name {name!r} is not a bare in-root filename "
+                    "(no path separators, '.', '..', or absolute paths) — it would read "
+                    "outside the source root"
+                )
+            path = root / name
+            if path.resolve().parent != base:
+                raise ValueError(
+                    f"registered upload file name {name!r} resolves outside the source "
+                    f"root {root} (a symlink escaping the corpus)"
+                )
+            suffix = path.suffix.lower()
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"registered upload file {name!r} is missing from {root} — the "
+                    "managed source lists it but it is not on disk (a lost write); "
+                    "ingesting fewer documents than the SoR accepted would corrupt results"
+                )
+            if suffix not in TEXT_SUFFIXES:
+                raise ValueError(
+                    f"registered upload file {name!r} has an unaccepted suffix {suffix!r} "
+                    f"(accepted: {sorted(TEXT_SUFFIXES)})"
+                )
+            yield DocumentPayload(
+                source_uri=path.resolve().as_uri(),
+                raw=path.read_text(encoding="utf-8"),
+                mime=TEXT_SUFFIXES[suffix],
+                metadata=metadata_by_filename[name],
+            )
+        return
     for path in sorted(root.rglob("*")):
         suffix = path.suffix.lower()
         if not path.is_file() or suffix not in TEXT_SUFFIXES:

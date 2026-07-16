@@ -91,6 +91,27 @@ class Settings(BaseSettings):
     mcp_http_host: str = "127.0.0.1"
     mcp_http_port: int = 8300
 
+    # UXC1b uploads (tunable 🔧, DR-010): the server-managed corpus root — each
+    # project's uploaded files live under ``<upload_corpus_dir>/<project>/`` and a
+    # single canonical file:// source points at that directory. Assumes the API
+    # and the build worker share a filesystem (single-host deploy); a distributed
+    # deploy would swap this for object storage behind the same source uri.
+    upload_corpus_dir: str = "data/uploads"
+    # Per-file size ceiling — a single file above this is a STATED per-file
+    # rejection (manifest row), not a request failure (DR-010).
+    upload_max_file_bytes: int = 10_000_000
+    # Whole-request size ceiling — a multipart body whose total exceeds this is
+    # refused with 413 before any file is stored.
+    upload_max_total_bytes: int = 50_000_000
+
+    # UXC1b eval (tunable 🔧, DR-010): root of the per-project on-disk files the
+    # eval job reads — the project's golden set (``<projects_dir>/<project>/eval/
+    # golden.yaml``) and query policy (``<projects_dir>/<project>/config.yaml``),
+    # the same paths the CLI ``eval`` walks. CFG1 will unify this with the
+    # ``projects.config`` registry source; until then the API eval endpoint runs
+    # the CLI's exact core path.
+    projects_dir: str = "projects"
+
     # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-nano"

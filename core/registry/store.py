@@ -12,6 +12,7 @@ to the frozen error codes; SQL never leaks upward.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -145,6 +146,16 @@ _SOURCE_COLS = (
     tables.sources.c.metadata,
     tables.sources.c.added_at,
 )
+
+#: Reserved, SERVER-OWNED key under which an upload stashes its per-file DR-010
+#: envelopes on the ONE managed text source (keyed by stored filename). Its PRESENCE
+#: marks the source managed (its registered file list is authoritative — see
+#: ``core.builds.sources._files_metadata`` / ``read_text_documents``). A dunder name
+#: so it can't collide with a NON-upload text source's free-form ``metadata`` (which
+#: the sources API stores verbatim): a plain source with a top-level ``files`` key is
+#: legitimate project metadata and must still scan its directory, not be misread as an
+#: upload manifest. Shared by the writer here and the build-time reader.
+MANAGED_FILES_KEY = "__managed_files__"
 
 
 async def create_project(
@@ -332,6 +343,102 @@ async def add_source(
         if _sqlstate(exc) == _SQLSTATE_FK:
             raise ProjectNotFoundError(project) from exc
         raise
+    return Source(*row)
+
+
+async def upsert_managed_source(
+    conn: AsyncConnection,
+    project: str,
+    *,
+    uri: str,
+    kind: str,
+    files: Mapping[str, dict[str, Any]],
+) -> Source:
+    """Register or update the ONE canonical managed source for a project (DR-010).
+
+    The upload endpoint drops files into a per-project managed corpus directory
+    and calls this to point a single ``file://`` source at that directory,
+    stashing each accepted file's stored metadata envelope under
+    ``metadata[MANAGED_FILES_KEY][<stored filename>]``. The ingest connector threads that
+    envelope onto ``documents.metadata`` at build time (capture → persist), so
+    this stash is the capture-to-build bridge, not the long-term home. Repeated
+    uploads MERGE into the same source (by ``(project, uri)``) rather than mint a
+    new one per upload — a project's managed corpus is one source. If duplicate
+    rows already exist at that uri (the ``sources`` table has no ``(project, uri)``
+    uniqueness), ALL are coalesced to the one canonical managed-text shape so none
+    is left stale — ``list_sources`` feeds every matching row to the build.
+
+    Serializes concurrent uploads to the same project by locking the project row
+    (FOR UPDATE) before the find-or-create — the same row a concurrent insert
+    takes FOR KEY SHARE — so two uploads can't each insert a managed source.
+    Raises ProjectNotFoundError if the project is absent."""
+    locked = (
+        await conn.execute(
+            sa.select(tables.projects.c.name)
+            .where(tables.projects.c.name == project)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if locked is None:
+        raise ProjectNotFoundError(project)
+    existing_rows = (
+        await conn.execute(
+            sa.select(*_SOURCE_COLS)
+            .where(tables.sources.c.project == project, tables.sources.c.uri == uri)
+            .order_by(tables.sources.c.added_at.asc(), tables.sources.c.id.asc())
+        )
+    ).all()
+    if not existing_rows:
+        row = (
+            await conn.execute(
+                tables.sources.insert()
+                .values(
+                    project=project, kind=kind, uri=uri, metadata={MANAGED_FILES_KEY: dict(files)}
+                )
+                .returning(*_SOURCE_COLS)
+            )
+        ).one()
+        return Source(*row)
+    # Coalesce EVERY row at (project, uri), not just the oldest. The table has no
+    # (project, uri) uniqueness, so a project can hold duplicate managed-corpus
+    # rows, and list_sources feeds ALL of them to the build. A stale duplicate left
+    # behind would corrupt or break an otherwise-correct upload: a fileless text row
+    # directory-scans the corpus and persists FALLBACK metadata, and a non-text row
+    # fails the build in resolve_source. So merge the files of all matching rows with
+    # the new ones (union) and rewrite EVERY matching row to the one canonical
+    # managed-text shape — kind=text, metadata={MANAGED_FILES_KEY: …}, exactly what a
+    # fresh insert writes. Non-managed metadata on a stale row is dropped: it is inert
+    # for the text connector and this IS the canonical managed form. A row with NO
+    # managed stash (a plain/fileless or non-text duplicate) contributes nothing and is
+    # simply coalesced. But a row whose MANAGED_FILES_KEY is PRESENT-but-non-object is
+    # MALFORMED: _files_metadata fails LOUD on exactly that at read time, so the write
+    # path must not silently ERASE it by rewriting to a fresh map (that could change
+    # which files a build ingests). Malformed per-file ENTRIES *within* a dict stash are
+    # still carried forward — _files_metadata raises on those at read time, loud.
+    merged_files: dict[str, dict[str, Any]] = {}
+    for existing in existing_rows:
+        metadata = Source(*existing).metadata
+        if MANAGED_FILES_KEY not in metadata:
+            continue
+        prior = metadata[MANAGED_FILES_KEY]
+        if not isinstance(prior, dict):
+            raise ValueError(
+                f"managed source at {uri!r} has a non-object {MANAGED_FILES_KEY!r} metadata "
+                f"value ({type(prior).__name__}); refusing to coalesce over a malformed "
+                "managed marker — a present key marks the source managed and must be an object"
+            )
+        merged_files.update(prior)
+    merged_files.update(files)
+    await conn.execute(
+        tables.sources.update()
+        .where(tables.sources.c.project == project, tables.sources.c.uri == uri)
+        .values(kind=kind, metadata={MANAGED_FILES_KEY: merged_files})
+    )
+    # return the canonical (oldest) row, re-read to reflect the coalescing update
+    canonical_id = Source(*existing_rows[0]).id
+    row = (
+        await conn.execute(sa.select(*_SOURCE_COLS).where(tables.sources.c.id == canonical_id))
+    ).one()
     return Source(*row)
 
 

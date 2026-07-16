@@ -68,6 +68,69 @@ class SourceCreate(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class DocumentMetadataContextInput(BaseModel):
+    """The contract DocumentMetadataContext on upload (DR-010): a CLOSED core
+    (``title``/``document_type``) plus an OPEN ``attributes`` bag whose keys the
+    project metadata schema types. ``extra="forbid"`` keeps every project-defined
+    field inside ``attributes`` (never a new top-level key), so the envelope stays
+    a fixed shape, not a global field enum (rule 2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = None
+    document_type: str | None = None
+    attributes: dict[str, Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_null_attributes(cls, data: Any) -> Any:
+        # title/document_type ARE nullable (string|null core), but the frozen
+        # contract makes `attributes` an OBJECT when present, not nullable. An
+        # explicit null would parse to None, validate_context would treat it as {},
+        # and the stored envelope would silently rewrite it to {} — drift. Reject
+        # an explicit-null attributes (present-and-null), same as the sub-objects.
+        if isinstance(data, dict) and "attributes" in data and data["attributes"] is None:
+            raise ValueError("attributes must be an object when present, not null")
+        return data
+
+
+class DocumentMetadataGovernanceInput(BaseModel):
+    """The contract DocumentMetadataGovernance (DR-010): visibility/classification
+    plus an open bag (``additionalProperties: true``)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    visibility: str | None = None
+    classification: str | None = None
+
+
+class DocumentMetadataInput(BaseModel):
+    """The contract DocumentMetadataInput (DR-010 rule 1/4): a client may supply
+    ONLY ``context``/``governance``. ``extra="forbid"`` structurally rejects a
+    ``system``/``schema_version`` in the input, so human input can never overwrite
+    the server-owned namespace — the injection is unrepresentable, not merely
+    ignored."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    context: DocumentMetadataContextInput | None = None
+    governance: DocumentMetadataGovernanceInput | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_null_subobjects(cls, data: Any) -> Any:
+        # context/governance are OPTIONAL (may be absent) but NON-NULLABLE when
+        # present — the frozen contract makes them optional properties, not
+        # nullable. An explicit null would otherwise parse to None
+        # (indistinguishable from absent) and be stored as an empty envelope,
+        # drifting from the contract. Check key PRESENCE so absent stays valid.
+        if isinstance(data, dict):
+            for key in ("context", "governance"):
+                if key in data and data[key] is None:
+                    raise ValueError(f"{key} must be an object when present, not null")
+        return data
+
+
 class IngestRequest(BaseModel):
     """The contract IngestRequest — parsed to its shape, then ``source_ids``
     is loudly rejected while PRESENT (even as an explicit null — the contract

@@ -950,6 +950,13 @@ jobs = sa.Table(
     # build's chunking/ontology params (which would break convergent idempotency or
     # mix outputs). Internal only — not part of the frozen Job contract shape.
     sa.Column("config_snapshot", postgresql.JSONB),
+    # UXC1b: the eval-inputs (golden set + query policy) fingerprint AS OF the eval's
+    # ACCEPT time. The endpoint pins it so the worker can re-fingerprint the live inputs
+    # at dispatch and fail loud if they drifted (else it would score bytes the client
+    # never accepted under the accepted idempotency key). NULL for non-eval jobs and for
+    # eval jobs created before this pin existed (the worker guards on NULL). Internal
+    # only — not part of the frozen Job contract shape.
+    sa.Column("eval_inputs_fingerprint", sa.Text),
     sa.CheckConstraint(
         "status IN ('queued','running','done','failed','cancelled')", name="jobs_status_valid"
     ),

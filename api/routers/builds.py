@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, Query, Request
@@ -38,21 +39,30 @@ from neo4j.exceptions import DriverError, Neo4jError
 from qdrant_client.http.exceptions import ApiException
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from api.deps import Conn, neo4j_driver, qdrant_client, response_meta
+from api.deps import Conn, Queue, neo4j_driver, qdrant_client, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
 from api.pagination import decode_id_cursor, encode_cursor
 from api.registry_errors import translate_registry_error
 from api.routers._query import reject_unsupported_query
-from api.schemas import build_dto
+from api.schemas import build_dto, job_accepted_dto
+from api.workers.build_worker import EVAL_JOB_KIND, enqueue_eval
 from core.builds.lifecycle import (
     BuildInfo,
     activate_in_caller_txn,
     get_build_info,
     list_builds_page,
 )
-from core.registry import ProjectNotFoundError, get_project
+from core.config import get_settings
+from core.eval.idempotency import eval_inputs_fingerprint
+from core.registry import (
+    JobConflictError,
+    ProjectNotFoundError,
+    create_job_exclusive,
+    get_project,
+    set_eval_inputs_fingerprint,
+)
 
 router = APIRouter(tags=["builds"])
 
@@ -243,3 +253,77 @@ async def rollback_build_endpoint(
     return await _run_rollback(
         request, conn, project, build_id, idempotency_key, allow_archived=True, history_exempt=True
     )
+
+
+@router.post("/projects/{project}/builds/{build_id}/eval")
+async def run_build_eval_endpoint(
+    request: Request,
+    conn: Conn,
+    get_redis: Queue,
+    project: str,
+    build_id: uuid.UUID,
+    idempotency_key: _IdempotencyKey = None,
+) -> JSONResponse:
+    """Run the project's golden set against the NAMED build as an async job
+    (UXC1b, DR-010) — the same core path the CLI eval walks; the report lands in
+    ``builds.eval`` where the activation gate already reads §14 scores, so
+    Console gating gets zero new coupling. Mirrors the trigger endpoints: one
+    active job per project (409 ``JOB_CONFLICT``), enqueue IN-BAND before commit
+    (the class-12 window), 202 + the job envelope, watchable via
+    ``GET /jobs/{id}/events``. The build is named in the path (no request body);
+    a bad/unready build is a REFUSAL the eval job records, not a synchronous
+    gate — the CLI path refuses the same way.
+
+    Idempotency is per (build, golden-set fingerprint) per the frozen contract: the
+    build is in the path, and the golden set / query policy content is folded into
+    the request hash (``eval_inputs_fingerprint``), so reusing an ``Idempotency-Key``
+    after the golden set changes within the TTL does NOT replay a run scored against
+    the stale inputs — a changed fingerprint is the §27 key-reused-with-a-different-
+    request conflict (client uses a fresh key), never a silent stale replay."""
+
+    # Fingerprint the eval inputs ONCE at accept, then use it for BOTH the idempotency
+    # hash AND the job's pin. The worker re-fingerprints the live inputs at dispatch and
+    # fails loud on drift (build_worker), so a job created here never scores golden/policy
+    # bytes edited between this 202 and dispatch — the report always matches the accepted,
+    # idempotency-keyed inputs. (Computed before produce so it exists for both paths; on
+    # an idempotent REPLAY produce is skipped and no new job is pinned — correct, the
+    # first accept's job carries it.)
+    fingerprint = eval_inputs_fingerprint(Path(get_settings().projects_dir), project)
+
+    async def produce() -> tuple[int, dict[str, Any]]:
+        try:
+            job = await create_job_exclusive(conn, project, EVAL_JOB_KIND, build_id=build_id)
+        except (ProjectNotFoundError, JobConflictError) as exc:
+            raise translate_registry_error(exc) from exc
+        # pin the accept-time fingerprint in the SAME txn as the job insert (atomic)
+        await set_eval_inputs_fingerprint(conn, job.id, fingerprint)
+        # queue touched HERE only — a §27 replay or a 409 must be served even
+        # with Redis unreachable (the Queue dep is a lazy handle), same as _trigger
+        await enqueue_eval(await get_redis(), project, job.id, build_id)
+        return 202, success(job_accepted_dto(job), **response_meta(request))
+
+    if idempotency_key:
+        status, resp = await run_idempotent(
+            conn,
+            key=idempotency_key,
+            project=project,
+            endpoint="runBuildEval",
+            # per (build, golden-set fingerprint): the build_id is in request.url.path;
+            # the golden set + query policy content is folded as the "body" so a changed
+            # golden set flips the hash (no stale replay). The ACTUAL request body is
+            # folded too — the endpoint is bodyless, but FastAPI still accepts one, and
+            # the sibling bodyless endpoints (rollback) hash await request.body(); a
+            # stray/different body on a reused key must be a §27 conflict, not a silent
+            # replay. The fingerprint (a hex digest / sentinel, never containing \0)
+            # leads, then a \0 delimiter, then the raw body — an unambiguous split, so
+            # no (fingerprint, body) pair can alias another.
+            req_hash=request_hash(
+                "POST",
+                request.url.path,
+                fingerprint.encode() + b"\0" + await request.body(),
+            ),
+            produce=produce,
+        )
+        return JSONResponse(status_code=status, content=resp)
+    status, resp = await produce()
+    return JSONResponse(status_code=status, content=jsonable_encoder(resp))

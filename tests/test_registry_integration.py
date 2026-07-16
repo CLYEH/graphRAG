@@ -22,16 +22,21 @@ from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
 from core.registry import (
+    MANAGED_FILES_KEY,
     ProjectExistsError,
     ProjectHasBuildsError,
     ProjectNotFoundError,
     add_source,
+    create_job_exclusive,
     create_project,
     delete_project,
+    get_eval_inputs_fingerprint,
     get_project,
     list_projects,
     list_sources,
+    set_eval_inputs_fingerprint,
     update_project,
+    upsert_managed_source,
 )
 from core.stores.tables import (
     builds,
@@ -163,6 +168,118 @@ async def test_add_source_requires_project_and_lists(migrated: None) -> None:
             listed, after = await list_sources(conn, name, limit=10)
             assert [x.id for x in listed] == [s.id]
             assert after is None
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_upsert_managed_source_forces_kind_text_on_a_reused_row(migrated: None) -> None:
+    """WHY: the upload endpoint returns 201 pointing at the source this upserts, and
+    builds dispatch by ``source.kind`` in ``resolve_source``. If a row already exists
+    at the managed corpus uri from ``POST /sources`` with a NON-text kind (structured
+    / null / typo), merging only the ``files`` metadata would leave that kind — so the
+    accepted managed-text upload routes to the wrong connector (or none) and is never
+    ingested. Upsert must (re)assert kind=text on the reused row, not just on insert."""
+    engine = _engine()
+    name = _proj()
+    uri = "file:///managed/corpus"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=name)
+            # a pre-existing conflicting source at the managed uri (structured)
+            stale = await add_source(
+                conn, name, uri=uri, kind="structured", metadata={"table": "t"}
+            )
+            reused = await upsert_managed_source(
+                conn, name, uri=uri, kind="text", files={"a.txt": {"context": {"title": "A"}}}
+            )
+            assert reused.id == stale.id  # same row reused (by project, uri), not a new one
+            assert reused.kind == "text"  # kind FORCED to the managed kind
+            assert reused.metadata[MANAGED_FILES_KEY] == {"a.txt": {"context": {"title": "A"}}}
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_upsert_managed_source_coalesces_all_duplicate_rows(migrated: None) -> None:
+    """WHY: ``sources`` has no ``(project, uri)`` uniqueness, so a project can hold
+    MULTIPLE rows at the managed corpus uri, and ``list_sources`` feeds EVERY one to
+    the build. Canonicalizing only the oldest would leave a stale duplicate: a fileless
+    text row directory-scans the corpus (persisting fallback metadata) and a non-text
+    row fails the build. Upsert must coalesce ALL matching rows to the one canonical
+    managed-text shape, merging their file stashes — no stale row survives."""
+    engine = _engine()
+    name = _proj()
+    uri = "file:///managed/corpus"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=name)
+            # two pre-existing duplicate rows at the managed uri: a fileless text row
+            # (would directory-scan) and a non-text row (would fail the build)
+            fileless = await add_source(conn, name, uri=uri, kind="text", metadata={})
+            nontext = await add_source(
+                conn, name, uri=uri, kind="structured", metadata={"table": "t"}
+            )
+            await upsert_managed_source(
+                conn, name, uri=uri, kind="text", files={"a.txt": {"context": {}}}
+            )
+            listed, _ = await list_sources(conn, name, limit=10)
+            managed = [s for s in listed if s.uri == uri]
+            assert {s.id for s in managed} == {fileless.id, nontext.id}  # both preserved
+            # ...and BOTH are now canonical managed-text carrying the files stash —
+            # no stale fileless/non-text row is left for the build to trip over
+            assert all(s.kind == "text" for s in managed)
+            assert all(
+                s.metadata.get(MANAGED_FILES_KEY) == {"a.txt": {"context": {}}} for s in managed
+            )
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_upsert_managed_source_rejects_a_malformed_managed_marker(migrated: None) -> None:
+    """WHY (triage 25): a row at the managed uri whose ``MANAGED_FILES_KEY`` is
+    PRESENT-but-non-object is malformed — ``_files_metadata`` fails LOUD on exactly
+    that at read time. The coalescing must NOT silently ERASE it by rewriting to a
+    fresh managed map (which could change which files a build ingests); it must fail
+    loud too. Presence of the key with a non-dict value is the trigger — an ABSENT
+    key (a plain/fileless row) is coalesced normally (the sibling test)."""
+    engine = _engine()
+    name = _proj()
+    uri = "file:///managed/corpus"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=name)
+            # a stale row at the managed uri with a malformed (string, not object)
+            # managed marker — storable because the sources API metadata is free-form
+            await add_source(conn, name, uri=uri, kind="text", metadata={MANAGED_FILES_KEY: "x"})
+            with pytest.raises(ValueError, match="non-object '__managed_files__'"):
+                await upsert_managed_source(
+                    conn, name, uri=uri, kind="text", files={"a.txt": {"context": {}}}
+                )
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_eval_inputs_fingerprint_pin_round_trips(migrated: None) -> None:
+    """WHY (triage 27): the eval endpoint pins the accept-time golden+policy fingerprint
+    on the job and the worker reads it back to fail loud on drift. Pin the DB round-trip:
+    a fresh job has NO pin (None → the worker's drift check is skipped), and a set value
+    reads back verbatim — the real SQL the endpoint/worker component tests mock."""
+    engine = _engine()
+    name = _proj()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=name)
+            job = await create_job_exclusive(conn, name, "eval", build_id=uuid.uuid4())
+            assert await get_eval_inputs_fingerprint(conn, job.id) is None  # nothing pinned yet
+            await set_eval_inputs_fingerprint(conn, job.id, "fp-abc123")
+            assert await get_eval_inputs_fingerprint(conn, job.id) == "fp-abc123"
             await trans.rollback()
     finally:
         await engine.dispose()

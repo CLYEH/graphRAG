@@ -56,6 +56,25 @@ async def _capture_passthrough(conn: Any, job_id: uuid.UUID, live: Any) -> Any:
     return live
 
 
+async def _lock_active(conn: Any, job_id: uuid.UUID) -> Any:
+    # lock_job stand-in for the eval task's pre-start terminal-job guard: a LIVE
+    # (running) job, so the guard proceeds instead of no-opping. The eval task also
+    # calls lock_job at finalize (via _eval_leads), so this is safe for both.
+    return SimpleNamespace(status="running")
+
+
+async def _holds_lease_yes(conn: Any, job_id: uuid.UUID, owner: str) -> bool:
+    # holds_lease stand-in: this worker still OWNS the lease, so the eval finalize /
+    # failure guard (_eval_leads) proceeds to write instead of no-opping to a peer.
+    return True
+
+
+async def _no_fingerprint_pin(conn: Any, job_id: uuid.UUID) -> None:
+    # get_eval_inputs_fingerprint stand-in: NO accept-time pin (a pre-pin job), so the
+    # eval task's input-drift guard is skipped — isolates a test from that check.
+    return None
+
+
 def _fake_lease(calls: dict[str, Any] | None = None, *, acquired: bool = True) -> Any:
     # stand-in for job_lease: records (job_id, owner) and yields `acquired`.
     @asynccontextmanager
@@ -298,6 +317,632 @@ async def test_run_build_task_reuses_pinned_config_on_resume(
     assert loaded["raw"] != drifted  # …NOT the drifted live config
 
 
+async def test_run_eval_task_terminalizes_on_store_error_never_strands_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: once the eval job is marked 'running', a store outage out of run_eval
+    # (Neo4j/Qdrant/Postgres-read down) must terminalize the jobs row, not let the
+    # error propagate. If it propagated, job_lease's finally releases the lease and
+    # the row is left 'running'+unleased — which NO sweep recovers (find_reapable
+    # needs a held lease; find_unenqueued needs 'queued'), permanently locking the
+    # project out of every future job via create_job_exclusive. So it must end
+    # 'failed', mirroring run_build's stage boundary.
+    statuses: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _boom(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("neo4j connection refused")  # a store outage, not a refusal
+
+    async def _not_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False  # no cancel — this test isolates the store-outage path
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
+    monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _boom)
+
+    ctx = {
+        "engine": _FakeEngine(),
+        "neo4j": _FakeNeo4j(),
+        "qdrant": "QD",
+        "embedder": "EMB",
+        "llm": "LLM",
+        "owner": "worker-abc",
+    }
+    result = await bw.run_eval_task(ctx, "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "failed"  # terminal, not a propagated exception
+    # marked running, then FAILED — never left dangling at 'running'
+    assert statuses == ["running", "failed"]
+
+
+async def test_run_eval_task_no_ops_when_lease_lost_before_marking_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 32): a large SYNCHRONOUS preflight load (golden/policy YAML) can block
+    # the event loop past the lease TTL — the heartbeat can't renew, the lease lapses, and
+    # the reaper hands this job to a REPLACEMENT that terminalizes + releases it. An
+    # UNCONDITIONAL 'running' write would REOPEN that terminal job as 'running' while this
+    # worker no longer leads; finalize's _eval_leads then no-ops, stranding it
+    # 'running'+unleased (no sweep recovers it → create_job_exclusive blocks the project).
+    # So the 'running' mark is gated on still LEADING (lease-owning + live) under the row
+    # lock: if a replacement took over, this worker no-ops (None) and never reopens the job.
+    # Here holds_lease=False models the lapsed-lease handoff. Revert-probe: drop the guard
+    # and 'running' is written (and run_eval fires) even though we lost the lease.
+    statuses: list[str] = []
+    ran = {"n": 0}
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _lease_lost(conn: Any, job_id: uuid.UUID, owner: str) -> bool:
+        return False  # a replacement reclaimed the lapsed lease during the preflight stall
+
+    async def _not_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        ran["n"] += 1  # must NOT run — we no longer lead
+        return "REPORT"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)  # pre-start guard sees a live job
+    monkeypatch.setattr(bw, "holds_lease", _lease_lost)  # but the lease was lost by mark-running
+    monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result is None  # benign no-op — the replacement is authoritative
+    assert "running" not in statuses  # never REOPENED the terminalized job as 'running'
+    assert ran["n"] == 0  # run_eval never ran
+
+
+async def test_run_eval_task_terminalizes_on_a_preflight_loader_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: preflight (load the golden set / policy, pick models) is all-LOCAL, so a
+    # bad golden PATH is a deterministic refusal but NOT one of the expected
+    # GoldenError/PolicyError types — a directory / bad perms raises OSError, invalid
+    # UTF-8 raises UnicodeDecodeError. If such an error escaped, job_lease releases
+    # the lease but the row stays 'queued'+unleased: the queued-sweep replays the bad
+    # eval FOREVER and create_job_exclusive blocks every later job for the project. So
+    # it must terminalize 'failed', BEFORE the 'running' mark (never a 'running' here).
+    statuses: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _not_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    def _boom_load(path: Any) -> Any:
+        raise OSError("golden.yaml is a directory")  # a preflight I/O error, not GoldenError
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(
+        bw, "holds_lease", _holds_lease_yes
+    )  # still leads → _fail_eval marks failed
+    monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", _boom_load)
+
+    ctx = {"engine": _FakeEngine(), "neo4j": _FakeNeo4j(), "owner": "worker-abc"}
+    result = await bw.run_eval_task(ctx, "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "failed"  # terminal, never left 'queued' for the sweep to loop
+    assert statuses == ["failed"]  # failed at preflight, before any 'running' mark
+
+
+async def test_run_eval_task_preflight_failure_no_ops_after_lease_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 34): a LARGE synchronous golden/policy load can block the event loop past
+    # the lease TTL BEFORE it raises — the heartbeat can't renew, the lease lapses, and the
+    # reaper hands this job to a replacement that may already be running/finished. An
+    # UNCONDITIONAL _fail_job on the preflight error would clobber the replacement's
+    # result/status with 'failed'. So the preflight failure terminalizes via _fail_eval,
+    # which re-checks lead under the row lock: a stale worker (holds_lease False) no-ops
+    # (None) and writes NOTHING. Revert-probe: use the unconditional _fail_job and 'failed'
+    # is written despite the handoff.
+    statuses: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _lease_lost(conn: Any, job_id: uuid.UUID, owner: str) -> bool:
+        return False  # the lease was reclaimed by a replacement during the slow preflight
+
+    async def _not_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    def _boom_load(path: Any) -> Any:
+        raise OSError("golden.yaml is a directory")  # the preflight failure after the stall
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(bw, "holds_lease", _lease_lost)  # we no longer lead by the failure
+    monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", _boom_load)
+
+    ctx = {"engine": _FakeEngine(), "neo4j": _FakeNeo4j(), "owner": "worker-abc"}
+    result = await bw.run_eval_task(ctx, "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result is None  # benign no-op — the replacement is authoritative
+    assert statuses == []  # never wrote 'failed' over the replacement's status
+
+
+async def test_run_eval_task_fails_loud_when_eval_inputs_drifted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 27): the endpoint pins the ACCEPT-time golden+policy fingerprint on the
+    # job. If a user edits those between the 202 and dispatch, the worker must NOT score
+    # the new bytes (the idempotency key is scoped to the OLD fingerprint) — it re-
+    # fingerprints the live inputs in preflight and, on a mismatch, terminalizes the job
+    # 'failed' BEFORE running (no run_eval, no dangling 'running'). Revert-probe: drop the
+    # drift guard and preflight passes, so run_eval fires on the drifted inputs (ran['n']
+    # → 1) — the exact harm, scoring bytes the client never accepted.
+    statuses: list[str] = []
+    ran = {"n": 0}
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _pinned(conn: Any, job_id: uuid.UUID) -> str:
+        return "accepted-fingerprint"  # what the endpoint pinned at accept time
+
+    async def _not_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        ran["n"] += 1  # must NOT run — the inputs drifted from what was accepted
+        return "REPORT"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(
+        bw, "holds_lease", _holds_lease_yes
+    )  # still leads → _fail_eval marks failed
+    monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _pinned)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    # a SINGLE read of the live inputs whose joint fingerprint DIFFERS from what was
+    # accepted (an edit since the 202). The one-read seam (triage 35) is also what closes
+    # the TOCTOU: the same bytes it fingerprints are the bytes the parse would score.
+    monkeypatch.setattr(
+        "core.eval.idempotency.read_and_fingerprint_eval_inputs",
+        lambda root: ("live-DIFFERENT", b"golden", b"policy"),
+    )
+    # mocked so that WITHOUT the drift guard preflight passes and run_eval fires on the
+    # drifted inputs (the revert path this probe guards against); **kw tolerates the
+    # worker passing the already-read text= on the pinned path.
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path, **kw: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path, **kw: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "failed"  # terminalized, never scored the drifted inputs
+    assert ran["n"] == 0  # run_eval never called
+    assert statuses == ["failed"]  # failed at preflight, BEFORE the 'running' mark
+
+
+async def test_run_eval_task_pinned_eval_parses_the_fingerprinted_bytes_not_a_reread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 35): the drift guard is only sound if the bytes it FINGERPRINTS are the bytes
+    # it PARSES. A pinned eval reads golden+policy ONCE (read_and_fingerprint_eval_inputs) and
+    # must hand THOSE bytes to the loaders — if load_golden/load_query_policy re-opened the paths
+    # instead, an edit landing between the fingerprint and the parse would be scored under the
+    # matched-but-now-stale fingerprint, reopening the very TOCTOU the guard closes. Proof: on a
+    # MATCHING fingerprint (no drift) the loaders receive text= equal to the single read's bytes.
+    # Revert-probe: drop the text= plumbing and the loaders get text=None (a path re-read), which
+    # this asserts against.
+    seen: dict[str, str | None] = {}
+
+    async def _noop_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        pass
+
+    async def _pinned_matches(conn: Any, job_id: uuid.UUID) -> str:
+        return "MATCH"  # equals the live fingerprint below → guard passes, parse proceeds
+
+    async def _never_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        return "REPORT"
+
+    async def _persist(conn: Any, report: Any) -> None:
+        pass
+
+    def _capture_golden(path: Any, *, text: str | None = None) -> str:
+        seen["golden"] = text  # the loader must be handed the fingerprinted bytes, not re-read
+        return "GOLDEN"
+
+    def _capture_policy(path: Any, *, text: str | None = None) -> str:
+        seen["policy"] = text
+        return "POLICY"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _noop_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
+    monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _pinned_matches)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    # the ONE read: fingerprint MATCHES the pin (no drift), and carries the exact bytes the
+    # loaders must parse — the same in-memory bytes that were fingerprinted, never a path re-read.
+    monkeypatch.setattr(
+        "core.eval.idempotency.read_and_fingerprint_eval_inputs",
+        lambda root: ("MATCH", b"golden-YAML", b"policy-YAML"),
+    )
+    monkeypatch.setattr("core.eval.golden.load_golden", _capture_golden)
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", _capture_policy)
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "done"
+    # the loaders parsed the SINGLE read's bytes (decoded), never re-opened the path (text=None)
+    assert seen == {"golden": "golden-YAML", "policy": "policy-YAML"}
+
+
+async def test_run_eval_task_rejects_project_name_escaping_projects_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: the eval worker reads <projects_dir>/<project>/{eval/golden.yaml,
+    # config.yaml}. A project named '..' would read config OUTSIDE the projects
+    # root (a traversal, the same class the upload corpus guards). It must fail the
+    # job BEFORE any on-disk config read — never load a file outside the root.
+    statuses: list[str] = []
+    loaded: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    def _load_golden(path: Any) -> Any:
+        loaded.append(str(path))  # must NOT run for an unsafe project name
+        return "GOLDEN"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", _load_golden)
+
+    ctx = {"engine": _FakeEngine(), "neo4j": _FakeNeo4j(), "owner": "worker-abc"}
+    result = await bw.run_eval_task(ctx, "..", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "failed"
+    assert loaded == []  # the traversal read never happened
+    assert statuses == ["failed"]  # failed at the guard, before the 'running' mark
+
+
+async def test_run_eval_task_honors_cancellation_before_starting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: /jobs/{id}/cancel flags cancel_requested cooperatively. An eval accepted
+    # for cancellation must NOT run to completion and report success — it is
+    # terminalized 'cancelled' before any work (no golden load, no run_eval).
+    statuses: list[str] = []
+    loaded: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return True
+
+    def _load_golden(path: Any) -> Any:
+        loaded.append(str(path))  # must NOT run for a cancelled job
+        return "GOLDEN"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(bw, "is_cancel_requested", _cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", _load_golden)
+
+    ctx = {"engine": _FakeEngine(), "neo4j": _FakeNeo4j(), "owner": "worker-abc"}
+    result = await bw.run_eval_task(ctx, "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "cancelled"
+    assert loaded == []  # no eval work started
+    assert statuses == ["cancelled"]  # terminalized before the 'running' mark
+
+
+async def test_run_eval_task_noops_when_job_already_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 19): the execution lease is status-BLIND, so a stale-lease reaper
+    # race can hand a worker a row that is ALREADY terminal — the reaper enqueued a
+    # replacement while the original was only STARVED, then the original finished
+    # (status → done) and released its lease, which this replacement then acquired.
+    # Re-running would reopen the finished eval and OVERWRITE builds.eval (the §20
+    # gate's input). The pre-start guard LOCKs the row and, finding it no longer
+    # queued/running, does NO work: no 'running' mark, no preflight, no run_eval, no
+    # persist — a benign no-op (None), mirroring run_build's BuildNotResumableError.
+    # Revert-probe: drop the guard and the job is re-marked running and re-persisted.
+    events: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        events.append(f"status={fields.get('status')}")
+
+    async def _lock_terminal(conn: Any, job_id: uuid.UUID) -> Any:
+        return SimpleNamespace(status="done")  # already finished by the original worker
+
+    async def _never_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False  # isolate the terminal-status guard from the cancel path
+
+    def _load_golden(path: Any) -> Any:
+        events.append("load_golden")  # must NOT run for a terminal job
+        return "GOLDEN"
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        events.append("run_eval")  # must NOT run
+        return "REPORT"
+
+    async def _persist(conn: Any, report: Any) -> None:
+        events.append("persist")  # must NOT overwrite builds.eval
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_terminal)
+    monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", _load_golden)
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result is None  # benign no-op, not a re-run
+    assert events == []  # nothing happened: no running mark, no preflight, no run, no persist
+
+
+async def test_run_eval_task_cancel_during_run_finalizes_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # a cancel that arrives AFTER the pre-start check but during run_eval finalizes
+    # the job 'cancelled', not 'done' (mirrors run_build's terminalize). The finalize
+    # must LOCK the row (FOR UPDATE) BEFORE reading cancel_requested — the lock is the
+    # cutoff (class-10: the decisive read lives under the write's lock, not a prior
+    # unlocked SELECT), so we also pin lock→read ordering.
+    checks = {"n": 0}
+    statuses: list[str] = []
+    events: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _cancel_on_finalize(conn: Any, job_id: uuid.UUID) -> bool:
+        checks["n"] += 1
+        events.append(f"cancel_read#{checks['n']}")
+        return checks["n"] > 1  # False at the pre-start check, True at finalize
+
+    async def _lock_job(conn: Any, job_id: uuid.UUID) -> Any:
+        events.append("lock")  # the FOR UPDATE cutoff — pre-start guard AND finalize read
+        return SimpleNamespace(status="running")  # live job → both guards proceed
+
+    async def _run_eval(*a: Any, **k: Any) -> None:
+        return None
+
+    async def _persist(conn: Any, report: Any) -> None:
+        events.append("persist")  # must NOT run on the cancelled path
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "is_cancel_requested", _cancel_on_finalize)
+    monkeypatch.setattr(bw, "lock_job", _lock_job)
+    monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
+
+    ctx = {
+        "engine": _FakeEngine(),
+        "neo4j": _FakeNeo4j(),
+        "qdrant": "QD",
+        "embedder": "EMB",
+        "llm": "LLM",
+        "owner": "worker-abc",
+    }
+    result = await bw.run_eval_task(ctx, "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "cancelled"
+    assert statuses == ["running", "cancelled"]  # ran, then cancelled at finalize
+    # Three FOR-UPDATE locks, each BEFORE the decision it guards: the pre-start guard
+    # (lock → cancel_read#1, False = still running), the mark-running lead re-check
+    # (triage 32: lock, no cancel read — it only confirms we still lead before writing
+    # 'running'), and the finalize (lock → cancel_read#2, True). A cancel is always
+    # decided under the lock, never lost to an unlocked read. And a cancelled eval NEVER
+    # persists builds.eval (no "persist") — the report is withheld, nothing for the §20
+    # gate to read.
+    assert events == ["lock", "cancel_read#1", "lock", "lock", "cancel_read#2"]
+
+
+async def test_run_eval_task_cancelled_eval_never_persists_the_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 17 / Finding F): the §20 activation gate reads builds.eval WITHOUT
+    # consulting the eval job, so builds.eval must be committed ONLY when the eval is not
+    # cancelled. run_eval(persist=False) computes but does NOT write; the worker persists
+    # in the finalize txn only if not cancelled — so a cancelled eval leaves NO report the
+    # gate could read (no transient write, no revert window). Revert-probe: persist
+    # unconditionally and `persisted` is non-empty.
+    persisted: list[Any] = []
+    checks = {"n": 0}
+
+    async def _noop_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        pass
+
+    async def _noop_lock(conn: Any, job_id: uuid.UUID) -> Any:
+        return SimpleNamespace(status="running")  # live job → the pre-start guard proceeds
+
+    async def _cancel_on_finalize(conn: Any, job_id: uuid.UUID) -> bool:
+        checks["n"] += 1
+        return checks["n"] > 1  # False at pre-start, True at finalize (cancel mid-run)
+
+    async def _persist(conn: Any, report: Any) -> None:
+        persisted.append(report)
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        return "REPORT"  # computed but unpersisted (persist=False)
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _noop_progress)
+    monkeypatch.setattr(bw, "is_cancel_requested", _cancel_on_finalize)
+    monkeypatch.setattr(bw, "lock_job", _noop_lock)
+    monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "cancelled"
+    assert persisted == []  # a cancelled eval commits NOTHING to builds.eval
+
+
+async def test_run_eval_task_completed_eval_persists_the_report_in_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the other side of Finding F: a COMPLETED (not cancelled) eval commits the report
+    # run_eval computed — exactly once, in the finalize txn (the one canonical write).
+    persisted: list[Any] = []
+
+    async def _noop_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        pass
+
+    async def _noop_lock(conn: Any, job_id: uuid.UUID) -> Any:
+        return SimpleNamespace(status="running")  # live job → the pre-start guard proceeds
+
+    async def _never_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    async def _persist(conn: Any, report: Any) -> None:
+        persisted.append(report)
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        return "REPORT"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _noop_progress)
+    monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
+    monkeypatch.setattr(bw, "lock_job", _noop_lock)
+    monkeypatch.setattr(bw, "holds_lease", _holds_lease_yes)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "done"
+    assert persisted == ["REPORT"]  # the computed report is written exactly once
+
+
+async def test_run_eval_task_stale_worker_does_not_overwrite_after_lease_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 21): the lease is a LIVENESS layer — if this worker's heartbeat lapses,
+    # the reaper hands execution to a replacement (its acquire_lease reassigns
+    # lease_owner). This now-stale worker can still reach the finalize; ignoring
+    # lock_job's result it would persist its report and mark the job terminal,
+    # OVERWRITING the replacement's builds.eval/status (or hiding its failure). The
+    # finalize re-checks UNDER the row lock that we still OWN the lease (_eval_leads); a
+    # reclaimed worker (holds_lease False) does a benign no-op (None) — no persist, no
+    # terminal write. Revert-probe: drop the ownership check and the stale report
+    # overwrites builds.eval and marks the job done. (We still LEAD when we mark running —
+    # the handoff happens DURING the long run — so holds_lease is True at the mark-running
+    # lead check (triage 32) and False by the finalize.)
+    statuses: list[str] = []
+    persisted: list[Any] = []
+    lease_calls = {"n": 0}
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        if "status" in fields:
+            statuses.append(fields["status"])
+
+    async def _lock_running(conn: Any, job_id: uuid.UUID) -> Any:
+        return SimpleNamespace(status="running")  # the job the replacement is running
+
+    async def _lease_reclaimed(conn: Any, job_id: uuid.UUID, owner: str) -> bool:
+        # led at mark-running, then the reaper handed the lease to a replacement during the
+        # run — so the finalize's lead check finds it gone.
+        lease_calls["n"] += 1
+        return lease_calls["n"] == 1  # True at mark-running, False at finalize
+
+    async def _never_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    async def _persist(conn: Any, report: Any) -> None:
+        persisted.append(report)  # must NOT overwrite the replacement's builds.eval
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        return "REPORT"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_running)
+    monkeypatch.setattr(bw, "holds_lease", _lease_reclaimed)
+    monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result is None  # benign no-op — the replacement is authoritative
+    assert persisted == []  # the stale report NEVER overwrites builds.eval
+    assert statuses == ["running"]  # ran, but wrote NO terminal status (done/failed/cancelled)
+
+
 async def test_enqueue_build_uses_job_id_dedup() -> None:
     calls: dict[str, Any] = {}
 
@@ -347,7 +992,9 @@ async def test_reenqueue_build_uses_a_deterministic_per_stale_lease_id() -> None
     assert calls[0][:2] == (bw.BUILD_TASK, ("proj", str(jid)))
 
 
-async def _no_unenqueued(conn: Any, grace: float) -> list[tuple[uuid.UUID, str]]:
+async def _no_unenqueued(
+    conn: Any, grace: float
+) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None]]:
     return []
 
 
@@ -359,8 +1006,9 @@ async def test_reap_stuck_builds_reenqueues_each_crashed_job(
     e2 = datetime(2026, 7, 9, 1, 0, 30, tzinfo=UTC)
     enq: list[Any] = []
 
-    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
-        return [(j1, "p1", e1), (j2, "p2", e2)]
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        # build/ingest jobs carry no build_id on the jobs row → build-family branch
+        return [(j1, "p1", "build", None, e1), (j2, "p2", "ingest", None, e2)]
 
     class _Redis:
         async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
@@ -386,8 +1034,8 @@ async def test_reap_stuck_builds_counts_only_new_dispatches(
     # stale row keeps matching every 30s tick. arq refuses the duplicate id
     # (enqueue_job → None) and the tick must report 0 new dispatches — the reaper
     # piles up NO duplicates for one crashed job.
-    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
-        return [(uuid.uuid4(), "p1", datetime(2026, 7, 9, tzinfo=UTC))]
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        return [(uuid.uuid4(), "p1", "build", None, datetime(2026, 7, 9, tzinfo=UTC))]
 
     class _Redis:
         async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
@@ -405,7 +1053,7 @@ async def test_reap_stuck_builds_is_a_noop_when_nothing_crashed(
 ) -> None:
     enq: list[Any] = []
 
-    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
         return []  # no expired leases → an idle tick
 
     class _Redis:
@@ -434,12 +1082,16 @@ async def test_reap_stuck_builds_replays_lost_enqueues(
     enq: list[Any] = []
     seen_grace: list[float] = []
 
-    async def _none_reapable(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
+    async def _none_reapable(
+        conn: Any,
+    ) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
         return []
 
-    async def _find_lost(conn: Any, grace: float) -> list[tuple[uuid.UUID, str]]:
+    async def _find_lost(
+        conn: Any, grace: float
+    ) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None]]:
         seen_grace.append(grace)
-        return [(j1, "p1"), (j2, "p2")]
+        return [(j1, "p1", "build", None), (j2, "p2", "ingest", None)]
 
     class _Redis:
         async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
@@ -465,11 +1117,13 @@ async def test_reap_stuck_builds_counts_both_sweeps(
     crashed, lost = uuid.uuid4(), uuid.uuid4()
     expiry = datetime(2026, 7, 10, 1, 0, 0, tzinfo=UTC)
 
-    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, datetime]]:
-        return [(crashed, "p1", expiry)]
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        return [(crashed, "p1", "build", None, expiry)]
 
-    async def _find_lost(conn: Any, grace: float) -> list[tuple[uuid.UUID, str]]:
-        return [(lost, "p2")]
+    async def _find_lost(
+        conn: Any, grace: float
+    ) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None]]:
+        return [(lost, "p2", "build", None)]
 
     class _Redis:
         async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
@@ -480,6 +1134,101 @@ async def test_reap_stuck_builds_counts_both_sweeps(
     reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
 
     assert reaped == 2  # one crashed re-dispatch + one replayed lost enqueue
+
+
+async def test_reap_reenqueues_crashed_eval_as_eval_task_not_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: an eval job maps to EVAL_TASK, not BUILD_TASK. Before the reaper became
+    # kind-aware, a crashed eval (expired lease, non-terminal) was re-dispatched as
+    # a build — running run_build against an eval job's id, corrupting recovery. It
+    # must resume as an eval, carrying the job's target build_id, under the same
+    # deterministic per-stale-lease reap id.
+    eval_job, target_build = uuid.uuid4(), uuid.uuid4()
+    expiry = datetime(2026, 7, 11, 2, 0, 0, tzinfo=UTC)
+    enq: list[Any] = []
+
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        return [(eval_job, "p1", "eval", target_build, expiry)]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            enq.append((fn, args, _job_id))
+            return object()
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    monkeypatch.setattr(bw, "find_unenqueued_jobs", _no_unenqueued)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 1
+    assert enq == [
+        (
+            bw.EVAL_TASK,
+            ("p1", str(eval_job), str(target_build)),
+            f"reap:{eval_job}:{expiry.isoformat()}",
+        )
+    ]
+
+
+async def test_reap_replays_lost_eval_enqueue_as_eval_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (BA2e queued-sweep, eval): a lost eval dispatch (queued, no lease) must be
+    # replayed as EVAL_TASK under the job's OWN arq id — the eval trigger's exact
+    # enqueue_eval — not as a build.
+    eval_job, target_build = uuid.uuid4(), uuid.uuid4()
+    enq: list[Any] = []
+
+    async def _none_reapable(
+        conn: Any,
+    ) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        return []
+
+    async def _find_lost(
+        conn: Any, grace: float
+    ) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None]]:
+        return [(eval_job, "p1", "eval", target_build)]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            enq.append((fn, args, _job_id))
+            return object()
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _none_reapable)
+    monkeypatch.setattr(bw, "find_unenqueued_jobs", _find_lost)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 1
+    assert enq == [(bw.EVAL_TASK, ("p1", str(eval_job), str(target_build)), str(eval_job))]
+
+
+async def test_reap_skips_eval_job_missing_build_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY: EVAL_TASK cannot run without its target build_id. That state is forbidden
+    # by create_job_exclusive(kind="eval", build_id=…), but if a malformed eval row
+    # ever appears the reaper must skip it (logged) rather than crash the tick —
+    # which would strand every OTHER stuck job the same tick would have recovered.
+    eval_job, good = uuid.uuid4(), uuid.uuid4()
+    expiry = datetime(2026, 7, 11, 3, 0, 0, tzinfo=UTC)
+    enq: list[Any] = []
+
+    async def _find(conn: Any) -> list[tuple[uuid.UUID, str, str, uuid.UUID | None, datetime]]:
+        # a broken eval row (no build_id) alongside a healthy build — the build
+        # must still be recovered
+        return [(eval_job, "p1", "eval", None, expiry), (good, "p2", "build", None, expiry)]
+
+    class _Redis:
+        async def enqueue_job(self, fn: str, *args: Any, _job_id: str | None = None) -> Any:
+            enq.append((fn, args, _job_id))
+            return object()
+
+    monkeypatch.setattr(bw, "find_reapable_jobs", _find)
+    monkeypatch.setattr(bw, "find_unenqueued_jobs", _no_unenqueued)
+    reaped = await bw.reap_stuck_builds({"engine": _FakeEngine(), "redis": _Redis()})
+
+    assert reaped == 1  # only the healthy build was re-dispatched
+    assert enq == [(bw.BUILD_TASK, ("p2", str(good)), f"reap:{good}:{expiry.isoformat()}")]
 
 
 async def test_on_startup_builds_the_dep_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -520,7 +1269,7 @@ async def test_on_shutdown_closes_every_engine() -> None:
 
 
 def test_worker_settings_shape() -> None:
-    assert bw.WorkerSettings.functions == [bw.run_build_task]
+    assert bw.WorkerSettings.functions == [bw.run_build_task, bw.run_eval_task]
     # accessed on the class, these are the plain module coroutines arq calls
     assert bw.WorkerSettings.on_startup is bw.on_startup
     assert bw.WorkerSettings.on_shutdown is bw.on_shutdown

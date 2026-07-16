@@ -26,7 +26,7 @@ def _alembic_config() -> Config:
 
 def test_migration_chain_has_a_single_head() -> None:
     heads = ScriptDirectory.from_config(_alembic_config()).get_heads()
-    assert heads == ["0014_jobs_error_frozen_shape"]
+    assert heads == ["0015_jobs_eval_inputs_fp"]
 
 
 def test_builds_columns_match_design_spec() -> None:

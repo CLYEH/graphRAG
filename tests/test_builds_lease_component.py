@@ -145,6 +145,47 @@ async def test_release_runs_even_when_run_build_raises(monkeypatch: pytest.Monke
     assert calls["released"] == "A"
 
 
+async def test_cancellation_leaves_the_lease_held_for_the_reaper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 31): arq's job_timeout cancels a dispatch that outruns it (via
+    # asyncio.wait_for), raising asyncio.CancelledError INTO run_build/run_eval AFTER the
+    # row is already 'running'/'building'. CancelledError is BaseException, so the worker's
+    # `except Exception` boundary never catches it and the row stays non-terminal. If the
+    # lease were released here the row would be non-terminal + unleased — find_reapable_jobs
+    # needs a HELD lease and find_unenqueued_jobs needs 'queued', so NO sweep recovers it and
+    # create_job_exclusive blocks the project forever. The lease must stay HELD so it lapses
+    # on the DB clock and the BA2d-3 reaper re-enqueues it (the recovery job_timeout
+    # documents). CONTRAST with the RuntimeError test above (a normal failure DOES release so
+    # arq retries). Revert-probe: release unconditionally in the finally and `released` is set.
+    calls: dict[str, Any] = {}
+
+    async def _acquire(conn: Any, job_id: uuid.UUID, owner: str, ttl: float) -> bool:
+        return True
+
+    async def _run(*a: Any, **k: Any) -> Any:
+        raise asyncio.CancelledError
+
+    async def _release(conn: Any, job_id: uuid.UUID, owner: str) -> None:
+        calls["released"] = owner
+
+    async def _renew(conn: Any, job_id: uuid.UUID, owner: str, ttl: float) -> bool:
+        return True
+
+    monkeypatch.setattr(lease_mod, "acquire_lease", _acquire)
+    monkeypatch.setattr(lease_mod, "run_build", _run)
+    monkeypatch.setattr(lease_mod, "release_lease", _release)
+    monkeypatch.setattr(lease_mod, "renew_lease", _renew)
+
+    # cancellation must propagate (never be swallowed) ...
+    with pytest.raises(asyncio.CancelledError):
+        await run_build_leased(_engine(), "p", _JOB, _stages(), owner="A", heartbeat_seconds=1e9)
+
+    # ... and the lease must NOT have been released — left held to lapse so the reaper
+    # reclaims the timed-out job instead of it stranding non-terminal + unleased.
+    assert "released" not in calls
+
+
 async def test_heartbeat_renews_until_it_loses_the_lease(monkeypatch: pytest.MonkeyPatch) -> None:
     # renew True, True, then False → the loop renews 3× and stops on the loss
     # (an expiry-reclaim handed the lease off); no cancel needed.

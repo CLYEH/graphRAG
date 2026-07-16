@@ -65,10 +65,13 @@ async def job_lease(
 ) -> AsyncIterator[bool]:
     """Hold the job's execution lease for the duration of the block, yielding
     whether it was acquired (False → a live peer holds it; the caller should
-    no-op). While held, a background heartbeat renews it; on exit (success OR
-    failure) it is released so a retry can re-acquire. A crashed holder never
-    releases, but its lease expires on the DB clock and the next dispatch (or the
-    reaper) reclaims it.
+    no-op). While held, a background heartbeat renews it; on a clean exit or a
+    normal-exception exit it is released so a retry can re-acquire. On CANCELLATION
+    (arq's ``job_timeout`` via ``asyncio.wait_for``, or worker shutdown) it is
+    deliberately left HELD — see the ``except`` below — so a timed-out job lapses
+    into the reaper's crash-recovery path instead of stranding non-terminal and
+    unleased. A crashed holder never releases either, but its lease expires on the
+    DB clock and the next dispatch (or the reaper) reclaims it.
 
     The worker enters this FIRST — before preflight/stage construction — so the
     lease brackets the ENTIRE dispatch: a crash anywhere mid-dispatch leaves a
@@ -86,14 +89,29 @@ async def job_lease(
         yield False
         return
     beat = asyncio.create_task(_heartbeat(engine, job_id, owner, ttl_seconds, heartbeat_seconds))
+    release_on_exit = True
     try:
         yield True
+    except asyncio.CancelledError:
+        # arq's job_timeout (asyncio.wait_for) — or worker shutdown — cancels the
+        # dispatch mid-run, raising CancelledError AFTER the row is already
+        # 'running'/'building'. It is a BaseException, so the worker's `except Exception`
+        # stage/eval boundary never catches it and the row stays non-terminal. Do NOT
+        # release the lease: a released lease on a non-terminal row is unrecoverable —
+        # find_reapable_jobs needs a HELD lease and find_unenqueued_jobs needs 'queued',
+        # so create_job_exclusive would block the project forever. Leaving the lease HELD
+        # makes a timeout behave like a crash — it lapses on the DB clock and the BA2d-3
+        # reaper re-enqueues it (the recovery WorkerSettings.job_timeout documents). Stop
+        # the heartbeat in the finally, and re-raise: never swallow cancellation.
+        release_on_exit = False
+        raise
     finally:
         beat.cancel()
         with suppress(asyncio.CancelledError):
             await beat
-        async with engine.begin() as conn:
-            await release_lease(conn, job_id, owner)
+        if release_on_exit:
+            async with engine.begin() as conn:
+                await release_lease(conn, job_id, owner)
 
 
 async def run_build_leased(

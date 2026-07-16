@@ -52,6 +52,7 @@ from api.routers import query as query_router
 from api.routers import review as review_router
 from api.routers import sources as sources_router
 from api.routers import triggers as triggers_router
+from api.routers import uploads as uploads_router
 
 #: source checkout keeps contracts/ at the repo root; an installed wheel
 #: ships the build-time copy inside core/ (pyproject force-include) — same
@@ -182,6 +183,7 @@ def create_app() -> FastAPI:
     # contract regardless of what's mounted (DR-002, _openapi above).
     app.include_router(projects_router.router)
     app.include_router(sources_router.router)
+    app.include_router(uploads_router.router)
     app.include_router(triggers_router.router)
     app.include_router(jobs_router.router)
     app.include_router(inspect_router.router)

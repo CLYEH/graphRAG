@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from api.app import create_app
 from api.deps import db_conn
 from core.registry import (
+    MANAGED_FILES_KEY,
     Project,
     ProjectExistsError,
     ProjectHasBuildsError,
@@ -170,3 +171,29 @@ def test_add_source_201_and_missing_project(
     r = client.post("/projects/x/sources", json={"uri": "u"})
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "PROJECT_NOT_FOUND"
+
+
+def test_add_source_rejects_reserved_managed_key(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (triage 26): MANAGED_FILES_KEY is a reserved server-owned metadata key whose
+    # presence marks an upload-managed source. A client that set it via POST /sources
+    # would SPOOF a managed source — an ordinary directory then ingests only the listed
+    # names (or nothing for {}), or fails the build on a malformed value. The endpoint
+    # rejects it as a 400 BEFORE add_source runs, so the store never stores the spoof.
+    called = {"n": 0}
+
+    async def add_should_not_run(conn: Any, project: str, **kw: Any) -> Source:
+        called["n"] += 1
+        return _SOURCE
+
+    _stub(monkeypatch, "sources", "add_source", add_should_not_run)
+    r = client.post(
+        "/projects/p/sources",
+        json={"uri": "file:///d", "kind": "text", "metadata": {MANAGED_FILES_KEY: {}}},
+    )
+    assert r.status_code == 400
+    error = r.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert error["details"]["reserved_key"] == MANAGED_FILES_KEY
+    assert called["n"] == 0  # rejected before touching the store
