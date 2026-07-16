@@ -131,6 +131,36 @@
   color: #c0392b;
 }
 
+.import__filemetas {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+.import__filemeta {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.import__filemeta legend {
+  font-size: 13px;
+  padding: 0 4px;
+  overflow-wrap: anywhere;
+}
+
+.import__metafield {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text);
+}
+
 @media (prefers-color-scheme: dark) {
   .import__line--error {
     color: #f87171;

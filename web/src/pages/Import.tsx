@@ -232,7 +232,7 @@ export function Import() {
         目前專案:<code>{project}</code>
       </p>
       <Sources project={project} />
-      <UploadSection project={project} />
+      <UploadSection project={project} requiredAttrs={requiredAttrs(active?.config)} />
       <RunPipeline
         project={project}
         ontologyMissing={ontologyMissing}
@@ -394,6 +394,33 @@ function Sources({ project }: { project: string }) {
   );
 }
 
+// The project's REQUIRED context attributes (config.metadata_schema.attributes
+// entries with required: true) — the fields the upload endpoint refuses a file
+// WITHOUT (core/metadata/schema.py validates even an absent context against
+// the declared schema). This mirror exists only to GENERATE the per-file
+// inputs; the verdict stays the server's (a lenient parse of a malformed
+// block yields no fields, and the endpoint's own config load fails the
+// request loudly). Optional attributes and the core title/document_type stay
+// API/CLI territory — the dead end this closes is the REQUIRED ones, without
+// which a configured project can never accept any upload (Codex #83).
+type RequiredAttr = { name: string; type: "string" | "number" | "boolean" };
+
+function requiredAttrs(config: Project["config"] | undefined): RequiredAttr[] {
+  const block = (config as Record<string, unknown> | undefined)?.metadata_schema;
+  if (typeof block !== "object" || block === null || Array.isArray(block)) return [];
+  const attrs = (block as Record<string, unknown>).attributes;
+  if (typeof attrs !== "object" || attrs === null || Array.isArray(attrs)) return [];
+  const out: RequiredAttr[] = [];
+  for (const [name, defn] of Object.entries(attrs as Record<string, unknown>)) {
+    if (typeof defn !== "object" || defn === null) continue;
+    const rec = defn as Record<string, unknown>;
+    if (rec.required !== true) continue;
+    const t = rec.type;
+    if (t === "string" || t === "number" || t === "boolean") out.push({ name, type: t });
+  }
+  return out;
+}
+
 // 上傳檔案 (UXC2b): drag-drop or file-pick → multipart upload → the server's
 // per-file accepted/rejected manifest rendered honestly.
 //
@@ -417,22 +444,64 @@ function Sources({ project }: { project: string }) {
 //   server's manifest is the verdict — a client allowlist would fork from
 //   core/ingest/connectors.py TEXT_SUFFIXES (checker/consumer split) and the
 //   endpoint already refuses per-file loudly.
-function UploadSection({ project }: { project: string }) {
+// - Required metadata: when the project declares required context attributes,
+//   each picked file gets inputs for exactly those fields (string/number →
+//   typed inputs, boolean → checkbox). A BLANK field is OMITTED from the
+//   payload — the server then refuses that file with its own "required
+//   attribute missing" reason (an empty string is server-legal, so a client
+//   non-blank gate would over-block; omission keeps the verdict honest and
+//   server-owned). Values reset with the selection (they belong to the batch).
+function UploadSection({
+  project,
+  requiredAttrs,
+}: {
+  project: string;
+  requiredAttrs: RequiredAttr[];
+}) {
   const upload = useUploadDocuments(project);
   const [picked, setPicked] = useState<File[]>([]);
+  const [attrValues, setAttrValues] = useState<Record<string, string | boolean>>({});
   const attemptKey = useRef(crypto.randomUUID());
 
   function pick(files: FileList | null) {
     if (!files || files.length === 0) return;
     setPicked(Array.from(files));
+    setAttrValues({});
     attemptKey.current = crypto.randomUUID();
     upload.reset();
+  }
+
+  // one flat key per (file position, attribute) — file NAME alone would
+  // collide for a batch carrying duplicate names (the server rejects those
+  // whole-request, but the inputs must not alias before that verdict)
+  function valueKey(fileIndex: number, attr: string): string {
+    return `${fileIndex} ${attr}`;
+  }
+
+  function metadataPayload(): Record<string, unknown> | undefined {
+    if (requiredAttrs.length === 0) return undefined;
+    const out: Record<string, unknown> = {};
+    picked.forEach((f, i) => {
+      const attributes: Record<string, unknown> = {};
+      for (const a of requiredAttrs) {
+        const v = attrValues[valueKey(i, a.name)];
+        if (a.type === "boolean") {
+          attributes[a.name] = v === true; // a checkbox always answers
+        } else if (typeof v === "string" && v.trim() !== "") {
+          const parsed = a.type === "number" ? Number(v) : v;
+          if (a.type === "number" && Number.isNaN(parsed as number)) continue;
+          attributes[a.name] = parsed;
+        }
+      }
+      if (Object.keys(attributes).length > 0) out[f.name] = { context: { attributes } };
+    });
+    return Object.keys(out).length > 0 ? out : undefined;
   }
 
   function submit() {
     if (picked.length === 0 || upload.isPending) return;
     upload.mutate(
-      { files: picked, idempotencyKey: attemptKey.current },
+      { files: picked, metadata: metadataPayload(), idempotencyKey: attemptKey.current },
       { onSuccess: () => setPicked([]) },
     );
   }
@@ -470,12 +539,57 @@ function UploadSection({ project }: { project: string }) {
           />
         </label>
       </div>
-      {picked.length > 0 && (
+      {picked.length > 0 && requiredAttrs.length === 0 && (
         <ul className="import__picked">
           {picked.map((f, i) => (
             <li key={`${i}:${f.name}`}>{f.name}</li>
           ))}
         </ul>
+      )}
+      {picked.length > 0 && requiredAttrs.length > 0 && (
+        <div className="import__filemetas">
+          <p className="runs__muted">這個專案要求每個檔案填寫下列欄位(留空會被伺服器退回):</p>
+          {picked.map((f, i) => (
+            <fieldset key={`${i}:${f.name}`} className="import__filemeta">
+              <legend>{f.name}</legend>
+              {requiredAttrs.map((a) =>
+                a.type === "boolean" ? (
+                  <label key={a.name} className="import__metafield">
+                    {a.name}
+                    <input
+                      type="checkbox"
+                      checked={attrValues[valueKey(i, a.name)] === true}
+                      onChange={(e) =>
+                        setAttrValues((prev) => ({
+                          ...prev,
+                          [valueKey(i, a.name)]: e.target.checked,
+                        }))
+                      }
+                    />
+                  </label>
+                ) : (
+                  <label key={a.name} className="import__metafield">
+                    {a.name}(必填)
+                    <input
+                      type={a.type === "number" ? "number" : "text"}
+                      value={
+                        typeof attrValues[valueKey(i, a.name)] === "string"
+                          ? (attrValues[valueKey(i, a.name)] as string)
+                          : ""
+                      }
+                      onChange={(e) =>
+                        setAttrValues((prev) => ({
+                          ...prev,
+                          [valueKey(i, a.name)]: e.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                ),
+              )}
+            </fieldset>
+          ))}
+        </div>
       )}
       <button type="button" onClick={submit} disabled={picked.length === 0 || upload.isPending}>
         {upload.isPending ? "上傳中…" : "上傳"}

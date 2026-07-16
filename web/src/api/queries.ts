@@ -463,9 +463,22 @@ export type UploadResult = components["schemas"]["UploadResult"];
 export function useUploadDocuments(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ files, idempotencyKey }: { files: File[]; idempotencyKey: string }) => {
+    mutationFn: async ({
+      files,
+      metadata,
+      idempotencyKey,
+    }: {
+      files: File[];
+      /** Per-file DocumentMetadataInput keyed by SUBMITTED filename — the
+       *  endpoint's one metadata part. Only include files in this batch
+       *  (orphan keys are a whole-request 400). */
+      metadata?: Record<string, unknown>;
+      idempotencyKey: string;
+    }) => {
       const form = new FormData();
       for (const f of files) form.append("files", f);
+      if (metadata && Object.keys(metadata).length > 0)
+        form.append("metadata", JSON.stringify(metadata));
       const { data, error } = await api.POST("/projects/{project}/uploads", {
         params: { path: { project }, header: { "Idempotency-Key": idempotencyKey } },
         body: form as unknown as { files: string[] },

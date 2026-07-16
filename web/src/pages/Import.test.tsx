@@ -661,6 +661,97 @@ describe("Import 上傳 (UXC2b)", () => {
     ]);
     expect(first.params.header["Idempotency-Key"]).toMatch(/[0-9a-f-]{36}/);
     expect(second.params.header["Idempotency-Key"]).toBe(first.params.header["Idempotency-Key"]);
+    // no declared metadata schema → no metadata part rides along
+    expect((first.body as FormData).get("metadata")).toBeNull();
+  });
+
+  it("collects the project's REQUIRED context attributes per file and sends them typed", async () => {
+    // a project whose metadata_schema declares required attributes would
+    // otherwise reject EVERY upload (the endpoint validates even an absent
+    // context against the schema) with no UI path to supply the values — the
+    // per-file inputs close that dead end (Codex #83). Only required fields
+    // are offered; optional ones stay API/CLI territory.
+    const proj = {
+      ...project("acme"),
+      config: {
+        metadata_schema: {
+          attributes: {
+            location: { type: "string", required: true },
+            floor: { type: "number", required: true },
+            featured: { type: "boolean", required: true },
+            note: { type: "string", required: false },
+          },
+        },
+      },
+    };
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      Promise.resolve(
+        path === "/projects"
+          ? { data: { data: [proj], meta: META }, error: undefined }
+          : { data: { data: [], meta: META }, error: undefined },
+      )) as never);
+    const post = stubUpload([acceptedRow("a.txt")]);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "a.txt")]);
+    // required fields render per file; the optional one is not offered
+    expect(await screen.findByText(/這個專案要求每個檔案填寫下列欄位/)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/note/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/location/), { target: { value: "深海探索廳" } });
+    fireEvent.change(screen.getByLabelText(/floor/), { target: { value: "3" } });
+    fireEvent.click(screen.getByLabelText("featured"));
+    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    const body = (post.mock.calls[0][1] as { body: FormData }).body;
+    expect(JSON.parse(body.get("metadata") as string)).toEqual({
+      "a.txt": {
+        context: { attributes: { location: "深海探索廳", floor: 3, featured: true } },
+      },
+    });
+  });
+
+  it("omits a BLANK required field so the server's own refusal stays the verdict", async () => {
+    // an empty string is server-legal for a required string (presence is the
+    // rule), so a client non-blank gate would over-block; omitting the blank
+    // key instead lets the server refuse that file with its own reason —
+    // honest, and no checker fork
+    const proj = {
+      ...project("acme"),
+      config: {
+        metadata_schema: {
+          attributes: {
+            location: { type: "string", required: true },
+            floor: { type: "number", required: true },
+          },
+        },
+      },
+    };
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      Promise.resolve(
+        path === "/projects"
+          ? { data: { data: [proj], meta: META }, error: undefined }
+          : { data: { data: [], meta: META }, error: undefined },
+      )) as never);
+    const post = stubUpload([
+      rejectedRow("a.txt", "required attribute 'location' is missing from context.attributes"),
+    ]);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "a.txt")]);
+    expect(await screen.findByText(/這個專案要求每個檔案填寫下列欄位/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/floor/), { target: { value: "2" } });
+    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    const body = (post.mock.calls[0][1] as { body: FormData }).body;
+    expect(JSON.parse(body.get("metadata") as string)).toEqual({
+      "a.txt": { context: { attributes: { floor: 2 } } },
+    });
+    // and the server's per-file refusal renders verbatim
+    expect(await screen.findByText(/required attribute 'location' is missing/)).toBeInTheDocument();
   });
 
   it("renders the per-file manifest honestly: verdict words, verbatim reason, no bare stored ids", async () => {
