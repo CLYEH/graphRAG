@@ -472,3 +472,33 @@ async def run_eval(
                 "stored (pruned concurrently?) — nothing persisted"
             )
     return report
+
+
+async def read_build_eval(conn: AsyncConnection, build_id: uuid.UUID) -> dict[str, Any] | None:
+    """The build's currently-stored ``builds.eval`` report (or None). Captured BEFORE
+    an async eval run so a cancelled run can restore it: ``run_eval`` commits the report
+    before the worker's finalize cancel-check, and the activation gate reads ``builds.eval``
+    without consulting the eval job, so a cancelled eval must not leave its report there."""
+    row = (
+        await conn.execute(sa.select(tables.builds.c.eval).where(tables.builds.c.id == build_id))
+    ).one_or_none()
+    return row.eval if row is not None else None
+
+
+async def restore_build_eval(
+    conn: AsyncConnection, build_id: uuid.UUID, prior: dict[str, Any] | None
+) -> None:
+    """Revert ``builds.eval`` to a captured ``prior`` value — the cancel path's undo of
+    ``run_eval``'s write, so a cancelled eval is a true no-op on the gate-read column
+    (a prior report is restored; no prior → back to SQL NULL). A build pruned mid-run
+    matches zero rows, which is fine: there is nothing left to gate.
+
+    ``sa.null()`` (not Python ``None``) for the absent case: JSONB's
+    ``should_evaluate_none`` is True, so ``eval=None`` would persist the JSON ``'null'``
+    LITERAL — a third representation distinct from a fresh build's SQL NULL, which
+    ``builds.eval IS NULL`` readers (§19 Health) would then miscount."""
+    await conn.execute(
+        tables.builds.update()
+        .where(tables.builds.c.id == build_id)
+        .values(eval=sa.null() if prior is None else sa.cast(prior, postgresql.JSONB))
+    )

@@ -21,6 +21,7 @@ build's ingest stage to thread onto ``documents.metadata``.
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -225,6 +226,16 @@ def _reject_non_finite_constant(value: str) -> NoReturn:
     raise ValueError(f"non-finite constant {value!r} is not allowed")
 
 
+def _finite_float(value: str) -> float:
+    """``json.loads(parse_float=…)`` hook for every float token. Rejects one that
+    OVERFLOWS to a non-finite float (``1e999`` → ``inf``) — a token parse_constant
+    never sees — so it cannot pass a ``number`` attribute and 500 in Postgres JSONB."""
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite number {value!r} is not allowed")
+    return parsed
+
+
 def _parse_metadata_field(raw: Any, submitted_names: set[str]) -> dict[str, Any]:
     """Parse the optional ``metadata`` form field (a JSON object keyed by
     submitted filename). A key that names no submitted file is a client error
@@ -237,13 +248,17 @@ def _parse_metadata_field(raw: Any, submitted_names: set[str]) -> dict[str, Any]
             ErrorCode.VALIDATION_ERROR, "the 'metadata' form field must be a JSON string"
         )
     try:
-        # parse_constant rejects the non-standard constants json.loads accepts by
-        # default (NaN/Infinity/-Infinity). A non-finite float would otherwise pass a
-        # `number` attribute or the open governance bag and 500 downstream (Postgres
-        # JSONB refuses non-finite), turning a malformed upload into a 500 instead of
-        # the documented 400 — RFC 8259 JSON has no non-finite numbers. JSONDecodeError
-        # is a ValueError, so one except covers both malformed JSON and this reject.
-        parsed = json.loads(raw, parse_constant=_reject_non_finite_constant)
+        # Two hooks close the non-finite→JSONB-500 path (RFC 8259 JSON has no non-finite
+        # numbers): parse_constant catches the literal NaN/Infinity/-Infinity tokens
+        # json.loads accepts by default; parse_float catches a VALID number token that
+        # OVERFLOWS to inf (e.g. `1e999` → float('inf')), which never reaches
+        # parse_constant. Either would otherwise pass a `number` attribute or the open
+        # governance bag and 500 in Postgres JSONB — a malformed upload must be the
+        # documented 400, not a 500. (Huge INTEGERS stay Python int → JSONB-safe.)
+        # JSONDecodeError is a ValueError, so one except covers malformed JSON + both.
+        parsed = json.loads(
+            raw, parse_constant=_reject_non_finite_constant, parse_float=_finite_float
+        )
     except ValueError as exc:
         raise ApiError(
             ErrorCode.VALIDATION_ERROR, f"the 'metadata' field is not valid JSON: {exc}"

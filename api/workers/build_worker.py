@@ -129,7 +129,7 @@ async def run_eval_task(
     re-runs — eval is idempotent (it just re-writes ``builds.eval``)."""
     from core.eval.golden import load_golden
     from core.eval.inputs import eval_input_paths
-    from core.eval.runner import models_needed, run_eval
+    from core.eval.runner import models_needed, read_build_eval, restore_build_eval, run_eval
     from core.mcp.policy import load_query_policy
 
     engine = ctx["engine"]
@@ -170,6 +170,11 @@ async def run_eval_task(
             await _fail_job(engine, eval_job, exc)
             return "failed"
         async with engine.begin() as conn:
+            # capture builds.eval BEFORE the run: run_eval commits the new report before
+            # the finalize cancel-check below, and the activation gate reads builds.eval
+            # without consulting the eval job, so a cancel must restore this prior value
+            # (§20 gate must never be satisfied by a cancelled eval's report).
+            prior_eval = await read_build_eval(conn, target_build)
             await set_progress(conn, eval_job, status="running", progress=0.0)
         try:
             async with engine.connect() as conn, ctx["neo4j"].session() as session:
@@ -197,7 +202,14 @@ async def run_eval_task(
         # under the write's row lock, never a prior unlocked SELECT.
         async with engine.begin() as conn:
             await lock_job(conn, eval_job)  # FOR UPDATE — the cancel cutoff
-            status = "cancelled" if await is_cancel_requested(conn, eval_job) else "done"
+            cancelled = await is_cancel_requested(conn, eval_job)
+            if cancelled:
+                # run_eval already committed the report; a cancelled eval must be a
+                # true no-op on the gate-read column, so revert builds.eval to its
+                # pre-run value in the SAME txn that marks the job cancelled (mirrors
+                # run_build: a cancelled build never becomes gate-eligible).
+                await restore_build_eval(conn, target_build, prior_eval)
+            status = "cancelled" if cancelled else "done"
             await set_progress(
                 conn, eval_job, status=status, progress=1.0, finished_at=sa.func.now()
             )

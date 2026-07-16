@@ -264,15 +264,18 @@ def test_null_per_file_metadata_entry_rejects_that_file_not_the_batch(
 def test_non_finite_metadata_constant_is_400_not_500(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
-    # WHY: json.loads accepts the non-standard constants NaN/Infinity/-Infinity by
-    # default; a non-finite float would pass a `number` attribute or the open governance
-    # bag and then 500 downstream (Postgres JSONB refuses non-finite). A malformed upload
-    # must be the documented 400 at parse time, never a 500 — parse_constant rejects it.
+    # WHY: json.loads accepts non-finite values two ways — the literal constants
+    # NaN/Infinity/-Infinity (parse_constant), AND a valid number token that OVERFLOWS
+    # to inf like `1e999` (parse_float, never seen by parse_constant). Either would pass
+    # a `number` attribute or the open governance bag and then 500 downstream (Postgres
+    # JSONB refuses non-finite). A malformed upload must be the documented 400 at parse
+    # time, never a 500 — so BOTH routes are rejected.
     _project(monkeypatch)
     _settings(monkeypatch, tmp_path)
     for raw in (
         '{"doc.txt": {"context": {"attributes": {"year": NaN}}}}',
         '{"doc.txt": {"governance": {"score": Infinity}}}',
+        '{"doc.txt": {"context": {"attributes": {"year": 1e999}}}}',  # overflow → inf
     ):
         resp = client.post(
             _URL,

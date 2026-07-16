@@ -56,6 +56,15 @@ async def _capture_passthrough(conn: Any, job_id: uuid.UUID, live: Any) -> Any:
     return live
 
 
+def _fake_read_eval(prior: Any) -> Any:
+    # stand-in for core.eval.runner.read_build_eval: yields the captured prior
+    # builds.eval value (the worker restores it on cancel). Kept off the fake engine.
+    async def read(conn: Any, build_id: uuid.UUID) -> Any:
+        return prior
+
+    return read
+
+
 def _fake_lease(calls: dict[str, Any] | None = None, *, acquired: bool = True) -> Any:
     # stand-in for job_lease: records (job_id, owner) and yields `acquired`.
     @asynccontextmanager
@@ -327,6 +336,7 @@ async def test_run_eval_task_terminalizes_on_store_error_never_strands_running(
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _boom)
+    monkeypatch.setattr("core.eval.runner.read_build_eval", _fake_read_eval(None))
 
     ctx = {
         "engine": _FakeEngine(),
@@ -474,8 +484,14 @@ async def test_run_eval_task_cancel_during_run_finalizes_cancelled(
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
     monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+
+    async def _restore(conn: Any, build_id: uuid.UUID, prior: Any) -> None:
+        events.append("restore")  # the cancel-path undo of run_eval's builds.eval write
+
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.read_build_eval", _fake_read_eval(None))
+    monkeypatch.setattr("core.eval.runner.restore_build_eval", _restore)
 
     ctx = {
         "engine": _FakeEngine(),
@@ -491,7 +507,99 @@ async def test_run_eval_task_cancel_during_run_finalizes_cancelled(
     assert statuses == ["running", "cancelled"]  # ran, then cancelled at finalize
     # the finalize acquires the row lock BEFORE its cancel read (#2): a cancel
     # racing the finalize is decided under the lock, never lost to an unlocked read.
-    assert events == ["cancel_read#1", "lock", "cancel_read#2"]
+    # The restore (builds.eval undo) runs UNDER that same lock, after the read.
+    assert events == ["cancel_read#1", "lock", "cancel_read#2", "restore"]
+
+
+async def test_run_eval_task_cancel_reverts_builds_eval_to_the_prior_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 16 / Finding F): run_eval COMMITS builds.eval before the finalize
+    # cancel-check, and the §20 activation gate reads builds.eval WITHOUT consulting the
+    # eval job status. So a cancelled eval must be a true no-op on that column: the worker
+    # captures the pre-run value and, on cancel, RESTORES it — else a cancelled eval's
+    # fresh report could still satisfy the gate. Here the build had a valid EARLIER eval;
+    # the cancelled re-run must restore THAT (not wipe it), for THIS build.
+    prior = {"score": 0.9, "was_prior": True}
+    restored: list[tuple[str, Any]] = []
+    checks = {"n": 0}
+
+    async def _noop_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        pass
+
+    async def _noop_lock(conn: Any, job_id: uuid.UUID) -> None:
+        return None
+
+    async def _cancel_on_finalize(conn: Any, job_id: uuid.UUID) -> bool:
+        checks["n"] += 1
+        return checks["n"] > 1  # False at pre-start, True at finalize (cancel mid-run)
+
+    async def _restore(conn: Any, build_id: uuid.UUID, value: Any) -> None:
+        restored.append((str(build_id), value))
+
+    async def _run_eval(*a: Any, **k: Any) -> None:
+        return None  # "wrote" a fresh report; the cancel must undo it
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _noop_progress)
+    monkeypatch.setattr(bw, "is_cancel_requested", _cancel_on_finalize)
+    monkeypatch.setattr(bw, "lock_job", _noop_lock)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.read_build_eval", _fake_read_eval(prior))
+    monkeypatch.setattr("core.eval.runner.restore_build_eval", _restore)
+
+    build_id = str(uuid.uuid4())
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), build_id)
+
+    assert result == "cancelled"
+    # restored builds.eval to EXACTLY the captured prior value, for THIS build — so the
+    # gate reads the prior state, never the cancelled report. (Revert-probe: drop the
+    # restore call and `restored` is empty.)
+    assert restored == [(build_id, prior)]
+
+
+async def test_run_eval_task_completed_eval_does_not_revert_builds_eval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the other side of Finding F: a COMPLETED (not cancelled) eval must keep the report
+    # run_eval wrote — the restore is cancel-only, never touched on the happy path.
+    restored: list[Any] = []
+
+    async def _noop_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        pass
+
+    async def _noop_lock(conn: Any, job_id: uuid.UUID) -> None:
+        return None
+
+    async def _never_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    async def _restore(conn: Any, build_id: uuid.UUID, value: Any) -> None:
+        restored.append(value)
+
+    async def _run_eval(*a: Any, **k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _noop_progress)
+    monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
+    monkeypatch.setattr(bw, "lock_job", _noop_lock)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+    monkeypatch.setattr("core.eval.runner.read_build_eval", _fake_read_eval({"score": 0.5}))
+    monkeypatch.setattr("core.eval.runner.restore_build_eval", _restore)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result == "done"
+    assert restored == []  # happy path never reverts — the fresh report stands
 
 
 async def test_enqueue_build_uses_job_id_dedup() -> None:
