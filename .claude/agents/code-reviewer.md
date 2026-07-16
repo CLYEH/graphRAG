@@ -242,7 +242,34 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      TOCTOU — the recheck read the files once to fingerprint and the parser
      re-read them, so an edit between the two reads was scored as "verified".
      If later rounds are reviewing your fixes rather than the task, the fixes
-     skipped their catalog pass.
+     skipped their catalog pass. (#82's triage-3 fix recurred this: the new
+     stream-terminal predicate read a RETAINED prior-job event without gating
+     on the event's own id — reading retained/carried-over state across an
+     identity flip must be gated on that identity, the same rule as the
+     producing hook's own stale-frame guard.)
+   - **An implicit default does not survive time or a handoff (class 26,
+     PR #82 — all three Codex findings)**: a DERIVED default (newest-X,
+     first-eligible) is only valid at the instant it is derived. Any
+     operation that OUTLIVES the derivation (an async job whose terminal
+     refetch re-derives it — a newer candidate landing mid-run steals the
+     result scope) or CROSSES pages (a CTA link whose destination has a
+     DIFFERENT default rule) must MATERIALIZE the value it means: pin it as
+     explicit state when the operation starts, carry it in the link
+     (`?build=<id>`). Reviewing a diff, pair every "default + thing that
+     acts" (job/mutation/link) and ask: "will this default re-derive to the
+     same value when the action lands?"
+   - **Invalidation/refetch probes need WORLD-STATE stubs, not call-counted
+     pages (class 26)**: a test that proves "the fix triggers the refresh"
+     is false-green if its stub serves responses by CALL COUNT — a buggy
+     premature/extra refetch gets handed the "after" world and the assertion
+     passes with the fix reverted (#82: the second-run revert-probe passed
+     with the id gate removed). Model the stub on world state (flags flipped
+     when the modeled event ACTUALLY happens, gated behind a manually
+     released promise), then PROVE discrimination by running the mutation:
+     apply it (assert it landed — a no-op mutation proves nothing, and the
+     probe script must fail-fast so a failed mutation can't run the probe
+     anyway), see the exact test go red, restore from a TEMP COPY — never
+     `git checkout --` over uncommitted work.
    - **Per-surface inventory (transfer ≠ sweep)**: a boundary module's NEW
      surfaces get their own catalog pass — C1c (surfaces 1:1 with C1b) took 0
      Codex rounds while C1d (new surfaces) took 4, every finding a cataloged

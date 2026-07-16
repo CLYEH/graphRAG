@@ -105,3 +105,13 @@ class 17 寫入側對偶;修法即新面;跨 ≥2 新面的任務計畫期就切
 **下一站:UXC2**——評測頁+上傳 UI+檢索改名(需 UXC1b✅);記得帶上 UXC1a 的 format:binary
 codegen follow-up(FE `File`/`Blob` wrapper)。
 
+**UXC2 切成 2a/2b/2c(docs 6721a64,class-25 切片先例)。UXC2a ✅ merged(PR #82,
+2026-07-16,bba0321)**:品質頁上線——golden-set 評測(UXC1b 端點+job SSE+逐題
+通過/未過表+終態 invalidate ["builds"] 餵總覽 step ③ 同讀取);總覽三處 CLI 交接改連
+品質頁(帶 ?build=<id>)。**2 輪 Codex 3 P2 + 本地 reviewer 連續 2 FAIL 推翻我的修法**
+(streamTerminal 殘留事件回歸+revert-probe 假綠)——教訓入 [[graphrag-loop-paused-pr5]]
+**class 26**(隱含預設不跨時間與交接;殘留狀態 gate 身分;invalidation 探針 stub=世界
+模型+mutation 實證;probe 還原用 temp copy 勿 git checkout)。真瀏覽器 QA:museum 真實
+eval 3/3 通過、step ③ 自動翻綠。**下一站:UXC2b 上傳 UI(資料 tab)+ format:binary
+codegen follow-up;之後 UXC2c 檢索改名+全流程 e2e。**
+
