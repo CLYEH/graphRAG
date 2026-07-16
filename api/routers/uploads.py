@@ -133,6 +133,20 @@ async def upload_documents_endpoint(
             ErrorCode.VALIDATION_ERROR,
             "every file part must carry a filename (it is the manifest's correlation key)",
         )
+    # A NUL in a filename is the SAME U+0000→JSONB-500 class the metadata guard closes, on
+    # a second string feeding the same write: the submitted filename is echoed verbatim into
+    # the stored envelope's server-owned system.original_filename, and Postgres text/JSONB
+    # cannot hold U+0000 — so an accepted NUL filename 500s the upsert_managed_source write.
+    # Reject it as a whole-request 400 here (a filename with a NUL is not a valid name on any
+    # filesystem, and it is the correlation key), grouped with the empty/duplicate filename
+    # guards so it also covers a file that carries no per-file metadata (the per-file
+    # _contains_nul guard only scans a file's supplied context/governance).
+    if any("\x00" in name for name in submitted_names):
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            "a submitted filename contains a NUL character (U+0000), which is not a valid "
+            "filename and cannot be stored",
+        )
     duplicates = sorted({n for n in submitted_names if submitted_names.count(n) > 1})
     if duplicates:
         raise ApiError(
@@ -274,6 +288,22 @@ def _finite_float(value: str) -> float:
     if not math.isfinite(parsed):
         raise ValueError(f"non-finite number {value!r} is not allowed")
     return parsed
+
+
+def _contains_nul(obj: Any) -> bool:
+    """True if any string key or value nested in a parsed-metadata structure holds a
+    NUL (U+0000). A JSON string may legally carry ``\\u0000``, but Postgres text/JSONB
+    cannot store it — the same JSON-valid-but-JSONB-unstorable class as the non-finite
+    guards above — so such a value would 500 the ``upsert_managed_source`` write. Scans
+    keys too: the open ``context.attributes`` / ``governance`` bags let a client NUL hide
+    in an object KEY, which Postgres rejects just as it does a value."""
+    if isinstance(obj, str):
+        return "\x00" in obj
+    if isinstance(obj, dict):
+        return any((isinstance(k, str) and "\x00" in k) or _contains_nul(v) for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(_contains_nul(v) for v in obj)
+    return False
 
 
 async def _canonical_upload_fingerprint(
@@ -437,6 +467,17 @@ def _validate_file(
             parsed = DocumentMetadataInput.model_validate(entry)
         except ValidationError as exc:
             return f"metadata is invalid: {_first_pydantic_error(exc)}", None
+        if _contains_nul(parsed.model_dump()):
+            # A JSON string may hold U+0000, but Postgres text/JSONB cannot store it, so
+            # upsert_managed_source would 500 the WHOLE upload rather than this file's
+            # stated metadata refusal. Reject at capture (same class as the non-finite
+            # guards in _parse_metadata_field), before the accept path reaches the DB.
+            # Per-file here (a file's own metadata is its own concern), unlike the
+            # non-finite guard (a parse-time hook that can't attribute the token to a
+            # file → whole-request 400) and the NUL-filename guard (a structural
+            # correlation-key check → whole-request 400): granularity follows where the
+            # bad string lives, not the shared JSONB-unstorable class.
+            return "metadata contains a NUL character (U+0000), which cannot be stored", None
         if parsed.context is not None:
             context_to_check = parsed.context.model_dump()
     # validate the context against the project schema ALWAYS — with an empty

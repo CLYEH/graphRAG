@@ -266,6 +266,74 @@ def test_non_utf8_file_is_rejected_not_accepted(
     assert rows["good.txt"]["status"] == "accepted"  # the decodable sibling is unaffected
 
 
+def test_metadata_with_nul_is_rejected_not_accepted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY (triage 29): a metadata string may legally carry U+0000 (json.loads and the
+    # DocumentMetadataInput validation both accept it), but Postgres text/JSONB cannot
+    # store U+0000 — so it would 500 the WHOLE upload at the upsert_managed_source write
+    # instead of this file's STATED per-file metadata refusal. It must be rejected AT
+    # CAPTURE, recursively (here in an open governance value), and a clean sibling in the
+    # same batch stays accepted (per-file, not whole-request). Revert-probe: drop the
+    # _contains_nul guard and bad.txt is accepted, and the NUL rides into the JSONB write.
+    _project(monkeypatch)
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    metadata = {"bad.txt": {"governance": {"note": "secret\x00leak"}}}
+    resp = client.post(
+        _URL,
+        files=[
+            ("files", ("bad.txt", b"clean text", "text/plain")),
+            ("files", ("good.txt", b"clean text", "text/plain")),
+        ],
+        data={"metadata": json.dumps(metadata)},
+    )
+    assert resp.status_code == 201  # per-file reject, not a whole-request failure/500
+    rows = {r["original_filename"]: r for r in resp.json()["data"]["files"]}
+    assert rows["bad.txt"]["status"] == "rejected"
+    assert "NUL" in rows["bad.txt"]["reason"]
+    assert rows["good.txt"]["status"] == "accepted"  # the clean sibling is unaffected
+
+
+def test_nul_in_filename_is_rejected_not_accepted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY (triage 29, filename sibling): the submitted filename is echoed VERBATIM into the
+    # stored envelope's server-owned system.original_filename — a JSONB write — so a raw NUL
+    # (U+0000) in it is the SAME "accepted then 500s the upsert" class as a NUL in metadata
+    # (Postgres text/JSONB cannot store U+0000). It also evades the per-file metadata guard
+    # entirely for a file carrying no metadata. So it must be a STATED whole-request 400 at
+    # capture, never accepted. httpx `files=` percent-encodes a NUL, so the body is built
+    # RAW to put the real byte on the wire the way an adversarial client would. Revert-probe:
+    # drop the filename NUL guard and this file is accepted and the NUL rides into the write.
+    _project(monkeypatch)
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    boundary = "----graphragnulname"
+    body = (
+        "\r\n".join(
+            [
+                f"--{boundary}",
+                'Content-Disposition: form-data; name="files"; filename="bad\x00.txt"',
+                "Content-Type: text/plain",
+                "",
+                "clean text",
+                f"--{boundary}--",
+                "",
+            ]
+        )
+    ).encode()
+    resp = client.post(
+        _URL,
+        content=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    assert resp.status_code == 400  # whole-request refusal, before any per-file accept
+    error = resp.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert "NUL" in error["message"]
+
+
 # --- metadata (server-owned system, project-typed attributes) ----------------
 
 
