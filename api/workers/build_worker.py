@@ -205,9 +205,8 @@ async def run_eval_task(
             needs_embedder, needs_llm = models_needed(golden, policy)
             embedder = ctx["embedder"] if needs_embedder else None
             llm = ctx["llm"] if needs_llm else None
-        except Exception as exc:  # noqa: BLE001 — preflight is ALL-LOCAL (read+parse+validate the golden set / policy, pick models). GoldenError/PolicyError/LLMNotConfiguredError are the expected refusals, but a bad golden/policy PATH is equally deterministic: a directory or bad perms raises OSError, invalid UTF-8 raises UnicodeDecodeError, malformed YAML its own error. ANY escape here strands the job 'queued'+unleased (job_lease's finally released the lease before the 'running' mark), which the queued-sweep replays FOREVER and create_job_exclusive uses to block every later job for the project. So terminalize like the run phase below, never propagate. (CancelledError is BaseException → still propagates to job_lease, which on cancel leaves the lease HELD so the reaper reclaims — no strand.)
-            await _fail_job(engine, eval_job, exc)
-            return "failed"
+        except Exception as exc:  # noqa: BLE001 — preflight is ALL-LOCAL (read+parse+validate the golden set / policy, pick models). GoldenError/PolicyError/LLMNotConfiguredError are the expected refusals, but a bad golden/policy PATH is equally deterministic: a directory or bad perms raises OSError, invalid UTF-8 raises UnicodeDecodeError, malformed YAML its own error. ANY escape here would leave the row non-terminal for the sweep to replay FOREVER (create_job_exclusive then blocks every later job for the project), so terminalize instead of propagating. Via _fail_eval (NOT the unconditional _fail_job): a LARGE synchronous golden/policy load can block the event loop past the lease TTL, so the reaper can hand this job to a replacement DURING preflight (the same handoff window run/finalize guard) — an unconditional 'failed' write would clobber the replacement's result. _fail_eval re-checks lead under the row lock, so a stale worker no-ops (None). (CancelledError is BaseException → still propagates to job_lease, which on cancel leaves the lease HELD so the reaper reclaims — no strand.)
+            return await _fail_eval(engine, eval_job, ctx["owner"], exc)
         async with engine.begin() as conn:
             # Re-verify we still LEAD before the 'running' write (class-10, under the row
             # lock). Preflight is local but a large SYNCHRONOUS golden/policy YAML load can
@@ -475,10 +474,13 @@ def _failure_error(exc: Exception) -> dict[str, Any]:
 async def _fail_job(engine: AsyncEngine, job_id: uuid.UUID, exc: Exception) -> None:
     """Record a preflight failure on the durable jobs row (its own committed
     transaction), so a build that never reached the orchestrator still terminates
-    the job instead of leaving it queued. Used for failures BEFORE the 'running'
-    mark, where this worker just acquired the lease and no replacement can exist —
-    so it is unconditional (the eval RUN/finalize failures use _fail_eval, which is
-    lease-guarded, because the lease can lapse across their long window)."""
+    the job instead of leaving it queued. Used only where this worker just acquired
+    the lease with NO intervening await/stall, so no replacement can exist and the
+    write is safely unconditional: the build preflight, and the eval path-safety
+    refusal. Every eval failure that can span a heartbeat-lapse window — the preflight
+    LOADER failure (a large synchronous golden/policy load can block the loop past the
+    TTL), the run, and the finalize — uses the lease-guarded _fail_eval instead, so a
+    stale worker can't clobber a replacement's result."""
     async with engine.begin() as conn:
         await set_progress(
             conn, job_id, status="failed", finished_at=sa.func.now(), error=_failure_error(exc)

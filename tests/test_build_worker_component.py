@@ -437,6 +437,9 @@ async def test_run_eval_task_terminalizes_on_a_preflight_loader_error(
     monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "set_progress", _set_progress)
     monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(
+        bw, "holds_lease", _holds_lease_yes
+    )  # still leads → _fail_eval marks failed
     monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
@@ -447,6 +450,47 @@ async def test_run_eval_task_terminalizes_on_a_preflight_loader_error(
 
     assert result == "failed"  # terminal, never left 'queued' for the sweep to loop
     assert statuses == ["failed"]  # failed at preflight, before any 'running' mark
+
+
+async def test_run_eval_task_preflight_failure_no_ops_after_lease_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 34): a LARGE synchronous golden/policy load can block the event loop past
+    # the lease TTL BEFORE it raises — the heartbeat can't renew, the lease lapses, and the
+    # reaper hands this job to a replacement that may already be running/finished. An
+    # UNCONDITIONAL _fail_job on the preflight error would clobber the replacement's
+    # result/status with 'failed'. So the preflight failure terminalizes via _fail_eval,
+    # which re-checks lead under the row lock: a stale worker (holds_lease False) no-ops
+    # (None) and writes NOTHING. Revert-probe: use the unconditional _fail_job and 'failed'
+    # is written despite the handoff.
+    statuses: list[str] = []
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _lease_lost(conn: Any, job_id: uuid.UUID, owner: str) -> bool:
+        return False  # the lease was reclaimed by a replacement during the slow preflight
+
+    async def _not_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    def _boom_load(path: Any) -> Any:
+        raise OSError("golden.yaml is a directory")  # the preflight failure after the stall
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(bw, "holds_lease", _lease_lost)  # we no longer lead by the failure
+    monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", _boom_load)
+
+    ctx = {"engine": _FakeEngine(), "neo4j": _FakeNeo4j(), "owner": "worker-abc"}
+    result = await bw.run_eval_task(ctx, "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result is None  # benign no-op — the replacement is authoritative
+    assert statuses == []  # never wrote 'failed' over the replacement's status
 
 
 async def test_run_eval_task_fails_loud_when_eval_inputs_drifted(
@@ -478,6 +522,9 @@ async def test_run_eval_task_fails_loud_when_eval_inputs_drifted(
     monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "set_progress", _set_progress)
     monkeypatch.setattr(bw, "lock_job", _lock_active)
+    monkeypatch.setattr(
+        bw, "holds_lease", _holds_lease_yes
+    )  # still leads → _fail_eval marks failed
     monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
     monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _pinned)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
