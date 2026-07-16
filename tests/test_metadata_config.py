@@ -68,6 +68,38 @@ def test_attribute_definition_rejects_unknown_key() -> None:
         )
 
 
+def test_attribute_definition_allows_contract_documented_display_and_filterable() -> None:
+    # WHY: the frozen contract (openapi.yaml DocumentMetadataContext) documents
+    # ``type/required/display/filterable`` as the metadata_schema attribute keys, so a
+    # valid v1.2 config carrying display/filterable must NOT be rejected at the upload
+    # boundary. They are FE-facing hints with no backend semantics yet — allowed but not
+    # parsed into AttributeDef (the loader still only reads type/required). Revert-probe:
+    # under the old {"type","required"} closed set this raised "unknown key".
+    schema = load_metadata_schema(
+        {
+            "metadata_schema": {
+                "attributes": {
+                    "case_number": {
+                        "type": "string",
+                        "required": True,
+                        "display": "Case number",
+                        "filterable": True,
+                    }
+                }
+            }
+        }
+    )
+    # the documented config loads, and the backend-relevant fields are still parsed…
+    assert schema.attributes["case_number"].type == "string"
+    assert schema.attributes["case_number"].required is True
+    # …while a genuine typo still fails loud (the closed set is only widened by the
+    # two documented keys, not opened up).
+    with pytest.raises(MetadataConfigError, match="unknown key"):
+        load_metadata_schema(
+            {"metadata_schema": {"attributes": {"x": {"type": "string", "displ": True}}}}
+        )
+
+
 def test_schema_rejects_missing_type() -> None:
     with pytest.raises(MetadataConfigError, match="type is required"):
         load_metadata_schema({"metadata_schema": {"attributes": {"x": {"required": True}}}})

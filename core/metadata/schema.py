@@ -173,7 +173,14 @@ def load_metadata_schema(config: Mapping[str, Any]) -> MetadataSchema:
     for name, raw in raw_attributes.items():
         path = f"metadata_schema.attributes.{name}"
         defn = _mapping(raw, path)
-        _reject_unknown(defn, {"type", "required"}, path)
+        # `display`/`filterable` are contract-documented attribute keys (openapi.yaml
+        # DocumentMetadataContext: "keys' type/required/display/filterable are defined
+        # by projects.config.metadata_schema"). They are FE-facing hints with no backend
+        # ingest/validation semantics yet, so they are ALLOWED (a valid v1.2 config must
+        # not be rejected at the upload boundary) but not parsed into AttributeDef — the
+        # loader only needs type/required. Rejecting them would make a documented config
+        # unusable; consuming them (surfacing to the Console) is a separate FE concern.
+        _reject_unknown(defn, {"type", "required", "display", "filterable"}, path)
         if "type" not in defn:
             raise MetadataConfigError(f"{path}.type is required")
         attr_type = _str(defn["type"], f"{path}.type")
