@@ -25,7 +25,9 @@ scheme is required rather than guessed.
 from __future__ import annotations
 
 import re
+import uuid
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, unquote_to_bytes, urlparse
@@ -238,6 +240,28 @@ def _local_path(source: Source) -> Path:
             "reads depends on the worker's cwd; name the drive (file:///C:/data/corpus)"
         )
     return resolved
+
+
+def ensure_resolvable_file_uri(uri: str) -> None:
+    """Raise :class:`SourceResolutionError` unless ``uri`` is a canonical, resolvable
+    ``file://`` uri — the SAME rules :func:`resolve_source` applies to a managed source
+    at ingest (delegated to :func:`_local_path`, whose result is discarded here). The
+    upload endpoint calls this on the corpus uri it is about to register, so a project
+    name that IS a safe path component but whose ``as_uri()`` encodes to a form no build
+    can resolve — e.g. ``foo:bar`` → ``%3A`` (drive separator), ``foo|bar`` → ``|`` — is
+    rejected at capture, not accepted into a source every later build then fails to
+    resolve. The probe carries sentinel id/added_at (never surfaced: the caller catches
+    and re-raises its own error) since only the uri is under test."""
+    _local_path(
+        Source(
+            id=uuid.UUID(int=0),
+            project="",
+            kind="text",
+            uri=uri,
+            metadata={},
+            added_at=datetime.min,
+        )
+    )
 
 
 def _files_metadata(source: Source) -> dict[str, dict[str, Any]] | None:

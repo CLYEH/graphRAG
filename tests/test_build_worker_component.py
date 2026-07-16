@@ -365,6 +365,54 @@ async def test_run_eval_task_terminalizes_on_store_error_never_strands_running(
     assert statuses == ["running", "failed"]
 
 
+async def test_run_eval_task_no_ops_when_lease_lost_before_marking_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WHY (triage 32): a large SYNCHRONOUS preflight load (golden/policy YAML) can block
+    # the event loop past the lease TTL — the heartbeat can't renew, the lease lapses, and
+    # the reaper hands this job to a REPLACEMENT that terminalizes + releases it. An
+    # UNCONDITIONAL 'running' write would REOPEN that terminal job as 'running' while this
+    # worker no longer leads; finalize's _eval_leads then no-ops, stranding it
+    # 'running'+unleased (no sweep recovers it → create_job_exclusive blocks the project).
+    # So the 'running' mark is gated on still LEADING (lease-owning + live) under the row
+    # lock: if a replacement took over, this worker no-ops (None) and never reopens the job.
+    # Here holds_lease=False models the lapsed-lease handoff. Revert-probe: drop the guard
+    # and 'running' is written (and run_eval fires) even though we lost the lease.
+    statuses: list[str] = []
+    ran = {"n": 0}
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        statuses.append(fields.get("status", ""))
+
+    async def _lease_lost(conn: Any, job_id: uuid.UUID, owner: str) -> bool:
+        return False  # a replacement reclaimed the lapsed lease during the preflight stall
+
+    async def _not_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
+        return False
+
+    async def _run_eval(*a: Any, **k: Any) -> str:
+        ran["n"] += 1  # must NOT run — we no longer lead
+        return "REPORT"
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_active)  # pre-start guard sees a live job
+    monkeypatch.setattr(bw, "holds_lease", _lease_lost)  # but the lease was lost by mark-running
+    monkeypatch.setattr(bw, "is_cancel_requested", _not_cancelled)
+    monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
+    monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
+    monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
+    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
+    monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
+
+    result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert result is None  # benign no-op — the replacement is authoritative
+    assert "running" not in statuses  # never REOPENED the terminalized job as 'running'
+    assert ran["n"] == 0  # run_eval never ran
+
+
 async def test_run_eval_task_terminalizes_on_a_preflight_loader_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -624,12 +672,14 @@ async def test_run_eval_task_cancel_during_run_finalizes_cancelled(
 
     assert result == "cancelled"
     assert statuses == ["running", "cancelled"]  # ran, then cancelled at finalize
-    # BOTH the pre-start guard and the finalize acquire the row lock BEFORE their cancel
-    # read: a cancel is always decided under the lock, never lost to an unlocked read. The
-    # pre-start read (#1) is False (still running), the finalize read (#2) True. And a
-    # cancelled eval NEVER persists builds.eval (no "persist") — the report is withheld,
-    # so no window and nothing for the §20 gate to read.
-    assert events == ["lock", "cancel_read#1", "lock", "cancel_read#2"]
+    # Three FOR-UPDATE locks, each BEFORE the decision it guards: the pre-start guard
+    # (lock → cancel_read#1, False = still running), the mark-running lead re-check
+    # (triage 32: lock, no cancel read — it only confirms we still lead before writing
+    # 'running'), and the finalize (lock → cancel_read#2, True). A cancel is always
+    # decided under the lock, never lost to an unlocked read. And a cancelled eval NEVER
+    # persists builds.eval (no "persist") — the report is withheld, nothing for the §20
+    # gate to read.
+    assert events == ["lock", "cancel_read#1", "lock", "lock", "cancel_read#2"]
 
 
 async def test_run_eval_task_cancelled_eval_never_persists_the_report(
@@ -731,9 +781,12 @@ async def test_run_eval_task_stale_worker_does_not_overwrite_after_lease_handoff
     # finalize re-checks UNDER the row lock that we still OWN the lease (_eval_leads); a
     # reclaimed worker (holds_lease False) does a benign no-op (None) — no persist, no
     # terminal write. Revert-probe: drop the ownership check and the stale report
-    # overwrites builds.eval and marks the job done.
+    # overwrites builds.eval and marks the job done. (We still LEAD when we mark running —
+    # the handoff happens DURING the long run — so holds_lease is True at the mark-running
+    # lead check (triage 32) and False by the finalize.)
     statuses: list[str] = []
     persisted: list[Any] = []
+    lease_calls = {"n": 0}
 
     async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
         if "status" in fields:
@@ -743,7 +796,10 @@ async def test_run_eval_task_stale_worker_does_not_overwrite_after_lease_handoff
         return SimpleNamespace(status="running")  # the job the replacement is running
 
     async def _lease_reclaimed(conn: Any, job_id: uuid.UUID, owner: str) -> bool:
-        return False  # our lease was reclaimed by the replacement — we no longer lead
+        # led at mark-running, then the reaper handed the lease to a replacement during the
+        # run — so the finalize's lead check finds it gone.
+        lease_calls["n"] += 1
+        return lease_calls["n"] == 1  # True at mark-running, False at finalize
 
     async def _never_cancelled(conn: Any, job_id: uuid.UUID) -> bool:
         return False

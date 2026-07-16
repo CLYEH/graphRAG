@@ -124,6 +124,30 @@ def test_oversized_total_is_413(
     assert "limit" in error["message"] and error["request_id"]
 
 
+def test_project_name_with_unresolvable_corpus_uri_is_rejected(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY (triage 33): the project name is a path component of the managed corpus, and the
+    # corpus's `as_uri()` is registered as the source every build resolves. A name that is a
+    # SAFE path component but whose as_uri() encodes to a form the source resolver rejects
+    # (a pipe '|' → the Windows drive separator; a colon → %3A) would let the upload succeed
+    # and register a source EVERY later build then fails to resolve — an unbuildable upload.
+    # It must be a STATED whole-request 400 at capture (the same source-resolution rules),
+    # never accepted. Revert-probe: drop the ensure_resolvable_file_uri check and this is no
+    # longer a 400 at capture (it slips past the corpus guard into the accept path).
+    _settings(monkeypatch, tmp_path)
+    # '|' is percent-encoded to %7C by as_uri(), decodes back to '|', which the resolver
+    # refuses (the drive separator); the URL carries it as %7C so the path param is 'a|b'.
+    resp = client.post(
+        "/projects/a%7Cb/uploads",
+        files=[("files", ("doc.txt", b"hello", "text/plain"))],
+    )
+    assert resp.status_code == 400  # whole-request refusal, before any file work
+    error = resp.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert "resolve" in error["message"]  # the corpus URI builds cannot resolve
+
+
 def test_db_checkout_is_deferred_until_after_preflight(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:

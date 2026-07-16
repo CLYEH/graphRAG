@@ -209,6 +209,18 @@ async def run_eval_task(
             await _fail_job(engine, eval_job, exc)
             return "failed"
         async with engine.begin() as conn:
+            # Re-verify we still LEAD before the 'running' write (class-10, under the row
+            # lock). Preflight is local but a large SYNCHRONOUS golden/policy YAML load can
+            # block the event loop past the lease TTL — the heartbeat can't renew, the lease
+            # lapses, and the reaper hands this job to a replacement that terminalizes +
+            # releases it. An UNCONDITIONAL 'running' write here would then REOPEN that
+            # terminal job as 'running' while we no longer hold the lease; finalize's
+            # _eval_leads would no-op, stranding it 'running'+unleased (no sweep recovers it,
+            # and create_job_exclusive blocks the project). So mark running ONLY if we still
+            # lead — else a benign no-op (None), the replacement is authoritative (mirrors
+            # the finalize/failure cutoffs, which already guard on _eval_leads).
+            if not await _eval_leads(conn, eval_job, ctx["owner"]):
+                return None
             await set_progress(conn, eval_job, status="running", progress=0.0)
         try:
             # persist=False: run_eval COMPUTES the report but does NOT write builds.eval.
