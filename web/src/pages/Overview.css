@@ -145,22 +145,6 @@
   color: var(--text);
 }
 
-.overview__cli {
-  font-size: 13px;
-  color: var(--text);
-}
-
-.overview__cli code {
-  display: block;
-  margin-top: 4px;
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-size: 12px;
-  overflow-x: auto;
-  user-select: all;
-}
-
 .overview__confirm {
   display: flex;
   flex-wrap: wrap;

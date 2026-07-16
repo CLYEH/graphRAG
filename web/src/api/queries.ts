@@ -130,6 +130,37 @@ export function useActivateBuild(project: string) {
   });
 }
 
+// Runs the project's golden set against a NAMED build as an async job (UXC2a,
+// over the UXC1a eval endpoint): 202 returns the job envelope, progress rides
+// the job SSE like the triggers. `idempotencyKey` is a per-logical-attempt
+// random key (the trigger/cancel discipline) — the server hashes it with the
+// build path AND the golden-set fingerprint, so a retry after a lost 202
+// replays the ORIGINAL job id instead of 409ing against the still-running job
+// or double-running a finished eval. Deliberately NO invalidation here: the
+// report lands in builds.eval only when the JOB completes, so the caller's
+// terminal-state watcher owns the builds/health refresh (invalidating at
+// accept time would refetch a world the eval has not changed yet).
+export function useRunEval(project: string) {
+  return useMutation({
+    mutationFn: async ({
+      buildId,
+      idempotencyKey,
+    }: {
+      buildId: string;
+      idempotencyKey: string;
+    }) => {
+      const { data, error } = await api.POST("/projects/{project}/builds/{build_id}/eval", {
+        params: {
+          path: { project, build_id: buildId },
+          header: { "Idempotency-Key": idempotencyKey },
+        },
+      });
+      if (error) throw new Error(error.error.message);
+      return data.data;
+    },
+  });
+}
+
 // Current job state (DESIGN §27.7). `jobId` is the user-pasted id; the query is
 // disabled until one is entered. The live SSE stream (useJobStream) overlays the
 // fast-moving fields on top of this; this fetch supplies the static ones (kind,

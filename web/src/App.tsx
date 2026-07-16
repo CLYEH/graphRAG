@@ -11,6 +11,7 @@ import { Overview } from "./pages/Overview";
 import { NotFound } from "./pages/NotFound";
 import { Playground } from "./pages/Playground";
 import { ProjectHealth } from "./pages/ProjectHealth";
+import { Quality } from "./pages/Quality";
 import { ReviewQueue } from "./pages/ReviewQueue";
 import { Settings } from "./pages/Settings";
 
@@ -30,6 +31,7 @@ export default function App() {
         <Route path="graph" element={<Graph />} />
         <Route path="jobs" element={<JobsDashboard />} />
         <Route path="review" element={<ReviewQueue />} />
+        <Route path="quality" element={<Quality />} />
         <Route path="playground" element={<Playground />} />
         <Route path="settings" element={<Settings />} />
         <Route path="*" element={<NotFound />} />

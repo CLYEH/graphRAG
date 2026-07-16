@@ -1,0 +1,143 @@
+.quality {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  max-width: 860px;
+}
+
+.quality__title {
+  margin: 0;
+  font-family: var(--heading);
+  font-size: 22px;
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+.quality h2 {
+  margin: 16px 0 0;
+  font-family: var(--heading);
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.quality__body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+}
+
+.quality__line {
+  color: var(--text);
+  margin: 0;
+}
+
+.quality__line--error {
+  color: #c0392b;
+}
+
+.quality__line--warn {
+  color: #9a6a00;
+}
+
+.quality__hint {
+  margin: 0;
+  color: var(--text);
+}
+
+.quality__run {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.quality__pick {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.quality__job {
+  border: 1px solid var(--line, #ddd);
+  border-radius: 6px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 560px;
+}
+
+.quality__jobhead {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.quality__jobtarget {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.quality__bar {
+  width: 100%;
+}
+
+.quality__pct {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.quality__jobmsg {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.quality__scope {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.quality__summary {
+  margin: 0;
+  color: var(--text-h);
+}
+
+.quality__cases {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.quality__cases th,
+.quality__cases td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line, #eee);
+  vertical-align: top;
+}
+
+.quality__question {
+  max-width: 420px;
+  overflow-wrap: anywhere;
+}
+
+.quality__advanced summary {
+  cursor: pointer;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.quality__advanced pre {
+  overflow-x: auto;
+  max-width: 100%;
+  font-size: 12px;
+}

@@ -76,9 +76,10 @@ describe("Overview", () => {
     expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
   });
 
-  it("built but not evaluated: step ③ hands over the copyable CLI command", async () => {
-    // eval has no API endpoint until UXC1 — the checklist must hand the
-    // operator the exact terminal command instead of a dead end
+  it("built but not evaluated: step ③ links to the 品質 page", async () => {
+    // the eval endpoint exists since UXC1b and the 品質 page (UXC2a) runs it —
+    // the checklist hands the operator that page, not a terminal command and
+    // not a dead end
     stubOverview({
       sources: [source()],
       builds: [build({ id: READY_ID, status: "ready", eval: null })],
@@ -86,7 +87,10 @@ describe("Overview", () => {
     renderOverview();
 
     expect(await screen.findByText(/已建置,尚未上線/)).toBeInTheDocument();
-    expect(screen.getByText(new RegExp(`eval --build ${READY_ID} -- acme`))).toBeInTheDocument();
+    // the link CARRIES the blocking build (step ③'s candidate): the quality
+    // page's own default can name a different build (Codex #82)
+    const evalLink = screen.getByRole("link", { name: "去評測" });
+    expect(evalLink).toHaveAttribute("href", expect.stringContaining(`quality?build=${READY_ID}`));
     expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
   });
 
@@ -131,7 +135,7 @@ describe("Overview", () => {
     expect(screen.getByRole("button", { name: "上線這個版本" })).toBeEnabled();
   });
 
-  it("renders the server's refusal verbatim, with the CLI hint ONLY for the missing-score case", async () => {
+  it("renders the server's refusal verbatim, with the 品質 link ONLY for the missing-score case", async () => {
     // the server owns §14 — the UI relays its message and turns it into
     // guidance instead of a dead end
     stubOverview({
@@ -161,7 +165,11 @@ describe("Overview", () => {
     fireEvent.click(screen.getByRole("button", { name: "確定上線" }));
 
     expect(await screen.findByText(/上線失敗:eval gate/)).toBeInTheDocument();
-    expect(screen.getByText(/先在終端機執行/)).toBeInTheDocument();
+    expect(screen.getByText(/還沒有評測分數/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "去評測" })).toHaveAttribute(
+      "href",
+      expect.stringContaining(`quality?build=${READY_ID}`),
+    );
   });
 
   it("does NOT claim missing scores for OTHER eval-gate refusals (Codex #77 R2)", async () => {
@@ -193,65 +201,6 @@ describe("Overview", () => {
 
     expect(await screen.findByText(/上線失敗:eval gate/)).toBeInTheDocument();
     expect(screen.queryByText(/還沒有評測分數/)).not.toBeInTheDocument();
-  });
-
-  it("shell-escapes quotes/dollars/backticks in the CLI hint (Codex #77 R2 round 2)", async () => {
-    // the first escape implementation was a no-op ("\\$1" in intent, "$1" at
-    // runtime) and its spaces-only test could not tell — this key pins the
-    // actual escaping of every dangerous character
-    stubOverview({
-      sources: [source()],
-      builds: [build({ id: READY_ID, status: "ready", eval: null })],
-    });
-    renderWithProviders(
-      <Routes>
-        <Route path="/p/:project/overview" element={<Overview />} />
-      </Routes>,
-      { route: projectRoute('a"b$c`d', "overview") },
-    );
-
-    const code = await screen.findByText((text) => text.includes('-- "a\\"b\\$c\\`d"'), {
-      selector: "code",
-    });
-    expect(code).toBeInTheDocument();
-  });
-
-  it("orders the eval command so a leading-dash key stays positional (Codex #77 R3)", async () => {
-    // quoting cannot save `-foo`: the shell strips quotes before argv and
-    // argparse reads it as an option — everything after `--` is positional
-    stubOverview({
-      sources: [source()],
-      builds: [build({ id: READY_ID, status: "ready", eval: null })],
-    });
-    renderWithProviders(
-      <Routes>
-        <Route path="/p/:project/overview" element={<Overview />} />
-      </Routes>,
-      { route: projectRoute("-corpus", "overview") },
-    );
-
-    const code = await screen.findByText(
-      (text) => text.includes(`eval --build ${READY_ID} -- -corpus`),
-      { selector: "code" },
-    );
-    expect(code).toBeInTheDocument();
-  });
-
-  it("shell-quotes a project key with spaces in the CLI hint (Codex #77 R2)", async () => {
-    stubOverview({
-      sources: [source()],
-      builds: [build({ id: READY_ID, status: "ready", eval: null })],
-    });
-    renderWithProviders(
-      <Routes>
-        <Route path="/p/:project/overview" element={<Overview />} />
-      </Routes>,
-      { route: projectRoute("my corpus", "overview") },
-    );
-
-    expect(
-      await screen.findByText(new RegExp(`eval --build ${READY_ID} -- "my corpus"`)),
-    ).toBeInTheDocument();
   });
 
   it("active project: 服務中 status, scale strip, all steps done, review deep link", async () => {
@@ -295,17 +244,34 @@ describe("Overview", () => {
     stubOverview({
       sources: [source()],
       builds: [
-        build({ id: OLD_ID, status: "ready", eval: null, started_at: "2026-07-01T00:00:00Z" }),
-        build({ id: READY_ID, status: "ready", eval: null, started_at: "2026-07-02T00:00:00Z" }),
+        build({
+          id: OLD_ID,
+          status: "ready",
+          eval: { score: 1 },
+          started_at: "2026-07-01T00:00:00Z",
+        }),
+        build({
+          id: READY_ID,
+          status: "ready",
+          eval: { score: 1 },
+          started_at: "2026-07-02T00:00:00Z",
+        }),
       ],
     });
+    const post = vi.spyOn(api, "POST").mockResolvedValue({
+      data: { data: build({ id: READY_ID, status: "active" }), meta: META },
+      error: undefined,
+    } as never);
     renderOverview();
 
-    // the CLI command names the NEWER build even though it is listed second
-    expect(
-      await screen.findByText(new RegExp(`eval --build ${READY_ID} -- acme`)),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(new RegExp(OLD_ID))).not.toBeInTheDocument();
+    // the activate flow targets the NEWER build even though it is listed second
+    fireEvent.click(await screen.findByRole("button", { name: "上線這個版本" }));
+    fireEvent.click(screen.getByRole("button", { name: "確定上線" }));
+    await waitFor(() => {
+      const [, opts] = post.mock.calls[0] as [string, Record<string, unknown>];
+      const params = (opts as { params: { path: { build_id: string } } }).params;
+      expect(params.path.build_id).toBe(READY_ID);
+    });
   });
 
   it("offers an update card when an active project grows a newer evaluated ready build (Codex #77)", async () => {
@@ -370,7 +336,7 @@ describe("Overview", () => {
     expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
   });
 
-  it("the update card without eval scores hands over the CLI command, no button", async () => {
+  it("the update card without eval scores links to the 品質 page, no button", async () => {
     const ACTIVE = "b2222222-2222-2222-2222-222222222222";
     stubOverview({
       health: healthReport({ active_build_id: ACTIVE, counts: {} }),
@@ -383,7 +349,10 @@ describe("Overview", () => {
     renderOverview();
 
     expect(await screen.findByText(/新版本還沒有評測分數/)).toBeInTheDocument();
-    expect(screen.getByText(new RegExp(`eval --build ${READY_ID} -- acme`))).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "去評測" })).toHaveAttribute(
+      "href",
+      expect.stringContaining(`quality?build=${READY_ID}`),
+    );
     expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
   });
 
