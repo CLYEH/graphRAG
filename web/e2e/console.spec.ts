@@ -101,7 +101,7 @@ test("console shell loads with the project switcher and section nav", async ({ p
     "圖譜",
     "審核",
     "品質",
-    "問答",
+    "檢索",
     "診斷",
     "設定",
   ]) {
@@ -408,8 +408,8 @@ test("the playground runs a query and shows results", async ({ page }) => {
   });
   await page.goto("/");
 
-  await page.getByRole("link", { name: "問答" }).click();
-  await expect(page.getByRole("heading", { name: "問答測試" })).toBeVisible();
+  await page.getByRole("link", { name: "檢索" }).click();
+  await expect(page.getByRole("heading", { name: "檢索測試" })).toBeVisible();
 
   await page.getByLabel("問題", { exact: true }).fill("what is the answer?");
   await page.getByRole("button", { name: /run query/i }).click();
@@ -923,4 +923,317 @@ test("the settings page saves a vocabulary edit over a fresh-spread PATCH", asyn
   await expect(page.getByText("已儲存。")).toBeVisible();
   // the PATCH spreads the whole config: the untouched chunking block rides along
   expect(patched?.config?.["chunking"]).toEqual({ max_chars: 500, overlap: 50 });
+});
+
+// UXC2c — the Phase C 目標 as an executable assertion: the FULL operator
+// journey runs in the browser with no terminal — create project → upload →
+// build → eval → activate → query. Every read is a WORLD-STATE stub (flags
+// flip when the modeled action actually lands, never call counts — class 26),
+// so each step only succeeds because the previous step's write happened.
+test("the full no-terminal path: create → upload → build → eval → activate → query", async ({
+  page,
+}) => {
+  const B1 = "b1111111-aaaa-4aaa-8aaa-000000000001";
+  const world = {
+    created: false,
+    uploaded: false,
+    hasOntology: false,
+    buildDone: false,
+    evalDone: false,
+    activated: false,
+  };
+  // a text corpus cannot build without an ontology (the worker's
+  // OntologyRequiredError; the Import run-gate mirrors it) — the REAL journey
+  // includes the Settings 知識類型 step, so the config is world-state too
+  const proj = () => ({
+    name: "e2e",
+    display_name: null,
+    description: null,
+    config: world.hasOntology
+      ? { ontology: { entity_types: ["EVENT"], relation_types: ["PRACTICED_BY"] } }
+      : {},
+    created_at: "2026-07-01T00:00:00Z",
+  });
+  const doneJob = (jobId: string, kind: string) => ({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: {
+        job_id: jobId,
+        status: "done",
+        kind,
+        project: "e2e",
+        build_id: B1,
+        step: null,
+        progress: 1,
+        message: null,
+        error: null,
+        created_at: "2026-07-01T00:00:00Z",
+        finished_at: "2026-07-01T00:01:00Z",
+      },
+      meta: META,
+    }),
+  });
+
+  await page.route("**/projects", (route) => {
+    if (route.request().method() === "POST") {
+      world.created = true;
+      return route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({ data: proj(), meta: META }),
+      });
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: world.created ? [proj()] : [], meta: META }),
+    });
+  });
+  await page.route("**/projects?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: world.created ? [proj()] : [], meta: META }),
+    }),
+  );
+  await page.route("**/projects/e2e", (route) => {
+    // the Settings page reads/patches the single project (the API path takes
+    // the RAW name); saving 知識類型 flips the world's ontology
+    if (route.request().method() === "PATCH") world.hasOntology = true;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: proj(), meta: META }),
+    });
+  });
+  await page.route("**/projects/*/health", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          status: world.activated ? "healthy" : "empty",
+          active_build_id: world.activated ? B1 : null,
+          counts: world.activated ? { documents: 1, entities: 5, relations: 3 } : {},
+          pending_review: 0,
+          drift: null,
+          warnings: [],
+        },
+        meta: META,
+      }),
+    }),
+  );
+  await page.route("**/projects/*/sources*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: world.uploaded
+          ? [
+              {
+                id: "50000000-0000-0000-0000-000000000001",
+                project: "e2e",
+                kind: "text",
+                uri: "file:///C:/data/uploads/e2e",
+                metadata: {},
+                created_at: "2026-07-01T00:00:00Z",
+              },
+            ]
+          : [],
+        meta: META,
+      }),
+    }),
+  );
+  await page.route("**/projects/*/builds?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: world.buildDone
+          ? [
+              {
+                id: B1,
+                project: "e2e",
+                status: world.activated ? "active" : "ready",
+                config_hash: null,
+                source_hash: null,
+                started_at: "2026-07-01T00:00:00Z",
+                finished_at: "2026-07-01T00:05:00Z",
+                activated_at: world.activated ? "2026-07-01T00:10:00Z" : null,
+                metrics: null,
+                eval: world.evalDone
+                  ? {
+                      build_id: B1,
+                      score: 1,
+                      passed: 1,
+                      failed: 0,
+                      fingerprint: "deadbeef",
+                      metrics: {},
+                      cases: [
+                        {
+                          question: "海祭是哪一族的祭儀?",
+                          mode: "semantic",
+                          score: 1,
+                          passed: true,
+                        },
+                      ],
+                    }
+                  : null,
+              },
+            ]
+          : [],
+        meta: META,
+      }),
+    }),
+  );
+  await page.route("**/projects/*/uploads*", (route) => {
+    world.uploaded = true;
+    return route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          source_id: "50000000-0000-0000-0000-000000000001",
+          files: [
+            {
+              filename: "deadbeefcafe0000.txt",
+              original_filename: "guide.txt",
+              status: "accepted",
+              document_uri: "file:///C:/data/uploads/e2e/deadbeefcafe0000.txt",
+              metadata: {
+                schema_version: "1.2",
+                system: { connector: "upload", original_filename: "guide.txt" },
+                context: {},
+                governance: {},
+              },
+            },
+          ],
+        },
+        meta: META,
+      }),
+    });
+  });
+  await page.route("**/projects/*/build", (route) => route.fulfill(jobAcceptedResponse()));
+  await page.route("**/builds/*/eval", (route) => {
+    return route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: { job_id: "1d8e8b4f-3a76-4b1b-9c3d-8e2f0a1b2c3e", status: "queued" },
+        meta: META,
+      }),
+    });
+  });
+  await page.route("**/builds/*/activate", (route) => {
+    world.activated = true;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: { id: B1, project: "e2e", status: "active" },
+        meta: META,
+      }),
+    });
+  });
+  await page.route("**/jobs/*/events", (route) =>
+    route.fulfill({ status: 200, contentType: "text/event-stream", body: "" }),
+  );
+  // the world advances when the modeled JOB is OBSERVED terminal (the snapshot
+  // GET the UI's job watch performs), never at the trigger POST: a UI that
+  // stopped wiring the job watch would leave the flag unset, the builds list
+  // empty, and the journey red — the load-bearing boundary of the no-terminal
+  // path (Codex #84)
+  await page.route("**/jobs/0c9f7a3e*", (route) => {
+    world.buildDone = true;
+    return route.fulfill(doneJob("0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f", "build"));
+  });
+  await page.route("**/jobs/1d8e8b4f*", (route) => {
+    world.evalDone = true;
+    return route.fulfill(doneJob("1d8e8b4f-3a76-4b1b-9c3d-8e2f0a1b2c3e", "eval"));
+  });
+  await page.route("**/projects/*/query/*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          mode: "hybrid",
+          build_id: B1,
+          results: [
+            {
+              result_type: "chunk",
+              id: "c1111111-aaaa-4aaa-8aaa-000000000001",
+              title: null,
+              text: "海祭是阿美族的祭儀,每年5月初由頭目率領族人舉行。",
+              score: 0.93,
+              confidence: null,
+              source_refs: [{ source_type: "chunk", id: "c1111111-aaaa-4aaa-8aaa-000000000001" }],
+            },
+          ],
+          graph_context: null,
+          warnings: [],
+          debug: null,
+        },
+        meta: META,
+      }),
+    }),
+  );
+
+  // ① create the FIRST project from the root bootstrap form
+  await page.goto("/");
+  await expect(page.getByText(/No projects yet/)).toBeVisible();
+  await page.getByLabel("name", { exact: true }).fill("e2e");
+  await page.getByRole("button", { name: "Create project" }).click();
+  await expect(page.getByText(/尚未開始/)).toBeVisible(); // landed on 總覽
+
+  // ② upload the corpus (匯入)
+  await page.getByRole("link", { name: "去匯入" }).click();
+  await page.setInputFiles('input[type="file"]', [
+    { name: "guide.txt", mimeType: "text/plain", buffer: Buffer.from("海祭是阿美族的祭儀") },
+  ]);
+  const uploadBtn = page.getByRole("button", { name: "上傳", exact: true });
+  await expect(uploadBtn).toBeEnabled();
+  await uploadBtn.click();
+  await expect(page.getByText(/接受 1 檔/)).toBeVisible();
+  await expect(page.getByText("file:///C:/data/uploads/e2e", { exact: true })).toBeVisible();
+
+  // ②b a text corpus can't build without an ontology — set 知識類型 (設定)
+  await page.getByRole("link", { name: "設定", exact: true }).click();
+  const entityInput = page.getByLabel("新增實體類型");
+  await entityInput.fill("EVENT");
+  await entityInput.press("Enter");
+  const relationInput = page.getByLabel("新增關係類型");
+  await relationInput.fill("PRACTICED_BY");
+  await relationInput.press("Enter");
+  await page.getByRole("button", { name: "儲存知識類型" }).click();
+  await expect(page.getByText("已儲存。")).toBeVisible();
+
+  // ③ build (back on 匯入 — the ontology gate is now open)
+  await page.getByRole("link", { name: "匯入", exact: true }).click();
+  const buildBtn = page.getByRole("button", { name: "開始建置" });
+  await expect(buildBtn).toBeEnabled();
+  await buildBtn.click();
+  await expect(page.getByText(/建置已排入佇列/)).toBeVisible();
+
+  // ④ eval (品質)
+  await page.getByRole("link", { name: "品質", exact: true }).click();
+  await expect(page.getByText("此版本還沒有評測結果。")).toBeVisible();
+  await page.getByRole("button", { name: "開始評測" }).click();
+  await expect(page.getByRole("cell", { name: "海祭是哪一族的祭儀?" })).toBeVisible();
+  await expect(page.getByText("通過", { exact: true })).toBeVisible();
+
+  // ⑤ activate (總覽)
+  await page.getByRole("link", { name: "總覽", exact: true }).click();
+  await page.getByRole("button", { name: "上線這個版本" }).click();
+  await page.getByRole("button", { name: "確定上線" }).click();
+  await expect(page.getByText(/服務中/)).toBeVisible();
+
+  // ⑥ query (檢索) — the journey ends with real ranked hits, in-browser only
+  await page.getByRole("link", { name: "檢索", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "檢索測試" })).toBeVisible();
+  await page.getByLabel("問題").fill("海祭是哪一族的祭儀?");
+  await page.getByRole("button", { name: "Run query" }).click();
+  await expect(page.getByText("1 筆結果")).toBeVisible();
+  await expect(page.getByText(/海祭是阿美族的祭儀/)).toBeVisible();
 });

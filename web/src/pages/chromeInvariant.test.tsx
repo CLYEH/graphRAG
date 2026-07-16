@@ -457,7 +457,7 @@ describe("chrome invariant — no raw ids or store vocabulary outside folds", ()
     assertChromeClean(container);
   });
 
-  it("問答結果 (QueryResults)", () => {
+  it("檢索結果 (QueryResults)", () => {
     const { container } = render(
       <QueryResults
         result={queryResult({

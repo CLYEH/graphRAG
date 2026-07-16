@@ -12,7 +12,9 @@ const TEMPLATES: GraphOptions["template"][] = ["neighbors", "path", "subgraph"];
 
 // FE6 Query playground (DESIGN §13/§21/§22): run any of the five modes against the
 // active build and show results + citations + warnings + routing trace. Graph viz
-// is v2 (FE4), so graph_context renders as a summary line.
+// is v2 (FE4), so graph_context renders as a summary line. Titled 檢索測試 (was
+// 問答測試 until UXC2c): the results are ranked retrieval hits, never a
+// synthesized answer — retrieval-first, owner-decided 2026-07-15 (review §P1#5).
 export function Playground() {
   const project = useActiveProject();
 
@@ -28,7 +30,7 @@ export function Playground() {
 
   return (
     <section className="play">
-      <h1 className="play__title">問答測試</h1>
+      <h1 className="play__title">檢索測試</h1>
       <QueryConsole project={project} />
     </section>
   );
