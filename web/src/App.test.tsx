@@ -23,7 +23,7 @@ describe("App shell", () => {
     // the routed placeholder page
     expect(await screen.findByRole("heading", { name: "專案健康(診斷)" })).toBeInTheDocument();
     // every section is navigable
-    for (const label of ["診斷", "匯入", "建置", "審核", "問答"]) {
+    for (const label of ["診斷", "匯入", "建置", "審核", "檢索"]) {
       expect(screen.getByRole("link", { name: label })).toBeInTheDocument();
     }
   });
