@@ -221,6 +221,28 @@ against `docs/DESIGN.md` (the spec) and `CLAUDE.md` (guardrails).
      new delete guard with no `translate_registry_error` case became a
      client-triggerable 500). "This slice has no HTTP" is wrong if the function
      you touched is HTTP-consumed.
+   - **Write-authorization matrix for async job handlers (class 25, PR #81 —
+     ~10 of 35 rounds on ONE handler)**: a handler running on a lease/liveness
+     mechanism has ONE write-license predicate ("under the row lock: status
+     still active ∧ lease still mine") — derive it once, then ENUMERATE EVERY
+     DB write site in the handler (mark-running, each failure terminalization,
+     finalize, result persist) and apply it at each, because a lapsed lease can
+     hand the job to a replacement DURING any phase (a large synchronous load
+     blocks the heartbeat past the TTL). #81 added these guards one write-site
+     per review round (finalize → preflight-fail → mark-running → cancel
+     handling). This is class 17's dual: the read side asks "may this cache be
+     shown?", the write side asks "may I still write?" — and it is the
+     write-site-level sharpening of class 12(b)'s "liveness brackets the entire
+     handler".
+   - **A fix that adds machinery is itself a new surface**: a guard/pin/
+     lease-check introduced DURING review must be re-swept against this
+     checklist before push — especially class-10 ("the check and the
+     consumption must share one read/lock"). #81 T27 pinned an accept-time
+     fingerprint and re-verified it at dispatch; T35 found the guard's own
+     TOCTOU — the recheck read the files once to fingerprint and the parser
+     re-read them, so an edit between the two reads was scored as "verified".
+     If later rounds are reviewing your fixes rather than the task, the fixes
+     skipped their catalog pass.
    - **Per-surface inventory (transfer ≠ sweep)**: a boundary module's NEW
      surfaces get their own catalog pass — C1c (surfaces 1:1 with C1b) took 0
      Codex rounds while C1d (new surfaces) took 4, every finding a cataloged
