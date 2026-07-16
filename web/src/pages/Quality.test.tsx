@@ -8,14 +8,22 @@ import { build, job, projectRoute, renderWithProviders } from "../test-utils";
 
 import type { Build, Job } from "../api/queries";
 
-// The job SSE rides raw fetch (jobStream.ts), which jsdom cannot serve — keep
-// the stream silent and drive every state through the job SNAPSHOT instead
-// (the page treats a terminal snapshot as authoritative either way).
+// The job SSE rides raw fetch (jobStream.ts), which jsdom cannot serve — the
+// module is mocked behind a swappable impl: silent by default (states driven
+// through the job SNAPSHOT), overridden per test to emit frames or close (the
+// stream-terminal invalidation and refetch-failure cells need the stream).
+type StreamOpts = { signal: AbortSignal; onFrame: (frame: { data: string }) => void };
+const stream = vi.hoisted(() => ({
+  impl: ((_jobId: string, _opts: unknown) => new Promise<void>(() => {})) as (
+    jobId: string,
+    opts: unknown,
+  ) => Promise<void>,
+}));
 vi.mock("../api/jobStream", async (importOriginal) => {
   const real = await importOriginal<typeof import("../api/jobStream")>();
   return {
     ...real,
-    streamJobEvents: () => new Promise<void>(() => {}),
+    streamJobEvents: (jobId: string, opts: unknown) => stream.impl(jobId, opts),
   };
 });
 
@@ -88,6 +96,7 @@ function renderQuality() {
 }
 
 afterEach(() => {
+  stream.impl = () => new Promise<void>(() => {});
   vi.restoreAllMocks();
 });
 
@@ -362,6 +371,226 @@ describe("Quality (品質/評測)", () => {
 
     expect(await screen.findByText(/無法載入版本:down/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "開始評測" })).not.toBeInTheDocument();
+  });
+
+  it("invalidates on a TERMINAL STREAM EVENT even when the snapshot never turns terminal", async () => {
+    // the stream can see the job finish while the snapshot read is stuck: if
+    // the post-close refetch fails, react-query retains the stale RUNNING
+    // snapshot forever — a snapshot-only terminal guard would then never
+    // refresh the builds read and the fresh report never renders (Codex #82
+    // triage 3). Revert-probe: drop streamTerminal from the invalidation
+    // predicate and the table below never appears.
+    stream.impl = async (_jobId, opts) => {
+      (opts as StreamOpts).onFrame({
+        data: JSON.stringify({
+          job_id: JOB_ID,
+          status: "done",
+          step: null,
+          progress: 1,
+          message: null,
+          ts: "2026-07-01T00:01:00Z",
+        }),
+      });
+      await new Promise<void>(() => {}); // never closes — no close-refetch path
+    };
+    stubQualityWorld({
+      buildPages: [
+        [build({ id: READY_ID, status: "ready", eval: null })],
+        [build({ id: READY_ID, status: "ready", eval: evalBlock() })],
+      ],
+      // the snapshot stays non-terminal (the stale-read cell under test)
+      jobSnapshot: job({
+        job_id: JOB_ID,
+        status: "running",
+        kind: "eval",
+        build_id: READY_ID,
+        progress: 0.9,
+      }),
+    });
+    stubEvalAccepted();
+    renderQuality();
+
+    fireEvent.click(await screen.findByRole("button", { name: "開始評測" }));
+
+    // the event-terminal invalidation refreshed the builds read → report renders
+    expect(await screen.findByText("海祭是哪一族的祭儀?")).toBeInTheDocument();
+  });
+
+  it("a second eval run on the same mount refreshes ITS report (stale prior-job event gated)", async () => {
+    // useJobStream retains job A's terminal event across the jobId flip to
+    // job B until its reset effect runs — the invalidation effect's first
+    // jobId=B render still sees it. Without gating streamTerminal on
+    // event.job_id === jobId, B is prematurely marked settled and B's REAL
+    // completion is skipped by the once-per-job guard: the builds read never
+    // refreshes and B's report never renders (reviewer catch on triage 3).
+    // Revert-probe: drop the job_id gate and the second report never appears.
+    // The builds read models WORLD STATE (which evals have actually finished),
+    // never a call count: in the buggy version the premature settle at B-start
+    // fires an EXTRA builds refetch, and a call-counted page list would serve
+    // the "after B" world to it — making the probe pass with the gate removed
+    // (a false-green revert-probe, the first version of this test).
+    const SECOND_RUN_CASES = [
+      { question: "第二輪:黑潮對台灣有什麼影響?", mode: "semantic", score: 0.8, passed: true },
+    ];
+    const JOB_B = "1d8e8b4f-3a76-4b1b-9c3d-8e2f0a1b2c3e";
+    let aFinished = false;
+    let bFinished = false;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/builds") {
+        const evalState = bFinished
+          ? evalBlock({ cases: SECOND_RUN_CASES })
+          : aFinished
+            ? evalBlock()
+            : null;
+        return Promise.resolve({
+          data: {
+            data: [build({ id: READY_ID, status: "ready", eval: evalState })],
+            meta: META,
+          },
+          error: undefined,
+        });
+      }
+      if (path === "/jobs/{job_id}")
+        // snapshots stay non-terminal — settlement rides the stream events
+        return Promise.resolve({
+          data: {
+            data: job({ job_id: JOB_ID, status: "running", kind: "eval", build_id: READY_ID }),
+            meta: META,
+          },
+          error: undefined,
+        });
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    // job A's stream reports done immediately; job B's terminal event is HELD
+    // until the test releases it, so at the jobId A→B flip the retained A
+    // event is the ONLY terminal event in sight — the exact stale-frame window
+    let releaseB: () => void = () => {};
+    const bGate = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    stream.impl = async (jobId, opts) => {
+      if (jobId !== JOB_ID) await bGate;
+      if (jobId === JOB_ID) aFinished = true;
+      else bFinished = true;
+      (opts as StreamOpts).onFrame({
+        data: JSON.stringify({
+          job_id: jobId,
+          status: "done",
+          step: null,
+          progress: 1,
+          message: null,
+          ts: "2026-07-01T00:01:00Z",
+        }),
+      });
+      await new Promise<void>(() => {}); // never closes — no close-refetch path
+    };
+    const post = vi
+      .spyOn(api, "POST")
+      .mockResolvedValueOnce({
+        data: { data: { job_id: JOB_ID, status: "queued" }, meta: META },
+        error: undefined,
+      } as never)
+      .mockResolvedValueOnce({
+        data: { data: { job_id: JOB_B, status: "queued" }, meta: META },
+        error: undefined,
+      } as never);
+    renderQuality();
+
+    // run A settles via its own stream event → first report renders
+    fireEvent.click(await screen.findByRole("button", { name: "開始評測" }));
+    expect(await screen.findByText("海祭是哪一族的祭儀?")).toBeInTheDocument();
+
+    // run B on the same mount — job A's terminal event is still retained at
+    // the moment jobId flips; B must settle on ITS OWN event, not A's
+    const run = screen.getByRole("button", { name: "開始評測" });
+    await waitFor(() => expect(run).toBeEnabled());
+    fireEvent.click(run);
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+
+    // only NOW does job B finish: in the buggy version B was already marked
+    // settled by A's stale event (with no B result in the world), so this real
+    // completion is skipped by the once-per-job guard and the second report
+    // never renders
+    releaseB();
+    expect(await screen.findByText("第二輪:黑潮對台灣有什麼影響?")).toBeInTheDocument();
+  });
+
+  it("surfaces a FAILED snapshot refetch even when stale job data still renders", async () => {
+    // stream closed (job finished server-side) but the refetch for the
+    // terminal-only fields fails: the panel keeps rendering the stale
+    // running snapshot — that broken read must not be silent (no error line,
+    // no recovery) just because data exists (Codex #82 triage 3)
+    let jobCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path === "/projects/{project}/builds")
+        return Promise.resolve({
+          data: { data: [build({ id: READY_ID, status: "ready", eval: null })], meta: META },
+          error: undefined,
+        });
+      if (path === "/jobs/{job_id}") {
+        jobCalls += 1;
+        if (jobCalls === 1)
+          return Promise.resolve({
+            data: {
+              data: job({ job_id: JOB_ID, status: "running", kind: "eval", build_id: READY_ID }),
+              meta: META,
+            },
+            error: undefined,
+          });
+        return Promise.resolve({
+          data: undefined,
+          error: {
+            error: {
+              code: "STORE_UNAVAILABLE",
+              message: "jobs store down",
+              details: null,
+              request_id: META.request_id,
+            },
+          },
+        });
+      }
+      throw new Error(`unstubbed GET ${path}`);
+    }) as never);
+    stream.impl = () => Promise.resolve(); // closes immediately → triggers the refetch
+    stubEvalAccepted();
+    renderQuality();
+
+    fireEvent.click(await screen.findByRole("button", { name: "開始評測" }));
+
+    // the stale panel still shows the last-known state…
+    expect(await screen.findByRole("status")).toHaveTextContent("評測中");
+    // …but the broken refetch is stated, with a retry
+    expect(await screen.findByText(/無法載入評測工作狀態:jobs store down/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新整理狀態" })).toBeEnabled();
+  });
+
+  it("honors a ?build= deep link as the initial selection (the Overview step-③ hand-off)", async () => {
+    // the Overview CTA names the build whose MISSING score blocks step ③
+    // (active ?? newest ready) — this page's own default (newest ready) can
+    // be a different build, so the link's target must win or the operator
+    // evaluates the wrong build and the checklist stays blocked (Codex #82)
+    const newerReady = build({
+      id: READY_ID,
+      status: "ready",
+      eval: null,
+      started_at: "2026-07-02T00:00:00Z",
+    });
+    const activeNoEval = build({
+      id: ACTIVE_ID,
+      status: "active",
+      eval: null,
+      started_at: "2026-07-01T00:00:00Z",
+    });
+    stubQualityWorld({ buildPages: [[newerReady, activeNoEval]] });
+    renderWithProviders(
+      <Routes>
+        <Route path="/p/:project/quality" element={<Quality />} />
+      </Routes>,
+      { route: `${projectRoute("acme", "quality")}?build=${ACTIVE_ID}` },
+    );
+
+    // the deep-linked ACTIVE build is selected, not the newest-ready default
+    expect(((await screen.findByLabelText("選擇版本")) as HTMLSelectElement).value).toBe(ACTIVE_ID);
   });
 
   it("pins the evaluated build: a newer ready build landing mid-run must not steal the scope", async () => {

@@ -148,7 +148,7 @@ function OverviewBody({ project }: { project: string }) {
           ) : (
             <p className="overview__stephint">
               新版本還沒有評測分數(沒有分數的版本不能上線)——
-              <Link to="../quality">去評測</Link>
+              <Link to={`../quality?build=${updateCandidate.id}`}>去評測</Link>
             </p>
           )}
         </div>
@@ -184,7 +184,15 @@ function OverviewBody({ project }: { project: string }) {
           active={step2 && !step3}
           title="檢查品質(評測)"
           hint="用評測題組確認檢索品質——沒有分數的版本不能上線"
-          action={<Link to="../quality">去評測</Link>}
+          action={
+            // carry the blocking build into the quality link: step ③ is
+            // computed from candidate (active ?? newest ready), while the
+            // quality page's own default is newest ready FIRST — they name
+            // different builds exactly when an unevaluated ACTIVE build
+            // coexists with ready ones, and a generic link would send the
+            // operator to evaluate the wrong build (Codex #82)
+            <Link to={candidate ? `../quality?build=${candidate.id}` : "../quality"}>去評測</Link>
+          }
         />
         <ActivateStep
           project={project}
@@ -305,7 +313,8 @@ function ActivateControl({
           </p>
           {/candidate build has no eval score/.test(String(activate.error?.message ?? "")) && (
             <p className="overview__stephint">
-              這個版本還沒有評測分數——<Link to="../quality">去評測</Link>
+              這個版本還沒有評測分數——
+              <Link to={`../quality?build=${candidate.id}`}>去評測</Link>
             </p>
           )}
         </div>

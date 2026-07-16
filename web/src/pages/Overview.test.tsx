@@ -87,8 +87,10 @@ describe("Overview", () => {
     renderOverview();
 
     expect(await screen.findByText(/已建置,尚未上線/)).toBeInTheDocument();
+    // the link CARRIES the blocking build (step ③'s candidate): the quality
+    // page's own default can name a different build (Codex #82)
     const evalLink = screen.getByRole("link", { name: "去評測" });
-    expect(evalLink).toHaveAttribute("href", expect.stringContaining("quality"));
+    expect(evalLink).toHaveAttribute("href", expect.stringContaining(`quality?build=${READY_ID}`));
     expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
   });
 
@@ -166,7 +168,7 @@ describe("Overview", () => {
     expect(screen.getByText(/還沒有評測分數/)).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "去評測" })).toHaveAttribute(
       "href",
-      expect.stringContaining("quality"),
+      expect.stringContaining(`quality?build=${READY_ID}`),
     );
   });
 
@@ -349,7 +351,7 @@ describe("Overview", () => {
     expect(await screen.findByText(/新版本還沒有評測分數/)).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "去評測" })).toHaveAttribute(
       "href",
-      expect.stringContaining("quality"),
+      expect.stringContaining(`quality?build=${READY_ID}`),
     );
     expect(screen.queryByRole("button", { name: "上線這個版本" })).not.toBeInTheDocument();
   });

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 
 import { useBuilds, useCancelJob, useJob, useRunEval } from "../api/queries";
 import { useJobStream } from "../hooks/useJobStream";
@@ -167,7 +167,14 @@ function QualityBody({ project }: { project: string }) {
   const queryClient = useQueryClient();
   const builds = useBuilds(project);
   const runEval = useRunEval(project);
-  const [pickedId, setPickedId] = useState<string | null>(null);
+  // an entry link may name its intended target (?build=<id>): the Overview
+  // step ③ CTA points at the build whose MISSING score blocks the checklist
+  // (active ?? newest ready), and this page's own default (newest ready) can
+  // be a DIFFERENT build when an unevaluated active build coexists with ready
+  // ones (Codex #82). Read once at mount; an absent/invalid id falls through
+  // the derivation below to the normal default.
+  const [searchParams] = useSearchParams();
+  const [pickedId, setPickedId] = useState<string | null>(() => searchParams.get("build"));
   const [jobId, setJobId] = useState<string | null>(null);
 
   // page-level job watch (class 20: the mutate/stream lifecycle lives in a
@@ -197,19 +204,32 @@ function QualityBody({ project }: { project: string }) {
     if (stream.status === "closed") void refetchJob();
   }, [stream.status, refetchJob]);
 
-  // terminal snapshot → the eval report (or its absence) is now the world:
+  // terminal job → the eval report (or its absence) is now the world:
   // invalidate the builds/health reads ONCE per job. ["builds", project] is
   // the SAME read the per-case table below and the Overview checklist's step
   // ③ project from — this invalidation IS the "result feeds step ③" wire.
+  // Terminal is read from EITHER surface: the snapshot (authoritative) OR the
+  // live stream event — if the post-close snapshot refetch fails, react-query
+  // retains the stale non-terminal snapshot forever, and a snapshot-only
+  // guard would never refresh the report for a job the stream already saw
+  // finish (Codex #82 triage 3). The event must name THIS job: useJobStream
+  // retains the previous job's event across a jobId change until its own
+  // reset effect runs, so on a re-run the first jobId=B render still sees
+  // job A's terminal event — ungated, that would prematurely mark B settled
+  // and B's REAL completion would be skipped by the once-per-job guard
+  // (reviewer catch; mirrors the hook's own stale-frame abort guard).
+  const streamTerminal =
+    stream.event !== null && stream.event.job_id === jobId && TERMINAL.has(stream.event.status);
   const settledJob = useRef<string | null>(null);
   useEffect(() => {
-    if (jobId === null || job === undefined) return;
-    if (!TERMINAL.has(job.status)) return;
+    if (jobId === null) return;
+    const snapshotTerminal = job !== undefined && TERMINAL.has(job.status);
+    if (!snapshotTerminal && !streamTerminal) return;
     if (settledJob.current === jobId) return;
     settledJob.current = jobId;
     void queryClient.invalidateQueries({ queryKey: ["builds", project] });
     void queryClient.invalidateQueries({ queryKey: ["health", project] });
-  }, [jobId, job, project, queryClient]);
+  }, [jobId, job, streamTerminal, project, queryClient]);
 
   // one cancel key per cancel intent per job (the JobProgress discipline)
   const cancelKey = useRef<{ id: string; key: string } | null>(null);
@@ -314,10 +334,13 @@ function QualityBody({ project }: { project: string }) {
         </p>
       )}
 
-      {jobId !== null && jobQuery.isError && job === undefined && (
-        // the accepted job's snapshot failed to load: the run gate is (rightly)
-        // fail-closed on an unknown job state, but a locked button must never
-        // be silent — say what broke and offer the retry (Rule 12)
+      {jobId !== null && jobQuery.isError && (
+        // the job snapshot failed to load (or to REFETCH — stale data may
+        // still render below): the run gate may be fail-closed on an unknown
+        // job state and the terminal-only fields (job.error) may be missing,
+        // but a broken read must never be silent — say what broke and offer
+        // the retry (Rule 12; Codex #82 triage 3 widened this from the
+        // no-data case to any snapshot error)
         <p className="quality__line quality__line--error">
           無法載入評測工作狀態:
           {jobQuery.error instanceof Error ? jobQuery.error.message : "unknown error"}
