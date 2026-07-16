@@ -617,6 +617,14 @@ function pickFiles(files: File[]) {
   fireEvent.change(input, { target: { files } });
 }
 
+// the submit gate fails closed until the projects read settles (configLoaded)
+// — clicking a disabled button is a silent no-op, so wait for it to open
+async function clickUpload() {
+  const btn = screen.getByRole("button", { name: "上傳" });
+  await waitFor(() => expect(btn).toBeEnabled());
+  fireEvent.click(btn);
+}
+
 describe("Import 上傳 (UXC2b)", () => {
   it("uploads the batch as real FormData with a per-attempt Idempotency-Key reused on retry", async () => {
     // the wire: files ride a FormData under repeated "files" parts (the
@@ -645,9 +653,9 @@ describe("Import 上傳 (UXC2b)", () => {
       new File(["hello"], "a.txt", { type: "text/plain" }),
       new File(["world"], "b.md", { type: "text/markdown" }),
     ]);
-    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+    await clickUpload();
     await screen.findByText(/上傳失敗:down/);
-    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+    await clickUpload();
     await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
 
     type Call = [string, { params: { header: { "Idempotency-Key": string } }; body: unknown }];
@@ -701,7 +709,7 @@ describe("Import 上傳 (UXC2b)", () => {
     fireEvent.change(screen.getByLabelText(/location/), { target: { value: "深海探索廳" } });
     fireEvent.change(screen.getByLabelText(/floor/), { target: { value: "3" } });
     fireEvent.click(screen.getByLabelText("featured"));
-    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+    await clickUpload();
 
     await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
     const body = (post.mock.calls[0][1] as { body: FormData }).body;
@@ -743,7 +751,7 @@ describe("Import 上傳 (UXC2b)", () => {
     pickFiles([new File(["x"], "a.txt")]);
     expect(await screen.findByText(/這個專案要求每個檔案填寫下列欄位/)).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText(/floor/), { target: { value: "2" } });
-    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+    await clickUpload();
 
     await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
     const body = (post.mock.calls[0][1] as { body: FormData }).body;
@@ -767,7 +775,7 @@ describe("Import 上傳 (UXC2b)", () => {
     await screen.findByText("上傳檔案");
 
     pickFiles([new File(["x"], "guide.txt"), new File(["y"], "virus.exe")]);
-    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+    await clickUpload();
 
     expect(await screen.findByText(/接受 1 檔 · 退回 1 檔/)).toBeInTheDocument();
     expect(screen.getByText("已接受")).toBeInTheDocument();
@@ -821,7 +829,7 @@ describe("Import 上傳 (UXC2b)", () => {
     expect(await screen.findByText("No sources registered yet.")).toBeInTheDocument();
 
     pickFiles([new File(["x"], "a.txt")]);
-    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+    await clickUpload();
 
     expect(await screen.findByText("file:///C:/data/uploads/acme")).toBeInTheDocument();
   });
@@ -840,7 +848,8 @@ describe("Import 上傳 (UXC2b)", () => {
       dataTransfer: { files: [new File(["x"], "dropped.txt")] },
     });
     expect(screen.getByText("dropped.txt")).toBeInTheDocument();
-    expect(button).toBeEnabled();
+    // opens once BOTH gates satisfy: files picked AND the config read settled
+    await waitFor(() => expect(button).toBeEnabled());
   });
 
   it("a new selection clears the previous batch's verdicts", async () => {
@@ -852,12 +861,57 @@ describe("Import 上傳 (UXC2b)", () => {
     await screen.findByText("上傳檔案");
 
     pickFiles([new File(["x"], "first.txt")]);
-    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+    await clickUpload();
     expect(await screen.findByText(/接受 1 檔/)).toBeInTheDocument();
 
     pickFiles([new File(["y"], "second.txt")]);
     expect(screen.queryByText(/接受 1 檔/)).not.toBeInTheDocument();
     expect(screen.queryByText("已接受")).not.toBeInTheDocument();
+  });
+
+  it("stays locked while the project config is UNKNOWN — loading or failed (fail closed)", async () => {
+    // requiredAttrs=[] during a pending/failed projects read means "unknown",
+    // not "none": submitting then would skip the metadata form and recreate
+    // the configured-project dead end for the window (Codex #83 triage 2) —
+    // the same fail-closed predicate RunPipeline gates on, stated honestly
+    // rather than a silent disabled button
+    const post = stubUpload([acceptedRow("a.txt")]);
+    // the projects read NEVER settles; sources settle normally
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      path === "/projects"
+        ? new Promise(() => {})
+        : Promise.resolve({ data: { data: [], meta: META }, error: undefined })) as never);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "a.txt")]);
+    expect(screen.getByRole("button", { name: "上傳" })).toBeDisabled();
+    expect(screen.getByText(/正在確認專案設定/)).toBeInTheDocument();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("stays locked when the projects read FAILED (unknown ≠ none)", async () => {
+    stubUpload([acceptedRow("a.txt")]);
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      path === "/projects"
+        ? Promise.resolve({
+            data: undefined,
+            error: {
+              error: {
+                code: "STORE_UNAVAILABLE",
+                message: "down",
+                details: null,
+                request_id: META.request_id,
+              },
+            },
+          })
+        : Promise.resolve({ data: { data: [], meta: META }, error: undefined })) as never);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "a.txt")]);
+    await waitFor(() => expect(screen.getByText(/正在確認專案設定/)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "上傳" })).toBeDisabled();
   });
 
   it("surfaces a whole-request refusal verbatim (413/415/400 family)", async () => {
@@ -867,7 +921,7 @@ describe("Import 上傳 (UXC2b)", () => {
     await screen.findByText("上傳檔案");
 
     pickFiles([new File(["x"], "huge.txt")]);
-    fireEvent.click(screen.getByRole("button", { name: "上傳" }));
+    await clickUpload();
 
     expect(
       await screen.findByText(/上傳失敗:upload exceeds the total size limit/),

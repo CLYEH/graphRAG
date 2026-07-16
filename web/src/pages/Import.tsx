@@ -232,7 +232,15 @@ export function Import() {
         目前專案:<code>{project}</code>
       </p>
       <Sources project={project} />
-      <UploadSection project={project} requiredAttrs={requiredAttrs(active?.config)} />
+      <UploadSection
+        project={project}
+        requiredAttrs={requiredAttrs(active?.config)}
+        // the same fail-closed predicate RunPipeline gates on: while the
+        // config is loading/refetching/errored, "no required attrs" is
+        // indistinguishable from "unknown" — submitting then would recreate
+        // the configured-project dead end this section closes (Codex #83)
+        configLoaded={projects.data !== undefined && !projects.isFetching && !projects.isError}
+      />
       <RunPipeline
         project={project}
         ontologyMissing={ontologyMissing}
@@ -451,12 +459,20 @@ function requiredAttrs(config: Project["config"] | undefined): RequiredAttr[] {
 //   attribute missing" reason (an empty string is server-legal, so a client
 //   non-blank gate would over-block; omission keeps the verdict honest and
 //   server-owned). Values reset with the selection (they belong to the batch).
+// - Fail closed on UNKNOWN config: while the projects read is loading,
+//   refetching, or errored, requiredAttrs=[] means "unknown", not "none" —
+//   submitting then would silently skip the metadata form and recreate the
+//   configured-project dead end. The submit stays locked (with an honest
+//   line, not a silent disabled button) until the config is current — the
+//   UXB1 form discipline, same predicate as RunPipeline's gatesLoaded.
 function UploadSection({
   project,
   requiredAttrs,
+  configLoaded,
 }: {
   project: string;
   requiredAttrs: RequiredAttr[];
+  configLoaded: boolean;
 }) {
   const upload = useUploadDocuments(project);
   const [picked, setPicked] = useState<File[]>([]);
@@ -499,7 +515,7 @@ function UploadSection({
   }
 
   function submit() {
-    if (picked.length === 0 || upload.isPending) return;
+    if (picked.length === 0 || upload.isPending || !configLoaded) return;
     upload.mutate(
       { files: picked, metadata: metadataPayload(), idempotencyKey: attemptKey.current },
       { onSuccess: () => setPicked([]) },
@@ -591,9 +607,16 @@ function UploadSection({
           ))}
         </div>
       )}
-      <button type="button" onClick={submit} disabled={picked.length === 0 || upload.isPending}>
+      <button
+        type="button"
+        onClick={submit}
+        disabled={picked.length === 0 || upload.isPending || !configLoaded}
+      >
         {upload.isPending ? "上傳中…" : "上傳"}
       </button>
+      {picked.length > 0 && !configLoaded && (
+        <p className="runs__muted">正在確認專案設定(必填欄位)——設定讀取完成前暫停上傳。</p>
+      )}
       {upload.isError && (
         <p className="npf__error">
           上傳失敗:{upload.error instanceof Error ? upload.error.message : "unknown error"}
