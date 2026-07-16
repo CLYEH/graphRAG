@@ -523,6 +523,91 @@ test("the import section registers a source and triggers a build", async ({ page
   expect(buildBody).toBeNull();
 });
 
+test("the import section uploads files and shows the per-file manifest", async ({ page }) => {
+  await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  // world-state sources: the managed corpus source exists only AFTER the
+  // upload landed (never a call count — a premature refetch must not be
+  // handed the "after" world)
+  let uploaded = false;
+  await page.route("**/projects/*/sources*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: uploaded
+          ? [
+              {
+                id: "50000000-0000-0000-0000-000000000001",
+                project: "acme",
+                kind: "text",
+                uri: "file:///C:/data/uploads/acme",
+                metadata: {},
+                created_at: "2026-07-01T00:00:00Z",
+              },
+            ]
+          : [],
+        meta: META,
+      }),
+    }),
+  );
+  let uploadKey = "";
+  await page.route("**/projects/*/uploads*", (route) => {
+    uploadKey = route.request().headers()["idempotency-key"] ?? "";
+    uploaded = true;
+    return route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          source_id: "50000000-0000-0000-0000-000000000001",
+          files: [
+            {
+              filename: "deadbeefcafe0000.txt",
+              original_filename: "guide.txt",
+              status: "accepted",
+              document_uri: "file:///C:/data/uploads/acme/deadbeefcafe0000.txt",
+              metadata: {
+                schema_version: "1.2",
+                system: { connector: "upload", original_filename: "guide.txt" },
+                context: {},
+                governance: {},
+              },
+            },
+            {
+              original_filename: "virus.exe",
+              status: "rejected",
+              reason: "extension '.exe' is not allowlisted (txt, md)",
+            },
+          ],
+        },
+        meta: META,
+      }),
+    });
+  });
+  await page.goto("/");
+
+  await page.getByRole("link", { name: "匯入", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "匯入資料" })).toBeVisible();
+  await expect(page.getByText("No sources registered yet.")).toBeVisible();
+
+  await page.setInputFiles('input[type="file"]', [
+    { name: "guide.txt", mimeType: "text/plain", buffer: Buffer.from("hello") },
+    { name: "virus.exe", mimeType: "application/octet-stream", buffer: Buffer.from("MZ") },
+  ]);
+  await page.getByRole("button", { name: "上傳", exact: true }).click();
+
+  // honest per-file manifest: verdict words + verbatim refusal reason
+  await expect(page.getByText(/接受 1 檔 · 退回 1 檔/)).toBeVisible();
+  await expect(page.getByText("已接受")).toBeVisible();
+  await expect(page.getByText("已退回")).toBeVisible();
+  await expect(page.getByText(/extension '\.exe' is not allowlisted/)).toBeVisible();
+  expect(uploadKey).toMatch(/[0-9a-f-]{36}/);
+
+  // the registered managed source appears in the list without a manual refresh
+  await expect(page.getByText("file:///C:/data/uploads/acme", { exact: true })).toBeVisible();
+});
+
 function documentsResponse(rows: unknown[], meta: Record<string, unknown> = {}) {
   return {
     status: 200,

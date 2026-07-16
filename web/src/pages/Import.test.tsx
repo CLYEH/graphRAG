@@ -580,3 +580,403 @@ describe("Import", () => {
     expect(get).not.toHaveBeenCalledWith("/projects/{project}/sources", expect.anything());
   });
 });
+
+// ---- UXC2b 上傳檔案 -----------------------------------------------------------
+
+function acceptedRow(name: string) {
+  return {
+    filename: "deadbeefcafe0000.txt",
+    original_filename: name,
+    status: "accepted",
+    document_uri: "file:///C:/data/uploads/acme/deadbeefcafe0000.txt",
+    metadata: {
+      schema_version: "1.2",
+      system: { connector: "upload", original_filename: name },
+      context: {},
+      governance: {},
+    },
+  };
+}
+
+function rejectedRow(name: string, reason: string) {
+  return { original_filename: name, status: "rejected", reason };
+}
+
+function stubUpload(files: unknown[]) {
+  return vi.spyOn(api, "POST").mockResolvedValue({
+    data: {
+      data: { source_id: "50000000-0000-0000-0000-000000000000", files },
+      meta: META,
+    },
+    error: undefined,
+  } as never);
+}
+
+function pickFiles(files: File[]) {
+  const input = screen.getByLabelText("選擇檔案") as HTMLInputElement;
+  fireEvent.change(input, { target: { files } });
+}
+
+// the submit gate fails closed until the projects read settles (configLoaded)
+// — clicking a disabled button is a silent no-op, so wait for it to open
+async function clickUpload() {
+  const btn = screen.getByRole("button", { name: "上傳" });
+  await waitFor(() => expect(btn).toBeEnabled());
+  fireEvent.click(btn);
+}
+
+describe("Import 上傳 (UXC2b)", () => {
+  it("uploads the batch as real FormData with a per-attempt Idempotency-Key reused on retry", async () => {
+    // the wire: files ride a FormData under repeated "files" parts (the
+    // compiled type says string[] — the runtime shape is the contract's);
+    // the key is minted per SELECTION and reused across retries of the same
+    // batch, so a lost 201 replays the stored manifest instead of writing the
+    // corpus twice
+    stubSources([]);
+    const post = vi
+      .spyOn(api, "POST")
+      .mockResolvedValueOnce({
+        data: undefined,
+        error: { error: { code: "STORE_UNAVAILABLE", message: "down", details: null } },
+      } as never)
+      .mockResolvedValue({
+        data: {
+          data: { source_id: null, files: [acceptedRow("a.txt"), acceptedRow("b.md")] },
+          meta: META,
+        },
+        error: undefined,
+      } as never);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([
+      new File(["hello"], "a.txt", { type: "text/plain" }),
+      new File(["world"], "b.md", { type: "text/markdown" }),
+    ]);
+    await clickUpload();
+    await screen.findByText(/上傳失敗:down/);
+    await clickUpload();
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+
+    type Call = [string, { params: { header: { "Idempotency-Key": string } }; body: unknown }];
+    const [path, first] = post.mock.calls[0] as Call;
+    const [, second] = post.mock.calls[1] as Call;
+    expect(path).toBe("/projects/{project}/uploads");
+    expect(first.body).toBeInstanceOf(FormData);
+    expect((first.body as FormData).getAll("files").map((f) => (f as File).name)).toEqual([
+      "a.txt",
+      "b.md",
+    ]);
+    expect(first.params.header["Idempotency-Key"]).toMatch(/[0-9a-f-]{36}/);
+    expect(second.params.header["Idempotency-Key"]).toBe(first.params.header["Idempotency-Key"]);
+    // no declared metadata schema → no metadata part rides along
+    expect((first.body as FormData).get("metadata")).toBeNull();
+  });
+
+  it("collects the project's REQUIRED context attributes per file and sends them typed", async () => {
+    // a project whose metadata_schema declares required attributes would
+    // otherwise reject EVERY upload (the endpoint validates even an absent
+    // context against the schema) with no UI path to supply the values — the
+    // per-file inputs close that dead end (Codex #83). Only required fields
+    // are offered; optional ones stay API/CLI territory.
+    const proj = {
+      ...project("acme"),
+      config: {
+        metadata_schema: {
+          attributes: {
+            location: { type: "string", required: true },
+            floor: { type: "number", required: true },
+            featured: { type: "boolean", required: true },
+            note: { type: "string", required: false },
+          },
+        },
+      },
+    };
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      Promise.resolve(
+        path === "/projects"
+          ? { data: { data: [proj], meta: META }, error: undefined }
+          : { data: { data: [], meta: META }, error: undefined },
+      )) as never);
+    const post = stubUpload([acceptedRow("a.txt")]);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "a.txt")]);
+    // required fields render per file; the optional one is not offered
+    expect(await screen.findByText(/這個專案要求每個檔案填寫下列欄位/)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/note/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/location/), { target: { value: "深海探索廳" } });
+    fireEvent.change(screen.getByLabelText(/floor/), { target: { value: "3" } });
+    fireEvent.click(screen.getByLabelText("featured"));
+    await clickUpload();
+
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    const body = (post.mock.calls[0][1] as { body: FormData }).body;
+    expect(JSON.parse(body.get("metadata") as string)).toEqual({
+      "a.txt": {
+        context: { attributes: { location: "深海探索廳", floor: 3, featured: true } },
+      },
+    });
+  });
+
+  it("rotates the idempotency key when metadata is edited between attempts", async () => {
+    // the server folds the metadata content into the idempotency fingerprint:
+    // a lost-response retry of an EDITED batch under the old key would 409
+    // IDEMPOTENCY_CONFLICT instead of submitting the correction — an edit
+    // mints a fresh key (the source form's discipline), while an unchanged
+    // retry keeps it (pinned by the FormData test above)
+    const proj = {
+      ...project("acme"),
+      config: {
+        metadata_schema: {
+          attributes: { location: { type: "string", required: true } },
+        },
+      },
+    };
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      Promise.resolve(
+        path === "/projects"
+          ? { data: { data: [proj], meta: META }, error: undefined }
+          : { data: { data: [], meta: META }, error: undefined },
+      )) as never);
+    const post = vi
+      .spyOn(api, "POST")
+      .mockResolvedValueOnce({
+        data: undefined,
+        error: { error: { code: "STORE_UNAVAILABLE", message: "down", details: null } },
+      } as never)
+      .mockResolvedValue({
+        data: { data: { source_id: null, files: [acceptedRow("a.txt")] }, meta: META },
+        error: undefined,
+      } as never);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "a.txt")]);
+    expect(await screen.findByText(/這個專案要求每個檔案填寫下列欄位/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/location/), { target: { value: "打錯的展廳" } });
+    await clickUpload();
+    await screen.findByText(/上傳失敗:down/);
+
+    // correct the value, retry — the request content changed, so must the key
+    fireEvent.change(screen.getByLabelText(/location/), { target: { value: "深海探索廳" } });
+    await clickUpload();
+
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+    type Call = [string, { params: { header: { "Idempotency-Key": string } } }];
+    const [, first] = post.mock.calls[0] as Call;
+    const [, second] = post.mock.calls[1] as Call;
+    expect(second.params.header["Idempotency-Key"]).not.toBe(
+      first.params.header["Idempotency-Key"],
+    );
+  });
+
+  it("omits a BLANK required field so the server's own refusal stays the verdict", async () => {
+    // an empty string is server-legal for a required string (presence is the
+    // rule), so a client non-blank gate would over-block; omitting the blank
+    // key instead lets the server refuse that file with its own reason —
+    // honest, and no checker fork
+    const proj = {
+      ...project("acme"),
+      config: {
+        metadata_schema: {
+          attributes: {
+            location: { type: "string", required: true },
+            floor: { type: "number", required: true },
+          },
+        },
+      },
+    };
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      Promise.resolve(
+        path === "/projects"
+          ? { data: { data: [proj], meta: META }, error: undefined }
+          : { data: { data: [], meta: META }, error: undefined },
+      )) as never);
+    const post = stubUpload([
+      rejectedRow("a.txt", "required attribute 'location' is missing from context.attributes"),
+    ]);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "a.txt")]);
+    expect(await screen.findByText(/這個專案要求每個檔案填寫下列欄位/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/floor/), { target: { value: "2" } });
+    await clickUpload();
+
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    const body = (post.mock.calls[0][1] as { body: FormData }).body;
+    expect(JSON.parse(body.get("metadata") as string)).toEqual({
+      "a.txt": { context: { attributes: { floor: 2 } } },
+    });
+    // and the server's per-file refusal renders verbatim
+    expect(await screen.findByText(/required attribute 'location' is missing/)).toBeInTheDocument();
+  });
+
+  it("renders the per-file manifest honestly: verdict words, verbatim reason, no bare stored ids", async () => {
+    // a refused extension is a STATED refusal row beside the accepted ones —
+    // never a silent drop; the stored corpus name/uri are identifiers and live
+    // on hover only (chrome shows the operator's own filename)
+    stubSources([]);
+    stubUpload([
+      acceptedRow("guide.txt"),
+      rejectedRow("virus.exe", "extension '.exe' is not allowlisted (txt, md)"),
+    ]);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "guide.txt"), new File(["y"], "virus.exe")]);
+    await clickUpload();
+
+    expect(await screen.findByText(/接受 1 檔 · 退回 1 檔/)).toBeInTheDocument();
+    expect(screen.getByText("已接受")).toBeInTheDocument();
+    expect(screen.getByText("已退回")).toBeInTheDocument();
+    expect(screen.getByText("guide.txt")).toBeInTheDocument();
+    expect(screen.getByText("virus.exe")).toBeInTheDocument();
+    expect(screen.getByText(/extension '\.exe' is not allowlisted/)).toBeInTheDocument();
+    // stored identifiers never appear as text — hover title only
+    expect(screen.queryByText(/deadbeefcafe0000/)).not.toBeInTheDocument();
+    expect(screen.getByText("guide.txt")).toHaveAttribute(
+      "title",
+      expect.stringContaining("file:///"),
+    );
+  });
+
+  it("refreshes the sources list from the WORLD the upload actually changed", async () => {
+    // the accepted files register the project's managed corpus source — it
+    // must appear in the list above without a manual refresh. The stub models
+    // WORLD STATE (the source exists only after the POST landed), never a
+    // call count — a premature refetch must not be handed the "after" world
+    // (class 26).
+    let uploaded = false;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      Promise.resolve(
+        path === "/projects"
+          ? { data: { data: [project("acme")], meta: META }, error: undefined }
+          : {
+              data: {
+                data: uploaded
+                  ? [source({ uri: "file:///C:/data/uploads/acme", kind: "text" })]
+                  : [],
+                meta: META,
+              },
+              error: undefined,
+            },
+      )) as never);
+    vi.spyOn(api, "POST").mockImplementation((() => {
+      uploaded = true;
+      return Promise.resolve({
+        data: {
+          data: {
+            source_id: "50000000-0000-0000-0000-000000000000",
+            files: [acceptedRow("a.txt")],
+          },
+          meta: META,
+        },
+        error: undefined,
+      });
+    }) as never);
+    renderImport(projectRoute("acme", "import"));
+    expect(await screen.findByText("No sources registered yet.")).toBeInTheDocument();
+
+    pickFiles([new File(["x"], "a.txt")]);
+    await clickUpload();
+
+    expect(await screen.findByText("file:///C:/data/uploads/acme")).toBeInTheDocument();
+  });
+
+  it("gates the upload on a selection and accepts a drag-drop batch", async () => {
+    stubSources([]);
+    stubUpload([acceptedRow("dropped.txt")]);
+    const { container } = renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    const button = screen.getByRole("button", { name: "上傳" });
+    expect(button).toBeDisabled();
+
+    const dropzone = container.querySelector(".import__dropzone") as HTMLElement;
+    fireEvent.drop(dropzone, {
+      dataTransfer: { files: [new File(["x"], "dropped.txt")] },
+    });
+    expect(screen.getByText("dropped.txt")).toBeInTheDocument();
+    // opens once BOTH gates satisfy: files picked AND the config read settled
+    await waitFor(() => expect(button).toBeEnabled());
+  });
+
+  it("a new selection clears the previous batch's verdicts", async () => {
+    // verdicts belong to the batch that produced them: a stale manifest
+    // sitting beside a NEW selection would read as that selection's result
+    stubSources([]);
+    stubUpload([acceptedRow("first.txt")]);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "first.txt")]);
+    await clickUpload();
+    expect(await screen.findByText(/接受 1 檔/)).toBeInTheDocument();
+
+    pickFiles([new File(["y"], "second.txt")]);
+    expect(screen.queryByText(/接受 1 檔/)).not.toBeInTheDocument();
+    expect(screen.queryByText("已接受")).not.toBeInTheDocument();
+  });
+
+  it("stays locked while the project config is UNKNOWN — loading or failed (fail closed)", async () => {
+    // requiredAttrs=[] during a pending/failed projects read means "unknown",
+    // not "none": submitting then would skip the metadata form and recreate
+    // the configured-project dead end for the window (Codex #83 triage 2) —
+    // the same fail-closed predicate RunPipeline gates on, stated honestly
+    // rather than a silent disabled button
+    const post = stubUpload([acceptedRow("a.txt")]);
+    // the projects read NEVER settles; sources settle normally
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      path === "/projects"
+        ? new Promise(() => {})
+        : Promise.resolve({ data: { data: [], meta: META }, error: undefined })) as never);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "a.txt")]);
+    expect(screen.getByRole("button", { name: "上傳" })).toBeDisabled();
+    expect(screen.getByText(/正在確認專案設定/)).toBeInTheDocument();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("stays locked when the projects read FAILED (unknown ≠ none)", async () => {
+    stubUpload([acceptedRow("a.txt")]);
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      path === "/projects"
+        ? Promise.resolve({
+            data: undefined,
+            error: {
+              error: {
+                code: "STORE_UNAVAILABLE",
+                message: "down",
+                details: null,
+                request_id: META.request_id,
+              },
+            },
+          })
+        : Promise.resolve({ data: { data: [], meta: META }, error: undefined })) as never);
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "a.txt")]);
+    await waitFor(() => expect(screen.getByText(/正在確認專案設定/)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "上傳" })).toBeDisabled();
+  });
+
+  it("surfaces a whole-request refusal verbatim (413/415/400 family)", async () => {
+    stubSources([]);
+    stubPostError("VALIDATION_ERROR", "upload exceeds the total size limit (50000000 bytes)");
+    renderImport(projectRoute("acme", "import"));
+    await screen.findByText("上傳檔案");
+
+    pickFiles([new File(["x"], "huge.txt")]);
+    await clickUpload();
+
+    expect(
+      await screen.findByText(/上傳失敗:upload exceeds the total size limit/),
+    ).toBeInTheDocument();
+  });
+});
