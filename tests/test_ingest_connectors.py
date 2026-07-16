@@ -324,6 +324,34 @@ def test_xlsx_blank_id_falls_back_to_ordinal_and_duplicates_fail_loud(tmp_path: 
         list(read_xlsx_rows(dup, title_column="標題", body_column="內容詳情", id_column="編號"))
 
 
+def test_xlsx_duplicate_mapped_header_fails_loud_but_unmapped_duplicates_pass(
+    tmp_path: Path,
+) -> None:
+    """Why: two headers that NORMALIZE to the same mapped name (問題(必填) and
+    問題) are ambiguous — the mapping names only the normalized header, so it
+    cannot say which column is meant, and a first-wins bind would silently
+    render the wrong column (Codex #85). The dual: duplicates among UNMAPPED
+    columns stay tolerated — the render never reads them, and refusing the
+    workbook for decorative junk would over-block real files."""
+    ambiguous = _write_xlsx(
+        tmp_path / "dup_mapped.xlsx",
+        ["編號", "問題(必填)", "問題", "答案"],
+        [[1, "甲", "乙", "內文"]],
+    )
+    with pytest.raises(ValueError, match="more than once"):
+        list(read_xlsx_rows(ambiguous, title_column="問題", body_column="答案"))
+
+    # the over-block dual: 備註(一)/備註(二) collide after normalization but are
+    # unmapped — the workbook still ingests
+    tolerated = _write_xlsx(
+        tmp_path / "dup_unmapped.xlsx",
+        ["編號", "標題", "內容", "備註(一)", "備註(二)"],
+        [[1, "甲", "內文", "x", "y"]],
+    )
+    payloads = list(read_xlsx_rows(tolerated, title_column="標題", body_column="內容"))
+    assert len(payloads) == 1
+
+
 def test_xlsx_missing_mapped_column_and_empty_sheet_fail_loud(tmp_path: Path) -> None:
     """Why: a mapping that names a column the workbook doesn't have would
     otherwise render blank documents forever — refuse at the door, naming the

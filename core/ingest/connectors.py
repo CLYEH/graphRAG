@@ -274,10 +274,28 @@ def read_xlsx_rows(
             raise ValueError(f"{path} first sheet is empty — no header row to map columns on")
         header = [_normalize_header(_cell_text(h)) for h in raw_header]
         columns: dict[str, int] = {}
+        duplicated: set[str] = set()
         for i, h in enumerate(header):
-            if h and h not in columns:
-                columns[h] = i  # first occurrence wins; later duplicates are unmapped
+            if not h:
+                continue
+            if h in columns:
+                duplicated.add(h)
+            else:
+                columns[h] = i
         wanted = [title_column, body_column, *([id_column] if id_column else []), *extra_columns]
+        # a MAPPED name that appears twice after normalization (e.g. 問題(必填)
+        # and 問題 collapse to the same name) is ambiguous — the mapping only
+        # names the normalized header, so it cannot say which column is meant;
+        # binding first-wins would silently render the wrong column. Duplicates
+        # among UNMAPPED columns stay tolerated: the render never reads them,
+        # and refusing the whole workbook for decorative junk would over-block.
+        ambiguous = sorted(set(wanted) & duplicated)
+        if ambiguous:
+            raise ValueError(
+                f"mapped column(s) {ambiguous!r} appear more than once in {path} header "
+                "after normalization — the mapping cannot say which column is meant; "
+                "rename the duplicate columns in the workbook"
+            )
         missing = [c for c in wanted if c not in columns]
         if missing:
             raise ValueError(
