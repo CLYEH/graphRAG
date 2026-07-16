@@ -1114,12 +1114,8 @@ test("the full no-terminal path: create → upload → build → eval → activa
       }),
     });
   });
-  await page.route("**/projects/*/build", (route) => {
-    world.buildDone = true;
-    return route.fulfill(jobAcceptedResponse());
-  });
+  await page.route("**/projects/*/build", (route) => route.fulfill(jobAcceptedResponse()));
   await page.route("**/builds/*/eval", (route) => {
-    world.evalDone = true;
     return route.fulfill({
       status: 202,
       contentType: "application/json",
@@ -1143,12 +1139,19 @@ test("the full no-terminal path: create → upload → build → eval → activa
   await page.route("**/jobs/*/events", (route) =>
     route.fulfill({ status: 200, contentType: "text/event-stream", body: "" }),
   );
-  await page.route("**/jobs/0c9f7a3e*", (route) =>
-    route.fulfill(doneJob("0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f", "build")),
-  );
-  await page.route("**/jobs/1d8e8b4f*", (route) =>
-    route.fulfill(doneJob("1d8e8b4f-3a76-4b1b-9c3d-8e2f0a1b2c3e", "eval")),
-  );
+  // the world advances when the modeled JOB is OBSERVED terminal (the snapshot
+  // GET the UI's job watch performs), never at the trigger POST: a UI that
+  // stopped wiring the job watch would leave the flag unset, the builds list
+  // empty, and the journey red — the load-bearing boundary of the no-terminal
+  // path (Codex #84)
+  await page.route("**/jobs/0c9f7a3e*", (route) => {
+    world.buildDone = true;
+    return route.fulfill(doneJob("0c9f7a3e-2f65-4f0a-8a2b-7d1e9c4b5a6f", "build"));
+  });
+  await page.route("**/jobs/1d8e8b4f*", (route) => {
+    world.evalDone = true;
+    return route.fulfill(doneJob("1d8e8b4f-3a76-4b1b-9c3d-8e2f0a1b2c3e", "eval"));
+  });
   await page.route("**/projects/*/query/*", (route) =>
     route.fulfill({
       status: 200,
