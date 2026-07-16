@@ -115,3 +115,12 @@ codegen follow-up(FE `File`/`Blob` wrapper)。
 eval 3/3 通過、step ③ 自動翻綠。**下一站:UXC2b 上傳 UI(資料 tab)+ format:binary
 codegen follow-up;之後 UXC2c 檢索改名+全流程 e2e。**
 
+**UXC2b ✅ merged(PR #83,2026-07-17,f6c767a)**:匯入頁上傳區上線——拖放/多檔
+multipart(FormData cast=format:binary follow-up 落地)、逐檔誠實 manifest(已接受/
+已退回+拒因逐字)、受管來源自動入列、必填 metadata 逐檔輸入(產生用鏡像+留空省略鍵)、
+config 未知 fail-closed、metadata 編輯輪換冪等鍵。3 輪 Codex 各 1 P2,無新 class——
+三個 finding 全是「同頁 sibling 已有紀律、新 section 沒繼承」(gatesLoaded 在隔壁
+component、欄位編輯重鑄鍵在上方表單)+ config-driven 變體沒枚舉(required-schema
+專案=保證被拒死路)。詳 [[graphrag-loop-paused-pr5]] #83 條。真瀏覽器 QA:museum
+真實上傳 .txt 落盤+.exe 逐字拒因。**下一站:UXC2c 檢索改名+全流程 e2e(Phase C 收尾)。**
+
