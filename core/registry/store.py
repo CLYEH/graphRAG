@@ -408,14 +408,26 @@ async def upsert_managed_source(
     # the new ones (union) and rewrite EVERY matching row to the one canonical
     # managed-text shape — kind=text, metadata={MANAGED_FILES_KEY: …}, exactly what a
     # fresh insert writes. Non-managed metadata on a stale row is dropped: it is inert
-    # for the text connector and this IS the canonical managed form. (Malformed prior
-    # entries are NOT filtered here — _files_metadata raises on them at read time,
-    # loud, rather than this silently dropping them.)
+    # for the text connector and this IS the canonical managed form. A row with NO
+    # managed stash (a plain/fileless or non-text duplicate) contributes nothing and is
+    # simply coalesced. But a row whose MANAGED_FILES_KEY is PRESENT-but-non-object is
+    # MALFORMED: _files_metadata fails LOUD on exactly that at read time, so the write
+    # path must not silently ERASE it by rewriting to a fresh map (that could change
+    # which files a build ingests). Malformed per-file ENTRIES *within* a dict stash are
+    # still carried forward — _files_metadata raises on those at read time, loud.
     merged_files: dict[str, dict[str, Any]] = {}
     for existing in existing_rows:
-        prior = Source(*existing).metadata.get(MANAGED_FILES_KEY)
-        if isinstance(prior, dict):
-            merged_files.update(prior)
+        metadata = Source(*existing).metadata
+        if MANAGED_FILES_KEY not in metadata:
+            continue
+        prior = metadata[MANAGED_FILES_KEY]
+        if not isinstance(prior, dict):
+            raise ValueError(
+                f"managed source at {uri!r} has a non-object {MANAGED_FILES_KEY!r} metadata "
+                f"value ({type(prior).__name__}); refusing to coalesce over a malformed "
+                "managed marker — a present key marks the source managed and must be an object"
+            )
+        merged_files.update(prior)
     merged_files.update(files)
     await conn.execute(
         tables.sources.update()

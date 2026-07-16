@@ -20,6 +20,7 @@ build's ingest stage to thread onto ``documents.metadata``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import uuid
@@ -211,7 +212,16 @@ async def upload_documents_endpoint(
             key=idempotency_key,
             project=project,
             endpoint="uploadDocuments",
-            req_hash=request_hash("POST", request.url.path, body),
+            # Hash the CANONICAL request (submitted names + file bytes + parsed
+            # metadata), NOT the raw multipart body: encoders pick a fresh random
+            # boundary each time, so a faithful retry of the same files/metadata under
+            # the same Idempotency-Key would otherwise hash differently and 409
+            # IDEMPOTENCY_CONFLICT instead of replaying the first 201.
+            req_hash=request_hash(
+                "POST",
+                request.url.path,
+                await _canonical_upload_fingerprint(files, metadata_by_name),
+            ),
             produce=produce,
         )
         return JSONResponse(status_code=status, content=resp)
@@ -264,6 +274,33 @@ def _finite_float(value: str) -> float:
     if not math.isfinite(parsed):
         raise ValueError(f"non-finite number {value!r} is not allowed")
     return parsed
+
+
+async def _canonical_upload_fingerprint(
+    files: list[UploadFile], metadata_by_name: dict[str, Any]
+) -> bytes:
+    """A boundary-independent idempotency fingerprint for an upload: the submitted
+    filenames, each file's BYTES, and the parsed metadata — NOT the raw multipart
+    framing (whose boundary a client's encoder re-randomizes on every retry). Files
+    are folded in submitted-NAME order (they are already duplicate-rejected, so the
+    name set is unique) so a retry that reorders the parts still matches; each is
+    ``seek(0)``'d back afterward so ``_process_files`` re-reads it from the start.
+    Length is folded before content so no name/content boundary is ambiguous, and the
+    parsed metadata is canonical JSON (sorted keys) so key order can't spuriously
+    differ. Returned digest is handed to ``request_hash`` (which folds method+path)."""
+    hasher = hashlib.sha256()
+    for part in sorted(files, key=lambda p: p.filename or ""):
+        name = part.filename or ""
+        content = await part.read()
+        await part.seek(0)
+        hasher.update(name.encode())
+        hasher.update(b"\0")
+        hasher.update(str(len(content)).encode())
+        hasher.update(b"\0")
+        hasher.update(content)
+        hasher.update(b"\0")
+    hasher.update(json.dumps(metadata_by_name, sort_keys=True, separators=(",", ":")).encode())
+    return hasher.digest()
 
 
 def _parse_metadata_field(raw: Any, submitted_names: set[str]) -> dict[str, Any]:

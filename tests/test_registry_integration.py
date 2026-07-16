@@ -236,6 +236,32 @@ async def test_upsert_managed_source_coalesces_all_duplicate_rows(migrated: None
         await engine.dispose()
 
 
+async def test_upsert_managed_source_rejects_a_malformed_managed_marker(migrated: None) -> None:
+    """WHY (triage 25): a row at the managed uri whose ``MANAGED_FILES_KEY`` is
+    PRESENT-but-non-object is malformed — ``_files_metadata`` fails LOUD on exactly
+    that at read time. The coalescing must NOT silently ERASE it by rewriting to a
+    fresh managed map (which could change which files a build ingests); it must fail
+    loud too. Presence of the key with a non-dict value is the trigger — an ABSENT
+    key (a plain/fileless row) is coalesced normally (the sibling test)."""
+    engine = _engine()
+    name = _proj()
+    uri = "file:///managed/corpus"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=name)
+            # a stale row at the managed uri with a malformed (string, not object)
+            # managed marker — storable because the sources API metadata is free-form
+            await add_source(conn, name, uri=uri, kind="text", metadata={MANAGED_FILES_KEY: "x"})
+            with pytest.raises(ValueError, match="non-object '__managed_files__'"):
+                await upsert_managed_source(
+                    conn, name, uri=uri, kind="text", files={"a.txt": {"context": {}}}
+                )
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
 async def test_list_sources_keyset_pagination(migrated: None) -> None:
     """The sources keyset (added_at desc, id desc) is distinct from projects'
     and must page live without skips/dupes."""

@@ -14,6 +14,7 @@ are 400); and an accepted file's stored envelope carries the server-stamped
 
 from __future__ import annotations
 
+import io
 import json
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -22,9 +23,11 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.datastructures import UploadFile
 
 from api.app import create_app
 from api.deps import db_conn
+from api.routers.uploads import _canonical_upload_fingerprint
 
 pytestmark = pytest.mark.contract
 
@@ -140,6 +143,36 @@ def test_non_file_files_part_is_400_not_silently_dropped(
     assert error["code"] == "VALIDATION_ERROR"
     assert "must be an uploaded file" in error["message"]
     assert error["details"]["non_file_files_parts"] == 1
+
+
+async def test_canonical_upload_fingerprint_is_content_based_not_framing() -> None:
+    # WHY (triage 24): the idempotency hash keys on the CANONICAL request (submitted
+    # names + file bytes + parsed metadata), NOT the multipart framing, so a faithful
+    # retry under a fresh boundary replays instead of 409-ing. Pin the properties the
+    # endpoint relies on: identical content → identical digest even when the parts are
+    # REORDERED, and any file-byte or metadata change → a different digest. Also pin
+    # that each part is seek(0)'d back so _process_files re-reads it from the start.
+    def _uf(name: str, content: bytes) -> UploadFile:
+        return UploadFile(file=io.BytesIO(content), filename=name, size=len(content))
+
+    meta = {"a.txt": {"context": {"title": "A"}}}
+    base = await _canonical_upload_fingerprint([_uf("a.txt", b"one"), _uf("b.txt", b"two")], meta)
+    reordered = await _canonical_upload_fingerprint(
+        [_uf("b.txt", b"two"), _uf("a.txt", b"one")], meta
+    )
+    assert base == reordered  # order-independent (a retry may reorder the parts)
+    diff_bytes = await _canonical_upload_fingerprint(
+        [_uf("a.txt", b"ONE"), _uf("b.txt", b"two")], meta
+    )
+    assert diff_bytes != base  # different file content → different request
+    diff_meta = await _canonical_upload_fingerprint(
+        [_uf("a.txt", b"one"), _uf("b.txt", b"two")], {"a.txt": {"context": {"title": "B"}}}
+    )
+    assert diff_meta != base  # different metadata → different request
+
+    f = _uf("a.txt", b"hello")
+    await _canonical_upload_fingerprint([f], {})
+    assert await f.read() == b"hello"  # seek(0)'d back for _process_files to re-read
 
 
 def test_duplicate_filenames_is_400(

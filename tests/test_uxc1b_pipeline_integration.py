@@ -370,9 +370,9 @@ async def test_idempotent_upload_replays_after_project_deleted(
     """WHY (§27): the upload endpoint reads project existence/config INSIDE the
     idempotent producer, so a retry with the same Idempotency-Key after the
     project is DELETED replays the stored 201 — the idempotency row is not
-    project-FK-scoped — instead of surfacing a fresh 404. A byte-identical body
-    is required (multipart boundaries would otherwise change the request hash), so
-    the raw body is posted twice verbatim."""
+    project-FK-scoped — instead of surfacing a fresh 404. Posts the raw body twice
+    verbatim (boundary-independence of the request hash is pinned separately by
+    ``test_idempotent_upload_replays_across_different_multipart_boundaries``)."""
     monkeypatch.setenv("GRAPHRAG_UPLOAD_CORPUS_DIR", str(tmp_path))
     engine = _engine()
     project = f"itest-{uuid.uuid4().hex[:10]}"
@@ -421,6 +421,72 @@ async def test_idempotent_upload_replays_after_project_deleted(
             await conn.execute(
                 idempotency_keys.delete().where(idempotency_keys.c.project == project)
             )
+            await conn.execute(projects.delete().where(projects.c.name == project))
+        await engine.dispose()
+
+
+async def test_idempotent_upload_replays_across_different_multipart_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, migrated: None
+) -> None:
+    """WHY (triage 24): the idempotency hash is the CANONICAL request (submitted
+    filenames + file bytes + parsed metadata), NOT the raw multipart body. Real
+    clients re-encode a retry under a fresh random boundary, so hashing the raw
+    framing would 409 IDEMPOTENCY_CONFLICT on a faithful retry. Same key + same
+    files/metadata under a DIFFERENT boundary must REPLAY the first 201."""
+    monkeypatch.setenv("GRAPHRAG_UPLOAD_CORPUS_DIR", str(tmp_path))
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    key = f"k-{uuid.uuid4().hex[:8]}"
+
+    def _body(boundary: str) -> bytes:
+        # identical file + metadata; ONLY the boundary differs (what an encoder varies)
+        return (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="files"; filename="a.txt"\r\n'
+            "Content-Type: text/plain\r\n\r\n"
+            "hello world\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="metadata"\r\n\r\n'
+            '{"a.txt": {"context": {"title": "A"}}}\r\n'
+            f"--{boundary}--\r\n"
+        ).encode()
+
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+        app = create_app()
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client,
+        ):
+            first = await client.post(
+                f"/projects/{project}/uploads",
+                content=_body("firstboundary000"),
+                headers={
+                    "Idempotency-Key": key,
+                    "Content-Type": "multipart/form-data; boundary=firstboundary000",
+                },
+            )
+            assert first.status_code == 201, first.text
+
+            # same key, same file+metadata, DIFFERENT boundary → replay, not 409
+            retry = await client.post(
+                f"/projects/{project}/uploads",
+                content=_body("second-boundary-zzz"),
+                headers={
+                    "Idempotency-Key": key,
+                    "Content-Type": "multipart/form-data; boundary=second-boundary-zzz",
+                },
+            )
+            assert retry.status_code == 201, retry.text  # NOT 409 IDEMPOTENCY_CONFLICT
+            assert retry.json() == first.json()  # verbatim replay of the first response
+    finally:
+        async with engine.connect() as conn, conn.begin():
+            await conn.execute(
+                idempotency_keys.delete().where(idempotency_keys.c.project == project)
+            )
+            await conn.execute(sources.delete().where(sources.c.project == project))
+            await conn.execute(documents.delete().where(documents.c.project == project))
             await conn.execute(projects.delete().where(projects.c.name == project))
         await engine.dispose()
 
