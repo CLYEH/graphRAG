@@ -417,17 +417,29 @@ async def resolve_build(
         # pairs this rule exists to surface.)
         review_only = False
         if not carried and a_id and b_id:
-            if a.norm_name == b.norm_name:
-                # identical normalized name with TWO different external ids:
-                # the sources explicitly assert namesakes (§27.3's
-                # disambiguator exists for exactly this). Scoring them 1.0
-                # and auto-merging would destroy that distinction, and a
-                # candidate would re-spam review every build (DR-003).
-                # Only an explicit ledger merge may join them.
+            # the id VALUES decide what the sources asserted. Equal (trimmed)
+            # values assert the SAME thing — with cross-type blocking such
+            # pairs are now reachable (same (name, id) under two types = LLM
+            # type drift on one source row; within a type they'd collapse
+            # into one storage key). Pre-DR-011 rows carry their id only
+            # inside the hash (column None) → unanswerable → treated as NOT
+            # provably-same, failing CLOSED to the namesake skip below.
+            a_ext = (a.disambiguator or "").strip()
+            b_ext = (b.disambiguator or "").strip()
+            same_external_id = bool(a_ext) and a_ext == b_ext
+            if a.norm_name == b.norm_name and not same_external_id:
+                # identical normalized name, external ids NOT provably the
+                # same: the sources assert namesakes (§27.3's disambiguator
+                # exists for exactly this). Scoring them 1.0 and auto-merging
+                # would destroy that distinction, and a candidate would
+                # re-spam review every build (DR-003). Only an explicit
+                # ledger merge may join them.
                 counts["namesakes_skipped"] += 1
                 continue
-            # both ids, different names: the sources assert distinct
-            # identities, so similarity alone must not auto-merge them; the
+            # both ids: similarity alone must not auto-merge them (distinct
+            # values assert distinct identities; equal values stay review-
+            # band conservatively — same-name equal-id pairs are cross-type
+            # by construction, and §7 bars cross-type auto-merge anyway); the
             # review band may still propose a candidate for humans.
             review_only = True
         # one-sided ids never block: an id-less mention has asserted nothing,

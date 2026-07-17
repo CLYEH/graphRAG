@@ -308,6 +308,40 @@ async def test_disambiguated_namesakes_never_auto_merge() -> None:
     assert carried.ledger_merged == 1
 
 
+async def test_same_external_id_cross_type_twins_surface_for_review() -> None:
+    """The namesake skip is for ids that assert DIFFERENT things (hr-1 vs
+    hr-2). The SAME id on both rows asserts the SAME thing — and cross-type
+    blocking (DR-011) made such pairs reachable: same (name, id) under two
+    types is LLM type drift on one source row (within a type it collapses
+    into one storage key). A value-blind「both have ids」skip dropped exactly
+    those; they must surface as review-band candidates instead (§7: cross-
+    type never auto-merges, so review is where the join happens)."""
+    store = _FakeStore()
+    _seed(store, "區域探索廳", etype="Exhibit", disambiguator="poi-7", mentions=2)
+    _seed(store, "區域探索廳", etype="Location", disambiguator="poi-7")
+    report = await _run(store)
+    assert report.namesakes_skipped == 0
+    assert report.auto_merged == 0  # §7: still no cross-type auto-merge
+    assert report.candidates_created == 1
+    assert store.rows[tables.merge_candidates][0]["score"] == 1.0
+
+
+async def test_unrecoverable_external_ids_keep_the_namesake_skip() -> None:
+    """Pre-DR-011 rows carry their id only inside the entity_key hash — the
+    disambiguator column is None and the value is unrecoverable, so「same id
+    or different?」is unanswerable. Fail CLOSED to the namesake skip (an
+    explicit ledger merge remains the join path): guessing「same」would
+    silently destroy an asserted-namesake distinction, the §27.3 harm."""
+    store = _FakeStore()
+    _seed(store, "Alice", etype="Person", disambiguator="hr-1", mentions=2)
+    _seed(store, "Alice", etype="Owner", disambiguator="hr-1")
+    for row in store.rows[tables.entities]:
+        row["disambiguator"] = None  # the pre-column shape: id lives in the hash only
+    report = await _run(store)
+    assert report.namesakes_skipped == 1
+    assert report.auto_merged == 0 and report.candidates_created == 0
+
+
 async def test_cross_type_twins_reach_review_but_never_auto_merge() -> None:
     """DR-011's first half: the same name under two types (the 區域探索廳
     shape — extraction collapses per (type, name), so the twin is two rows)
