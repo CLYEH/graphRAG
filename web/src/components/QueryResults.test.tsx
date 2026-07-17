@@ -1,4 +1,4 @@
-import { fireEvent, screen } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { QueryResults } from "./QueryResults";
@@ -301,5 +301,79 @@ describe("QueryResults", () => {
     expect(screen.getByText(/引文:「潮境智能海洋館展出 320 種海洋生物」/)).toBeInTheDocument();
     expect(screen.getByText("manual:curator:42")).toBeInTheDocument(); // verbatim intact
     expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("prefers the quote even when a manual evidence_ref is uuid-shaped", () => {
+    // Codex #88 R2: a manual evidence_ref CAN be uuid-shaped
+    // (core/query/graph.py:647-651 emits it verbatim) — a detail lookup there
+    // would miss, or worse, title a DIFFERENT document that happens to own
+    // that uuid in the active build, while the exact quote sat in the
+    // citation. Quote-bearing document refs never reach the uuid lookup.
+    const spy = vi.spyOn(api, "GET");
+    renderWithProviders(
+      <QueryResults
+        result={queryResult({
+          results: [
+            retrievalResult({
+              source_refs: [
+                {
+                  source_type: "document",
+                  id: DOC_ID, // uuid-shaped, but it names EVIDENCE, not a document row
+                  source_uri: "file:///notes.md",
+                  metadata: { quote: "週一休館" },
+                },
+              ],
+            }),
+          ],
+        })}
+        project="demo"
+      />,
+    );
+    openFold();
+
+    expect(screen.getByText(/引文:「週一休館」/)).toBeInTheDocument();
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("caps fold-open fan-out at 30 distinct fetches and says what it skipped", async () => {
+    // Codex #88 R2: global/community hits cite every member entity
+    // (core/query/global_reports.py) — one click must not fan out hundreds of
+    // concurrent GETs. Distinct fetch-needing refs beyond the cap render no
+    // card, a visible note states the skip (no silent caps), and repeats of
+    // an id share one slot. Client-side parses (row/quote/stable) never count.
+    const ids = Array.from(
+      { length: 35 },
+      (_, i) => `${String(i).padStart(8, "0")}-1111-2222-3333-444444444444`,
+    );
+    vi.spyOn(api, "GET").mockImplementation(((_path: string, opts: never) => {
+      const params = (opts as { params: { path: Record<string, string> } }).params.path;
+      return Promise.resolve({
+        data: {
+          data: { id: params.entity_id, canonical_name: "某實體", type: "EXHIBIT" },
+          meta: META,
+        },
+        error: undefined,
+      });
+    }) as never);
+    renderWithProviders(
+      <QueryResults
+        result={queryResult({
+          results: [
+            retrievalResult({
+              source_refs: [...ids, ids[0]].map((id) => ({ source_type: "entity" as const, id })),
+            }),
+          ],
+        })}
+        project="demo"
+      />,
+    );
+    openFold();
+
+    // findAllByText resolves at the FIRST non-empty match — poll the full
+    // count instead (30 slots + the duplicate ref sharing slot 0's cache)
+    await waitFor(() => expect(screen.queryAllByText(/EXHIBIT · 某實體/)).toHaveLength(31));
+    expect(screen.getByText(/僅解析前 30 筆需查詢的引用/)).toBeInTheDocument();
+    expect(screen.getByText(/另有 5 筆未解析/)).toBeInTheDocument();
+    expect(api.GET).toHaveBeenCalledTimes(30); // react-query cache + cap, never 36
   });
 });

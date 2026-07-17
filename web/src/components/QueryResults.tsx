@@ -78,12 +78,37 @@ export function QueryResults({ result, project }: { result: QueryResult; project
   );
 }
 
+// One fold-open may resolve at most this many DISTINCT fetch-needing refs —
+// global/community hits cite every member entity (core/query/global_reports.py),
+// so an uncapped open would fan out hundreds of concurrent detail reads
+// (react-query dedupes identical ids, it does not batch different ones).
+// Quote/row/stable-chunk cards are client-side parses and never count.
+const RESOLVE_FETCH_CAP = 30;
+
 function Hit({ hit, project }: { hit: RetrievalResult; project?: string }) {
   // SS2: resolution fetches fire only once the fold is OPEN — a collapsed
   // fold must cost zero requests (a response can carry hundreds of refs).
   // The raw ref lines stay mounted regardless (UXA3: verbatim is the SoR of
   // this surface; the card is a translation layer ADDED next to it).
   const [open, setOpen] = useState(false);
+  // fan-out cap accounting: distinct (kind, id) pairs claim slots in ref
+  // order via the SAME fetchKind predicate the resolver dispatches on;
+  // repeats of an id share its slot (react-query serves them from cache)
+  const slotAllowed = new Map<string, boolean>();
+  let slotsUsed = 0;
+  for (const s of hit.source_refs) {
+    const kind = fetchKind(s);
+    if (kind === null) continue;
+    const key = `${kind}:${s.id}`;
+    if (slotAllowed.has(key)) continue;
+    slotAllowed.set(key, slotsUsed < RESOLVE_FETCH_CAP);
+    if (slotsUsed < RESOLVE_FETCH_CAP) slotsUsed += 1;
+  }
+  const unresolved = [...slotAllowed.values()].filter((allowed) => !allowed).length;
+  const allowFetch = (s: SourceRef): boolean => {
+    const kind = fetchKind(s);
+    return kind !== null && (slotAllowed.get(`${kind}:${s.id}`) ?? false);
+  };
   return (
     <li className="play__hit">
       <div className="play__hit-head">
@@ -114,10 +139,20 @@ function Hit({ hit, project }: { hit: RetrievalResult; project?: string }) {
                 {/* source_uri is rendered as text, never an href — an untrusted
                     value in an <a href> would be a fresh injection sink (FE7) */}
                 {s.source_uri ? <span className="play__uri"> · {s.source_uri}</span> : null}
-                {open && project ? <SourceRefResolve s={s} project={project} /> : null}
+                {open && project ? (
+                  <SourceRefResolve s={s} project={project} allowFetch={allowFetch(s)} />
+                ) : null}
               </li>
             ))}
           </ul>
+          {/* no silent caps: what was NOT resolved is stated, and the verbatim
+              ids above remain the complete §16 record regardless */}
+          {open && project && unresolved > 0 && (
+            <p className="play__resolve play__resolve--miss">
+              為避免一次抓取過多,僅解析前 {RESOLVE_FETCH_CAP} 筆需查詢的引用(另有 {unresolved}{" "}
+              筆未解析,原始識別碼仍完整列出)。
+            </p>
+          )}
         </details>
       )}
     </li>
@@ -141,13 +176,40 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // row id, so it has no detail read; its parts are still worth words.
 const STABLE_CHUNK_RE = /^chunk:([0-9a-f]+):(\d+)$/i;
 
-function SourceRefResolve({ s, project }: { s: SourceRef; project: string }) {
-  // §16 relation evidence rides its display fields ON the ref (metadata.quote
-  // — core/query/graph.py evidence_ref): manual/document evidence's id is the
-  // writer's evidence_ref (NOT a uuid), so the quote, not a detail read, is
-  // the card. The exact quoted span also beats a generic snippet wherever it
-  // is present, so quote-bearing refs never need a fetch.
-  const quote = typeof s.metadata?.quote === "string" && s.metadata.quote ? s.metadata.quote : null;
+function refQuote(s: SourceRef): string | null {
+  return typeof s.metadata?.quote === "string" && s.metadata.quote ? s.metadata.quote : null;
+}
+
+/** Which detail read (if any) resolving this ref would fire.
+ *
+ * The ONE dispatch predicate — `SourceRefResolve` renders by it and `Hit`'s
+ * fan-out cap counts by it, so「要不要 fetch」can never fork between the two
+ * (class 5). Quote-bearing refs never fetch: §16 relation evidence rides its
+ * display fields ON the ref (core/query/graph.py evidence_ref), the quote IS
+ * the resolution — and that holds even when a manual evidence_ref happens to
+ * be UUID-shaped (Codex #88 R2: a detail lookup there would 404 or, worse,
+ * title a DIFFERENT document while the exact quote sat in the citation). */
+function fetchKind(s: SourceRef): "document" | "chunk" | "entity" | "relation" | null {
+  if (refQuote(s) !== null || s.source_type === "row") return null;
+  if (s.source_type === "chunk") {
+    return !STABLE_CHUNK_RE.test(s.id) && UUID_RE.test(s.id) ? "chunk" : null;
+  }
+  if (s.source_type === "document" || s.source_type === "entity" || s.source_type === "relation") {
+    return UUID_RE.test(s.id) ? s.source_type : null;
+  }
+  return null;
+}
+
+function SourceRefResolve({
+  s,
+  project,
+  allowFetch,
+}: {
+  s: SourceRef;
+  project: string;
+  allowFetch: boolean;
+}) {
+  const quote = refQuote(s);
   if (s.source_type === "row") {
     // the producer splits the lossless ref into metadata {table, pk}
     // (contract SourceRef.metadata) — render words when present, else stay raw
@@ -159,28 +221,21 @@ function SourceRefResolve({ s, project }: { s: SourceRef; project: string }) {
       </span>
     ) : null;
   }
-  if (s.source_type === "chunk") {
-    const stable = STABLE_CHUNK_RE.exec(s.id);
-    if (stable) {
-      return (
-        <span className="play__resolve">
-          段落 #{stable[2]} · 內容雜湊 {stable[1].slice(0, 12)}…{quote ? `:「${quote}」` : ""}
-        </span>
-      );
-    }
-    if (quote) return <span className="play__resolve">引文:「{quote}」</span>;
-    return UUID_RE.test(s.id) ? <ChunkCard project={project} id={s.id} /> : null;
+  if (s.source_type === "chunk" && STABLE_CHUNK_RE.test(s.id)) {
+    const stable = STABLE_CHUNK_RE.exec(s.id) as RegExpExecArray;
+    return (
+      <span className="play__resolve">
+        段落 #{stable[2]} · 內容雜湊 {stable[1].slice(0, 12)}…{quote ? `:「${quote}」` : ""}
+      </span>
+    );
   }
-  if (s.source_type === "document" && quote && !UUID_RE.test(s.id)) {
-    // manual evidence: uri already sits on the verbatim line; the quote is
-    // the resolution
-    return <span className="play__resolve">引文:「{quote}」</span>;
-  }
-  if (!UUID_RE.test(s.id)) return null;
-  if (s.source_type === "document") return <DocumentCard project={project} id={s.id} />;
-  if (s.source_type === "entity") return <EntityCard project={project} id={s.id} />;
-  if (s.source_type === "relation") return <RelationCard project={project} id={s.id} />;
-  return null;
+  if (quote) return <span className="play__resolve">引文:「{quote}」</span>;
+  const kind = fetchKind(s);
+  if (kind === null || !allowFetch) return null;
+  if (kind === "document") return <DocumentCard project={project} id={s.id} />;
+  if (kind === "chunk") return <ChunkCard project={project} id={s.id} />;
+  if (kind === "entity") return <EntityCard project={project} id={s.id} />;
+  return <RelationCard project={project} id={s.id} />;
 }
 
 const MISS = (
