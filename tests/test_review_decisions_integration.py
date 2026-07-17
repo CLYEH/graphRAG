@@ -105,7 +105,7 @@ async def test_decision_writes_ledger_and_audit_in_lockstep(migrated: None) -> N
         async with engine.connect() as conn:
             trans = await conn.begin()
             project = _proj()
-            build_id, candidate_id, left_key, right_key = await _seed_candidate(conn, project)
+            build_id, candidate_id, _, _ = await _seed_candidate(conn, project)
 
             decided = await decide_merge_candidate(
                 conn,
@@ -126,10 +126,15 @@ async def test_decision_writes_ledger_and_audit_in_lockstep(migrated: None) -> N
                 )
             ).one()
             # the carry-forward key is EXACTLY what resolve will recompute —
-            # the same fingerprints.merge_key over the two entity_keys
-            assert ledger.target_key == fingerprints.merge_key(left_key, right_key)
+            # the TYPE-FREE v2 ledger_merge_key over (name, disambiguator)
+            # pairs (DR-011): the decision must survive either side being
+            # re-typed by the next build's extraction
+            assert ledger.target_key == fingerprints.ledger_merge_key(
+                fingerprints.ledger_entity_key("Alice"),
+                fingerprints.ledger_entity_key("Alyce"),
+            )
             assert ledger.target_kind == "merge"
-            assert ledger.fingerprint_version == fingerprints.FINGERPRINT_VERSION
+            assert ledger.fingerprint_version == fingerprints.LEDGER_FINGERPRINT_VERSION
             assert ledger.decision == "approve" and ledger.decided_by == "console"
             assert ledger.reason == "same person, spelling variant"
             # one instant: now() is transaction-stable, both stamps identical

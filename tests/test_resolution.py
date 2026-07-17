@@ -42,17 +42,26 @@ def _e(
     )
 
 
-def test_blocking_pairs_same_type_by_token_or_prefix_only() -> None:
-    """The §7 block key: 'Acme Corp' & 'ACME Corporation' share the token/
-    prefix 'acme' → paired; a different type or an unrelated name → never
-    scored (blocking exists to make O(n²) scoring unnecessary, not to lose
-    real matches)."""
+def test_blocking_pairs_by_token_or_prefix_across_types() -> None:
+    """The §7 block key, as amended by DR-011: name token/prefix sharing —
+    ACROSS types. The old same-type bucket structurally hid cross-type twins
+    (the same real thing re-typed by the LLM — 全量實測 one entity split
+    across 4 types) from ever being scored; a type disagreement now routes
+    the pair to REVIEW (pinned below), never out of existence. Unrelated
+    names still never pair (blocking exists to make O(n²) scoring
+    unnecessary, not to lose real matches)."""
     acme1 = _e("Acme Corp")
     acme2 = _e("ACME Corporation")
     person = _e("Acme Corp", etype="Person")  # same name, different type
     other = _e("Globex")
     pairs = _blocked_pairs([acme1, acme2, person, other])
-    assert {(a.name, b.name) for a, b in pairs} == {("Acme Corp", "ACME Corporation")}
+    got = {frozenset(((a.name, a.type), (b.name, b.type))) for a, b in pairs}
+    assert got == {
+        frozenset((("Acme Corp", "Company"), ("ACME Corporation", "Company"))),
+        # the cross-type twin pairs the old type bucket could never produce:
+        frozenset((("Acme Corp", "Company"), ("Acme Corp", "Person"))),
+        frozenset((("ACME Corporation", "Company"), ("Acme Corp", "Person"))),
+    }
 
 
 def test_scoring_uses_the_frozen_normalization() -> None:

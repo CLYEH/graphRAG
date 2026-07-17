@@ -132,7 +132,7 @@ pipeline_step_items(id uuid pk, step_id uuid, item_kind text, item_ref text,  --
 每專案 config 定核心 schema。結構化資料規則對映（規則 → entities/mentions/relations/evidence，決定性）；文件用 PropertyGraph 受 schema 引導抽取，允許 LLM 提議新型別 → 待審池，Console 決定採納（🔧 `ontology.proposal_policy: auto|review`）。**mentions 由抽取階段產生**（每個出現的 surface_form/來源只有抽取看得到）；§7 的 resolve 是將既有 mentions 重新指向合併後的 canonical，非另行建立。文件抽取走 §3 的 LlamaIndex `LLM` 抽象 + **自訂 span-capturing prompt/parse，不用現成 PropertyGraphIndex 抽取器**——§27.4 要求 chunk 證據帶逐字 quote + start/end offsets，現成 triplet 抽取器不產 span,無法滿足凍結的溯源最低要求。
 
 ## 7. 實體解析
-`blocking(type+正規化名) → similarity(字串+embedding 加權) → 高信心自動合併 / 中信心產 merge_candidate / 低信心不合併 → 寫 entities(canonical, entity_key) + entity_mentions`。canonical_id 為三庫共用鍵；`entity_key` 為跨 build 穩定身分。resolve 時先套 `review_ledger`（§17）。🟡 門檻 `auto_merge_threshold`/`review_threshold`。
+`blocking(正規化名,跨型別) → similarity(字串+embedding 加權) → 高信心自動合併(僅同型別) / 中信心或跨型別產 merge_candidate / 低信心不合併 → 寫 entities(canonical, entity_key) + entity_mentions`。canonical_id 為三庫共用鍵；`entity_key` 為 build 內儲存身分（含型別）。resolve 時先套 `review_ledger`（§17,鍵=§27.3 的 type-free ledger 鍵）。**DR-011**:blocking 不再以型別分桶——LLM 型別標籤不穩定(同一真實事物跨 build 被標成多型別),型別桶會讓跨型別分身永遠進不了審核;**跨型別配對一律只進 review band、不自動合併**(型別不一致=定義上的中信心,同名跨型別可得 1.0 分,自動合併會誤併同名異物;僅人工或其 carried ledger merge 可跨型別合併)。合併執行時 canonical 保留自身型別,loser 列保留其原型別供稽核。🟡 門檻 `auto_merge_threshold`/`review_threshold`。
 
 ## 8. 檢索層
 | 模態 | 引擎 | 實作 |
@@ -214,7 +214,7 @@ graphRAG/
 
 ## 17. 審核工作流 + 跨 build 延續（DR-003）
 **狀態**：entity/relation `needs_review → approved|rejected`（另 active|deprecated|merged）；merge_candidate `pending → approved|rejected|deferred`；ontology proposal `proposed → accepted|rejected`。
-**跨 build 延續（關鍵）**：審核決策存進 **非 build-scoped 的 `review_ledger`**，鍵為**穩定 fingerprint**（entity=`entity_key`、relation=`relation_signature`、merge=`merge_key=sorted(left_key,right_key)`）。每次 build 的 resolve/index 步驟先套 ledger：
+**跨 build 延續（關鍵）**：審核決策存進 **非 build-scoped 的 `review_ledger`**，鍵為**穩定 fingerprint**——自 DR-011 起為 **type-free 的 v2 ledger 鍵**（entity=`ledger_entity_key`、relation=`ledger_relation_signature`、merge=`ledger_merge_key`,定義見 §27.3;人的決策關於「那個東西」,LLM 型別標籤是不穩定證據,不得分割決策）。每次 build 的 resolve/index 步驟先套 ledger：
 - `reject` 的 key → 從投影中**排除**（不進 production graph），避免同一錯誤每次重抽再審。
 - `approve`/`merge` 的 key → 自動採納。
 - `defer` → 仍列入待審。
@@ -265,9 +265,10 @@ graphRAG/
 **DR-004 Neo4j 單庫過濾**：採單一 Neo4j database + `build_id` property 過濾（Community 相容、輕量），不用 multi-database。
 **DR-005 佇列 arq**：採 arq + Redis（async-native），非 Celery。
 **DR-006 Active Build 強制注入**：唯一 active build 以 Postgres partial unique index 保證；所有 store 存取一律經 build-scoped repository 層自動注入 `build_id`，query/MCP 層不得直接拿裸 client → 結構上杜絕「忘了帶 build_id 混到舊版」。
-**DR-007 Fingerprint 版本化**：review ledger 的 entity_key/relation_signature/merge_key 帶 `fingerprint_version`；正規化或 ontology 規則變更即升版，升版觸發 migration 或標記重審，不得靜默誤套。
+**DR-007 Fingerprint 版本化**：review ledger 的 entity_key/relation_signature/merge_key（自 DR-011 起為 v2 ledger 鍵家族 `ledger_entity_key`/`ledger_relation_signature`/`ledger_merge_key`）帶 `fingerprint_version`；正規化或 ontology 規則變更即升版，升版觸發 migration 或標記重審，不得靜默誤套。
 **DR-009 契約 v1.1 — cleaning 抽樣預覽端點（2026-07-13，owner 核准的首個 DR-002 回合）**：`openapi.yaml` `info.version` 1.0→1.1，新增 `POST /projects/{project}/clean/preview`（§10.2「清洗(含抽樣預覽)」缺的那一塊；寫入 chunking 參數沿用既有 `PATCH /projects/{project}`，不加端點）。body=`{max_chars?, overlap?, document_id | text}` 兩種來源**擇一**、一次一份；參數省略→專案 config→引擎預設（preview 不重驗 config——build loader 會拒絕的 chunking 值在此靜默退回引擎預設；驗證仍是 build-load 的職責）。純函式（`core.clean.chunking.chunk_text`）、不落地、不呼叫 LLM、**read-only RPC 不吃 Idempotency-Key**（同 query 類——鑰匙會謊稱寫入語意）；`meta.build_id` 僅 document_id 來源有值（讀 active build 的 raw），text 來源為 null（build 前即可試切）。其他三份契約 schema 未動。
 **DR-010 契約 v1.2 — eval 觸發 + 上傳 + 通用文件 metadata envelope（2026-07-15，owner 核准的 UX Phase C 契約回合）**：`openapi.yaml` `info.version` 1.1→1.2。三塊新增，**contract + contract-test only；runtime 由 UXC1b 落地**。(1) `POST /projects/{project}/builds/{build_id}/eval`：對「指名 build」跑專案既有 golden set（CLI 同一條 core 路徑），結果落在 activation preflight 讀 §14 分數的同處 → Console gating 零新耦合；async（golden set 無界）回 202 + job 信封、可經 `/jobs/{id}/events` SSE 觀察；**無 request body**（build 在路徑、golden set 為專案設定）；冪等於 (build, golden-set fingerprint)，疊在 Idempotency-Key 上。(2) `POST /projects/{project}/uploads`：multipart 上傳進伺服器託管語料夾，註冊/更新 ONE canonical `file://` source（BA9 uri 正規化仍是 SoR 職責）；**client 檔名絕不當路徑**（sanitize 成生成名、原名存 metadata）；逐檔 accept/reject（副檔名/單檔超限＝STATED 逐檔拒絕，非靜默丟棄），請求層 `415`（body 非 multipart）/`413`（總量超限）硬拒；回 201 + 逐檔 manifest + 託管 source_id。(3) **通用文件 metadata envelope**＝穩定核心 `{schema_version, system, context, governance}`（定義在 openapi.yaml components，**不新增凍結檔**；MCP `SourceRef.metadata` 早已 `additionalProperties:true`，故 `mcp_response.schema.json` 不動、`schema_version` 續為 1.0）。`system`＝connector 生成、client 不可寫（`DocumentMetadataInput` `additionalProperties:false` 且無 `system`/`schema_version` → 結構上杜絕注入，rule 1/4）；`context`＝穩定核心（`title`/`document_type`）＋ `attributes` 專案自訂欄位袋（袋內 key 的型別/必填/顯示/可篩選由 `projects.config.metadata_schema` 定義；context 本身 `additionalProperties:false`、專案欄位一律入 `attributes` 不撐開核心，例 `case_number`→`attributes.case_number` → 非全域列舉、不失一般性，rule 2）；`governance`（visibility/classification）不得混入 embedding text（rule 3），對 agent 的暴露由 **`projects.config.metadata_exposure` allowlist** 決定、非「存在即外洩」（rule 7）。**envelope 已 wire 進上傳回應**（`UploadedFileAccepted.metadata`＝完整 `DocumentMetadataEnvelope`，server-stamped `system`/`schema_version` 為 required 不可省 → 非 dead component）；allowlist 本身是 `projects.config` policy（**query_policy 前例**：policy schema 凍結為 config 概念、enforcement 在 runtime——per-project 動態 allowlist 無法在 OpenAPI response type 靜態表達「只含允許欄位」，故對 agent 的投影由 UXC1b 落地並附 exposure-projection 測試；契約凍結 policy 語意＋envelope 形狀）。document-level metadata 存一份（chunk-local 另計，rule 5）；retrieval 時經 chunk→document 從 Postgres SoR 動態 enrich `source_ref.metadata`（rule 6，UXC1b runtime）。下游階段（chunk-local 填值、可篩選索引＋按 metadata 搜尋、embedding 參與、自動抽取 namespace、entity 升級）進路線圖，非本回合。其他三份契約 schema 未動。
+**DR-011 Ledger 鍵 type-free 化 + 跨型別 resolve（2026-07-17，GOV1——owner 2026-07-15 核准的 Track 5 任務授權「cross-type resolve candidates and/or a type-stable fingerprint」）**：fingerprint_version 1→2（ledger 鍵家族）。病根＝全量實測（海科館 425 列）同一真實事物被 LLM 跨 build 標成多型別（`區域探索廳` 同時為 EXHIBIT/LOCATION/FACILITY/ORGANIZATION）：(a) resolve 以型別分桶 → 跨型別分身永遠不會被提議合併；(b) 型別入 ledger 鍵 → 型別漂移把 1/3 已審決策漂成白審。修法兩半互為必要：**(1) ledger 鍵 type-free 化**——`review_ledger.target_key` 改用 fpv2 家族（`ledger_entity_key = fpv2(norm(name)|disambiguator)` 等，§27.3）,人的決策關於「那個東西」,LLM 型別標籤是不穩定證據；儲存鍵（`entities.entity_key` 等）不動（build 內同名異型別仍是不同列）,`entities` 新增 `disambiguator` 欄使身分成分可回鑄（migration 0016）。**(2) 跨型別 candidate**——blocking 撤型別桶,跨型別配對一律 review band、永不自動合併（同名跨型別=1.0 分,自動併會誤併同名異物）;carried ledger merge（人已決策）可跨型別執行,canonical 保留自身型別。v1 ledger 列休眠（hash 不可回鑄原輸入,無自動對映;DR-007 的標記重審路徑）——現存部署為 dev 資料,重審量小且 pending candidates 本就未決。
 **DR-008 Migration 工具 = Alembic + SQLAlchemy (core)**：Postgres schema 變更一律以 Alembic 管理（表以 SQLAlchemy core 定義、autogenerate 產生 migration、asyncpg 相容）；migration scripts 為版本化交付物，自 P2（`builds` 表 + partial unique index）起隨各任務落地。
 
 ---
@@ -286,11 +287,20 @@ graphRAG/
 - **Idempotency**：`idempotency_keys(key pk, project, endpoint, request_hash, response jsonb, status, created_at, expires_at)`；TTL 🔧 24h；同 key+同 request_hash → 回存檔回應；同 key+不同 request_hash → `409 IDEMPOTENCY_CONFLICT`。
 - **source_refs 最低要求**（`require_sources` 強制，依 result_type）：chunk→≥1 chunk ref（source_uri+offsets）；entity→≥1 mention（chunk/row）；relation→≥1 relation_evidence；path→每條 edge 皆有 ref；row→table+pk；community_report→member entity refs。
 
-### 27.3 Review Fingerprint & Ledger 語意（DR-003/007）
-- `entity_key = fpv{N}( norm(type) | norm(canonical_name) | disambiguator )`（disambiguator＝有穩定外部 id 時採用，**僅去頭尾空白、保留大小寫** — 外部 id 可能區分大小寫；**去空白後為空＝視同未提供**，None／空字串／純空白鑄出同一把鍵）。
-- `relation_signature = fpv{N}( src_entity_key | norm(type) | dst_entity_key )`；`merge_key = fpv{N}( sorted(left_key, right_key) )`。
-- `norm` 凍結定義＝NFKC → casefold → 摺疊連續空白；hash 輸入以長度前綴編碼組合（杜絕分隔符歧義）。實作＝`core/resolve/fingerprints.py`，與本節逐字對應；任何變更即升 `fingerprint_version`。
-- **fingerprint_version**：隨正規化/ontology 變更升版；ledger 僅套用同版（或經 migration 對映）之鍵，否則標記**重審**而非誤套。
+### 27.3 Review Fingerprint & Ledger 語意（DR-003/007/011）
+兩個鍵家族,各自獨立升版(DR-007):
+
+**儲存鍵(fpv1,build 內身分/去重,含型別——同名異型別實體在 build 內是不同列)**:
+- `entity_key = fpv1( norm(type) | norm(canonical_name) | disambiguator )`（disambiguator＝有穩定外部 id 時採用，**僅去頭尾空白、保留大小寫** — 外部 id 可能區分大小寫；**去空白後為空＝視同未提供**，None／空字串／純空白鑄出同一把鍵;**自 DR-011 起 disambiguator 值持久化於 `entities.disambiguator` 欄**——身分成分必須可回鑄,只活在 hash 裡的值無法復原）。
+- `relation_signature = fpv1( src_entity_key | norm(type) | dst_entity_key )`；`merge_key = fpv1( sorted(left_key, right_key) )`（merge_key 為 v1 ledger 遺留鍵,新決策不再使用）。
+
+**Ledger 鍵(fpv2,跨 build 審核身分,type-free——DR-011)**:`review_ledger.target_key` 一律用本家族;實測同一真實事物被 LLM 跨 build 標成多型別,型別入鍵使 1/3 決策漂移成白審:
+- `ledger_entity_key = fpv2( norm(canonical_name) | disambiguator )`（disambiguator 規則同上——來源以外部 id 主張的真同名異物,審核身分必須維持區分）。
+- `ledger_relation_signature = fpv2( src_ledger_key | norm(type) | dst_ledger_key )`；`ledger_merge_key = fpv2( sorted(left_ledger_key, right_ledger_key) )`。
+- **接受的取捨**:僅以 LLM 型別區分的實體在 ledger 中共用審核身分——這正是設計意圖(型別標籤不得分割人的決策);真同名異物由 disambiguator 區分。
+
+- `norm` 凍結定義＝NFKC → casefold → 摺疊連續空白；hash 輸入以長度前綴編碼組合（杜絕分隔符歧義）。實作＝`core/resolve/fingerprints.py`，與本節逐字對應；任一家族的規則變更即升該家族版本。
+- **fingerprint_version**（`review_ledger.fingerprint_version`＝ledger 鍵家族版本,現為 2）：隨正規化/ontology/鍵構成變更升版；ledger 僅套用同版（或經 migration 對映）之鍵，否則標記**重審**而非誤套。**v1 列（type-bearing）自 DR-011 起休眠**——target_key 為 hash、原始輸入不可回鑄,不做自動對映,依 DR-007 標記重審。
 - **precedence**：同鍵多筆以 `decided_at` 最新為準；manual(curator) 優先於 auto。
 - **套用**：resolve/index 時 reject→排除出投影；approve/merge→採納；defer→留待審。
 - **ER 變動**：已審實體之後被 split/merge 導致 fingerprint 改變 → 該 ledger 條目失效並標記重審（不盲目 carry）。

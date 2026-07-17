@@ -102,6 +102,7 @@ def test_entities_columns_match_design_spec() -> None:
         "type",
         "canonical_name",
         "entity_key",
+        "disambiguator",
         "attributes",
         "embedding_point_id",
         "status",

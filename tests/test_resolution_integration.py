@@ -196,14 +196,14 @@ async def test_ledger_merge_carries_into_the_next_build(migrated: None) -> None:
             await resolve_build(conn, writer1, ResolutionConfig())  # mints the auto decision
 
             # a curator rejects merging two branches that LOOK identical
-            left = fingerprints.entity_key("Company", "Initech Ltd")
-            right = fingerprints.entity_key("Company", "Initech Ltd.")
+            left = fingerprints.ledger_entity_key("Initech Ltd")
+            right = fingerprints.ledger_entity_key("Initech Ltd.")
             await conn.execute(
                 review_ledger.insert().values(
                     project=project,
                     target_kind="merge",
-                    target_key=fingerprints.merge_key(left, right),
-                    fingerprint_version=fingerprints.FINGERPRINT_VERSION,
+                    target_key=fingerprints.ledger_merge_key(left, right),
+                    fingerprint_version=fingerprints.LEDGER_FINGERPRINT_VERSION,
                     decision="reject",
                     decided_by="curator-1",
                     decided_at=NOW,
@@ -261,6 +261,58 @@ async def test_mid_score_creates_one_pending_candidate(migrated: None) -> None:
         await engine.dispose()
 
 
+async def test_curator_merge_survives_type_drift_across_builds(migrated: None) -> None:
+    """DR-011's 白審 kill, end-to-end on live PG across the TWO code paths:
+    ``decide_merge_candidate`` (the curator write) and ``resolve_build`` (the
+    carry-forward read) must mint the SAME type-free v2 ledger key — build #1
+    records the merge over an Exhibit-typed pair, build #2's LLM re-types
+    BOTH sides (the 全量實測 drift: EXHIBIT→LOCATION/FACILITY), and the
+    decision still carries instead of re-surfacing for 白審. Under the v1
+    type-bearing keys this exact flow lost 1/3 of the full-run decisions."""
+    from core.resolve.decisions import decide_merge_candidate
+
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            # build #1: the twin typed Exhibit; a pending candidate a curator merges
+            writer1 = await _writer(conn, project)
+            left_id, _ = await _entity(writer1, "Exhibit", "區域探索廳", mentions=2)
+            right_id, _ = await _entity(writer1, "Exhibit", "區域探索厅", mentions=1)
+            candidate_id = uuid.uuid4()
+            await writer1.insert(
+                merge_candidates,
+                id=candidate_id,
+                left_entity_id=left_id,
+                right_entity_id=right_id,
+                score=0.9,
+                status="pending",
+            )
+            await decide_merge_candidate(
+                conn,
+                project=project,
+                build_id=writer1.build_id,
+                candidate_id=candidate_id,
+                verb="approve",
+                decided_by="curator-1",
+                reason="同一個展廳",
+            )
+
+            # build #2: the LLM re-typed BOTH sides — the decision must carry
+            writer2 = await _writer(conn, project)
+            await _entity(writer2, "Location", "區域探索廳", mentions=2)
+            await _entity(writer2, "Facility", "區域探索厅", mentions=1)
+            strict = ResolutionConfig(auto_merge_threshold=1.0, review_threshold=1.0)
+            report = await resolve_build(conn, writer2, strict)
+            assert report.ledger_merged == 1  # carried across the drift — no 白審
+            assert report.auto_merged == 0
+            assert report.candidates_created == 0  # never re-surfaced
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
 async def test_entity_reject_excludes_from_projection_and_pairing(migrated: None) -> None:
     """§17: a ledger reject on an entity_key marks the row rejected (C5
     filters on status) and keeps it out of scoring entirely."""
@@ -276,8 +328,10 @@ async def test_entity_reject_excludes_from_projection_and_pairing(migrated: None
                 review_ledger.insert().values(
                     project=project,
                     target_kind="entity",
-                    target_key=bad[1],
-                    fingerprint_version=fingerprints.FINGERPRINT_VERSION,
+                    # the TYPE-FREE v2 entity ledger key (DR-011), not the
+                    # stored type-bearing entity_key
+                    target_key=fingerprints.ledger_entity_key("Acme Corporatio"),
+                    fingerprint_version=fingerprints.LEDGER_FINGERPRINT_VERSION,
                     decision="reject",
                     decided_by="curator-1",
                     decided_at=NOW,

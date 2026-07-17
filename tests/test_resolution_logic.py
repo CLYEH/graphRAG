@@ -18,7 +18,13 @@ from typing import Any, cast
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from core.resolve.fingerprints import FINGERPRINT_VERSION, entity_key, merge_key
+from core.resolve.fingerprints import (
+    LEDGER_FINGERPRINT_VERSION,
+    entity_key,
+    ledger_entity_key,
+    ledger_merge_key,
+    ledger_relation_signature,
+)
 from core.resolve.resolution import ResolutionConfig, resolve_build
 from core.stores import tables
 from core.stores.repo import BuildScopedWriter
@@ -113,6 +119,9 @@ def _seed(
             "type": etype,
             "canonical_name": name,
             "entity_key": entity_key(etype, name, disambiguator),
+            # persisted alongside the hash since DR-011 (the v2 ledger keys
+            # re-mint from it) — the fake row models the real schema
+            "disambiguator": disambiguator,
             "status": status,
             "review_status": review_status,
             "created_at": datetime.now(tz=UTC),
@@ -131,7 +140,7 @@ def _ledger_row(kind: str, key: str, decision: str) -> dict[str, Any]:
         "decision": decision,
         "decided_by": "curator-1",
         "decided_at": datetime.now(tz=UTC),
-        "fingerprint_version": FINGERPRINT_VERSION,
+        "fingerprint_version": LEDGER_FINGERPRINT_VERSION,
     }
 
 
@@ -167,8 +176,8 @@ async def test_ledger_precedence_governs_pairs() -> None:
     store = _FakeStore()
     _seed(store, "Acme Corporation")
     _seed(store, "Acme Corporatio")
-    key = merge_key(
-        entity_key("Company", "Acme Corporation"), entity_key("Company", "Acme Corporatio")
+    key = ledger_merge_key(
+        ledger_entity_key("Acme Corporation"), ledger_entity_key("Acme Corporatio")
     )
     store.ledger.append(_ledger_row("merge", key, "reject"))
     report = await _run(store)
@@ -188,8 +197,8 @@ async def test_entity_verdicts_apply_before_scoring() -> None:
     store = _FakeStore()
     good = _seed(store, "Acme Corporation")
     bad = _seed(store, "Acme Corporatio")
-    store.ledger.append(_ledger_row("entity", entity_key("Company", "Acme Corporatio"), "reject"))
-    store.ledger.append(_ledger_row("entity", entity_key("Company", "Acme Corporation"), "approve"))
+    store.ledger.append(_ledger_row("entity", ledger_entity_key("Acme Corporatio"), "reject"))
+    store.ledger.append(_ledger_row("entity", ledger_entity_key("Acme Corporation"), "approve"))
     report = await _run(store)
     assert report.entities_rejected == 1 and report.entities_approved == 1
     assert report.auto_merged == 0  # the rejected twin never paired
@@ -200,7 +209,7 @@ async def test_entity_verdicts_apply_before_scoring() -> None:
     fresh = _FakeStore()
     _seed(fresh, "Acme Corporation", mentions=2)
     _seed(fresh, "Acme Corporatio")
-    fresh.ledger.append(_ledger_row("entity", entity_key("Company", "Acme Corporatio"), "reject"))
+    fresh.ledger.append(_ledger_row("entity", ledger_entity_key("Acme Corporatio"), "reject"))
     unled = await _run(fresh, carry_review=False)
     assert unled.entities_rejected == 0 and unled.auto_merged == 1
 
@@ -293,10 +302,113 @@ async def test_disambiguated_namesakes_never_auto_merge() -> None:
     assert store.ledger == []  # nothing recorded — nothing decided
 
     # an explicit human merge decision still governs
-    key = merge_key(entity_key("Person", "Alice", "hr-1"), entity_key("Person", "Alice", "hr-2"))
+    key = ledger_merge_key(ledger_entity_key("Alice", "hr-1"), ledger_entity_key("Alice", "hr-2"))
     store.ledger.append(_ledger_row("merge", key, "merge"))
     carried = await _run(store)
     assert carried.ledger_merged == 1
+
+
+async def test_same_external_id_cross_type_twins_surface_for_review() -> None:
+    """The namesake skip is for ids that assert DIFFERENT things (hr-1 vs
+    hr-2). The SAME id on both rows asserts the SAME thing — and cross-type
+    blocking (DR-011) made such pairs reachable: same (name, id) under two
+    types is LLM type drift on one source row (within a type it collapses
+    into one storage key). A value-blind「both have ids」skip dropped exactly
+    those; they must surface as review-band candidates instead (§7: cross-
+    type never auto-merges, so review is where the join happens)."""
+    store = _FakeStore()
+    _seed(store, "區域探索廳", etype="Exhibit", disambiguator="poi-7", mentions=2)
+    _seed(store, "區域探索廳", etype="Location", disambiguator="poi-7")
+    report = await _run(store)
+    assert report.namesakes_skipped == 0
+    assert report.auto_merged == 0  # §7: still no cross-type auto-merge
+    assert report.candidates_created == 1
+    assert store.rows[tables.merge_candidates][0]["score"] == 1.0
+
+
+async def test_unrecoverable_external_ids_keep_the_namesake_skip() -> None:
+    """Pre-DR-011 rows carry their id only inside the entity_key hash — the
+    disambiguator column is None and the value is unrecoverable, so「same id
+    or different?」is unanswerable. Fail CLOSED to the namesake skip (an
+    explicit ledger merge remains the join path): guessing「same」would
+    silently destroy an asserted-namesake distinction, the §27.3 harm."""
+    store = _FakeStore()
+    _seed(store, "Alice", etype="Person", disambiguator="hr-1", mentions=2)
+    _seed(store, "Alice", etype="Owner", disambiguator="hr-1")
+    for row in store.rows[tables.entities]:
+        row["disambiguator"] = None  # the pre-column shape: id lives in the hash only
+    report = await _run(store)
+    assert report.namesakes_skipped == 1
+    assert report.auto_merged == 0 and report.candidates_created == 0
+
+
+async def test_cross_type_twins_reach_review_but_never_auto_merge() -> None:
+    """DR-011's first half: the same name under two types (the 區域探索廳
+    shape — extraction collapses per (type, name), so the twin is two rows)
+    scores 1.0 yet must land in REVIEW, not auto-merge — a type disagreement
+    is definitionally 中信心, and auto-joining would conflate namesakes
+    (Apple the company vs the fruit). Revert-probe: restore the type bucket
+    in _blocked_pairs and no candidate exists at all (the old silent split);
+    drop the cross-type clamp and this auto-merges."""
+    store = _FakeStore()
+    _seed(store, "區域探索廳", etype="Exhibit", mentions=2)
+    _seed(store, "區域探索廳", etype="Location")
+    report = await _run(store)
+    assert report.auto_merged == 0
+    assert report.candidates_created == 1
+    row = store.rows[tables.merge_candidates][0]
+    assert row["status"] == "pending"
+    assert {row["left_snapshot"]["type"], row["right_snapshot"]["type"]} == {
+        "Exhibit",
+        "Location",
+    }
+    # the candidate carries the TRUE score — not an epsilon-demoted one. A
+    # mangled score both lies to the curator (1.0 is the signal「same name,
+    # types disagree」) and, under review == auto (below), exits both bands.
+    assert row["score"] == 1.0
+
+
+async def test_cross_type_twins_survive_equal_thresholds() -> None:
+    """review_threshold == auto_merge_threshold is a LEGAL config (both 1.0 =
+    「only surface exact matches」— the validator allows equality and the
+    strict-carry integration test runs it). The old epsilon-clamp demoted an
+    exact cross-type score to just under auto == review, so the pair fell out
+    of BOTH bands and silently vanished — dropping exactly the pairs DR-011
+    exists to surface. Barred-from-auto must be structural (review_only), not
+    score-mangling: the twin lands in review with its true 1.0 score."""
+    store = _FakeStore()
+    _seed(store, "區域探索廳", etype="Exhibit", mentions=2)
+    _seed(store, "區域探索廳", etype="Location")
+    report = await _run(store, auto_merge_threshold=1.0, review_threshold=1.0)
+    assert report.auto_merged == 0
+    assert report.candidates_created == 1
+    assert store.rows[tables.merge_candidates][0]["score"] == 1.0
+
+
+async def test_carried_merge_survives_type_drift() -> None:
+    """DR-011's second half — the 白審 kill: a curator's merge is keyed by the
+    TYPE-FREE v2 ledger key, so it still carries when the next build's LLM
+    re-types both sides (全量實測: EXHIBIT→FACILITY/LOCATION drift re-keyed
+    1/3 of prior decisions into dormancy under the type-bearing v1 keys).
+    Revert-probe: key the ledger on the v1 merge_key again and the re-typed
+    build sees no decision — the pair re-surfaces as a candidate."""
+    key = ledger_merge_key(ledger_entity_key("區域探索廳"), ledger_entity_key("區域探索厅"))
+    # build 1: both typed Exhibit; the human merge carries
+    first = _FakeStore()
+    _seed(first, "區域探索廳", etype="Exhibit", mentions=2)
+    _seed(first, "區域探索厅", etype="Exhibit")
+    first.ledger.append(_ledger_row("merge", key, "merge"))
+    r1 = await _run(first)
+    assert r1.ledger_merged == 1
+
+    # build 2: the LLM re-typed BOTH sides — the SAME ledger row still governs
+    drifted = _FakeStore()
+    _seed(drifted, "區域探索廳", etype="Location", mentions=2)
+    _seed(drifted, "區域探索厅", etype="Facility")
+    drifted.ledger.append(_ledger_row("merge", key, "merge"))
+    r2 = await _run(drifted)
+    assert r2.ledger_merged == 1
+    assert r2.candidates_created == 0  # carried, not re-surfaced (the 白審 fix)
 
 
 async def test_both_disambiguated_pairs_cap_at_candidate() -> None:
@@ -327,7 +439,7 @@ async def test_manual_approve_resurrects_a_rejected_row() -> None:
     (undo is 'split', deferred)."""
     store = _FakeStore()
     bad = _seed(store, "Acme Corporatio", status="rejected", review_status="rejected")
-    key = entity_key("Company", "Acme Corporatio")
+    key = ledger_entity_key("Acme Corporatio")
     reject = _ledger_row("entity", key, "reject")
     reject["decided_at"] = datetime(2026, 7, 1, tzinfo=UTC)
     approve = _ledger_row("entity", key, "approve")
@@ -364,10 +476,12 @@ async def test_one_sided_exact_namesake_merges_toward_the_id_bearing_side() -> N
 
 
 async def test_relation_ledger_reapplies_after_remint() -> None:
-    """A curator rejected canonical->X's signature in an earlier build; this
+    """A curator rejected canonical->X's identity in an earlier build; this
     build extracted the relation against the pre-merge loser, so the initial
     ledger pass could not see it. The re-mint must re-apply the decision —
-    otherwise the rejected signature sits ACTIVE in the projection."""
+    otherwise the rejected identity sits ACTIVE in the projection. The
+    verdict is keyed by the v2 LEDGER signature (DR-011, type-free), never
+    the fpv1 storage signature the row itself re-mints."""
     from core.resolve.fingerprints import relation_signature
 
     store = _FakeStore()
@@ -379,6 +493,9 @@ async def test_relation_ledger_reapplies_after_remint() -> None:
     alice_key = entity_key("Person", "Alice")
     pre_merge_sig = relation_signature(alice_key, "WORKS_AT", lose_key)
     post_merge_sig = relation_signature(alice_key, "WORKS_AT", keep_key)
+    post_merge_ledger_sig = ledger_relation_signature(
+        ledger_entity_key("Alice"), "WORKS_AT", ledger_entity_key("Acme Corporation")
+    )
     rid = uuid.uuid4()
     store.rows[tables.relations].append(
         {
@@ -392,7 +509,7 @@ async def test_relation_ledger_reapplies_after_remint() -> None:
             "attributes": {},
         }
     )
-    store.ledger.append(_ledger_row("relation", post_merge_sig, "reject"))
+    store.ledger.append(_ledger_row("relation", post_merge_ledger_sig, "reject"))
 
     report = await _run(store)
     assert report.auto_merged == 1 and report.relations_reminted == 1
@@ -464,9 +581,18 @@ async def test_rejected_relations_still_remint_and_approve_restores_them() -> No
     ev = store.rows[tables.relation_evidence][0]
     assert ev["evidence_hash"] == evidence_hash(post_sig, "9:employees:7", None)
 
-    # approve keyed to the NEW signature: restored, correctly aimed
+    # approve keyed to the NEW identity (its v2 LEDGER signature — the
+    # storage sig is not a ledger key, DR-011): restored, correctly aimed
     store, keep, rid, _pre, post_sig = build_store()
-    store.ledger.append(_ledger_row("relation", post_sig, "approve"))
+    store.ledger.append(
+        _ledger_row(
+            "relation",
+            ledger_relation_signature(
+                ledger_entity_key("Alice"), "WORKS_AT", ledger_entity_key("Acme Corporation")
+            ),
+            "approve",
+        )
+    )
     report = await _run(store)
     assert report.relations_restored == 1
     row = {r["id"]: r for r in store.rows[tables.relations]}[rid]
@@ -481,8 +607,8 @@ async def test_deferred_pairs_never_auto_merge_and_relist() -> None:
     store = _FakeStore()
     _seed(store, "Acme Corporation", mentions=2)
     _seed(store, "Acme Corporatio")  # scores ~0.97, above the default auto bar
-    key = merge_key(
-        entity_key("Company", "Acme Corporation"), entity_key("Company", "Acme Corporatio")
+    key = ledger_merge_key(
+        ledger_entity_key("Acme Corporation"), ledger_entity_key("Acme Corporatio")
     )
     store.ledger.append(_ledger_row("merge", key, "defer"))
     report = await _run(store)
@@ -552,7 +678,15 @@ async def test_approve_restores_needs_review_rows_to_projectability() -> None:
             "attributes": {},
         }
     )
-    store.ledger.append(_ledger_row("relation", sig, "approve"))
+    store.ledger.append(
+        _ledger_row(
+            "relation",
+            ledger_relation_signature(
+                ledger_entity_key("Alice"), "WORKS_AT", ledger_entity_key("Acme Corporation")
+            ),
+            "approve",
+        )
+    )
     report = await _run(store)
     assert report.relations_restored == 1
     row = {r["id"]: r for r in store.rows[tables.relations]}[rid]
@@ -561,7 +695,7 @@ async def test_approve_restores_needs_review_rows_to_projectability() -> None:
     # entity variant: a needs_review entity approved via its entity_key
     estore = _FakeStore()
     parked = _seed(estore, "Globex", status="needs_review")
-    estore.ledger.append(_ledger_row("entity", entity_key("Company", "Globex"), "approve"))
+    estore.ledger.append(_ledger_row("entity", ledger_entity_key("Globex"), "approve"))
     ereport = await _run(estore)
     assert ereport.entities_restored == 1
     erow = {r["id"]: r for r in estore.rows[tables.entities]}[parked]
