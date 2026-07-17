@@ -4,8 +4,10 @@ The ``list_*`` reads support only their default keyset order, and the opaque
 cursor is bound to it. The frozen op params still expose ``sort``/``filter``,
 so rather than silently ignore them (which would mislead a client into
 thinking they took effect), we accept only the default sort and reject
-everything else — and any ``filter[...]`` — as VALIDATION_ERROR. Broader
-sort/filter is a future item that extends the reads.
+everything else — and any ``filter[...]`` outside the endpoint's explicit
+``allowed_filters`` — as VALIDATION_ERROR (GAPS O4: a 200 that pretends a
+filter took effect misleads the consumer). Endpoints that implement a facet
+name it in ``allowed_filters`` and read the value themselves.
 """
 
 from __future__ import annotations
@@ -15,17 +17,37 @@ from fastapi import Request
 from api.errors import ApiError, ErrorCode
 
 
-def reject_unsupported_query(request: Request, sort_field: str | None) -> None:
-    """Reject a non-default ``sort`` or any ``filter[...]``. ``sort_field``
-    names the single-column desc default an explicit ``sort`` may restate
-    (BA1b lists); None means the default order is compound (e.g. chunks'
-    (document_id, ordinal)) and NO explicit sort can restate it — every
-    ``sort`` is rejected rather than half-matched."""
-    if any(k.startswith("filter[") for k in request.query_params):
+def reject_unsupported_query(
+    request: Request,
+    sort_field: str | None,
+    allowed_filters: frozenset[str] = frozenset(),
+) -> None:
+    """Reject a non-default ``sort`` or any unsupported ``filter``.
+    ``sort_field`` names the single-column desc default an explicit ``sort``
+    may restate (BA1b lists); None means the default order is compound (e.g.
+    chunks' (document_id, ordinal)) and NO explicit sort can restate it —
+    every ``sort`` is rejected rather than half-matched. ``allowed_filters``
+    names the deepObject fields the calling endpoint actually implements;
+    everything else — a field outside the set, a malformed bracket spelling,
+    or the bare non-deepObject ``filter=...`` (which used to pass the
+    ``filter[`` prefix check unseen and silently no-op, GAPS O4's evidence)
+    — is rejected, never ignored."""
+    for key in request.query_params:
+        if key != "filter" and not key.startswith("filter["):
+            continue
+        well_formed = key.startswith("filter[") and key.endswith("]")
+        field = key[len("filter[") : -1] if well_formed else None
+        if field is not None and field in allowed_filters:
+            continue
+        supported = (
+            f"supported filters: {', '.join(f'filter[{f}]' for f in sorted(allowed_filters))}"
+            if allowed_filters
+            else "filtering is not supported on this list"
+        )
         raise ApiError(
             ErrorCode.VALIDATION_ERROR,
-            "filtering is not supported yet",
-            details={"filter": "unsupported"},
+            f"{supported}; filters are spelled filter[field]=value",
+            details={"filter": key},
         )
     sort = request.query_params.get("sort")
     if sort is None:

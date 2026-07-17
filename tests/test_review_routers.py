@@ -117,8 +117,21 @@ def test_list_paginates_and_rejects_sort_filter(
     assert (
         client.get("/projects/p/merge-candidates", params={"sort": "score:desc"}).status_code == 400
     )
+    # GOV4: filter[status] is THIS list's implemented facet (any §17 value) —
+    # everything else still fails loud, never a 200 that pretends (GAPS O4)
     assert (
         client.get("/projects/p/merge-candidates", params={"filter[status]": "pending"}).status_code
+        == 200
+    )
+    assert (
+        client.get("/projects/p/merge-candidates", params={"filter[status]": "bogus"}).status_code
+        == 400
+    )
+    assert (
+        client.get("/projects/p/merge-candidates", params={"filter[score]": "1"}).status_code == 400
+    )
+    assert (
+        client.get("/projects/p/merge-candidates", params={"filter": "status:pending"}).status_code
         == 400
     )
 

@@ -155,6 +155,42 @@ async def test_review_flow_list_approve_refuse(api: Api) -> None:
     assert r.json()["data"] == []
 
 
+async def test_status_filter_serves_audit_and_fails_loud(api: Api) -> None:
+    """GOV4/GAPS O4: the contract's Filter param must never silently no-op —
+    the adaptation was once misled by a 200 + pending rows into believing
+    `filter=status:approved` had taken effect. filter[status] is the audit
+    surface over the same SoR (decided rows leave the default queue but stay
+    retrievable when named); every unsupported spelling is a loud 400."""
+    client, conn = api
+    project, _build_id, candidate_id = await _seed(client, conn)
+    r = await client.post(f"/projects/{project}/merge-candidates/{candidate_id}/approve")
+    assert r.status_code == 200
+
+    # the audit facet: a decided row is listable when its status is named
+    r = await client.get(f"/projects/{project}/merge-candidates?filter[status]=approved")
+    assert r.status_code == 200
+    (row,) = r.json()["data"]
+    assert row["id"] == str(candidate_id) and row["status"] == "approved"
+
+    # a named status the row does NOT have → empty, never the default queue
+    r = await client.get(f"/projects/{project}/merge-candidates?filter[status]=deferred")
+    assert r.status_code == 200 and r.json()["data"] == []
+
+    # fail loud, never pretend: a value outside §17's vocabulary, a field the
+    # endpoint doesn't implement, the bare non-deepObject spelling (O4's
+    # exact evidence — it used to slip past the `filter[` prefix check), and
+    # an ambiguous repeated param (拒絕勝於默選一邊)
+    for qs in (
+        "filter[status]=bogus",
+        "filter[score]=1",
+        "filter=status:approved",
+        "filter[status]=approved&filter[status]=rejected",
+    ):
+        r = await client.get(f"/projects/{project}/merge-candidates?{qs}")
+        assert r.status_code == 400, qs
+        assert r.json()["error"]["code"] == "VALIDATION_ERROR", qs
+
+
 async def test_idempotent_replay_never_stacks_ledger_entries(api: Api) -> None:
     # WHY §27: a client retrying its approve with the same key must get the
     # stored response back — NOT a second carry-forward ledger entry (stacked

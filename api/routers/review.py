@@ -1,12 +1,13 @@
 """Review endpoints (BA5) — the Console's §17 merge-candidate queue.
 
 List serves the ACTIVE build's candidates through the DR-006 repo (the BA3
-binding/cursor pattern verbatim); the three decision verbs call
+binding/cursor pattern verbatim) — the review queue by default, any single
+§17 status via ``filter[status]`` (GOV4); the three decision verbs call
 ``core.resolve.decisions.decide_merge_candidate``, whose single transaction
 locks the candidate, validates the §17 transition, writes the DR-003
-carry-forward ledger entry (keyed by the same ``merge_key`` resolve reads —
-including for DEFER, which must block a future auto-merge), and stamps the
-audit trail. Idempotency-Key rides the BA1b machinery with every precheck
+carry-forward ledger entry (keyed by the same v2 ``ledger_merge_key``
+resolve reads — including for DEFER, which must block a future auto-merge),
+and stamps the audit trail. Idempotency-Key rides the BA1b machinery with every precheck
 INSIDE produce (the #53 R2 ordering rule: a stored response replays even
 after the candidate's project is gone).
 
@@ -44,6 +45,7 @@ from core.resolve.decisions import (
     MergeCandidateNotFoundError,
     decide_merge_candidate,
 )
+from core.resolve.review import STATE_MACHINES
 from core.stores import tables
 from core.stores.repo import ActiveBinding, BuildScopedRepo, NoActiveBuildError
 from core.stores.repo import resolve_active_binding as _resolve_active_binding
@@ -66,6 +68,33 @@ async def _bind(conn: Any, project: str) -> ActiveBinding:
         raise translate_registry_error(exc) from exc
 
 
+def _status_filter(request: Request) -> str | None:
+    """The validated ``filter[status]`` value, or None when absent (GOV4).
+
+    The vocabulary is §17's merge-candidate state machine — read from
+    ``STATE_MACHINES`` itself, not a restated literal set, so the filter can
+    never drift from what decisions may actually write. Exactly one value:
+    a repeated param is ambiguous (which status did the caller mean?) and is
+    rejected, never first-one-wins (C3a: 拒絕勝於默選一邊)."""
+    values = request.query_params.getlist("filter[status]")
+    if not values:
+        return None
+    vocabulary = STATE_MACHINES["merge_candidate"]
+    if len(values) > 1:
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            "filter[status] accepts a single value",
+            details={"filter[status]": values},
+        )
+    if values[0] not in vocabulary:
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            f"unknown status {values[0]!r} — one of: {', '.join(sorted(vocabulary))}",
+            details={"filter[status]": values[0]},
+        )
+    return values[0]
+
+
 @router.get("/projects/{project}/merge-candidates")
 async def list_merge_candidates_endpoint(
     request: Request,
@@ -74,16 +103,22 @@ async def list_merge_candidates_endpoint(
     limit: int = Query(50, ge=1, le=500),
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    reject_unsupported_query(request, "id")
+    reject_unsupported_query(request, "id", allowed_filters=frozenset({"status"}))
+    status_filter = _status_filter(request)
     binding = await _bind(conn, project)
     repo = BuildScopedRepo.bound_to(conn, binding)
     mc = tables.merge_candidates
-    # the list IS the review queue: only still-reviewable candidates appear —
-    # the same pending+deferred definition §19's pending_review metric counts
-    # (core/observability/health.py), so the queue and its gauge never diverge
-    # (Codex #59 R1). Decided rows stay in the SoR for audit; surfacing them
-    # is the Filter param's future job (additive).
-    where: list[Any] = [mc.c.status.in_(("pending", "deferred"))]
+    # the DEFAULT list IS the review queue: only still-reviewable candidates
+    # appear — the same pending+deferred definition §19's pending_review
+    # metric counts (core/observability/health.py), so the queue and its
+    # gauge never diverge (Codex #59 R1). An explicit filter[status] (GOV4)
+    # is the audit surface over the same SoR: decided rows become listable
+    # only when the consumer names the status it wants.
+    where: list[Any] = (
+        [mc.c.status == status_filter]
+        if status_filter is not None
+        else [mc.c.status.in_(("pending", "deferred"))]
+    )
     if cursor:
         (after_id,) = decode_id_cursor(cursor)
         where.append(mc.c.id < after_id)
