@@ -326,7 +326,11 @@ def _required_meta(source: Source, key: str) -> str:
 
 
 def _xlsx_required(source: Source, key: str) -> str:
-    """A required non-empty string from an xlsx source's column mapping."""
+    """A required non-empty string from an xlsx source's column mapping —
+    returned STRIPPED (like ``_xlsx_optional``): an API/CLI-registered
+    ``" 標題 "`` passes the non-empty check, but the connector looks the value
+    up against NORMALIZED headers, so returning it padded would fail every
+    build with a missing-column error the mapping never earns (Codex #85)."""
     value = source.metadata.get(key)
     if not isinstance(value, str) or not value.strip():
         raise SourceResolutionError(
@@ -334,7 +338,7 @@ def _xlsx_required(source: Source, key: str) -> str:
             "the column mapping (which column is the title/body) lives on the source, "
             "never hard-coded in the connector"
         )
-    return value
+    return value.strip()
 
 
 def _xlsx_optional(source: Source, key: str) -> str | None:

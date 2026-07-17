@@ -403,6 +403,31 @@ def test_xlsx_source_yields_a_text_payload_per_row(tmp_path: Path) -> None:
     assert payloads[0].raw == "【導覽】深海探索廳\n位置:B1\n\n介紹深潛器。\n"
 
 
+def test_xlsx_padded_mapping_values_resolve_stripped(tmp_path: Path) -> None:
+    # WHY: an API/CLI-registered mapping can carry edge whitespace (" 標題 ");
+    # the non-empty CHECK strips, so acceptance must strip too — returning the
+    # padded value would fail every build with a missing-column error the
+    # mapping never earns (Codex #85). Extra_columns entries strip likewise.
+    book = _write_xlsx(
+        tmp_path / "padded.xlsx", ["標題", "內容詳情", "位置"], [["甲", "內文", "B1"]]
+    )
+    payloads = list(
+        resolve_source(
+            _source(
+                book.as_uri(),
+                kind="xlsx",
+                metadata={
+                    "title_column": " 標題 ",
+                    "body_column": " 內容詳情",
+                    "extra_columns": ["位置 "],
+                },
+            )
+        )
+    )
+    assert len(payloads) == 1
+    assert payloads[0].raw == "【甲】\n位置:B1\n\n內文\n"
+
+
 def test_xlsx_missing_or_malformed_mapping_fails_loud(tmp_path: Path) -> None:
     # WHY: a mapping gap is a deterministic build failure — refuse at resolve
     # time naming the key; and a PRESENT-but-wrong-typed optional key must
