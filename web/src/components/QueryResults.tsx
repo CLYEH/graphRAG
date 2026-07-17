@@ -210,6 +210,11 @@ function SourceRefResolve({
   allowFetch: boolean;
 }) {
   const quote = refQuote(s);
+  // the query boundary (core/query/metadata_enrich.py) already resolves every
+  // chunk ref — BOTH forms — to its document and rides the allowlisted
+  // envelope on metadata.document; when the API has provided the title,
+  // render it, don't re-derive it
+  const enrichedTitle = s.source_type === "chunk" ? documentTitle(s.metadata?.document) : null;
   if (s.source_type === "row") {
     // the producer splits the lossless ref into metadata {table, pk}
     // (contract SourceRef.metadata) — render words when present, else stay raw
@@ -225,15 +230,23 @@ function SourceRefResolve({
     const stable = STABLE_CHUNK_RE.exec(s.id) as RegExpExecArray;
     return (
       <span className="play__resolve">
-        段落 #{stable[2]} · 內容雜湊 {stable[1].slice(0, 12)}…{quote ? `:「${quote}」` : ""}
+        {enrichedTitle ? `${enrichedTitle} · ` : ""}段落 #{stable[2]} · 內容雜湊{" "}
+        {stable[1].slice(0, 12)}…{quote ? `:「${quote}」` : ""}
       </span>
     );
   }
-  if (quote) return <span className="play__resolve">引文:「{quote}」</span>;
+  if (quote) {
+    return (
+      <span className="play__resolve">
+        {enrichedTitle ? `${enrichedTitle} · ` : ""}引文:「{quote}」
+      </span>
+    );
+  }
   const kind = fetchKind(s);
   if (kind === null || !allowFetch) return null;
   if (kind === "document") return <DocumentCard project={project} id={s.id} />;
-  if (kind === "chunk") return <ChunkCard project={project} id={s.id} />;
+  if (kind === "chunk")
+    return <ChunkCard project={project} id={s.id} enrichedTitle={enrichedTitle} />;
   if (kind === "entity") return <EntityCard project={project} id={s.id} />;
   return <RelationCard project={project} id={s.id} />;
 }
@@ -262,14 +275,24 @@ function DocumentCard({ project, id }: { project: string; id: string }) {
   );
 }
 
-function ChunkCard({ project, id }: { project: string; id: string }) {
+function ChunkCard({
+  project,
+  id,
+  enrichedTitle,
+}: {
+  project: string;
+  id: string;
+  enrichedTitle: string | null;
+}) {
   const chunk = useChunk(project, id);
-  // chunk → its document's title: the second hop shares the per-id cache, so
-  // sibling refs citing the same document resolve it once
-  const doc = useDocument(project, chunk.data?.document_id);
+  // chunk → its document's title: skipped entirely when the query boundary
+  // already enriched the ref with it; otherwise the second hop shares the
+  // per-id cache, so sibling refs citing the same document resolve it once
+  const doc = useDocument(project, enrichedTitle ? undefined : chunk.data?.document_id);
   if (chunk.isError) return MISS;
   if (!chunk.data) return null;
-  const docName = doc.data ? (documentTitle(doc.data.metadata) ?? doc.data.source_uri) : null;
+  const docName =
+    enrichedTitle ?? (doc.data ? (documentTitle(doc.data.metadata) ?? doc.data.source_uri) : null);
   const snippet =
     chunk.data.text.length > 120 ? `${chunk.data.text.slice(0, 120)}…` : chunk.data.text;
   return (

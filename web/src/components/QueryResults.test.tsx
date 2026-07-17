@@ -303,6 +303,39 @@ describe("QueryResults", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
+  it("renders the enriched document title the query boundary already attached", () => {
+    // core/query/metadata_enrich.py resolves every chunk ref (stable AND
+    // uuid) to its document and rides the allowlisted envelope on
+    // metadata.document — when the API has already provided the title, the
+    // card must say it (Codex #88 R3: hash+ordinal alone left SS2 incomplete
+    // for the most common entity/graph citations), still with zero fetch.
+    const spy = vi.spyOn(api, "GET");
+    renderWithProviders(
+      <QueryResults
+        result={queryResult({
+          results: [
+            retrievalResult({
+              source_refs: [
+                {
+                  source_type: "chunk",
+                  id: "chunk:abc123def456:2",
+                  metadata: { document: { context: { title: "海科館導覽手冊" } } },
+                },
+              ],
+            }),
+          ],
+        })}
+        project="demo"
+      />,
+    );
+    openFold();
+
+    expect(
+      screen.getByText(/海科館導覽手冊 · 段落 #2 · 內容雜湊 abc123def456/),
+    ).toBeInTheDocument();
+    expect(spy).not.toHaveBeenCalled();
+  });
+
   it("prefers the quote even when a manual evidence_ref is uuid-shaped", () => {
     // Codex #88 R2: a manual evidence_ref CAN be uuid-shaped
     // (core/query/graph.py:647-651 emits it verbatim) — a detail lookup there
