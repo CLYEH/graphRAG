@@ -132,3 +132,17 @@ def test_reject_unsupported_query() -> None:
         reject_unsupported_query(_req("sort=name:asc"), "created_at")
     with pytest.raises(ApiError):  # any filter is rejected
         reject_unsupported_query(_req("filter%5Bx%5D=1"), "created_at")
+
+    # GOV4: an endpoint that implements a facet names it — everything else
+    # still fails loud (a 200 that pretends a filter took effect misleads)
+    allowed = frozenset({"status"})
+    reject_unsupported_query(_req("filter%5Bstatus%5D=approved"), "id", allowed)  # facet → ok
+    with pytest.raises(ApiError):  # field outside the allowlist
+        reject_unsupported_query(_req("filter%5Bother%5D=1"), "id", allowed)
+    with pytest.raises(ApiError):  # bare non-deepObject spelling used to slip
+        # past the "filter[" prefix check and silently no-op (GAPS O4)
+        reject_unsupported_query(_req("filter=status:approved"), "id", allowed)
+    with pytest.raises(ApiError):  # malformed bracket never half-matches
+        reject_unsupported_query(_req("filter%5Bstatus=approved"), "id", allowed)
+    # unrelated params that merely share the prefix are NOT filters
+    reject_unsupported_query(_req("filtering=1"), "id", allowed)
