@@ -142,6 +142,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const STABLE_CHUNK_RE = /^chunk:([0-9a-f]+):(\d+)$/i;
 
 function SourceRefResolve({ s, project }: { s: SourceRef; project: string }) {
+  // §16 relation evidence rides its display fields ON the ref (metadata.quote
+  // — core/query/graph.py evidence_ref): manual/document evidence's id is the
+  // writer's evidence_ref (NOT a uuid), so the quote, not a detail read, is
+  // the card. The exact quoted span also beats a generic snippet wherever it
+  // is present, so quote-bearing refs never need a fetch.
+  const quote = typeof s.metadata?.quote === "string" && s.metadata.quote ? s.metadata.quote : null;
   if (s.source_type === "row") {
     // the producer splits the lossless ref into metadata {table, pk}
     // (contract SourceRef.metadata) — render words when present, else stay raw
@@ -158,11 +164,17 @@ function SourceRefResolve({ s, project }: { s: SourceRef; project: string }) {
     if (stable) {
       return (
         <span className="play__resolve">
-          段落 #{stable[2]} · 內容雜湊 {stable[1].slice(0, 12)}…
+          段落 #{stable[2]} · 內容雜湊 {stable[1].slice(0, 12)}…{quote ? `:「${quote}」` : ""}
         </span>
       );
     }
+    if (quote) return <span className="play__resolve">引文:「{quote}」</span>;
     return UUID_RE.test(s.id) ? <ChunkCard project={project} id={s.id} /> : null;
+  }
+  if (s.source_type === "document" && quote && !UUID_RE.test(s.id)) {
+    // manual evidence: uri already sits on the verbatim line; the quote is
+    // the resolution
+    return <span className="play__resolve">引文:「{quote}」</span>;
   }
   if (!UUID_RE.test(s.id)) return null;
   if (s.source_type === "document") return <DocumentCard project={project} id={s.id} />;

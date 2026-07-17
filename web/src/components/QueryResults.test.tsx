@@ -257,4 +257,49 @@ describe("QueryResults", () => {
     expect(screen.getByText("9:customers:12345")).toBeInTheDocument(); // lossless id intact
     expect(spy).not.toHaveBeenCalled();
   });
+
+  it("resolves quote-bearing evidence refs from their own metadata, no fetch", () => {
+    // §16 relation evidence (core/query/graph.py evidence_ref): manual
+    // evidence emits a document ref whose id is the writer's evidence_ref —
+    // NOT a uuid — with the quote riding metadata. A uuid-gated card would
+    // silently skip exactly these citations (Codex #88); the quote IS the
+    // resolution, and the exact span also beats a fetched snippet on
+    // quote-bearing chunk evidence, so neither shape may fire a request.
+    const spy = vi.spyOn(api, "GET");
+    renderWithProviders(
+      <QueryResults
+        result={queryResult({
+          results: [
+            retrievalResult({
+              source_refs: [
+                {
+                  source_type: "document",
+                  id: "manual:curator:42",
+                  source_uri: "file:///notes.md",
+                  metadata: { quote: "館內每日十點有導覽" },
+                },
+                {
+                  source_type: "chunk",
+                  id: DOC_ID, // chunk_id uuid, but the quote makes fetch moot
+                  source_uri: "file:///a.md",
+                  metadata: {
+                    quote: "潮境智能海洋館展出 320 種海洋生物",
+                    start_offset: 0,
+                    end_offset: 17,
+                  },
+                },
+              ],
+            }),
+          ],
+        })}
+        project="demo"
+      />,
+    );
+    openFold();
+
+    expect(screen.getByText(/引文:「館內每日十點有導覽」/)).toBeInTheDocument();
+    expect(screen.getByText(/引文:「潮境智能海洋館展出 320 種海洋生物」/)).toBeInTheDocument();
+    expect(screen.getByText("manual:curator:42")).toBeInTheDocument(); // verbatim intact
+    expect(spy).not.toHaveBeenCalled();
+  });
 });
