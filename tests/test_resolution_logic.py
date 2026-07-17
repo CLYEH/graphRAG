@@ -328,6 +328,27 @@ async def test_cross_type_twins_reach_review_but_never_auto_merge() -> None:
         "Exhibit",
         "Location",
     }
+    # the candidate carries the TRUE score — not an epsilon-demoted one. A
+    # mangled score both lies to the curator (1.0 is the signal「same name,
+    # types disagree」) and, under review == auto (below), exits both bands.
+    assert row["score"] == 1.0
+
+
+async def test_cross_type_twins_survive_equal_thresholds() -> None:
+    """review_threshold == auto_merge_threshold is a LEGAL config (both 1.0 =
+    「only surface exact matches」— the validator allows equality and the
+    strict-carry integration test runs it). The old epsilon-clamp demoted an
+    exact cross-type score to just under auto == review, so the pair fell out
+    of BOTH bands and silently vanished — dropping exactly the pairs DR-011
+    exists to surface. Barred-from-auto must be structural (review_only), not
+    score-mangling: the twin lands in review with its true 1.0 score."""
+    store = _FakeStore()
+    _seed(store, "區域探索廳", etype="Exhibit", mentions=2)
+    _seed(store, "區域探索廳", etype="Location")
+    report = await _run(store, auto_merge_threshold=1.0, review_threshold=1.0)
+    assert report.auto_merged == 0
+    assert report.candidates_created == 1
+    assert store.rows[tables.merge_candidates][0]["score"] == 1.0
 
 
 async def test_carried_merge_survives_type_drift() -> None:

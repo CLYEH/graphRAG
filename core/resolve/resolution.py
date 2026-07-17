@@ -165,18 +165,26 @@ def _blocked_pairs(entities: list[_Entity]) -> list[tuple[_Entity, _Entity]]:
     """§7 blocking (DR-011): shared name token OR shared 4-char prefix —
     across types. The old same-type bucket structurally hid cross-type twins
     (the same real thing re-typed by the LLM) from ever being scored; the
-    name conditions alone keep scoring off the full O(n²) for real corpora,
-    and the cross-type pairs they admit are exactly the ones review needs to
-    see. Deterministic order (callers sort scored output anyway)."""
-    pairs: list[tuple[_Entity, _Entity]] = []
-    for i, a in enumerate(entities):
-        a_tokens = set(a.norm_name.split())
-        for b in entities[i + 1 :]:
-            if a_tokens & set(b.norm_name.split()) or (
-                a.norm_name[:4] and a.norm_name[:4] == b.norm_name[:4]
-            ):
-                pairs.append((a, b))
-    return pairs
+    cross-type pairs the name conditions admit are exactly the ones review
+    needs to see. Inverted-index buckets (token → members, prefix → members)
+    generate pairs only WITHIN a bucket, so the cost tracks the pairs the
+    predicate admits — never a full O(n²) scan of unrelated names. Output is
+    deterministic: (i, j) index pairs, i < j, in ascending input order —
+    exactly the nested-loop order this replaces."""
+    buckets: dict[str, list[int]] = {}
+    for idx, entity in enumerate(entities):
+        keys = {f"t:{token}" for token in entity.norm_name.split()}
+        prefix = entity.norm_name[:4]
+        if prefix:
+            keys.add(f"p:{prefix}")
+        for key in keys:
+            buckets.setdefault(key, []).append(idx)
+    admitted: set[tuple[int, int]] = set()
+    for members in buckets.values():
+        for pos, i in enumerate(members):
+            for j in members[pos + 1 :]:
+                admitted.add((i, j))  # members ascend — i < j by construction
+    return [(entities[i], entities[j]) for i, j in sorted(admitted)]
 
 
 async def _load_ledger(
@@ -401,6 +409,13 @@ async def resolve_build(
             continue
         carried = verdict is not None and verdict.decision in ("merge", "approve")
         a_id, b_id = _has_disambiguator(a), _has_disambiguator(b)
+        # review_only bars a pair from the auto-merge branch STRUCTURALLY,
+        # keeping its TRUE score for the review-band check and the candidate
+        # row. (The earlier epsilon-clamp demoted the score itself, which
+        # under review_threshold == auto_merge_threshold — a legal config —
+        # pushed exact matches below BOTH bands and silently dropped the very
+        # pairs this rule exists to surface.)
+        review_only = False
         if not carried and a_id and b_id:
             if a.norm_name == b.norm_name:
                 # identical normalized name with TWO different external ids:
@@ -414,9 +429,7 @@ async def resolve_build(
             # both ids, different names: the sources assert distinct
             # identities, so similarity alone must not auto-merge them; the
             # review band may still propose a candidate for humans.
-            if score < config.review_threshold:
-                continue
-            score = min(score, config.auto_merge_threshold - 1e-9)
+            review_only = True
         # one-sided ids never block: an id-less mention has asserted nothing,
         # and joining it onto the id-bearing entity is exactly ER's job —
         # blocking exact-name one-sided pairs was round 1's over-block.
@@ -426,11 +439,9 @@ async def resolve_build(
             # auto-merge would conflate namesakes across types; the pair goes
             # to review, and only a human (or their carried ledger merge, the
             # `carried` branch above) joins across types.
-            if score < config.review_threshold:
-                continue
-            score = min(score, config.auto_merge_threshold - 1e-9)
+            review_only = True
         deferred = verdict is not None and verdict.decision == "defer"
-        if carried or (not deferred and score >= config.auto_merge_threshold):
+        if carried or (not deferred and not review_only and score >= config.auto_merge_threshold):
             canonical, loser = _pick_canonical(a, b)
             if a_id != b_id:
                 # exactly one side carries an external id: that key is the
