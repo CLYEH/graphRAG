@@ -132,5 +132,5 @@ component、欄位編輯重鑄鍵在上方表單)+ config-driven 變體沒枚舉
 旗標掛觀測邊界非觸發點)、1 以執行證據 decline(playwright glob 語意——讀源碼+實測
 regex,詳 [[graphrag-loop-paused-pr5]] #84)。**Console UX 翻新(UXA1-3/UXB1/UXC1a-b/
 UXC2a-c)九項全 merge;下一步=Track 5(SRC1 xlsx connector 為首個非 ⚠️ 項;CFG1/SRC2
-待 owner 確認)。**
+的 ⚠️ 已於 2026-07-17 由 owner「全部同意」解除,詳 [[graphrag-track5-owner-approvals]])。**
 

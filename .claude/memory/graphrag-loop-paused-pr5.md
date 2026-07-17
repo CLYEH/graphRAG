@@ -265,3 +265,5 @@ push 後 ~35 分鐘無回應=fresh-state check 後 poke `@codex review`。
 (R1b,class 9 對偶的再現——deny 面過寬即過度阻擋)遮蔽由「名稱包含」改「跨度重疊認領」:York+New York 並存=path 模板存在的理由,名稱級包含整個吃掉 York。已連結名的重複出現仍認領(防子名從第二次提及溜入)。
 (R2a)**async 保證需要真實 await 點**:純 CPU 掃描對 asyncio.timeout 隱形(class 12 的 asyncio 亞種——框架機制的精確語意:timeout 只在 await 邊界搶佔)。修法=純 stage 抽出、兩種組合共用(class 5 預防),async 路徑分段 + sleep(0) 取消點;parity 用執行測試釘住。
 (R2b)**跨文字系統的邊界語意**:拉丁短名(US/IT)需詞界、CJK 是 containment;str.isalnum() 對「區」為 True——通用 alnum 檢查會誤殺全部 CJK(class 8 的文字系統亞種:邊界規則要按 script 分別推導,並誠實標出殘餘=獨立同形 token 不可判)。
+
+**#90(H13 watcher --anchor,0 輪 Codex 首輪 +1;無新 class)**:harness 自我修復的正面示範——會咬 loop 的工具缺陷(triage-without-poke 使每次 watch 永遠 exit 10)在兩次手寫 inline 繞過後正式立案修掉。可複用點:(a) **同一個「anchor」概念可以有兩種 tie 語意**,取決於 anchor 是「對話的一方」(poke:同秒=回覆,未處理)還是「事件自身的時間戳」(--anchor:同秒=自己,已處理)——設計 timestamp 述詞時先問 anchor 指的是誰;(b) 執行級測試的假 gh 按「參數內容」路由 + 世界在 env vars,是 shell 感測器類工具的可複製測法(receipts 前例的 API 版);(c) exit-10 訊息印出事件時間戳=把「下一步需要的輸入」放進上一步的輸出,工作流工具的介面紀律。
