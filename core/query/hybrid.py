@@ -41,6 +41,7 @@ from llama_index.core.llms import LLM, ChatMessage, MessageRole
 
 from core.query.global_reports import global_summary
 from core.query.graph import GraphQueryParams, graph_query
+from core.query.linking import GraphPlan, plan_graph_query
 from core.query.policy import TextToCypher, TextToSql
 from core.query.results import (
     McpResponse,
@@ -140,8 +141,13 @@ async def hybrid_query(
     """§8 hybrid retrieval over the active build, as a §16 response.
 
     ``graph_params`` is the caller's optional graph invocation (template +
-    seed); without it the graph mode is skipped with a reason — the router
-    never fabricates traversal parameters from prose.
+    seed); without it the router derives a SAFE plan itself (QP1): the
+    question is entity-linked against the build's own names and an existing
+    §27.6 template is selected — deterministic, zero-LLM, fully surfaced in
+    the routing trace (``core.query.linking``). The router still never
+    fabricates FREE-FORM traversal parameters from prose: an auto plan is
+    template + SoR-resolvable seed or nothing, and with neither caller params
+    nor a link the graph mode is skipped with a reason.
     """
     started = time.monotonic()
     _check_scopes(deps)
@@ -151,18 +157,29 @@ async def hybrid_query(
         )
         return _response(deps, query, (), (warning,), None)
 
-    available, gated = _available_modes(policy, graph_params)
-
-    # ONE wall-clock deadline for the WHOLE call (§21 max_latency_ms): the
-    # per-mode DB timeouts are already clamped to it, but modes run
-    # SEQUENTIALLY and the selector/embedding work has no DB deadline — so
-    # every stage below runs on the remaining budget (the C6b/C6c per-phase
-    # lesson, applied to the router itself).
+    # ONE wall-clock deadline for the WHOLE call (§21 max_latency_ms) — set
+    # before linking so the auto plan spends the request's budget, not extra
     deadline = started + policy.max_latency_ms / 1000.0
 
     def _remaining() -> float:
         return deadline - time.monotonic()
 
+    auto_plan: GraphPlan | None = None
+    if graph_params is None:
+        try:
+            async with asyncio.timeout(max(_remaining(), 0.001)):
+                auto_plan = await plan_graph_query(deps.repo, query, policy.max_graph_hops)
+        except Exception:  # noqa: BLE001 — §22: a failed auto plan degrades to the old gating
+            auto_plan = None
+        if auto_plan is not None:
+            graph_params = auto_plan.params
+
+    available, gated = _available_modes(policy, graph_params)
+
+    # (the per-mode DB timeouts are already clamped to the shared deadline,
+    # but modes run SEQUENTIALLY and the selector/embedding work has no DB
+    # deadline — so every stage below runs on the remaining budget: the
+    # C6b/C6c per-phase lesson, applied to the router itself)
     try:
         async with asyncio.timeout(max(_remaining(), 0.001)):
             selected, unselected, reason = await _select_modes(deps.llm, query, available)
@@ -172,6 +189,15 @@ async def hybrid_query(
             [],
             "selector timed out — ran every available mode",
         )
+    if auto_plan is not None and "graph" in available and "graph" not in selected:
+        # QP1: an auto-planned graph run is deterministic — the question
+        # demonstrably names build entities, the templates are cheap and
+        # parameterized, and RRF fusion sinks irrelevant hits. Golden cases
+        # that NEED a relation path must not hinge on an LLM selector's mood
+        # (C3b: LLM-assisted, never LLM-trusted), so the plan always runs.
+        selected = [*selected, "graph"]
+        unselected = [mode for mode in unselected if mode != "graph"]
+        reason = f"{reason}; graph joined by auto plan (linked entities in the question)"
 
     mode_responses: dict[str, McpResponse] = {}
     warnings: list[QueryWarning] = []
@@ -228,9 +254,10 @@ async def hybrid_query(
                     stores.append(store)
         debug = {
             "stores_used": stores,
-            "retrieval_plan": [
-                f"{mode}: {len(mode_responses[mode].results)} result(s)" for mode in ran
-            ],
+            # the auto plan leads the trace (QP1): which entities linked and
+            # which template/seed the router chose must be auditable
+            "retrieval_plan": ([auto_plan.note] if auto_plan is not None else [])
+            + [f"{mode}: {len(mode_responses[mode].results)} result(s)" for mode in ran],
             "routing_decision": {
                 "selected": list(selected),
                 "skipped": [mode for mode, _ in gated] + list(unselected),
@@ -271,7 +298,13 @@ def _available_modes(
         if mode == "sql" and not policy.text_to_sql.enabled:
             gated.append((mode, "sql mode is disabled by policy"))
         elif mode == "graph" and graph_params is None:
-            gated.append((mode, "no graph parameters supplied (template + seed entity)"))
+            gated.append(
+                (
+                    mode,
+                    "no graph parameters supplied and no build entity name linked "
+                    "in the question (QP1 auto plan found no seed)",
+                )
+            )
         else:
             available.append(mode)
     return available, gated

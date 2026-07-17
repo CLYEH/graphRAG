@@ -248,9 +248,11 @@ class GraphQueryRequest(BaseModel):
 
 class HybridQueryRequest(BaseModel):
     """The hybrid mode's QueryRequest: ``top_k`` threads to fusion, ``options``
-    is the OPTIONAL graph invocation — absent means the router skips the graph
-    mode with an in-envelope reason (MCP parity: it never fabricates traversal
-    parameters from prose); present it must be complete (GraphOptions). The
+    is the OPTIONAL graph invocation — absent, the router derives a safe plan
+    itself when the question names a build entity (QP1 auto plan, surfaced in
+    the routing trace) and otherwise skips the graph mode with an in-envelope
+    reason (MCP parity; free-form traversal parameters are never fabricated
+    from prose); present it must be complete (GraphOptions). The
     contract types ``options`` as an optional OBJECT, not nullable — an
     explicit JSON null is a malformed request rejected loudly, never folded
     into omission (silently skipping graph would hide it — the omitted≠null
