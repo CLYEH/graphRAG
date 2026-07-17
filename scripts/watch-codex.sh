@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# watch-codex.sh <pr-number> [interval-seconds] [max-polls]
+# watch-codex.sh <pr-number> [interval-seconds] [max-polls] [--anchor <iso-ts>]
 #
 # The standard way to wait for Codex on a PR (LOOP.md step 7). Watches ALL THREE
 # channels Codex uses — issue reactions (+1 / eyes), PR reviews (inline threads;
 # how "changes wanted" arrives), and issue comments — because no single channel
 # carries every verdict (learned on PR #5: a review-only response is invisible
 # to reaction/comment polling).
+#
+# --anchor <iso-ts> (H13): the timestamp of the last Codex event you already
+# HANDLED. The bootstrap normally treats the last "@codex review" poke as the
+# triage-ack — but the normal flow now triages WITHOUT a poke (fix + resolve;
+# pushes auto-trigger the re-review), and without an anchor every later watch
+# would exit 10 at bootstrap on that same already-handled event forever. Pass
+# the handled event's own timestamp (the watcher prints it in its RESULT
+# lines) and "unprocessed" becomes "newer than the last HANDLED event".
 #
 # Exit codes (machine-readable):
 #   0  = +1 reaction present -> approved; proceed to merge checks
@@ -21,7 +29,22 @@
 # the default 30s interval keeps mean detection latency ~15s at 4 API calls/poll.
 set -o pipefail
 
-PR="${1:?usage: watch-codex.sh <pr-number> [interval-seconds] [max-polls]}"
+ANCHOR=""
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --anchor)
+      ANCHOR="${2:?--anchor needs an ISO-8601 timestamp}"
+      shift 2
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${args[@]}"
+PR="${1:?usage: watch-codex.sh <pr-number> [interval-seconds] [max-polls] [--anchor <iso-ts>]}"
 INTERVAL="${2:-30}"
 MAX_POLLS="${3:-60}"
 BOT='chatgpt-codex-connector[bot]'
@@ -60,10 +83,23 @@ boot_react="$(gh api --paginate "repos/$repo/issues/$PR/reactions" \
 # its own "no major issues" comment seconds apart, and classifying that
 # comment as triage work would misread an approval as findings. The merge
 # hook still independently verifies the +1 is newer than the head commit.
-# Ties count as AFTER the poke: created_at has one-second resolution, and a
-# bot reply sharing the poke's exact second can only BE the reply (triage
-# cycles take minutes — a same-second already-triaged event is not real).
-if [ -n "$boot_react" ] && [[ ! "$boot_react" < "$boot_poke" ]]; then
+#
+# Two tie rules, one per anchor kind (H13): against the POKE, ties count as
+# AFTER (created_at has one-second resolution; a bot reply sharing the poke's
+# exact second can only BE the reply — triage cycles take minutes). Against
+# an explicit --anchor, ties count as PROCESSED — the anchor IS the handled
+# event's own timestamp, and it must not re-trigger on itself. The LATER of
+# the two anchors governs.
+processed() {
+  # $1 = a bot event's timestamp; true (0) when it was already handled
+  local t="$1"
+  if [ -n "$ANCHOR" ] && { [ -z "$boot_poke" ] || [[ ! "$ANCHOR" < "$boot_poke" ]]; }; then
+    [[ ! "$t" > "$ANCHOR" ]] # t <= anchor → processed
+  else
+    [[ "$t" < "$boot_poke" ]] # t < poke → processed (ties = the reply)
+  fi
+}
+if [ -n "$boot_react" ] && ! processed "$boot_react"; then
   echo "RESULT: +1 — approved (reacted at $boot_react, before this watch started; the merge hook still verifies it is newer than the head commit)."
   exit 0
 fi
@@ -74,7 +110,7 @@ verdict=""
 for pair in "30:$boot_quota" "10:$boot_botc" "10:$boot_review"; do
   t="${pair#*:}"
   [ -n "$t" ] || continue
-  [[ "$t" < "$boot_poke" ]] && continue  # ties = after (second resolution)
+  processed "$t" && continue
   if [ -z "$newest" ] || [[ "$t" > "$newest" ]]; then
     newest="$t"
     verdict="${pair%%:*}"
@@ -82,7 +118,7 @@ for pair in "30:$boot_quota" "10:$boot_botc" "10:$boot_review"; do
 done
 case "$verdict" in
   10)
-    echo "RESULT: Codex responded at $newest, before this watch started — inspect and triage it (LOOP.md step 7)."
+    echo "RESULT: Codex responded at $newest, before this watch started — inspect and triage it (LOOP.md step 7; after triaging without a poke, pass --anchor $newest to the next watch)."
     exit 10
     ;;
   30)
@@ -129,7 +165,17 @@ for i in $(seq 1 "$MAX_POLLS"); do
       echo "RESULT: Codex is OUT OF QUOTA (its only fresh response is the usage-limits message) — stop waiting; re-poke '@codex review' after the quota window resets."
       exit 30
     fi
-    echo "RESULT: new Codex response — inspect and triage it (LOOP.md step 7)."
+    # surface the newest fresh event's timestamp: it is the --anchor a later
+    # watch needs after this event is triaged WITHOUT a poke (H13)
+    latest_rev="$(gh api --paginate "repos/$repo/pulls/$PR/reviews" \
+      --jq "[.[]|select((.user.login|startswith(\"$BOT_PREFIX\")) and .submitted_at > \"$START\")|.submitted_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
+    latest_com="$(gh api --paginate "repos/$repo/issues/$PR/comments" \
+      --jq "[.[]|select((.user.login|startswith(\"$BOT_PREFIX\")) and .created_at > \"$START\")|.created_at]|max // empty" 2>/dev/null | grep -v '^null$' | sort | tail -n1)"
+    latest_ts="$latest_rev"
+    if [ -n "$latest_com" ] && { [ -z "$latest_ts" ] || [[ "$latest_com" > "$latest_ts" ]]; }; then
+      latest_ts="$latest_com"
+    fi
+    echo "RESULT: new Codex response at ${latest_ts:-unknown} — inspect and triage it (LOOP.md step 7; after triaging without a poke, pass --anchor ${latest_ts:-<its-timestamp>} to the next watch)."
     exit 10
   fi
 done
