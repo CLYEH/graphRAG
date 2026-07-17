@@ -30,6 +30,25 @@ def test_single_character_names_never_link() -> None:
     assert link_names("這個廳在哪裡?", ["廳"]) == []
 
 
+def test_ascii_matches_require_word_boundaries() -> None:
+    """Codex #89 R2: short word-like names (US, IT) live inside countless
+    unrelated tokens — 「us」 in 「business」 is not a mention, and because
+    an auto-planned graph mode always RUNS, a boundary-less link would drag
+    irrelevant traversals into unrelated questions. CJK stays containment
+    (no word boundaries exist to require)."""
+    assert link_names("how does the business work?", ["US"]) == []
+    assert link_names("adjust the housing", ["US"]) == []  # inside a word, twice over
+    assert link_names("the us economy", ["US"]) == ["US"]
+    assert link_names("we outsource IT support", ["IT"]) == ["IT"]
+    # a STANDALONE homonym token still links ("what is it about" → IT): word
+    # boundaries fix intra-token matches, not pronoun homonymy — that residue
+    # is deliberate (deterministic linking cannot read intent; the graph run
+    # is cheap, parameterized, and RRF sinks irrelevant hits)
+    assert link_names("what is it about?", ["IT"]) == ["IT"]
+    # CJK containment is untouched by the ASCII boundary rule
+    assert link_names("區域探索廳有什麼?", ["區域探索廳"]) == ["區域探索廳"]
+
+
 def test_shadowed_substring_names_yield_to_the_longest() -> None:
     """「區域」 is contained in 「區域探索廳」: when both match ONLY there,
     the longest (most specific) name links — a generic fragment must not
@@ -119,3 +138,28 @@ def test_normalization_equal_spellings_dedupe_to_the_earliest() -> None:
     assert plan is not None
     assert plan.params.template == "neighbors"
     assert len(plan.linked_names) == 1
+
+
+async def test_yielding_async_scan_matches_the_sync_composition() -> None:
+    """plan_graph_query chunks the scan with event-loop yield points so the
+    router's asyncio.timeout can preempt a big dictionary (Codex #89 R2: a
+    pure CPU loop is invisible to cancellation). Chunking must not change the
+    ANSWER: the same two pure stages run, so a dictionary spanning several
+    chunks links identically to the sync composition — including a claim
+    whose names sit in different chunks."""
+    from core.query.linking import SCAN_YIELD_EVERY, plan_graph_query
+
+    class _Repo:
+        async def distinct_active_entity_names(self) -> list[str]:
+            # filler pushes the two real names into different scan chunks
+            filler = [f"unrelated-{i:05d}" for i in range(SCAN_YIELD_EVERY + 50)]
+            return [*filler[:SCAN_YIELD_EVERY], "海科館", *filler[SCAN_YIELD_EVERY:], "區域探索廳"]
+
+    question = "從海科館怎麼走到區域探索廳?"
+    plan = await plan_graph_query(_Repo(), question, max_graph_hops=3)  # type: ignore[arg-type]
+    names = await _Repo().distinct_active_entity_names()
+    sync_plan = derive_plan(question, names, max_graph_hops=3)
+    assert plan is not None and sync_plan is not None
+    assert plan == sync_plan
+    assert plan.params.template == "path"
+    assert plan.params.entity == "海科館" and plan.params.other_entity == "區域探索廳"
