@@ -400,7 +400,7 @@ def test_xlsx_source_yields_a_text_payload_per_row(tmp_path: Path) -> None:
     assert len(payloads) == 1
     assert payloads[0].mime == "text/plain"
     assert payloads[0].source_uri.endswith("#row=1")
-    assert payloads[0].raw == "【導覽】深海探索廳\n位置:B1\n\n介紹深潛器。\n"
+    assert payloads[0].raw == "【導覽】深海探索廳\n編號:1\n位置:B1\n\n介紹深潛器。\n"
 
 
 def test_xlsx_padded_mapping_values_resolve_stripped(tmp_path: Path) -> None:

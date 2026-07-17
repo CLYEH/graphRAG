@@ -234,9 +234,17 @@ def read_xlsx_rows(
     Each row renders to the pilot-validated text shape::
 
         【label】title      (or 【title】 when no label)
+        id_column:id        (when the id column is mapped and the cell non-blank)
         extra:value         (each non-blank extra column, mapping order)
 
         body
+
+    The authored id line doubles as ROW IDENTITY: ``content_hash(raw)`` is the
+    document identity (§18), so it is what keeps two same-content rows with
+    different authored ids from collapsing in ingest dedup (which would drop
+    the second row's ``#row=`` provenance). Blank-id rows carry no such line —
+    identical blank-id rows are true duplicates and dedup by design (the text
+    family's semantics; ingest reports them as skipped).
 
     which flows into the ordinary text pipeline (chunking + LLM extraction —
     per-row TEXT documents were what the pilot validated, so xlsx documents are
@@ -327,7 +335,8 @@ def read_xlsx_rows(
                 continue
             blank_streak = 0
             ordinal += 1
-            rid = (cell(row, id_column) if id_column else "") or str(ordinal)
+            id_text = cell(row, id_column) if id_column else ""
+            rid = id_text or str(ordinal)
             if rid in seen:
                 raise ValueError(
                     f"row {ordinal} of {path} repeats id {rid!r} — a duplicated row id "
@@ -336,6 +345,19 @@ def read_xlsx_rows(
                 )
             seen.add(rid)
             lines = [f"【{label}】{title}" if label else f"【{title}】"]
+            if id_text:
+                # the authored row id rides the RENDERED text: content_hash(raw)
+                # is THE document identity (§18), so two distinct rows whose
+                # title/body/extras render identically would otherwise collapse
+                # in ingest dedup and silently drop the second row's #row=
+                # provenance (Codex #85) — with the id in the text, distinct
+                # authored ids mint distinct documents by construction (the
+                # structured family gets this from the pk riding the row JSON).
+                # Ordinal-FALLBACK ids are deliberately NOT rendered (the cell
+                # was blank — printing an invented number would misquote the
+                # sheet), so identical blank-id rows keep the text-family
+                # semantics: true duplicates dedup, reported as skipped.
+                lines.append(f"{id_column}:{id_text}")
             for extra in extra_columns:
                 extra_value = cell(row, extra)
                 if extra_value:

@@ -241,8 +241,8 @@ def test_xlsx_rows_render_the_mapped_columns_with_per_row_citation(tmp_path: Pat
         f"{path.resolve().as_uri()}#row=1",
         f"{path.resolve().as_uri()}#row=2",
     ]
-    assert payloads[0].raw == "【導覽】深海探索廳\n位置:B1\n分類:常設展\n\n介紹深潛器。\n"
-    assert payloads[1].raw == "【導覽】海洋劇場\n分類:設施\n\n球幕電影。\n"
+    assert payloads[0].raw == "【導覽】深海探索廳\n編號:1\n位置:B1\n分類:常設展\n\n介紹深潛器。\n"
+    assert payloads[1].raw == "【導覽】海洋劇場\n編號:2\n分類:設施\n\n球幕電影。\n"
     assert all(p.mime == "text/plain" for p in payloads)
     assert payloads[0].metadata == {"filename": "guide.xlsx", "row": "1"}
 
@@ -277,7 +277,7 @@ def test_xlsx_headers_normalize_annotations_and_ids_normalize_floats(tmp_path: P
     )
     assert len(payloads) == 1
     assert payloads[0].source_uri.endswith("#row=7")
-    assert payloads[0].raw == "【常見問題】開放時間?\n主題:服務\n\n每日九點。\n"
+    assert payloads[0].raw == "【常見問題】開放時間?\n編號:7\n主題:服務\n\n每日九點。\n"
 
 
 def test_xlsx_skips_template_rows_and_stops_after_the_blank_streak(tmp_path: Path) -> None:
@@ -342,6 +342,39 @@ def test_xlsx_blank_id_falls_back_to_ordinal_and_duplicates_fail_loud(tmp_path: 
     )
     with pytest.raises(ValueError, match="repeats id"):
         list(read_xlsx_rows(dup, title_column="標題", body_column="內容詳情", id_column="編號"))
+
+
+def test_xlsx_same_content_rows_with_distinct_ids_stay_distinct_documents(
+    tmp_path: Path,
+) -> None:
+    """Why: content_hash(raw) is THE document identity (§18) and ingest dedups
+    on it — two rows whose title/body render identically would collapse and
+    silently drop the second row's #row= provenance (Codex #85). The authored
+    id rides the rendered text, so distinct ids mint distinct hashes by
+    construction. The dual: blank-id rows carry NO id line (an invented
+    ordinal in the text would misquote the sheet), so identical blank-id rows
+    are true duplicates and share a hash — the text family's dedup semantics,
+    reported by ingest as skipped."""
+    book = _write_xlsx(
+        tmp_path / "same_content.xlsx",
+        ["編號", "標題", "內容詳情"],
+        [[1, "相同標題", "相同內文"], [2, "相同標題", "相同內文"]],
+    )
+    payloads = list(
+        read_xlsx_rows(book, title_column="標題", body_column="內容詳情", id_column="編號")
+    )
+    assert [p.source_uri.rsplit("#", 1)[1] for p in payloads] == ["row=1", "row=2"]
+    assert content_hash(payloads[0].raw) != content_hash(payloads[1].raw)
+
+    blank_ids = _write_xlsx(
+        tmp_path / "blank_ids.xlsx",
+        ["編號", "標題", "內容詳情"],
+        [[None, "相同標題", "相同內文"], [None, "相同標題", "相同內文"]],
+    )
+    dup = list(
+        read_xlsx_rows(blank_ids, title_column="標題", body_column="內容詳情", id_column="編號")
+    )
+    assert content_hash(dup[0].raw) == content_hash(dup[1].raw)  # true duplicates dedup
 
 
 def test_xlsx_duplicate_mapped_header_fails_loud_but_unmapped_duplicates_pass(
