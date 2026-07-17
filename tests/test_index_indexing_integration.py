@@ -272,7 +272,11 @@ async def test_index_projects_active_graph_and_embeddings_end_to_end(
                 await conn.execute(entities.select().where(entities.c.id == ghost[0]))
             ).one()
             assert ghost_row.embedding_point_id is None  # rejected → never embedded
-            chunk_rows = (await conn.execute(chunks.select())).fetchall()
+            chunk_rows = (
+                # H11: this build's chunks only — the dev DB holds other
+                # projects' chunks whose vector_point_id is legitimately unset
+                await conn.execute(chunks.select().where(chunks.c.build_id == writer.build_id))
+            ).fetchall()
             assert chunk_rows and all(r.vector_point_id == r.id for r in chunk_rows)
             # the converged re-run above added no duplicate points (ids are the
             # row ids, so an upsert overwrites in place)

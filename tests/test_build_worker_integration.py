@@ -42,6 +42,29 @@ def migrated(require_services: None) -> None:
     command.upgrade(Config(str(REPO_ROOT / "alembic.ini")), "head")
 
 
+@pytest.fixture(autouse=True)
+async def dedicated_redis_db(require_services: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """H11: run arq against redis db 15, flushed per test — NEVER the dev
+    machine's db 0. The dev worker lives on db 0, and a stale
+    ``arq:in-progress:cron:*`` key from an interrupted worker WEDGES a burst
+    worker indefinitely (the class-12 cross-generation key retention, biting
+    tests); conversely a test flush on db 0 would wipe the dev worker's
+    queue. ``get_settings()`` re-reads env per call, so the monkeypatched
+    REDIS_URL governs every ``_redis_settings()`` below; the flush kills
+    leftovers of KILLED runs at the next run's start."""
+    base = get_settings().redis_url.rsplit("/", 1)[0]
+    monkeypatch.setenv("GRAPHRAG_REDIS_URL", f"{base}/15")
+    # self-verifying: a wrong env name (Settings uses env_prefix GRAPHRAG_;
+    # bare REDIS_URL is silently ignored) would flush the DEV worker's db 0 —
+    # the exact harm this fixture exists to prevent. Fail loud instead.
+    assert get_settings().redis_url.endswith("/15"), get_settings().redis_url
+    pool = await create_pool(bw._redis_settings())
+    try:
+        await pool.flushdb()
+    finally:
+        await pool.aclose()
+
+
 def _engine() -> AsyncEngine:
     dsn = get_settings().postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
     return create_async_engine(dsn, poolclass=NullPool)
