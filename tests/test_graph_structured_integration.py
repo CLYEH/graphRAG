@@ -154,7 +154,16 @@ async def test_rerun_writes_nothing_new(migrated: None) -> None:
             )
             assert len(await writer.fetch_all(entities)) == 2
             mentions = (
-                await conn.execute(sa.select(sa.func.count()).select_from(entity_mentions))
+                await conn.execute(
+                    # scoped to THIS project's entities: a lived-in dev DB
+                    # holds other projects' mentions (H11 — whole-table
+                    # counts made the suite fail on real machines)
+                    sa.select(sa.func.count())
+                    .select_from(
+                        entity_mentions.join(entities, entities.c.id == entity_mentions.c.entity_id)
+                    )
+                    .where(entities.c.project == project)
+                )
             ).scalar_one()
             assert mentions == 2
             await trans.rollback()
@@ -176,7 +185,12 @@ async def test_two_builds_stay_isolated(migrated: None) -> None:
                 await _ingest_row(writer, "1", name="Alice", employer="Acme")
                 await extract_structured(writer, _MAPPING)
             total = (
-                await conn.execute(sa.select(sa.func.count()).select_from(entities))
+                await conn.execute(
+                    # H11: scoped to this test's own project — never the table
+                    sa.select(sa.func.count())
+                    .select_from(entities)
+                    .where(entities.c.project == project)
+                )
             ).scalar_one()
             assert total == 4  # 2 entities x 2 builds, no collision
             await trans.rollback()

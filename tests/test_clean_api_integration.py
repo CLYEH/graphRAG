@@ -108,8 +108,16 @@ async def _make_document(
     )
 
 
-async def _chunk_rows(conn: AsyncConnection) -> int:
-    count = (await conn.execute(sa.select(sa.func.count()).select_from(chunks))).scalar_one()
+async def _chunk_rows(conn: AsyncConnection, project: str) -> int:
+    # H11: scoped to the test's own project — a lived-in dev DB (and the dev
+    # worker running beside the suite) mutates OTHER projects' chunks freely
+    count = (
+        await conn.execute(
+            sa.select(sa.func.count())
+            .select_from(chunks.join(documents, documents.c.id == chunks.c.document_id))
+            .where(documents.c.project == project)
+        )
+    ).scalar_one()
     return int(count)
 
 
@@ -119,7 +127,7 @@ async def test_document_preview_reads_the_active_build_and_persists_nothing(api:
     active = await _make_build(conn, project, "active")
     raw = "alpha beta gamma delta epsilon zeta eta theta iota kappa " * 20
     doc = await _make_document(conn, project, active, raw)
-    before = await _chunk_rows(conn)
+    before = await _chunk_rows(conn, project)
 
     r = await client.post(
         f"/projects/{project}/clean/preview",
@@ -135,7 +143,7 @@ async def test_document_preview_reads_the_active_build_and_persists_nothing(api:
     for c in got:
         assert raw[c["start_offset"] : c["end_offset"]] == c["text"]
     # the defining promise: a preview writes NOTHING (chunk count unchanged)
-    assert await _chunk_rows(conn) == before
+    assert await _chunk_rows(conn, project) == before
 
 
 async def test_document_in_a_non_active_build_is_invisible(api: Api) -> None:
@@ -160,7 +168,7 @@ async def test_text_preview_uses_the_project_config_from_the_registry(api: Api) 
     # read back out of Postgres, not the module constants.
     client, conn = api
     project = await _make_project(client, config={"chunking": {"max_chars": 30, "overlap": 5}})
-    before = await _chunk_rows(conn)
+    before = await _chunk_rows(conn, project)
 
     r = await client.post(
         f"/projects/{project}/clean/preview",
@@ -171,4 +179,4 @@ async def test_text_preview_uses_the_project_config_from_the_registry(api: Api) 
     payload = r.json()
     assert payload["meta"]["build_id"] is None  # no build involved — and none required
     assert len(payload["data"]["chunks"]) > 1
-    assert await _chunk_rows(conn) == before
+    assert await _chunk_rows(conn, project) == before

@@ -150,7 +150,11 @@ async def test_auto_merge_cascades_and_converges(migrated: None) -> None:
             assert loser.attributes["merged_into"] == str(acme[0])
             # the relation now points at the canonical, re-minted + re-hashed
             edge = (
-                await conn.execute(relations.select().where(relations.c.type == "WORKS_AT"))
+                await conn.execute(
+                    relations.select().where(
+                        relations.c.project == project, relations.c.type == "WORKS_AT"
+                    )
+                )
             ).one()
             expected_sig = fingerprints.relation_signature(alice[1], "WORKS_AT", acme[1])
             assert edge.dst_entity_id == acme[0]
@@ -391,7 +395,10 @@ async def test_remint_collision_demotes_duplicate_and_dedups_evidence(migrated: 
             survivor_sig = fingerprints.relation_signature(alice[1], "WORKS_AT", acme[1])
             survivor = (
                 await conn.execute(
-                    relations.select().where(relations.c.relation_signature == survivor_sig)
+                    relations.select().where(
+                        relations.c.project == project,
+                        relations.c.relation_signature == survivor_sig,
+                    )
                 )
             ).one()
             ev_rows = (
