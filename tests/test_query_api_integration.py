@@ -216,10 +216,16 @@ async def test_graph_and_hybrid_end_to_end_over_the_shared_seam(
             assert "community_report" in [res["result_type"] for res in data["results"]]
             codes = [w["code"] for w in data["warnings"]]
             assert "STORE_UNAVAILABLE" in codes  # semantic degraded, not fatal (§22)
-            assert codes.count("MODE_SKIPPED") == 2  # sql disabled, graph unparameterized
+            # QP1 flipped graph's fate here: "main hall" NAMES the seeded
+            # entity, so the auto plan links it and graph RUNS (neighbors over
+            # live Neo4j; the unprojected node yields no hits, but the mode is
+            # selected and traced) — only sql remains policy-skipped
+            assert codes.count("MODE_SKIPPED") == 1
             routing = data["debug"]["routing_decision"]
             assert "global" in routing["selected"]
+            assert "graph" in routing["selected"]
             assert "selector failed" in routing["reason"]
+            assert any("auto plan" in line for line in data["debug"]["retrieval_plan"])
 
             # graph: the hop ceiling degrades IN-ENVELOPE over the live stack
             # (facade parity — same answer as the MCP tool), never a 400 …

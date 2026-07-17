@@ -601,6 +601,26 @@ class BuildScopedRepo:
         rows = (await self._execute(query)).fetchall()
         return [row.id for row in rows]
 
+    async def distinct_active_entity_names(self) -> list[str]:
+        """Every DISTINCT canonical_name among the build's ACTIVE entities,
+        deterministically ordered — the QP1 linking dictionary: the auto graph
+        plan matches the question against the build's own names, and the names
+        it emits resolve through :meth:`entity_ids_by_name`, so linking can
+        never name a seed the templates cannot resolve."""
+        entities = tables.entities
+        query = (
+            sa.select(entities.c.canonical_name)
+            .where(
+                entities.c.project == self.project,
+                entities.c.build_id == self.build_id,
+                entities.c.status == "active",
+            )
+            .distinct()
+            .order_by(entities.c.canonical_name)
+        )
+        rows = (await self._execute(query)).fetchall()
+        return [row.canonical_name for row in rows]
+
     async def active_entity_ids(self, entity_ids: Collection[uuid.UUID]) -> set[uuid.UUID]:
         """The subset of ``entity_ids`` that is ACTIVE in the SoR — §19
         projection-drift re-verification for graph traversal results: the

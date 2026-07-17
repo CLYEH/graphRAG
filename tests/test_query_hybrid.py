@@ -417,3 +417,125 @@ async def test_a_generous_deadline_changes_nothing(monkeypatch: pytest.MonkeyPat
     response = await _run(_deps(), _policy(max_latency_ms=30_000))
     assert all(len(calls[mode]) == 1 for mode in ("semantic", "graph", "sql", "global"))
     assert not any("deadline" in w.message for w in response.warnings)
+
+
+# ---- QP1: the auto graph plan --------------------------------------------------
+
+
+class _LinkableRepo(_Scoped):
+    """A repo whose build knows some entity names — the QP1 linking dictionary."""
+
+    def __init__(self, names: list[str]) -> None:
+        super().__init__()
+        self._names = names
+        self.name_reads = 0
+
+    async def distinct_active_entity_names(self) -> list[str]:
+        self.name_reads += 1
+        return list(self._names)
+
+
+def _linkable_deps(
+    names: list[str], llm: _FakeLLM | None = None
+) -> tuple[HybridDeps, _LinkableRepo]:
+    repo = _LinkableRepo(names)
+    deps = HybridDeps(
+        repo=cast(Any, repo),
+        vectors=cast(Any, _Scoped()),
+        embedder=cast(Any, object()),
+        sql_reader=cast(Any, _Scoped()),
+        graph=cast(Any, _Scoped()),
+        llm=cast(Any, llm or _FakeLLM(_pick_all())),
+    )
+    return deps, repo
+
+
+async def test_auto_plan_runs_graph_for_a_bare_nl_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """QP1's point: a plain-language question that names a build entity gets
+    the GraphRAG core WITHOUT the caller supplying template or seed — before
+    this, graph was gated forever for every NL caller (review §P0#3)."""
+    calls = _patch_modes(monkeypatch)
+    deps, _repo = _linkable_deps(["區域探索廳"])
+    response = await hybrid_query(deps, _policy(), "區域探索廳有什麼可以看的?", None)
+    _VALIDATOR.validate(response.to_dict())
+
+    assert len(calls["graph"]) == 1
+    params = calls["graph"][0][3]  # graph_query(graph, repo, policy, params, ...)
+    assert params.template == "neighbors" and params.entity == "區域探索廳"
+    assert not any(w.code == "MODE_SKIPPED" and "graph" in w.message for w in response.warnings)
+    assert response.debug is not None
+    # the plan leads the trace: entities + template + seed are auditable
+    assert "auto plan" in response.debug["retrieval_plan"][0]
+    assert "區域探索廳" in response.debug["retrieval_plan"][0]
+
+
+async def test_auto_plan_two_entities_takes_the_path_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _patch_modes(monkeypatch)
+    deps, _repo = _linkable_deps(["海科館", "區域探索廳"])
+    await hybrid_query(deps, _policy(), "從海科館怎麼走到區域探索廳?", None)
+
+    params = calls["graph"][0][3]
+    assert params.template == "path"
+    assert params.entity == "海科館" and params.other_entity == "區域探索廳"
+    assert params.hops == 3  # the policy ceiling (max_graph_hops), not a guess
+
+
+async def test_auto_planned_graph_survives_a_selector_that_skips_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The golden cases need relation-path questions to RUN graph mode — that
+    guarantee cannot hinge on an LLM selector's mood (C3b: LLM-assisted,
+    never LLM-trusted). An auto-planned graph mode always runs."""
+    calls = _patch_modes(monkeypatch)
+    # the selector picks modes that come AFTER graph in _MODE_ORDER — the
+    # discriminating case: append-last would run graph LAST, ordered insert
+    # runs it before them (a same-prefix selection like ["semantic"] cannot
+    # tell the two apart — the first probe of this pin was false-green)
+    picky = _FakeLLM(json.dumps({"modes": ["sql", "global"], "reason": "prose only"}))
+    deps, _repo = _linkable_deps(["區域探索廳"], llm=picky)
+    response = await hybrid_query(deps, _policy(), "區域探索廳和誰有關?", None)
+
+    assert len(calls["graph"]) == 1
+    assert response.debug is not None
+    routing = response.debug["routing_decision"]
+    assert "graph" not in routing["skipped"]
+    assert "auto plan" in routing["reason"]
+    # the joined mode sits at its _MODE_ORDER position, NOT last: modes run
+    # sequentially against one shared deadline, and a last-place graph would
+    # be the first cut on a tight budget — silently defeating the guarantee
+    # this test exists for (Codex #89 R1)
+    assert routing["selected"] == ["graph", "sql", "global"]
+
+
+async def test_no_link_keeps_graph_gated_with_the_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero linked entities = zero fabricated traversals: the old gating
+    stands, and the reason says the auto plan looked and found no seed."""
+    calls = _patch_modes(monkeypatch)
+    deps, repo = _linkable_deps(["潮境智能海洋館"])
+    response = await hybrid_query(deps, _policy(), "how do refunds work?", None)
+
+    assert repo.name_reads == 1  # linking ran…
+    assert len(calls["graph"]) == 0  # …but no plan was invented
+    skipped = [w.message for w in response.warnings if w.code == "MODE_SKIPPED"]
+    assert any("graph mode skipped" in m and "no build entity name linked" in m for m in skipped)
+
+
+async def test_caller_params_bypass_linking_entirely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit caller params are the caller's OWN plan — the router must not
+    second-guess them, and must not spend a query on the name dictionary."""
+    calls = _patch_modes(monkeypatch)
+    deps, repo = _linkable_deps(["區域探索廳"])
+    response = await hybrid_query(deps, _policy(), "區域探索廳?", _GRAPH_PARAMS)
+
+    assert repo.name_reads == 0  # linking never ran
+    assert calls["graph"][0][3] is _GRAPH_PARAMS  # the caller's params, verbatim
+    assert response.debug is not None
+    assert not any("auto plan" in line for line in response.debug["retrieval_plan"])

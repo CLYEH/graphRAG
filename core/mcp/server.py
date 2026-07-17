@@ -327,7 +327,9 @@ def build_server(project: str, config_path: Path) -> FastMCP:
         graph_hops: int = 1,
     ) -> dict[str, Any]:
         """The default entry (§9): route across every available mode and fuse.
-        Supply graph_template + graph_entity to make the graph mode available."""
+        Supply graph_template + graph_entity to run YOUR graph invocation;
+        without them the router derives a safe plan itself when the question
+        names a build entity (QP1 auto plan — see the routing trace)."""
         rt = _rt()
         params: GraphQueryParams | None = None
         if graph_template is not None and graph_entity is not None:

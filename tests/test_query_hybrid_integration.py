@@ -36,10 +36,10 @@ from core.query.policy import (
     TextToSql,
 )
 from core.resolve import fingerprints
-from core.stores.graph import BuildScopedGraphRepo, graph_driver
+from core.stores.graph import BuildScopedGraphProjector, BuildScopedGraphRepo, graph_driver
 from core.stores.repo import BuildScopedRepo, BuildScopedWriter
 from core.stores.sqlreader import BuildScopedSqlReader
-from core.stores.tables import builds, community_reports, entities
+from core.stores.tables import builds, community_reports, entities, relations
 from core.stores.vectors import BuildScopedVectorRepo, vector_client
 from tests.conftest import ensure_project
 
@@ -185,17 +185,154 @@ async def test_hybrid_routes_fuses_and_traces_on_live_stores(
         assert report_hits[0].source_refs[0].source_type == "entity"
         assert report_hits[0].source_refs[0].id == str(member)
 
-        # gated modes are surfaced, never silently absent
+        # gated modes are surfaced, never silently absent — and the QP1 auto
+        # plan changed graph's fate here: "what is acme about" NAMES the
+        # build's Acme entity, so the plan links it and graph RUNS (neighbors
+        # around Acme over live Neo4j — an unprojected node yields zero hits,
+        # but the mode ran and the trace says why), while sql stays gated
         skipped = [w.message for w in response.warnings if w.code == "MODE_SKIPPED"]
         assert any("sql mode skipped" in m for m in skipped)
-        assert any("graph mode skipped" in m for m in skipped)
+        assert not any("graph mode skipped" in m for m in skipped)
 
         # the trace tells the truth about the live run
         assert response.debug is not None
         decision = response.debug["routing_decision"]
-        assert decision["selected"] == ["semantic", "global"]
-        assert sorted(decision["skipped"]) == ["graph", "sql"]
+        # ordered insert (Codex #89 R1): graph sits at its _MODE_ORDER slot
+        assert decision["selected"] == ["semantic", "graph", "global"]
+        assert decision["skipped"] == ["sql"]
+        assert "auto plan" in response.debug["retrieval_plan"][0]
+        assert "Acme" in response.debug["retrieval_plan"][0]
         assert "postgres" in response.debug["stores_used"]
         assert response.debug["latency_ms"] >= 0
     finally:
         await _cleanup(project)
+
+
+_WIPE_PROJECT = """\
+MATCH (n:Entity {project: $project})
+DETACH DELETE n
+"""
+
+
+async def test_auto_plan_answers_a_relation_question_semantic_cannot(
+    stores: tuple[AsyncConnection, AsyncSession, Any],
+) -> None:
+    """QP1's golden shape (review §P0#3): a question that NEEDS a relation
+    path — asked with NO graph options — must reach the graph mode via the
+    auto plan and return the path hit. The pure-semantic baseline holds zero
+    relation knowledge (no chunks embed this fact), so the path result is
+    strictly beyond it: hybrid-without-options now answers what semantic
+    alone structurally cannot."""
+    conn, session, client = stores
+    project = f"hybtest-{uuid.uuid4().hex[:10]}"
+    try:
+        await ensure_project(conn, project)
+        build_id: uuid.UUID = (
+            await conn.execute(
+                builds.insert().values(project=project, status="building").returning(builds.c.id)
+            )
+        ).scalar_one()
+        writer = await BuildScopedWriter.for_building_build(conn, project, build_id)
+
+        async def seed_entity(name: str) -> tuple[uuid.UUID, str]:
+            key = fingerprints.entity_key("org", name)
+            entity_id = uuid.uuid4()
+            await writer.insert(
+                entities,
+                id=entity_id,
+                type="org",
+                canonical_name=name,
+                entity_key=key,
+                status="active",
+                review_status="unreviewed",
+                created_by="rule",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            return entity_id, key
+
+        acme = await seed_entity("Acme")
+        bobco = await seed_entity("BobCo")
+        signature = fingerprints.relation_signature(acme[1], "works_with", bobco[1])
+        await writer.insert(
+            relations,
+            id=uuid.uuid4(),
+            src_entity_id=acme[0],
+            dst_entity_id=bobco[0],
+            type="works_with",
+            relation_signature=signature,
+            status="active",
+            review_status="unreviewed",
+            created_by="rule",
+            confidence=1.0,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        await conn.commit()
+        projector = await BuildScopedGraphProjector.for_building_build(
+            conn, session, project, build_id
+        )
+        for row in await writer.fetch_all(entities):
+            await projector.project_entity(
+                str(row.id), row.type, row.status, name=row.canonical_name
+            )
+        for row in await writer.fetch_all(relations):
+            await projector.project_relation(
+                str(row.src_entity_id), str(row.dst_entity_id), row.type
+            )
+        await conn.execute(builds.update().where(builds.c.id == build_id).values(status="active"))
+        await conn.commit()
+
+        sql_reader = await BuildScopedSqlReader.for_active_build(conn, project)
+        repo = await BuildScopedRepo.for_active_build(conn, project)
+        vectors = await BuildScopedVectorRepo.for_active_build(conn, client, project)
+        graph = await BuildScopedGraphRepo.for_active_build(conn, session, project)
+        deps = HybridDeps(
+            repo=repo,
+            vectors=vectors,
+            embedder=cast(BaseEmbedding, _FakeEmbedder()),
+            sql_reader=sql_reader,
+            graph=graph,
+            llm=cast(LLM, _SelectorLLM()),  # picks semantic+global — graph joins by plan
+        )
+        policy = HybridPolicy(
+            text_to_sql=TextToSql(
+                enabled=False,
+                allowed_tables=(),
+                blocked_keywords=SQL_BLOCKED_KEYWORDS_MIN,
+                max_rows=50,
+                timeout_ms=1000,
+            ),
+            text_to_cypher=TextToCypher(
+                enabled=False,
+                allowed_clauses=CYPHER_ALLOWED_CLAUSES,
+                blocked=CYPHER_BLOCKED_MIN,
+                max_rows=50,
+                timeout_ms=2000,
+            ),
+            max_graph_hops=3,
+            top_k=10,
+            max_sql_rows=50,
+            expose_debug=True,
+        )
+
+        response = await hybrid_query(deps, policy, "Acme 和 BobCo 是什麼關係?")
+        _VALIDATOR.validate(response.to_dict())
+
+        # the auto plan read the two names in question order → path template
+        assert response.debug is not None
+        plan_line = response.debug["retrieval_plan"][0]
+        assert "auto plan" in plan_line and "path" in plan_line
+        assert "Acme" in plan_line and "BobCo" in plan_line
+        assert "graph" in response.debug["routing_decision"]["selected"]
+
+        # the relation chain surfaced — the hit semantic alone cannot produce
+        # (nothing was embedded; the fact lives only in the graph)
+        path_hits = [r for r in response.results if r.result_type == "path"]
+        assert path_hits, f"no path hit in {[r.result_type for r in response.results]}"
+        # the path TEXT carries the arrow chain, cited by the relation row
+        assert any("works_with" in (hit.text or "") for hit in path_hits)
+        assert path_hits[0].source_refs[0].source_type == "relation"
+    finally:
+        await _cleanup(project)
+        await (await session.run(_WIPE_PROJECT, {"project": project})).consume()
