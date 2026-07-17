@@ -453,3 +453,35 @@ async def test_subgraph_end_to_end_over_registry_policy(api: Api) -> None:
         await _make_build(conn, bare, "active")
     r = await client.get(f"/projects/{bare}/graph/subgraph", params={"entity_id": str(seed)})
     assert r.status_code == 400 and r.json()["error"]["details"] == {"query_policy": "missing"}
+
+
+async def test_ss1a_facets_filter_server_side(api: Api) -> None:
+    """SS1a (owner-approved slice of SS1): "load more until you find it"
+    doesn't scale — the list endpoints must filter SERVER-side. Mixed rows in
+    one build; each facet returns exactly its matches (never the whole page),
+    combined facets AND together, and a facet naming nothing returns empty —
+    proof the WHERE reached SQL, not a client-side sieve."""
+    client, conn = api
+    project = await _make_project(client)
+    async with conn.begin_nested():
+        build_id = await _make_build(conn, project, "active")
+        hall = await _make_entity(conn, project, build_id, "Hall", type="EXHIBIT")
+        await _make_entity(conn, project, build_id, "Alice", type="Person")
+        await _make_entity(conn, project, build_id, "Ghost", type="Person", status="rejected")
+
+    r = await client.get(f"/projects/{project}/entities?filter[type]=EXHIBIT")
+    assert r.status_code == 200
+    assert [row["id"] for row in r.json()["data"]] == [str(hall)]
+
+    r = await client.get(f"/projects/{project}/entities?filter[status]=rejected")
+    assert [row["canonical_name"] for row in r.json()["data"]] == ["Ghost"]
+
+    # combined facets AND: Person ∩ rejected = Ghost only
+    r = await client.get(
+        f"/projects/{project}/entities?filter[type]=Person&filter[status]=rejected"
+    )
+    assert [row["canonical_name"] for row in r.json()["data"]] == ["Ghost"]
+
+    # a facet naming nothing → empty list, never the unfiltered page
+    r = await client.get(f"/projects/{project}/entities?filter[type]=Spaceship")
+    assert r.status_code == 200 and r.json()["data"] == []

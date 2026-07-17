@@ -36,7 +36,7 @@ from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.pagination import decode_chunk_cursor, decode_id_cursor, encode_cursor
 from api.registry_errors import translate_registry_error
-from api.routers._query import reject_unsupported_query
+from api.routers._query import reject_unsupported_query, single_filter_value
 from api.schemas import chunk_dto, document_dto, entity_dto, relation_dto, relation_evidence_dto
 from core.mcp.policy import PolicyError, query_policy_from_mapping
 from core.query.graph import subgraph_context
@@ -64,6 +64,16 @@ def _not_found(resource: str, resource_id: uuid.UUID) -> HTTPException:
     return HTTPException(status_code=404, detail=f"{resource} {resource_id} not found")
 
 
+#: SS1a facet vocabularies — the SAME value sets the DDL CHECK constraints
+#: enforce (core/stores/tables.py entities/relations_status_valid and
+#: *_review_status_valid); a contract test parses the DDL and pins parity,
+#: so the filter can never accept a value the column cannot hold (or refuse
+#: one it can). Entity/relation TYPE is deliberately open (ontology-defined
+#: per project) — only blankness is invalid there.
+LIFECYCLE_STATUS: tuple[str, ...] = ("active", "deprecated", "merged", "rejected", "needs_review")
+REVIEW_STATUS: tuple[str, ...] = ("unreviewed", "approved", "rejected")
+
+
 @router.get("/projects/{project}/documents")
 async def list_documents_endpoint(
     request: Request,
@@ -72,11 +82,16 @@ async def list_documents_endpoint(
     limit: int = Query(50, ge=1, le=500),
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    reject_unsupported_query(request, "id")
+    reject_unsupported_query(request, "id", allowed_filters=frozenset({"status"}))
+    # documents.status is an OPEN vocabulary (no DDL CHECK — the ingest
+    # pipeline owns it), so the facet validates blankness only
+    status = single_filter_value(request, "status")
     binding = await _bind(conn, project)
     repo = BuildScopedRepo.bound_to(conn, binding)
     docs = tables.documents
     where = []
+    if status is not None:
+        where.append(docs.c.status == status)
     if cursor:
         (after_id,) = decode_id_cursor(cursor)
         where.append(docs.c.id < after_id)
@@ -164,11 +179,22 @@ async def list_entities_endpoint(
     limit: int = Query(50, ge=1, le=500),
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    reject_unsupported_query(request, "id")
+    reject_unsupported_query(
+        request, "id", allowed_filters=frozenset({"type", "status", "review_status"})
+    )
+    etype = single_filter_value(request, "type")
+    status = single_filter_value(request, "status", vocabulary=LIFECYCLE_STATUS)
+    review_status = single_filter_value(request, "review_status", vocabulary=REVIEW_STATUS)
     binding = await _bind(conn, project)
     repo = BuildScopedRepo.bound_to(conn, binding)
     ents = tables.entities
     where = []
+    if etype is not None:
+        where.append(ents.c.type == etype)
+    if status is not None:
+        where.append(ents.c.status == status)
+    if review_status is not None:
+        where.append(ents.c.review_status == review_status)
     if cursor:
         (after_id,) = decode_id_cursor(cursor)
         where.append(ents.c.id < after_id)
@@ -204,11 +230,22 @@ async def list_relations_endpoint(
     limit: int = Query(50, ge=1, le=500),
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    reject_unsupported_query(request, "id")
+    reject_unsupported_query(
+        request, "id", allowed_filters=frozenset({"type", "status", "review_status"})
+    )
+    rtype = single_filter_value(request, "type")
+    status = single_filter_value(request, "status", vocabulary=LIFECYCLE_STATUS)
+    review_status = single_filter_value(request, "review_status", vocabulary=REVIEW_STATUS)
     binding = await _bind(conn, project)
     repo = BuildScopedRepo.bound_to(conn, binding)
     rels = tables.relations
     where = []
+    if rtype is not None:
+        where.append(rels.c.type == rtype)
+    if status is not None:
+        where.append(rels.c.status == status)
+    if review_status is not None:
+        where.append(rels.c.review_status == review_status)
     if cursor:
         (after_id,) = decode_id_cursor(cursor)
         where.append(rels.c.id < after_id)

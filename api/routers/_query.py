@@ -73,3 +73,40 @@ async def reject_null_body(request: Request) -> None:
             ErrorCode.VALIDATION_ERROR,
             "request body may not be JSON null; omit the body instead",
         )
+
+
+def single_filter_value(
+    request: Request, field: str, *, vocabulary: tuple[str, ...] | None = None
+) -> str | None:
+    """The validated ``filter[<field>]`` value, or None when absent (GOV4/SS1a).
+
+    Exactly one value: a repeated param is ambiguous (which did the caller
+    mean?) and is rejected, never first-one-wins (C3a: 拒絕勝於默選一邊).
+    ``vocabulary`` closes the value set for enum-backed columns (the §17/DDL
+    CHECK vocabularies — pass the SAME tuple a contract test pins against the
+    DDL, or drift is silent); None means an open value set (e.g. entity type,
+    an ontology-defined vocabulary) where only blank is meaningless.
+    """
+    values = request.query_params.getlist(f"filter[{field}]")
+    if not values:
+        return None
+    if len(values) > 1:
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            f"filter[{field}] accepts a single value",
+            details={f"filter[{field}]": values},
+        )
+    value = values[0]
+    if vocabulary is not None and value not in vocabulary:
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            f"unknown {field} {value!r} — one of: {', '.join(sorted(vocabulary))}",
+            details={f"filter[{field}]": value},
+        )
+    if vocabulary is None and not value.strip():
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            f"filter[{field}] must be a non-blank value",
+            details={f"filter[{field}]": value},
+        )
+    return value
