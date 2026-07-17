@@ -149,6 +149,18 @@
   overflow-wrap: anywhere;
 }
 
+/* SS2: the resolved reference card — a words-line under the verbatim ref */
+.play__resolve {
+  display: block;
+  margin: 2px 0 6px;
+  color: var(--muted, #666);
+  overflow-wrap: anywhere;
+}
+
+.play__resolve--miss {
+  font-style: italic;
+}
+
 .play__graph,
 .play__routing {
   font-size: 13px;
