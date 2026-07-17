@@ -83,7 +83,12 @@ loop back to step 3.
      `10`=new response to triage, `20`=timeout (poke `@codex review`), `30`=Codex is out
      of review quota (its only fresh response is the usage-limits message) — stop waiting
      and re-poke after the quota window resets instead of polling for nothing. Don't
-     hand-roll one-off watchers.
+     hand-roll one-off watchers. **After triaging an event WITHOUT a poke** (the normal
+     flow: fix + resolve, the push auto-triggers the re-review), pass that handled
+     event's timestamp to the next watch — `watch-codex.sh <pr> --anchor <iso-ts>` (the
+     watcher prints it in its exit-10 RESULT line) — otherwise the bootstrap treats the
+     last poke as the triage-ack and every later watch exits 10 forever on the same
+     already-handled event (H13).
 
      **Never poke while `eyes` is showing (owner mandate).** `eyes` means Codex is
      actively reviewing; an `@codex review` then only burns its quota and produces a
