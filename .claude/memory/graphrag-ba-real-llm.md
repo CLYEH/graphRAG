@@ -15,5 +15,4 @@ metadata:
   ——有 key 則跑、無 key 則 skip，但 **CI 要 fail-loud** 不可假綠。
 - 成本紀律（全域 Rule 6）：nano model、小 fixture、少案例、per-task token budget；可 record-replay。
 - **只在任務真的動到 model 時才花呼叫**：BA1a/BA1b(schema/CRUD/routers)=0 呼叫；BA2+(pipeline/query)才加。
-- 待定案（BA2 時再問）：OPENAI_API_KEY 是否放 CI secret（CI 也跑真實 lane），或 local-only pre-push +
-  CI skip。我傾向 local-only（省錢、不曝 secret、反正每次 push 前都全 gate）。see [[graphrag-ci-before-codex]]
+- 已定案的常態:key 為 local-only(CI 跑 hermetic + service-integration,無真實 LLM lane);真實 LLM 驗證屬本地 pre-push 與真資料 QA。
