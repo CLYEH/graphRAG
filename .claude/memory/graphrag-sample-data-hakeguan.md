@@ -68,3 +68,11 @@ metadata:
   (同名實體劈成 3-4 型別、EVENT 12→264 不成比例),已記入 GAPS.md G4。
 - **G5(owner 2026-07-14 回饋)**:web「光看了不會操作」——主線有三個 UI 洞
   (config=curl、eval=CLI 無端點、activate=無按鈕),詳 GAPS.md G5。
+
+**SRC1 ✅ merged(PR #85,2026-07-17,580b889)**:xlsx 原生 connector 上線——每列渲染
+text/plain 文件(【label】title/編號行/extra 行/body)、#row=<id> 溯源、欄位對應住
+source.metadata(title/body 必填,id/extras/label 選填,全 fail-loud);髒資料防禦全數
+落地(全形/半形標頭附註、謊報 dimension+預編號模板尾列停掃、float 編號、撞號/歧義標頭
+大聲失敗、同內容異列以作者編號入文保身分)。4 輪 Codex 各 1 P2+本地 reviewer 抓「全形
+regex 其實是半形」假綠對(codepoint dump 實證),詳 [[graphrag-loop-paused-pr5]] #85。
+實資料 QA:區域探索廳 19 列 0 LLM 花費全數落 SoR。preprocess.py 就此退役;G1 關閉。
