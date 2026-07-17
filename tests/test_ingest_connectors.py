@@ -300,6 +300,26 @@ def test_xlsx_skips_template_rows_and_stops_after_the_blank_streak(tmp_path: Pat
     assert [p.metadata["row"] for p in payloads] == ["1"]
 
 
+def test_xlsx_pre_numbered_template_tail_trips_the_stop(tmp_path: Path) -> None:
+    """Why: real templates fill the id column DOWN the sheet — those rows pass
+    an any-cell blank check and would reset the streak on every row, so the
+    tail stop would never fire and a huge pre-numbered tail (or a lying
+    dimension over one) scans in full (Codex #85). No-content rows — blank
+    mapped title AND body — count toward the stop regardless of the id cell.
+    Revert-probe: reset the streak on any(values) again and the far row below
+    gets ingested."""
+    rows: list[list[Any]] = [
+        [1, "有內容", "正文"],
+        *[[n, None, None] for n in range(2, 2 + XLSX_BLANK_ROW_STOP)],  # pre-numbered tail
+        [99, "掃描不到", "在斷點之後"],
+    ]
+    path = _write_xlsx(tmp_path / "numbered_tail.xlsx", ["編號", "標題", "內容詳情"], rows)
+    payloads = list(
+        read_xlsx_rows(path, title_column="標題", body_column="內容詳情", id_column="編號")
+    )
+    assert [p.metadata["row"] for p in payloads] == ["1"]
+
+
 def test_xlsx_blank_id_falls_back_to_ordinal_and_duplicates_fail_loud(tmp_path: Path) -> None:
     """Why: real files leave 編號 blank mid-sheet — refusing them would block
     whole corpora, so a blank id falls back to the 1-based data-row ordinal.

@@ -246,19 +246,21 @@ def read_xlsx_rows(
     - headers carry authoring annotations (``問題(必填)``) → normalized before
       the mapping lookup; a mapped column missing AFTER normalization fails
       loud naming the headers that do exist.
-    - the sheet dimension can lie and template tails run long → blank rows are
-      skipped, and ``XLSX_BLANK_ROW_STOP`` consecutive blanks end the scan.
-    - a template row that is pre-numbered but has no content (blank title AND
-      blank body) is skipped — there is nothing to cite or extract.
+    - the sheet dimension can lie and template tails run long → NO-CONTENT
+      rows (blank title AND blank body — fully blank or pre-numbered template
+      rows alike) are skipped, and ``XLSX_BLANK_ROW_STOP`` consecutive
+      no-content rows end the scan. Pre-numbered tails count toward the stop:
+      an id column filled down the template must not keep the scan alive
+      (Codex #85).
     - the id column reads back as floats (``7.0``) → canonicalized; a blank id
       falls back to the 1-based data-row ordinal (the pilot's rule: real files
       leave 編號 blank mid-sheet, and refusing them would block whole corpora);
       a DUPLICATE id fails loud — two rows sharing ``#row=`` would make the
       citation ambiguous (mis-declared id column, or dirty data). The ordinal
-      counts every non-blank row (including skipped template rows), so a
-      re-export that inserts/removes rows SHIFTS blank-id citations — the
-      explicit id column is the stable identity; the ordinal is a best-effort
-      fallback, not a promise across re-exports.
+      counts CONTENT rows only (skipped no-content rows don't consume one),
+      so a re-export that inserts/removes rows still SHIFTS blank-id
+      citations — the explicit id column is the stable identity; the ordinal
+      is a best-effort fallback, not a promise across re-exports.
     """
     for name, value in (("title_column", title_column), ("body_column", body_column)):
         if not value.strip():
@@ -311,18 +313,20 @@ def read_xlsx_rows(
         blank_streak = 0
         ordinal = 0
         for row in rows:
-            values = [_cell_text(v) for v in row]
-            if not any(values):
+            title = cell(row, title_column)
+            body = cell(row, body_column)
+            if not title and not body:
+                # NO CONTENT — whether fully blank or a pre-numbered/
+                # pre-formatted template row (id filled down, title/body
+                # empty). Both count toward the tail stop: a pre-numbered
+                # tail would otherwise reset the streak on every row and the
+                # stop would never fire over a huge template tail (Codex #85).
                 blank_streak += 1
                 if blank_streak >= XLSX_BLANK_ROW_STOP:
                     break
                 continue
             blank_streak = 0
             ordinal += 1
-            title = cell(row, title_column)
-            body = cell(row, body_column)
-            if not title and not body:
-                continue  # a pre-numbered/pre-formatted template row: nothing to render
             rid = (cell(row, id_column) if id_column else "") or str(ordinal)
             if rid in seen:
                 raise ValueError(
