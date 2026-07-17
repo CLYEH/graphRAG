@@ -13,10 +13,12 @@ from typing import Any
 import pytest
 
 from core.ingest.connectors import (
+    XLSX_BLANK_ROW_STOP,
     DocumentPayload,
     content_hash,
     read_csv_rows,
     read_text_documents,
+    read_xlsx_rows,
 )
 
 
@@ -190,3 +192,232 @@ def test_payloads_default_to_empty_metadata() -> None:
     two = DocumentPayload("u2", "r2", "text/plain")
     assert one.metadata == {} and two.metadata == {}
     assert one.metadata is not two.metadata
+
+
+# ---- xlsx connector (SRC1) ---------------------------------------------------
+
+
+def _write_xlsx(path: Path, header: list[Any], rows: list[list[Any]]) -> Path:
+    """A minimal workbook fixture — rows carry TYPED cells so the tests can
+    bake in the real dirt (float ids, None cells) exactly as openpyxl reads it
+    back from authored files."""
+    import openpyxl
+    from openpyxl.worksheet.worksheet import Worksheet
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    assert isinstance(ws, Worksheet)
+    ws.append(header)
+    for row in rows:
+        ws.append(row)
+    wb.save(path)
+    return path
+
+
+def test_xlsx_rows_render_the_mapped_columns_with_per_row_citation(tmp_path: Path) -> None:
+    """Why: the column MAPPING comes from source metadata — no vocabulary is
+    hard-coded — and every row must mint a citable per-row identity
+    (source_uri #row=) the moment it is read, or it can never be traced back
+    to its spreadsheet row at query time."""
+    path = _write_xlsx(
+        tmp_path / "guide.xlsx",
+        ["編號", "標題", "內容詳情", "位置", "分類"],
+        [
+            [1, "深海探索廳", "介紹深潛器。", "B1", "常設展"],
+            [2, "海洋劇場", "球幕電影。", "", "設施"],  # blank extra is omitted, not rendered empty
+        ],
+    )
+    payloads = list(
+        read_xlsx_rows(
+            path,
+            title_column="標題",
+            body_column="內容詳情",
+            id_column="編號",
+            extra_columns=("位置", "分類"),
+            label="導覽",
+        )
+    )
+    assert [p.source_uri for p in payloads] == [
+        f"{path.resolve().as_uri()}#row=1",
+        f"{path.resolve().as_uri()}#row=2",
+    ]
+    assert payloads[0].raw == "【導覽】深海探索廳\n編號:1\n位置:B1\n分類:常設展\n\n介紹深潛器。\n"
+    assert payloads[1].raw == "【導覽】海洋劇場\n編號:2\n分類:設施\n\n球幕電影。\n"
+    assert all(p.mime == "text/plain" for p in payloads)
+    assert payloads[0].metadata == {"filename": "guide.xlsx", "row": "1"}
+
+
+def test_xlsx_headers_normalize_annotations_and_ids_normalize_floats(tmp_path: Path) -> None:
+    """Why: real workbooks annotate headers (問題(必填) — full- OR half-width
+    parens) and hand back integral ids as floats (7.0). The mapping must hit
+    the AUTHORED column name, and the citation must carry the id the author
+    typed — '7', never '7.0'."""
+    # one FULL-width pair and one half-width pair. Full- and half-width parens
+    # are visually identical in most fonts and a "full-width" spelling silently
+    # degraded to half-width once (reviewer catch), so the fixture VERIFIES its
+    # own codepoints — a re-mangled fixture fails here, never false-greens.
+    full_width_header = "問題（必填）"
+    # the escape spelling is plain ASCII in this source file — it cannot be
+    # mangled, so it discriminates a degraded literal above
+    assert "\uff08" in full_width_header and "\uff09" in full_width_header
+    path = _write_xlsx(
+        tmp_path / "faq.xlsx",
+        ["編號", "主題", full_width_header, "答案(必填)"],
+        [[7.0, "服務", "開放時間?", "每日九點。"]],
+    )
+    payloads = list(
+        read_xlsx_rows(
+            path,
+            title_column="問題",
+            body_column="答案",
+            id_column="編號",
+            extra_columns=("主題",),
+            label="常見問題",
+        )
+    )
+    assert len(payloads) == 1
+    assert payloads[0].source_uri.endswith("#row=7")
+    assert payloads[0].raw == "【常見問題】開放時間?\n編號:7\n主題:服務\n\n每日九點。\n"
+
+
+def test_xlsx_skips_template_rows_and_stops_after_the_blank_streak(tmp_path: Path) -> None:
+    """Why: authored workbooks carry template tails — pre-numbered rows with no
+    content, long runs of empty formatting rows — and the sheet's self-reported
+    dimension can lie outright (a pilot file claimed ~1M rows). A no-content
+    row is skipped, and a blank streak ends the scan so data beyond the
+    threshold is deliberately unreachable (a content gap that long is a tail,
+    not data)."""
+    rows: list[list[Any]] = [
+        [1, "有內容", "正文"],
+        [2, "", ""],  # pre-numbered template row: nothing to render → skipped
+        *([[None, None, None]] * XLSX_BLANK_ROW_STOP),  # the tail
+        [99, "掃描不到", "在斷點之後"],
+    ]
+    path = _write_xlsx(tmp_path / "tail.xlsx", ["編號", "標題", "內容詳情"], rows)
+    payloads = list(
+        read_xlsx_rows(path, title_column="標題", body_column="內容詳情", id_column="編號")
+    )
+    assert [p.metadata["row"] for p in payloads] == ["1"]
+
+
+def test_xlsx_pre_numbered_template_tail_trips_the_stop(tmp_path: Path) -> None:
+    """Why: real templates fill the id column DOWN the sheet — those rows pass
+    an any-cell blank check and would reset the streak on every row, so the
+    tail stop would never fire and a huge pre-numbered tail (or a lying
+    dimension over one) scans in full (Codex #85). No-content rows — blank
+    mapped title AND body — count toward the stop regardless of the id cell.
+    Revert-probe: reset the streak on any(values) again and the far row below
+    gets ingested."""
+    rows: list[list[Any]] = [
+        [1, "有內容", "正文"],
+        *[[n, None, None] for n in range(2, 2 + XLSX_BLANK_ROW_STOP)],  # pre-numbered tail
+        [99, "掃描不到", "在斷點之後"],
+    ]
+    path = _write_xlsx(tmp_path / "numbered_tail.xlsx", ["編號", "標題", "內容詳情"], rows)
+    payloads = list(
+        read_xlsx_rows(path, title_column="標題", body_column="內容詳情", id_column="編號")
+    )
+    assert [p.metadata["row"] for p in payloads] == ["1"]
+
+
+def test_xlsx_blank_id_falls_back_to_ordinal_and_duplicates_fail_loud(tmp_path: Path) -> None:
+    """Why: real files leave 編號 blank mid-sheet — refusing them would block
+    whole corpora, so a blank id falls back to the 1-based data-row ordinal.
+    But a DUPLICATED id makes #row= ambiguous (two rows, one citation) and
+    fails loud, the same rule as the CSV pk."""
+    path = _write_xlsx(
+        tmp_path / "blank_id.xlsx",
+        ["編號", "標題", "內容詳情"],
+        [[None, "甲", "內文一"], [None, "乙", "內文二"]],
+    )
+    payloads = list(
+        read_xlsx_rows(path, title_column="標題", body_column="內容詳情", id_column="編號")
+    )
+    assert [p.metadata["row"] for p in payloads] == ["1", "2"]
+
+    dup = _write_xlsx(
+        tmp_path / "dup_id.xlsx",
+        ["編號", "標題", "內容詳情"],
+        [[5, "甲", "內文一"], [5.0, "乙", "內文二"]],  # 5 and 5.0 canonicalize to the SAME id
+    )
+    with pytest.raises(ValueError, match="repeats id"):
+        list(read_xlsx_rows(dup, title_column="標題", body_column="內容詳情", id_column="編號"))
+
+
+def test_xlsx_same_content_rows_with_distinct_ids_stay_distinct_documents(
+    tmp_path: Path,
+) -> None:
+    """Why: content_hash(raw) is THE document identity (§18) and ingest dedups
+    on it — two rows whose title/body render identically would collapse and
+    silently drop the second row's #row= provenance (Codex #85). The authored
+    id rides the rendered text, so distinct ids mint distinct hashes by
+    construction. The dual: blank-id rows carry NO id line (an invented
+    ordinal in the text would misquote the sheet), so identical blank-id rows
+    are true duplicates and share a hash — the text family's dedup semantics,
+    reported by ingest as skipped."""
+    book = _write_xlsx(
+        tmp_path / "same_content.xlsx",
+        ["編號", "標題", "內容詳情"],
+        [[1, "相同標題", "相同內文"], [2, "相同標題", "相同內文"]],
+    )
+    payloads = list(
+        read_xlsx_rows(book, title_column="標題", body_column="內容詳情", id_column="編號")
+    )
+    assert [p.source_uri.rsplit("#", 1)[1] for p in payloads] == ["row=1", "row=2"]
+    assert content_hash(payloads[0].raw) != content_hash(payloads[1].raw)
+
+    blank_ids = _write_xlsx(
+        tmp_path / "blank_ids.xlsx",
+        ["編號", "標題", "內容詳情"],
+        [[None, "相同標題", "相同內文"], [None, "相同標題", "相同內文"]],
+    )
+    dup = list(
+        read_xlsx_rows(blank_ids, title_column="標題", body_column="內容詳情", id_column="編號")
+    )
+    assert content_hash(dup[0].raw) == content_hash(dup[1].raw)  # true duplicates dedup
+
+
+def test_xlsx_duplicate_mapped_header_fails_loud_but_unmapped_duplicates_pass(
+    tmp_path: Path,
+) -> None:
+    """Why: two headers that NORMALIZE to the same mapped name (問題(必填) and
+    問題) are ambiguous — the mapping names only the normalized header, so it
+    cannot say which column is meant, and a first-wins bind would silently
+    render the wrong column (Codex #85). The dual: duplicates among UNMAPPED
+    columns stay tolerated — the render never reads them, and refusing the
+    workbook for decorative junk would over-block real files."""
+    ambiguous = _write_xlsx(
+        tmp_path / "dup_mapped.xlsx",
+        ["編號", "問題(必填)", "問題", "答案"],
+        [[1, "甲", "乙", "內文"]],
+    )
+    with pytest.raises(ValueError, match="more than once"):
+        list(read_xlsx_rows(ambiguous, title_column="問題", body_column="答案"))
+
+    # the over-block dual: 備註(一)/備註(二) collide after normalization but are
+    # unmapped — the workbook still ingests
+    tolerated = _write_xlsx(
+        tmp_path / "dup_unmapped.xlsx",
+        ["編號", "標題", "內容", "備註(一)", "備註(二)"],
+        [[1, "甲", "內文", "x", "y"]],
+    )
+    payloads = list(read_xlsx_rows(tolerated, title_column="標題", body_column="內容"))
+    assert len(payloads) == 1
+
+
+def test_xlsx_missing_mapped_column_and_empty_sheet_fail_loud(tmp_path: Path) -> None:
+    """Why: a mapping that names a column the workbook doesn't have would
+    otherwise render blank documents forever — refuse at the door, naming the
+    headers that DO exist so the operator can fix the mapping."""
+    path = _write_xlsx(tmp_path / "cols.xlsx", ["標題", "內容"], [["甲", "內文"]])
+    with pytest.raises(ValueError, match="mapped column"):
+        list(read_xlsx_rows(path, title_column="標題", body_column="內容詳情"))
+    with pytest.raises(ValueError, match="title_column must be non-empty"):
+        list(read_xlsx_rows(path, title_column="  ", body_column="內容"))
+
+    import openpyxl
+
+    empty = tmp_path / "empty.xlsx"
+    openpyxl.Workbook().save(empty)
+    with pytest.raises(ValueError, match="empty"):
+        list(read_xlsx_rows(empty, title_column="標題", body_column="內容"))

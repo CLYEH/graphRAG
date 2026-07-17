@@ -21,7 +21,8 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
-from collections.abc import Iterator, Mapping
+import re
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -183,3 +184,191 @@ def read_csv_rows(path: Path, *, table: str, pk_column: str) -> Iterator[Documen
                 mime=STRUCTURED_MIME,
                 metadata={"table": table, "pk": pk},
             )
+
+
+#: Stop scanning an xlsx sheet after this many CONSECUTIVE blank rows: real
+#: workbooks carry template tails (pre-formatted empty rows), and a sheet's
+#: self-reported dimension can lie outright (a pilot file claimed ~1M rows) —
+#: trusting either would ingest garbage or spin forever. A content gap this
+#: long is a tail, not data (the pilot preprocessor's validated threshold).
+XLSX_BLANK_ROW_STOP = 50
+
+
+def _normalize_header(header: str) -> str:
+    """A header cell → its mapping name: trailing parenthetical annotations are
+    authoring guidance, not identity (``問題(必填)`` and ``問題`` are the same
+    column — half- and full-width parens both appear in real workbooks). The
+    full-width pair (U+FF08/U+FF09) is visually identical to half-width in
+    most fonts and silently degraded to half-width once already (reviewer
+    catch) — the unit test asserts the pattern's actual codepoints, so a
+    re-mangled pattern turns the suite red instead of shipping."""
+    return re.sub(r"[(（][^()（）]*[)）]\s*$", "", header.strip()).strip()
+
+
+def _cell_text(value: Any) -> str:
+    """One typed openpyxl cell → render text. Floats that carry no fraction are
+    the id-column dirt named by the pilot (``編號`` reads back as ``7.0``) —
+    canonicalize them to their integer spelling so ids and rendered values
+    match what the author typed."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def read_xlsx_rows(
+    path: Path,
+    *,
+    title_column: str,
+    body_column: str,
+    id_column: str | None = None,
+    extra_columns: Sequence[str] = (),
+    label: str | None = None,
+) -> Iterator[DocumentPayload]:
+    """Yield one per-row TEXT payload from an xlsx workbook's first sheet (SRC1).
+
+    The column MAPPING comes from the caller (source metadata) — this connector
+    hard-codes no vocabulary, so any workbook whose rows have "a heading and a
+    body" fits (不失一般性; the pilot's two families are just two mappings).
+    Each row renders to the pilot-validated text shape::
+
+        【label】title      (or 【title】 when no label)
+        id_column:id        (when the id column is mapped and the cell non-blank)
+        extra:value         (each non-blank extra column, mapping order)
+
+        body
+
+    The authored id line doubles as ROW IDENTITY: ``content_hash(raw)`` is the
+    document identity (§18), so it is what keeps two same-content rows with
+    different authored ids from collapsing in ingest dedup (which would drop
+    the second row's ``#row=`` provenance). Blank-id rows carry no such line —
+    identical blank-id rows are true duplicates and dedup by design (the text
+    family's semantics; ingest reports them as skipped).
+
+    which flows into the ordinary text pipeline (chunking + LLM extraction —
+    per-row TEXT documents were what the pilot validated, so xlsx documents are
+    text-mime and ontology-gated like every other text source).
+
+    Dirt defenses (each one observed in real workbooks):
+    - headers carry authoring annotations (``問題(必填)``) → normalized before
+      the mapping lookup; a mapped column missing AFTER normalization fails
+      loud naming the headers that do exist.
+    - the sheet dimension can lie and template tails run long → NO-CONTENT
+      rows (blank title AND blank body — fully blank or pre-numbered template
+      rows alike) are skipped, and ``XLSX_BLANK_ROW_STOP`` consecutive
+      no-content rows end the scan. Pre-numbered tails count toward the stop:
+      an id column filled down the template must not keep the scan alive
+      (Codex #85).
+    - the id column reads back as floats (``7.0``) → canonicalized; a blank id
+      falls back to the 1-based data-row ordinal (the pilot's rule: real files
+      leave 編號 blank mid-sheet, and refusing them would block whole corpora);
+      a DUPLICATE id fails loud — two rows sharing ``#row=`` would make the
+      citation ambiguous (mis-declared id column, or dirty data). The ordinal
+      counts CONTENT rows only (skipped no-content rows don't consume one),
+      so a re-export that inserts/removes rows still SHIFTS blank-id
+      citations — the explicit id column is the stable identity; the ordinal
+      is a best-effort fallback, not a promise across re-exports.
+    """
+    for name, value in (("title_column", title_column), ("body_column", body_column)):
+        if not value.strip():
+            raise ValueError(f"{name} must be non-empty — the render needs it")
+    import openpyxl  # heavy import, deliberately local (mirrors the lazy-IO stance)
+
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = workbook.worksheets[0]
+        rows = sheet.iter_rows(values_only=True)
+        raw_header = next(rows, None)
+        if raw_header is None:
+            raise ValueError(f"{path} first sheet is empty — no header row to map columns on")
+        header = [_normalize_header(_cell_text(h)) for h in raw_header]
+        columns: dict[str, int] = {}
+        duplicated: set[str] = set()
+        for i, h in enumerate(header):
+            if not h:
+                continue
+            if h in columns:
+                duplicated.add(h)
+            else:
+                columns[h] = i
+        wanted = [title_column, body_column, *([id_column] if id_column else []), *extra_columns]
+        # a MAPPED name that appears twice after normalization (e.g. 問題(必填)
+        # and 問題 collapse to the same name) is ambiguous — the mapping only
+        # names the normalized header, so it cannot say which column is meant;
+        # binding first-wins would silently render the wrong column. Duplicates
+        # among UNMAPPED columns stay tolerated: the render never reads them,
+        # and refusing the whole workbook for decorative junk would over-block.
+        ambiguous = sorted(set(wanted) & duplicated)
+        if ambiguous:
+            raise ValueError(
+                f"mapped column(s) {ambiguous!r} appear more than once in {path} header "
+                "after normalization — the mapping cannot say which column is meant; "
+                "rename the duplicate columns in the workbook"
+            )
+        missing = [c for c in wanted if c not in columns]
+        if missing:
+            raise ValueError(
+                f"mapped column(s) {missing!r} not in {path} header after normalization "
+                f"(found: {[h for h in header if h]})"
+            )
+
+        def cell(row: tuple[Any, ...], column: str) -> str:
+            index = columns[column]
+            return _cell_text(row[index]) if index < len(row) else ""
+
+        seen: set[str] = set()
+        blank_streak = 0
+        ordinal = 0
+        for row in rows:
+            title = cell(row, title_column)
+            body = cell(row, body_column)
+            if not title and not body:
+                # NO CONTENT — whether fully blank or a pre-numbered/
+                # pre-formatted template row (id filled down, title/body
+                # empty). Both count toward the tail stop: a pre-numbered
+                # tail would otherwise reset the streak on every row and the
+                # stop would never fire over a huge template tail (Codex #85).
+                blank_streak += 1
+                if blank_streak >= XLSX_BLANK_ROW_STOP:
+                    break
+                continue
+            blank_streak = 0
+            ordinal += 1
+            id_text = cell(row, id_column) if id_column else ""
+            rid = id_text or str(ordinal)
+            if rid in seen:
+                raise ValueError(
+                    f"row {ordinal} of {path} repeats id {rid!r} — a duplicated row id "
+                    "makes the per-row citation ambiguous (mis-declared id column, or "
+                    "dirty data)"
+                )
+            seen.add(rid)
+            lines = [f"【{label}】{title}" if label else f"【{title}】"]
+            if id_text:
+                # the authored row id rides the RENDERED text: content_hash(raw)
+                # is THE document identity (§18), so two distinct rows whose
+                # title/body/extras render identically would otherwise collapse
+                # in ingest dedup and silently drop the second row's #row=
+                # provenance (Codex #85) — with the id in the text, distinct
+                # authored ids mint distinct documents by construction (the
+                # structured family gets this from the pk riding the row JSON).
+                # Ordinal-FALLBACK ids are deliberately NOT rendered (the cell
+                # was blank — printing an invented number would misquote the
+                # sheet), so identical blank-id rows keep the text-family
+                # semantics: true duplicates dedup, reported as skipped.
+                lines.append(f"{id_column}:{id_text}")
+            for extra in extra_columns:
+                extra_value = cell(row, extra)
+                if extra_value:
+                    lines.append(f"{extra}:{extra_value}")
+            lines.append("")
+            lines.append(body)
+            yield DocumentPayload(
+                source_uri=f"{path.resolve().as_uri()}#row={rid}",
+                raw="\n".join(lines).strip() + "\n",
+                mime="text/plain",
+                metadata={"filename": path.name, "row": rid},
+            )
+    finally:
+        workbook.close()

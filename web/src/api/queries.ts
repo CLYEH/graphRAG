@@ -423,7 +423,9 @@ export function useAddSource(project: string) {
     mutationFn: async (input: {
       uri: string;
       kind: string;
-      metadata?: Record<string, string>;
+      // free bag per the contract (additionalProperties: true) — structured
+      // sends strings, xlsx's extra_columns is a string list (SRC1)
+      metadata?: Record<string, unknown>;
       idempotencyKey: string;
     }) => {
       const body: components["schemas"]["SourceCreate"] = { uri: input.uri, kind: input.kind };

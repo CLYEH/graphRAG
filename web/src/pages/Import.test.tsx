@@ -112,6 +112,47 @@ describe("Import", () => {
     });
   });
 
+  it("requires the xlsx column mapping and sends it typed (extra_columns as a list)", async () => {
+    // SRC1: the mapping (which column is the title/body) rides the source's
+    // metadata — resolve_source fails a build without title/body_column, so
+    // the submit stays blocked until both are supplied; the optional keys ride
+    // only when non-blank, and extra_columns is a comma-split LIST (the
+    // backend rejects a bare string loud)
+    stubSources([]);
+    const post = stubPost(source({ uri: "file:///data/guide.xlsx", kind: "xlsx" }));
+    renderImport(projectRoute("acme", "import"));
+
+    fireEvent.change(screen.getByLabelText("uri"), {
+      target: { value: "file:///data/guide.xlsx" },
+    });
+    fireEvent.change(screen.getByLabelText("kind"), { target: { value: "xlsx" } });
+
+    expect(screen.getByRole("button", { name: "登記來源" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText(/title_column/), { target: { value: "標題" } });
+    expect(screen.getByRole("button", { name: "登記來源" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText(/body_column/), { target: { value: "內容詳情" } });
+    fireEvent.change(screen.getByLabelText("id_column"), { target: { value: "編號" } });
+    fireEvent.change(screen.getByLabelText(/extra_columns/), {
+      target: { value: "位置, 分類, " },
+    });
+    fireEvent.change(screen.getByLabelText("label"), { target: { value: "導覽" } });
+    fireEvent.click(screen.getByRole("button", { name: "登記來源" }));
+
+    await waitFor(() => expect(post).toHaveBeenCalled());
+    const [, init] = post.mock.calls[0] as [string, { body: unknown }];
+    expect(init.body).toEqual({
+      uri: "file:///data/guide.xlsx",
+      kind: "xlsx",
+      metadata: {
+        title_column: "標題",
+        body_column: "內容詳情",
+        id_column: "編號",
+        extra_columns: ["位置", "分類"],
+        label: "導覽",
+      },
+    });
+  });
+
   it("blocks a uri the backend would misread, before POSTing", async () => {
     stubSources([]);
     const post = stubPost(source());

@@ -33,13 +33,18 @@ from typing import Any
 from urllib.parse import unquote, unquote_to_bytes, urlparse
 from urllib.request import url2pathname
 
-from core.ingest.connectors import DocumentPayload, read_csv_rows, read_text_documents
+from core.ingest.connectors import (
+    DocumentPayload,
+    read_csv_rows,
+    read_text_documents,
+    read_xlsx_rows,
+)
 from core.registry.store import MANAGED_FILES_KEY, Source
 
 #: Source kinds this task wires to a C2 connector. The ``sources`` table/API
 #: accept any kind string; a build over a kind absent from this tuple fails loud
 #: (no connector) rather than ingesting nothing.
-SUPPORTED_SOURCE_KINDS = ("text", "structured")
+SUPPORTED_SOURCE_KINDS = ("text", "structured", "xlsx")
 
 #: The one path segment a colon may appear in: a Windows drive ("C:"), which
 #: ``Path.as_uri()`` emits and ``url2pathname`` resolves as displayed.
@@ -320,6 +325,53 @@ def _required_meta(source: Source, key: str) -> str:
     return value
 
 
+def _xlsx_required(source: Source, key: str) -> str:
+    """A required non-empty string from an xlsx source's column mapping —
+    returned STRIPPED (like ``_xlsx_optional``): an API/CLI-registered
+    ``" 標題 "`` passes the non-empty check, but the connector looks the value
+    up against NORMALIZED headers, so returning it padded would fail every
+    build with a missing-column error the mapping never earns (Codex #85)."""
+    value = source.metadata.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise SourceResolutionError(
+            f"xlsx source {source.id} needs a non-empty string {key!r} in metadata — "
+            "the column mapping (which column is the title/body) lives on the source, "
+            "never hard-coded in the connector"
+        )
+    return value.strip()
+
+
+def _xlsx_optional(source: Source, key: str) -> str | None:
+    """An optional mapping string: absent/blank folds to None, but a present
+    NON-STRING value is a malformed mapping and fails loud (a silently dropped
+    key would render rows without the column the operator declared)."""
+    value = source.metadata.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SourceResolutionError(
+            f"xlsx source {source.id} metadata {key!r} must be a string, got {type(value).__name__}"
+        )
+    return value.strip() or None
+
+
+def _xlsx_extra_columns(source: Source) -> tuple[str, ...]:
+    """The optional ``extra_columns`` mapping list: absent folds to (); a present
+    value must be a list of non-empty strings — anything else fails loud rather
+    than silently dropping columns the operator declared."""
+    value = source.metadata.get("extra_columns")
+    if value is None:
+        return ()
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
+        raise SourceResolutionError(
+            f"xlsx source {source.id} metadata 'extra_columns' must be a list of "
+            f"non-empty strings, got {value!r}"
+        )
+    return tuple(item.strip() for item in value)
+
+
 def resolve_source(source: Source) -> Iterator[DocumentPayload]:
     """The §5-step-1 payload stream for one source, dispatched by ``kind``.
 
@@ -335,6 +387,17 @@ def resolve_source(source: Source) -> Iterator[DocumentPayload]:
             _local_path(source),
             table=_required_meta(source, "table"),
             pk_column=_required_meta(source, "pk_column"),
+        )
+    if source.kind == "xlsx":
+        # per-row TEXT documents (the pilot-validated render): they flow into
+        # chunking + LLM extraction and are ontology-gated like any text source
+        return read_xlsx_rows(
+            _local_path(source),
+            title_column=_xlsx_required(source, "title_column"),
+            body_column=_xlsx_required(source, "body_column"),
+            id_column=_xlsx_optional(source, "id_column"),
+            extra_columns=_xlsx_extra_columns(source),
+            label=_xlsx_optional(source, "label"),
         )
     raise SourceResolutionError(
         f"source {source.id} has unsupported kind {source.kind!r} — wired kinds are "
