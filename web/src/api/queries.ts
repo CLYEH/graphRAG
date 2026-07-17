@@ -526,10 +526,12 @@ export function useTrigger(project: string) {
 //
 // Three things the frozen contract makes non-negotiable here:
 //
-// 1. NEVER send `sort` or `filter[...]`. The op params still expose them, but
-//    `reject_unsupported_query` (api/routers/_query.py) 400s any `filter[...]`
-//    outside an endpoint's explicit allowlist (GOV4: only merge-candidates
-//    implements one — `filter[status]`; these inspect lists allow none) and
+// 1. NEVER send `sort` or `filter[...]` that this client hasn't adopted. The
+//    op params expose them, but `reject_unsupported_query`
+//    (api/routers/_query.py) 400s any `filter[...]` outside an endpoint's
+//    explicit allowlist (GOV4 merge-candidates `filter[status]`; SS1a inspect
+//    facets: entities/relations `type|status|review_status`, documents
+//    `status` — Console adoption is SS1b's Graph-page migration) and
 //    any sort other than the list's own default — and for CHUNKS, whose default
 //    order is the compound (document_id, ordinal), it rejects EVERY explicit sort
 //    (`sort_field=None`). Verified live: `?sort=id:desc` on chunks → HTTP 400.

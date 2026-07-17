@@ -258,9 +258,18 @@ def test_chunks_cursor_and_compound_order(
     ("path", "params"),
     [
         ("/projects/p/documents", {"sort": "id:asc"}),  # only id:desc restates the default
-        ("/projects/p/documents", {"filter[status]": "x"}),
+        # SS1a: filter[status] became documents' implemented facet — the
+        # reject pin moved to a field OUTSIDE the allowlist
+        ("/projects/p/documents", {"filter[mime]": "x"}),
         ("/projects/p/chunks", {"sort": "ordinal:desc"}),  # compound default: NO sort accepted
         ("/projects/p/chunks", {"filter[document_id]": "x"}),
+        # SS1a: closed-vocabulary facets refuse out-of-vocabulary values, open
+        # ones refuse blanks, and every facet refuses ambiguity (repeats)
+        ("/projects/p/entities", {"filter[status]": "bogus"}),
+        ("/projects/p/entities", {"filter[review_status]": "bogus"}),
+        ("/projects/p/entities", {"filter[type]": "   "}),
+        ("/projects/p/relations", {"filter[status]": "bogus"}),
+        ("/projects/p/relations", {"filter[confidence]": "1"}),
     ],
 )
 def test_unsupported_sort_filter_rejected(
@@ -439,9 +448,10 @@ def test_entities_and_relations_paginate_like_documents(
     repo.pages = rel_rows
     r = client.get("/projects/p/relations", params={"limit": 2})
     assert decode_id_cursor(r.json()["meta"]["next_cursor"]) == (rel_rows[1].id,)
-    # and both honor the sort/filter rejection
+    # and both honor the sort/filter rejection — filter[type] became a legal
+    # SS1a facet, so the reject pin uses a non-allowlisted field instead
     assert client.get("/projects/p/entities", params={"sort": "name:asc"}).status_code == 400
-    assert client.get("/projects/p/relations", params={"filter[type]": "x"}).status_code == 400
+    assert client.get("/projects/p/relations", params={"filter[weight]": "x"}).status_code == 400
 
 
 def test_cursor_types_are_distinct_per_resource() -> None:
@@ -646,3 +656,49 @@ def test_subgraph_no_active_build_beats_policy_errors(
     r = client.get("/projects/p/graph/subgraph", params={"entity_id": str(uuid.uuid4())})
     assert r.status_code == 409
     assert r.json()["error"]["code"] == "NO_ACTIVE_BUILD"
+
+
+def test_ss1a_facets_are_accepted_on_their_endpoints(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    """SS1a: the implemented facets pass the guard — a 200 here is the
+    over-block half of the fail-loud pin above (class 9 對偶: deny rules need
+    accept pins, or tightening silently swallows the feature)."""
+    _bindable(monkeypatch)
+    for path, params in (
+        ("/projects/p/documents", {"filter[status]": "ingested"}),
+        ("/projects/p/entities", {"filter[type]": "EXHIBIT"}),
+        ("/projects/p/entities", {"filter[status]": "active"}),
+        ("/projects/p/entities", {"filter[review_status]": "unreviewed"}),
+        ("/projects/p/relations", {"filter[type]": "works_with"}),
+        ("/projects/p/relations", {"filter[status]": "needs_review"}),
+    ):
+        r = client.get(path, params=params)
+        assert r.status_code == 200, (path, params, r.text)
+
+
+def test_facet_vocabularies_match_the_ddl() -> None:
+    """The router's closed vocabularies must equal the DDL CHECK constraints
+    VERBATIM — a drifted tuple would refuse a value the column holds (silent
+    under-serving) or accept one it cannot (a facet that can never match).
+    Parity is pinned mechanically by parsing the same DDL the database
+    enforces (the two-gate shared-corpus rule, class 16)."""
+    import re as _re
+
+    from api.routers.inspect import LIFECYCLE_STATUS, REVIEW_STATUS
+    from core.stores import tables as _tables
+
+    def _check_values(table: object, name: str) -> tuple[str, ...]:
+        for constraint in table.constraints:  # type: ignore[attr-defined]
+            if getattr(constraint, "name", None) == name:
+                return tuple(_re.findall(r"'([^']+)'", str(constraint.sqltext)))
+        raise AssertionError(f"constraint {name} not found")
+
+    assert set(LIFECYCLE_STATUS) == set(_check_values(_tables.entities, "entities_status_valid"))
+    assert set(LIFECYCLE_STATUS) == set(_check_values(_tables.relations, "relations_status_valid"))
+    assert set(REVIEW_STATUS) == set(
+        _check_values(_tables.entities, "entities_review_status_valid")
+    )
+    assert set(REVIEW_STATUS) == set(
+        _check_values(_tables.relations, "relations_review_status_valid")
+    )

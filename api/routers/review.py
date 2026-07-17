@@ -37,7 +37,7 @@ from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
 from api.pagination import decode_id_cursor, encode_cursor
 from api.registry_errors import translate_registry_error
-from api.routers._query import reject_null_body, reject_unsupported_query
+from api.routers._query import reject_null_body, reject_unsupported_query, single_filter_value
 from api.schemas import ReviewDecisionRequest, merge_candidate_dto
 from core.registry import ProjectNotFoundError, get_project
 from core.resolve.decisions import (
@@ -73,26 +73,12 @@ def _status_filter(request: Request) -> str | None:
 
     The vocabulary is §17's merge-candidate state machine — read from
     ``STATE_MACHINES`` itself, not a restated literal set, so the filter can
-    never drift from what decisions may actually write. Exactly one value:
-    a repeated param is ambiguous (which status did the caller mean?) and is
-    rejected, never first-one-wins (C3a: 拒絕勝於默選一邊)."""
-    values = request.query_params.getlist("filter[status]")
-    if not values:
-        return None
-    vocabulary = STATE_MACHINES["merge_candidate"]
-    if len(values) > 1:
-        raise ApiError(
-            ErrorCode.VALIDATION_ERROR,
-            "filter[status] accepts a single value",
-            details={"filter[status]": values},
-        )
-    if values[0] not in vocabulary:
-        raise ApiError(
-            ErrorCode.VALIDATION_ERROR,
-            f"unknown status {values[0]!r} — one of: {', '.join(sorted(vocabulary))}",
-            details={"filter[status]": values[0]},
-        )
-    return values[0]
+    never drift from what decisions may actually write. Single-value and
+    vocabulary rules live in the shared helper (SS1a: one implementation for
+    every facet endpoint, class 5)."""
+    return single_filter_value(
+        request, "status", vocabulary=tuple(STATE_MACHINES["merge_candidate"])
+    )
 
 
 @router.get("/projects/{project}/merge-candidates")
