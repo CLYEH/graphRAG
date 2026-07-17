@@ -361,6 +361,12 @@ entities = sa.Table(
     # §27.3: cross-build stable identity, minted by core.resolve.fingerprints
     # (non-empty by construction — fpv{N}: prefix; the CHECK pins it)
     sa.Column("entity_key", sa.Text, nullable=False),
+    # §27.3/DR-011: the stable EXTERNAL id (when the source declares one) —
+    # persisted so identity components stay recoverable: the type-free v2
+    # ledger keys re-mint from (canonical_name, disambiguator), and a value
+    # only baked into the entity_key hash could never be recovered. NULL =
+    # no external id (every text-extraction entity).
+    sa.Column("disambiguator", sa.Text),
     sa.Column("attributes", postgresql.JSONB),
     sa.Column("embedding_point_id", postgresql.UUID(as_uuid=True)),
     sa.Column("status", sa.Text, nullable=False),

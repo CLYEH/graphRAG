@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
 
-from core.resolve.fingerprints import FINGERPRINT_VERSION
+from core.resolve.fingerprints import LEDGER_FINGERPRINT_VERSION
 
 # --- frozen vocabularies (§4/§17) -------------------------------------------
 
@@ -90,13 +90,13 @@ class LedgerEntry:
     decision: str
     decided_by: str
     decided_at: datetime
-    fingerprint_version: int = FINGERPRINT_VERSION
+    fingerprint_version: int = LEDGER_FINGERPRINT_VERSION
 
 
 def effective_decision(
     entries: list[LedgerEntry],
     *,
-    fingerprint_version: int = FINGERPRINT_VERSION,
+    fingerprint_version: int = LEDGER_FINGERPRINT_VERSION,
 ) -> LedgerEntry | None:
     """Pick the entry that governs a target_key, or None if none applies.
 

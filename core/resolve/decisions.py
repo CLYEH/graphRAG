@@ -7,9 +7,9 @@ One decision = three writes that must land in ONE caller-owned transaction:
   UNDER the lock (class 10 — two concurrent decides serialize here; the loser
   re-reads the new status and gets a typed refusal, never a double decision);
 * ``review_ledger`` gains the CARRY-FORWARD entry (DR-003: non-build-scoped,
-  keyed by the §27.3 ``merge_key`` — computed with the SAME
-  ``fingerprints.merge_key`` C4's resolve reads, so key drift is structurally
-  impossible). DEFER writes a ledger entry too: #28 R4a froze that a deferred
+  keyed by the §27.3 v2 ``ledger_merge_key`` — computed with the SAME
+  ``fingerprints.ledger_merge_key`` C4's resolve reads, so key drift is
+  structurally impossible). DEFER writes a ledger entry too: #28 R4a froze that a deferred
   pair must not auto-merge, so resolve has to SEE the defer;
 * the candidate row records the audit trail (status/decision/decided_by/
   decided_at/reason). Both stamps reuse ONE ``clock_timestamp()`` captured
@@ -150,9 +150,9 @@ async def decide_merge_candidate(
 
     ents = tables.entities
     keys = {
-        r.id: r.entity_key
+        r.id: fingerprints.ledger_entity_key(r.canonical_name, r.disambiguator)
         for r in await conn.execute(
-            sa.select(ents.c.id, ents.c.entity_key).where(
+            sa.select(ents.c.id, ents.c.canonical_name, ents.c.disambiguator).where(
                 ents.c.id.in_([row.left_entity_id, row.right_entity_id]),
                 ents.c.project == project,
                 ents.c.build_id == build_id,
@@ -164,9 +164,11 @@ async def decide_merge_candidate(
         # identity is unmintable and recording a decision would be a lie
         raise LookupError(
             f"merge candidate {candidate_id}'s entities are missing from "
-            f"build {build_id} — cannot mint the §27.3 merge_key"
+            f"build {build_id} — cannot mint the §27.3 merge ledger key"
         )
-    target_key = fingerprints.merge_key(keys[row.left_entity_id], keys[row.right_entity_id])
+    # the TYPE-FREE v2 ledger key (DR-011): the curator's「這兩個是同一個東西」
+    # must survive either side being re-typed by the next build's extraction
+    target_key = fingerprints.ledger_merge_key(keys[row.left_entity_id], keys[row.right_entity_id])
 
     # ONE per-decision instant for both writes (module docstring: now() would
     # tie batched re-decisions and break §27.3's latest-wins tie-break)
@@ -176,7 +178,7 @@ async def decide_merge_candidate(
             project=project,
             target_kind="merge",
             target_key=target_key,
-            fingerprint_version=fingerprints.FINGERPRINT_VERSION,
+            fingerprint_version=fingerprints.LEDGER_FINGERPRINT_VERSION,
             decision=verb,
             decided_by=decided_by,
             decided_at=decided_at,

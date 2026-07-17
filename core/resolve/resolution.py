@@ -2,14 +2,22 @@
 
 Extraction (C3) already collapsed EXACT identities — two mentions of the same
 normalized (type, name) are one entity row. This step handles what exact keys
-cannot: ``Acme Corp`` vs ``ACME Corporation``. Per §7:
+cannot: ``Acme Corp`` vs ``ACME Corporation`` — and, since GOV1/DR-011, the
+same real thing typed differently (``區域探索廳`` as EXHIBIT vs LOCATION). Per
+§7 (amended by DR-011):
 
-``blocking(type+正規化名) → similarity(字串+embedding 加權) → 高信心自動合併 /
-中信心產 merge_candidate / 低信心不合併``
+``blocking(正規化名) → similarity(字串+embedding 加權) → 高信心自動合併(僅同
+型別)/ 中信心或跨型別產 merge_candidate / 低信心不合併``
 
-- **Blocking**: only same-normalized-type pairs that share a name token or a
-  4-char prefix are scored (§7 names type+normalized-name as the block key;
-  exact-equal names can't occur here — extraction already collapsed them).
+- **Blocking**: pairs that share a name token or a 4-char prefix are scored —
+  ACROSS types (DR-011): the LLM's type label is unstable evidence, and the
+  old type bucket structurally hid cross-type twins from review forever.
+  Same-name pairs now DO occur (extraction collapses per (type, name), so the
+  same name under two types is two rows): they score 1.0 and land in review.
+- **Cross-type pairs are review-band-only**: a type disagreement is
+  definitionally 中信心 — however high the name score, auto-merge would
+  conflate namesakes (Apple the company vs the fruit), so only a human (or a
+  carried ledger merge, i.e. an earlier human) may join across types.
 - **Similarity**: normalized-name string ratio (stdlib ``SequenceMatcher``),
   weighted ``1 - embedding_weight``. 🔧 ``embedding_weight`` defaults 0.0:
   the pipeline computes embeddings at the INDEX step (§5 step 5, C5), which
@@ -21,13 +29,17 @@ cannot: ``Acme Corp`` vs ``ACME Corporation``. Per §7:
   review ≤ score < auto ⇒ a pending ``merge_candidates`` row; below ⇒ nothing.
 
 **Ledger first (§17, 🔧 resolution.carry_review)**: before any scoring, the
-project's ledger is applied — ``reject`` on an entity_key/relation_signature
-excludes the row from projection (status='rejected'; C5 filters on status);
-``approve`` marks review_status; a ``merge``/``approve`` on a merge_key
-merges that pair regardless of score; ``reject`` on a merge_key suppresses
-the pair (never re-proposed); ``defer`` re-lists a pending candidate.
-Precedence is :func:`core.resolve.review.effective_decision` (manual outranks
-auto, DR-007 same-version only).
+project's ledger is applied — keyed by the TYPE-FREE v2 ledger keys (DR-011:
+``ledger_entity_key``/``ledger_relation_signature``/``ledger_merge_key``,
+minted from each row's (canonical_name, disambiguator) so decisions survive
+type drift). ``reject`` on an entity/relation ledger key excludes the row
+from projection (status='rejected'; C5 filters on status); ``approve`` marks
+review_status; a ``merge``/``approve`` on a merge ledger key merges that pair
+regardless of score (including across types — an earlier human already
+decided); ``reject`` suppresses the pair (never re-proposed); ``defer``
+re-lists a pending candidate. Precedence is
+:func:`core.resolve.review.effective_decision` (manual outranks auto, DR-007
+same-version only — v1 rows are dormant, 標記重審).
 
 **Merge application** — the C3a-flagged coupling, handled re-entrantly:
 merging ``loser`` into ``canonical`` re-points mentions, then every relation
@@ -117,6 +129,7 @@ class _Entity:
     name: str
     entity_key: str
     created_at: datetime
+    disambiguator: str | None = None
     attributes: dict[str, object] = field(default_factory=dict)
     mention_count: int = 0
     norm_name: str = field(init=False)
@@ -128,30 +141,41 @@ class _Entity:
 def _has_disambiguator(entity: _Entity) -> bool:
     """True iff the entity's stored key embeds an external id: the key minted
     WITHOUT a disambiguator would differ (§27.3 — the formula is frozen, so
-    the comparison is exact, not heuristic)."""
+    the comparison is exact, not heuristic). Deliberately key-derived rather
+    than column-derived: it also covers rows minted before the disambiguator
+    column existed (a pre-deploy build retried across the deploy)."""
     return fingerprints.entity_key(entity.type, entity.name) != entity.entity_key
+
+
+def _ledger_key(entity: _Entity) -> str:
+    """The entity's TYPE-FREE v2 review-ledger key (DR-011)."""
+    return fingerprints.ledger_entity_key(entity.name, entity.disambiguator)
 
 
 def _string_score(a: _Entity, b: _Entity) -> float:
     return SequenceMatcher(None, a.norm_name, b.norm_name).ratio()
 
 
+def _cross_type(a: _Entity, b: _Entity) -> bool:
+    """Whether a pair disagrees on normalized type — review-band-only (DR-011)."""
+    return fingerprints.norm_text(a.type) != fingerprints.norm_text(b.type)
+
+
 def _blocked_pairs(entities: list[_Entity]) -> list[tuple[_Entity, _Entity]]:
-    """§7 blocking: same normalized type AND (shared name token OR shared
-    4-char prefix). Keeps scoring off the full O(n²) while never separating
-    the pairs the block key names."""
-    by_type: dict[str, list[_Entity]] = {}
-    for entity in entities:
-        by_type.setdefault(fingerprints.norm_text(entity.type), []).append(entity)
+    """§7 blocking (DR-011): shared name token OR shared 4-char prefix —
+    across types. The old same-type bucket structurally hid cross-type twins
+    (the same real thing re-typed by the LLM) from ever being scored; the
+    name conditions alone keep scoring off the full O(n²) for real corpora,
+    and the cross-type pairs they admit are exactly the ones review needs to
+    see. Deterministic order (callers sort scored output anyway)."""
     pairs: list[tuple[_Entity, _Entity]] = []
-    for group in by_type.values():
-        for i, a in enumerate(group):
-            a_tokens = set(a.norm_name.split())
-            for b in group[i + 1 :]:
-                if a_tokens & set(b.norm_name.split()) or (
-                    a.norm_name[:4] and a.norm_name[:4] == b.norm_name[:4]
-                ):
-                    pairs.append((a, b))
+    for i, a in enumerate(entities):
+        a_tokens = set(a.norm_name.split())
+        for b in entities[i + 1 :]:
+            if a_tokens & set(b.norm_name.split()) or (
+                a.norm_name[:4] and a.norm_name[:4] == b.norm_name[:4]
+            ):
+                pairs.append((a, b))
     return pairs
 
 
@@ -229,9 +253,15 @@ async def resolve_build(
     entity_rows = sorted(await writer.fetch_all(tables.entities), key=lambda r: r.entity_key)
     entities: list[_Entity] = []
     key_of: dict[uuid.UUID, str] = {}
+    # the TYPE-FREE v2 ledger key per row id (DR-011): relation ledger keys
+    # re-mint from their endpoints' ledger keys, so EVERY row (active or not)
+    # gets one — a relation may point at a merged/rejected endpoint
+    ledger_key_of: dict[uuid.UUID, str] = {}
     for row in entity_rows:
         key_of[row.id] = row.entity_key
-        verdict = _decision(ledger, "entity", row.entity_key)
+        row_ledger_key = fingerprints.ledger_entity_key(row.canonical_name, row.disambiguator)
+        ledger_key_of[row.id] = row_ledger_key
+        verdict = _decision(ledger, "entity", row_ledger_key)
         status = row.status
         # merged rows are exempt: undoing a merge is 'split' (deferred), not
         # something a reject/approve on the ORIGINAL key should unwind
@@ -276,6 +306,7 @@ async def resolve_build(
                     row.canonical_name,
                     row.entity_key,
                     row.created_at,
+                    row.disambiguator,
                     dict(row.attributes or {}),
                 )
             )
@@ -283,7 +314,16 @@ async def resolve_build(
     for row in await writer.fetch_all(tables.relations):
         if row.relation_signature is None:
             continue
-        verdict = _decision(ledger, "relation", row.relation_signature)
+        # v2 relation ledger key: re-minted from the endpoints' type-free
+        # ledger keys + the relation type (DR-011) — a decision survives its
+        # endpoints being re-typed on the next build
+        verdict = _decision(
+            ledger,
+            "relation",
+            fingerprints.ledger_relation_signature(
+                ledger_key_of[row.src_entity_id], row.type, ledger_key_of[row.dst_entity_id]
+            ),
+        )
         if verdict is None:
             continue
         if row.status == "merged":
@@ -351,7 +391,7 @@ async def resolve_build(
     for score, a, b in scored:
         if a.id in merged_away or b.id in merged_away:
             continue  # an endpoint already merged this pass; pair is stale
-        merge_key = fingerprints.merge_key(a.entity_key, b.entity_key)
+        merge_key = fingerprints.ledger_merge_key(_ledger_key(a), _ledger_key(b))
         verdict = _decision(ledger, "merge", merge_key)
         if verdict is not None and verdict.decision not in ("merge", "approve", "defer"):
             # reject — or ANY other present verdict (a stray 'split', a future
@@ -363,11 +403,11 @@ async def resolve_build(
         a_id, b_id = _has_disambiguator(a), _has_disambiguator(b)
         if not carried and a_id and b_id:
             if a.norm_name == b.norm_name:
-                # identical normalized (type, name) with TWO different
-                # external ids: the sources explicitly assert namesakes
-                # (§27.3's disambiguator exists for exactly this). Scoring
-                # them 1.0 and auto-merging would destroy that distinction,
-                # and a candidate would re-spam review every build (DR-003).
+                # identical normalized name with TWO different external ids:
+                # the sources explicitly assert namesakes (§27.3's
+                # disambiguator exists for exactly this). Scoring them 1.0
+                # and auto-merging would destroy that distinction, and a
+                # candidate would re-spam review every build (DR-003).
                 # Only an explicit ledger merge may join them.
                 counts["namesakes_skipped"] += 1
                 continue
@@ -380,6 +420,15 @@ async def resolve_build(
         # one-sided ids never block: an id-less mention has asserted nothing,
         # and joining it onto the id-bearing entity is exactly ER's job —
         # blocking exact-name one-sided pairs was round 1's over-block.
+        if not carried and _cross_type(a, b):
+            # DR-011: a type disagreement is definitionally 中信心 — however
+            # high the name score (same-name cross-type twins score 1.0),
+            # auto-merge would conflate namesakes across types; the pair goes
+            # to review, and only a human (or their carried ledger merge, the
+            # `carried` branch above) joins across types.
+            if score < config.review_threshold:
+                continue
+            score = min(score, config.auto_merge_threshold - 1e-9)
         deferred = verdict is not None and verdict.decision == "defer"
         if carried or (not deferred and score >= config.auto_merge_threshold):
             canonical, loser = _pick_canonical(a, b)
@@ -389,7 +438,7 @@ async def resolve_build(
                 # re-mint — it must SURVIVE the merge, whatever the mention
                 # counts say.
                 canonical, loser = (a, b) if a_id else (b, a)
-            await _apply_merge(writer, canonical, loser, key_of, ledger, counts, now)
+            await _apply_merge(writer, canonical, loser, key_of, ledger_key_of, ledger, counts, now)
             merged_away.add(loser.id)
             if carried:
                 counts["ledger_merged"] += 1
@@ -400,7 +449,7 @@ async def resolve_build(
                         project=writer.project,
                         target_kind="merge",
                         target_key=merge_key,
-                        fingerprint_version=fingerprints.FINGERPRINT_VERSION,
+                        fingerprint_version=fingerprints.LEDGER_FINGERPRINT_VERSION,
                         decision="merge",
                         decided_by=AUTO_DECIDER,
                         decided_at=now,
@@ -451,6 +500,7 @@ async def _apply_merge(
     canonical: _Entity,
     loser: _Entity,
     key_of: dict[uuid.UUID, str],
+    ledger_key_of: dict[uuid.UUID, str],
     ledger: dict[tuple[str, str], list[LedgerEntry]],
     counts: dict[str, int],
     now: datetime,
@@ -467,6 +517,7 @@ async def _apply_merge(
         updated_at=now,
     )
     key_of[loser.id] = canonical.entity_key
+    ledger_key_of[loser.id] = ledger_key_of[canonical.id]
 
     # every relation touching the loser: re-point + re-mint (§27.3/§27.4)
     signature_owner = {
@@ -524,10 +575,18 @@ async def _apply_merge(
             "updated_at": now,
         }
         # the ledger pass ran BEFORE merges, over pre-merge signatures — a
-        # decision keyed to THIS post-merge signature (minted in an earlier
+        # decision keyed to THIS post-merge identity (minted in an earlier
         # build's resolve) must be re-applied now, or a carried reject would
-        # sit active in the projection under the very signature it rejects
-        verdict = _decision(ledger, "relation", new_signature)
+        # sit active in the projection under the very identity it rejects.
+        # Looked up by the v2 LEDGER key (DR-011), never the fpv1 storage
+        # signature — the ledger is keyed type-free.
+        verdict = _decision(
+            ledger,
+            "relation",
+            fingerprints.ledger_relation_signature(
+                ledger_key_of[new_src], relation.type, ledger_key_of[new_dst]
+            ),
+        )
         if verdict is not None and verdict.decision == "reject":
             if relation.status != "rejected":
                 counts["relations_rejected"] += 1

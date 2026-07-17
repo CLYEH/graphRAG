@@ -13,8 +13,12 @@ import pytest
 
 from core.resolve.fingerprints import (
     FINGERPRINT_VERSION,
+    LEDGER_FINGERPRINT_VERSION,
     entity_key,
     evidence_hash,
+    ledger_entity_key,
+    ledger_merge_key,
+    ledger_relation_signature,
     merge_key,
     relation_signature,
 )
@@ -81,6 +85,51 @@ def test_merge_key_is_symmetric() -> None:
     a = entity_key("Team", "People Ops")
     b = entity_key("Team", "PeopleOps")
     assert merge_key(a, b) == merge_key(b, a)
+
+
+# --- v2 ledger keys (§27.3/DR-011): TYPE-FREE review identity ------------------
+
+
+def test_ledger_entity_key_is_type_free_and_versioned() -> None:
+    """THE DR-011 property: the LLM's type label drifts across builds (the
+    same real thing re-typed EXHIBIT → LOCATION), and a type-bearing review
+    key turned every drift into 白審. The v2 key must be IDENTICAL whatever
+    type either build assigned — that identity is what carries a curator's
+    decision across the drift."""
+    key = ledger_entity_key("區域探索廳")
+    assert key.startswith(f"fpv{LEDGER_FINGERPRINT_VERSION}:")
+    # no type input exists — same name, same key, whatever the row's type says
+    assert ledger_entity_key("區域探索廳") == key
+    # normalization is the same frozen rule as v1 (NFKC/casefold/whitespace)
+    assert ledger_entity_key("people   ops") == ledger_entity_key("People Ops")
+    # and it is NOT the v1 key under any type (the families never collide)
+    assert key != entity_key("Exhibit", "區域探索廳")
+
+
+def test_ledger_entity_key_keeps_the_disambiguator() -> None:
+    """Type-freedom must NOT collapse asserted namesakes: the disambiguator
+    (a stable EXTERNAL id) is how sources declare「同名但不同物」, and it stays
+    in the v2 key — same trim/blank-folding rules as v1."""
+    base = ledger_entity_key("People Ops")
+    assert ledger_entity_key("People Ops", "hr-42") != base
+    assert ledger_entity_key("People Ops", " HR-42 ") == ledger_entity_key("People Ops", "HR-42")
+    assert ledger_entity_key("People Ops", "") == base
+    assert ledger_entity_key("People Ops", "   ") == base
+
+
+def test_ledger_merge_key_is_symmetric_and_type_free() -> None:
+    a = ledger_entity_key("People Ops")
+    b = ledger_entity_key("PeopleOps")
+    assert ledger_merge_key(a, b) == ledger_merge_key(b, a)
+
+
+def test_ledger_relation_signature_is_directional_and_survives_retyping() -> None:
+    a = ledger_entity_key("People Ops")
+    b = ledger_entity_key("Onboarding")
+    sig = ledger_relation_signature(a, "OWNS", b)
+    assert sig != ledger_relation_signature(b, "OWNS", a)
+    assert sig == ledger_relation_signature(a, "owns", b)
+    assert sig.startswith(f"fpv{LEDGER_FINGERPRINT_VERSION}:")
 
 
 def test_evidence_hash_dedups_row_evidence_and_is_not_versioned() -> None:
@@ -151,15 +200,19 @@ def test_frozen_vocabularies_match_design() -> None:
 # --- ledger precedence (§27.3) -------------------------------------------------
 
 
-def _entry(decision: str, by: str, at: str, fpv: int = FINGERPRINT_VERSION) -> LedgerEntry:
+def _entry(decision: str, by: str, at: str, fpv: int = LEDGER_FINGERPRINT_VERSION) -> LedgerEntry:
     return LedgerEntry(decision, by, datetime.fromisoformat(at).replace(tzinfo=UTC), fpv)
 
 
 def test_other_fingerprint_versions_never_apply() -> None:
     """DR-007: a key minted under different normalization rules must trigger
-    re-review, not silent reuse."""
-    stale = _entry("reject", "curator-1", "2026-07-01T00:00:00", fpv=FINGERPRINT_VERSION + 1)
+    re-review, not silent reuse — this covers BOTH a future version and the
+    RETIRED v1 (type-bearing) rows, which went dormant at the DR-011 bump
+    (標記重審, never silently mis-applied to type-free v2 keys)."""
+    stale = _entry("reject", "curator-1", "2026-07-01T00:00:00", fpv=LEDGER_FINGERPRINT_VERSION + 1)
     assert effective_decision([stale]) is None
+    retired_v1 = _entry("reject", "curator-1", "2026-07-01T00:00:00", fpv=1)
+    assert effective_decision([retired_v1]) is None
 
 
 def test_manual_outranks_newer_auto() -> None:

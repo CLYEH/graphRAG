@@ -196,6 +196,9 @@ async def _extract_row(
                 type=rule.entity_type,
                 canonical_name=name,
                 entity_key=key,
+                # persisted, not just baked into the key hash: the type-free
+                # v2 ledger keys re-mint from (name, disambiguator) — DR-011
+                disambiguator=(disamb or None),
                 attributes={},
                 status="active",
                 review_status="unreviewed",
