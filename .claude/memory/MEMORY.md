@@ -1,5 +1,7 @@
 # Memory Index
 
+- [PR 標題一律英文](graphrag-pr-titles-english.md) — owner 2026-07-17 指示;`<TASK-ID>: <english summary>`,body/commit 維持慣例
+
 - [graphRAG 架構定案](graphrag-architecture.md) — 多專案 hybrid RAG 平台：Python + LlamaIndex + Postgres/Qdrant/Neo4j，一專案一 MCP，DESIGN.md v0.5（實作凍結版）
 - [graphRAG 工作方式](graphrag-working-style.md) — agent 全開發追求最完整、使用者握定案權、可與 ChatGPT 交叉討論
 - [Codex +1 才能 merge](codex-plus-one-merge-gate.md) — 合併硬門檻=Codex 👍(+1),無例外;已用 PreToolUse hook 機械性強制

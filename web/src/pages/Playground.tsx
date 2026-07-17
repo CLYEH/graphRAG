@@ -177,7 +177,7 @@ function QueryConsole({ project }: { project: string }) {
           Query failed: {run.error instanceof Error ? run.error.message : "unknown error"}
         </p>
       )}
-      {run.data && <QueryResults result={run.data} />}
+      {run.data && <QueryResults result={run.data} project={project} />}
     </div>
   );
 }
