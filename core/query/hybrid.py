@@ -194,8 +194,13 @@ async def hybrid_query(
         # demonstrably names build entities, the templates are cheap and
         # parameterized, and RRF fusion sinks irrelevant hits. Golden cases
         # that NEED a relation path must not hinge on an LLM selector's mood
-        # (C3b: LLM-assisted, never LLM-trusted), so the plan always runs.
-        selected = [*selected, "graph"]
+        # (C3b: LLM-assisted, never LLM-trusted), so the plan always runs —
+        # inserted at its _MODE_ORDER position, NOT appended: modes execute
+        # sequentially against the shared deadline, and a last-place graph
+        # would be the first mode cut on a tight budget, silently defeating
+        # the very guarantee this block exists for (Codex #89 R1).
+        chosen = {*selected, "graph"}
+        selected = [mode for mode in _MODE_ORDER if mode in chosen]
         unselected = [mode for mode in unselected if mode != "graph"]
         reason = f"{reason}; graph joined by auto plan (linked entities in the question)"
 

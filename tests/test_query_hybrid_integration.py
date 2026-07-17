@@ -197,7 +197,8 @@ async def test_hybrid_routes_fuses_and_traces_on_live_stores(
         # the trace tells the truth about the live run
         assert response.debug is not None
         decision = response.debug["routing_decision"]
-        assert decision["selected"] == ["semantic", "global", "graph"]
+        # ordered insert (Codex #89 R1): graph sits at its _MODE_ORDER slot
+        assert decision["selected"] == ["semantic", "graph", "global"]
         assert decision["skipped"] == ["sql"]
         assert "auto plan" in response.debug["retrieval_plan"][0]
         assert "Acme" in response.debug["retrieval_plan"][0]

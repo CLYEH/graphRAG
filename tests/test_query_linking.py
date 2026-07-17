@@ -31,13 +31,34 @@ def test_single_character_names_never_link() -> None:
 
 
 def test_shadowed_substring_names_yield_to_the_longest() -> None:
-    """「區域」 is contained in 「區域探索廳」: when both match, only the
-    longest (most specific) name links — a generic fragment must not become a
-    second traversal seed."""
+    """「區域」 is contained in 「區域探索廳」: when both match ONLY there,
+    the longest (most specific) name links — a generic fragment must not
+    become a second traversal seed."""
     names = ["區域", "區域探索廳"]
     assert link_names("區域探索廳有什麼?", names) == ["區域探索廳"]
     # the short name still links when it stands alone
     assert link_names("這個區域的氣候如何?", names) == ["區域"]
+
+
+def test_shadowing_is_by_span_overlap_not_name_containment() -> None:
+    """Codex #89: 「York and New York」 names TWO entities — York's standalone
+    occurrence does not overlap New York's span, so both link (in question
+    order) and the relation question gets its path plan. Name-level
+    containment silently ate exactly these two-entity questions."""
+    names = ["York", "New York"]
+    assert link_names("york and new york", names) == ["York", "New York"]
+    plan = derive_plan("york and new york, what is the relation?", names, max_graph_hops=3)
+    assert plan is not None
+    assert plan.params.template == "path"
+    assert plan.params.entity == "York" and plan.params.other_entity == "New York"
+
+
+def test_every_occurrence_of_a_linked_name_claims_its_span() -> None:
+    """A sub-name must not sneak in through a LATER duplicate mention of the
+    longer name: with 「new york … new york」 both spans belong to New York,
+    and York (which never stands alone here) stays shadowed."""
+    names = ["York", "New York"]
+    assert link_names("new york and then new york again", names) == ["New York"]
 
 
 def test_question_order_becomes_path_direction() -> None:

@@ -491,16 +491,24 @@ async def test_auto_planned_graph_survives_a_selector_that_skips_it(
     guarantee cannot hinge on an LLM selector's mood (C3b: LLM-assisted,
     never LLM-trusted). An auto-planned graph mode always runs."""
     calls = _patch_modes(monkeypatch)
-    picky = _FakeLLM(json.dumps({"modes": ["semantic"], "reason": "prose only"}))
+    # the selector picks modes that come AFTER graph in _MODE_ORDER — the
+    # discriminating case: append-last would run graph LAST, ordered insert
+    # runs it before them (a same-prefix selection like ["semantic"] cannot
+    # tell the two apart — the first probe of this pin was false-green)
+    picky = _FakeLLM(json.dumps({"modes": ["sql", "global"], "reason": "prose only"}))
     deps, _repo = _linkable_deps(["區域探索廳"], llm=picky)
     response = await hybrid_query(deps, _policy(), "區域探索廳和誰有關?", None)
 
     assert len(calls["graph"]) == 1
     assert response.debug is not None
     routing = response.debug["routing_decision"]
-    assert "graph" in routing["selected"]
     assert "graph" not in routing["skipped"]
     assert "auto plan" in routing["reason"]
+    # the joined mode sits at its _MODE_ORDER position, NOT last: modes run
+    # sequentially against one shared deadline, and a last-place graph would
+    # be the first cut on a tight budget — silently defeating the guarantee
+    # this test exists for (Codex #89 R1)
+    assert routing["selected"] == ["graph", "sql", "global"]
 
 
 async def test_no_link_keeps_graph_gated_with_the_reason(

@@ -22,12 +22,15 @@ Matching rules (all deterministic, all surfaced in the plan note):
 - an entity name matches iff its normalized form appears inside the
   normalized question; names shorter than 2 characters never match (a
   single character matches nearly any question — noise, not a link).
-- a matched name that is a substring of ANOTHER matched name is shadowed by
-  it (「區域」 yields to 「區域探索廳」): the longest name is the most
-  specific claim about what the question means.
-- order = first occurrence in the question, longer name first on ties — for
-  the path template this reads as src → dst in question order (「從 A 到 B」
-  links A before B).
+- shadowing is by OVERLAPPING SPANS, not name containment: every occurrence
+  of every eligible name claims its span longest-first, and each question
+  character cites at most one entity — 「區域」 inside 「區域探索廳」 is
+  shadowed, but a standalone 「York」 next to 「New York」 still links
+  (Codex #89: name-level containment silently ate exactly the two-entity
+  relation questions the path template exists for).
+- order = the first claimed occurrence in the question, longer name first on
+  ties — for the path template this reads as src → dst in question order
+  (「從 A 到 B」 links A before B).
 
 Template selection is conservative: two or more linked names → ``path``
 between the first two (hops = the §21 ``max_graph_hops`` ceiling — a path
@@ -70,28 +73,32 @@ def link_names(question: str, names: Sequence[str]) -> list[str]:
     qnorm = norm_text(question)
     if not qnorm:
         return []
-    candidates: list[tuple[int, int, str, str]] = []
+    # EVERY occurrence of every eligible name — span shadowing needs them all
+    occurrences: list[tuple[int, int, str, str]] = []  # (start, end, norm, stored)
     for stored in names:
         normalized = norm_text(stored)
         if len(normalized) < MIN_LINK_LENGTH:
             continue
-        position = qnorm.find(normalized)
-        if position >= 0:
-            candidates.append((position, -len(normalized), normalized, stored))
-    kept = [
-        candidate
-        for candidate in candidates
-        if not any(candidate[2] != other[2] and candidate[2] in other[2] for other in candidates)
-    ]
-    kept.sort()
-    linked: list[str] = []
-    seen: set[str] = set()
-    for _, _, normalized, stored in kept:
-        if normalized in seen:
-            continue  # two stored spellings normalize equal — first (earliest) wins
-        seen.add(normalized)
-        linked.append(stored)
-    return linked
+        start = qnorm.find(normalized)
+        while start >= 0:
+            occurrences.append((start, start + len(normalized), normalized, stored))
+            start = qnorm.find(normalized, start + 1)
+    # longest-first claiming: each question character cites at most one
+    # entity, so a name links iff SOME occurrence survives the longer names'
+    # claims — every occurrence of a linked name still claims its span, or a
+    # sub-name could sneak in through a later duplicate mention
+    claimed: list[tuple[int, int]] = []
+    first_claim: dict[str, tuple[int, int, str]] = {}  # norm → (pos, -len, stored)
+    for start, end, normalized, stored in sorted(
+        occurrences, key=lambda o: (o[0] - o[1], o[0], o[2])
+    ):
+        if any(s < end and start < e for s, e in claimed):
+            continue
+        claimed.append((start, end))
+        if normalized not in first_claim:
+            # normalize-equal stored spellings collapse to the first claim
+            first_claim[normalized] = (start, start - end, stored)
+    return [stored for _, _, stored in sorted(first_claim.values())]
 
 
 def derive_plan(question: str, names: Sequence[str], max_graph_hops: int) -> GraphPlan | None:
