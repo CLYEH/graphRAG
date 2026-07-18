@@ -33,6 +33,7 @@ _NOW = datetime(2026, 7, 11, tzinfo=UTC)
 _FROZEN_BUILD_FIELDS = {
     "id",
     "project",
+    "parent_build_id",
     "status",
     "config_hash",
     "source_hash",

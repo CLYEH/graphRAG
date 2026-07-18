@@ -110,6 +110,9 @@ class BuildInfo:
     source_hash: str | None = None
     metrics: dict[str, Any] | None = None
     eval: dict[str, Any] | None = None
+    # RB1-retry (DR-013): the terminal `failed` build this one retries, or None
+    # for an ordinary build. Appended last so BuildInfo(*row) stays positional.
+    parent_build_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +143,7 @@ async def list_builds(conn: AsyncConnection, project: str) -> list[BuildInfo]:
             tables.builds.c.source_hash,
             tables.builds.c.metrics,
             tables.builds.c.eval,
+            tables.builds.c.parent_build_id,
         )
         .where(tables.builds.c.project == project)
         # NULLS LAST: a never-started row sorts OLDEST — coalescing to now()
@@ -161,6 +165,7 @@ _BUILD_INFO_COLS = (
     tables.builds.c.source_hash,
     tables.builds.c.metrics,
     tables.builds.c.eval,
+    tables.builds.c.parent_build_id,
 )
 
 

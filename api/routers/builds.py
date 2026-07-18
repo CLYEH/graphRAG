@@ -45,15 +45,23 @@ from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
 from api.pagination import decode_id_cursor, decode_step_cursor, encode_cursor
 from api.registry_errors import translate_registry_error
-from api.routers._query import reject_unsupported_query, single_filter_value
-from api.schemas import build_dto, build_step_dto, build_step_item_dto, job_accepted_dto
-from api.workers.build_worker import EVAL_JOB_KIND, enqueue_eval
+from api.routers._query import reject_null_body, reject_unsupported_query, single_filter_value
+from api.schemas import (
+    RetryRequest,
+    build_dto,
+    build_step_dto,
+    build_step_item_dto,
+    job_accepted_dto,
+)
+from api.workers.build_worker import EVAL_JOB_KIND, RETRY_JOB_KIND, enqueue_build, enqueue_eval
+from core.builds.creation import create_build
 from core.builds.lifecycle import (
     BuildInfo,
     activate_in_caller_txn,
     get_build_info,
     list_builds_page,
 )
+from core.builds.retry import clone_raw_artifacts
 from core.config import get_settings
 from core.eval.idempotency import eval_inputs_fingerprint, policy_fingerprint_bytes
 from core.observability.reads import (
@@ -422,6 +430,91 @@ async def run_build_eval_endpoint(
             produce=produce,
             # the record keeps the ACCEPTED identity (see the block comment)
             rekey=lambda: accepted.get("hash"),
+        )
+        return JSONResponse(status_code=status, content=resp)
+    status, resp = await produce()
+    return JSONResponse(status_code=status, content=jsonable_encoder(resp))
+
+
+@router.post("/projects/{project}/builds/{build_id}/retry")
+async def retry_build_endpoint(
+    request: Request,
+    conn: Conn,
+    get_redis: Queue,
+    project: str,
+    build_id: uuid.UUID,
+    body: RetryRequest | None = None,  # shape-validates; reason rejects loudly
+    idempotency_key: _IdempotencyKey = None,
+) -> JSONResponse:
+    """Retry a terminal ``failed`` build's failed items as a NEW build (RB1-retry,
+    DR-013). Opens a child build recording ``parent_build_id``, clones the
+    parent's documents into it, and dispatches it as a build job (kind ``retry``)
+    — the worker resumes the ready-seeded child, so the §5 pipeline reruns and
+    converges. The parent's terminal record is never mutated (audit integrity —
+    lineage is the child's pointer). Only a terminal ``failed`` build is
+    retryable (any other status → 409 ``BUILD_NOT_RETRYABLE``); a full re-run is
+    ``POST /build``.
+
+    Mirrors the trigger/eval endpoints: one active job per project (409
+    ``JOB_CONFLICT``), enqueue IN-BAND before the request commits (the class-12
+    window), 202 + the job envelope, watchable via ``GET /jobs/{id}/events``.
+    The child build, its document clone, and the job insert share the request's
+    ONE transaction: a ``JOB_CONFLICT`` rolls back the child + clone atomically
+    (no orphan ``building`` build stranded without a job).
+
+    NOTE (RB1-retry-core): the child reruns EVERY stage and converges — the
+    per-item compute-skip that reruns ONLY the failed items (and reuses the
+    parent's graph layer without re-extraction) is the deferred RB1-retry-skip
+    slice. Cloning only documents (not chunks/graph) is deliberate: ``clean``
+    re-chunks fresh (cloned chunks would risk InconsistentChunksError on a
+    chunk-config change) and re-running graph over cloned entities would
+    drift/grow them (see core.builds.retry).
+    """
+    # optional body, non-nullable when present (#53 R5 class — the shared guard
+    # every sibling optional-body POST uses; a literal `null` body must 400, not
+    # bind to None and silently proceed, which would contradict the field-null
+    # rejection RetryRequest already does on `reason`)
+    await reject_null_body(request)
+
+    # The 404/409 gates run BEFORE produce so a bad/non-retryable build answers
+    # synchronously (and a §27 replay for a build that isn't retryable 409s
+    # rather than replaying). The parent's status is immutable once terminal, so
+    # re-checking on an idempotent replay stays consistent.
+    parent = await _require_build(conn, project, build_id)
+    if parent.status != "failed":
+        raise ApiError(
+            ErrorCode.BUILD_NOT_RETRYABLE,
+            f"build {build_id} is {parent.status!r}, not a terminal 'failed' build; "
+            "only a failed build can be retried",
+            details={"build_id": str(build_id), "status": parent.status},
+        )
+
+    async def produce() -> tuple[int, dict[str, Any]]:
+        # child + clone + job in this ONE txn: create_job_exclusive raising
+        # JobConflictError rolls the child + clone back with it (no orphan). Both
+        # create_build (project vanished under us) and create_job_exclusive map
+        # their registry errors through the same translator (symmetric 404/409).
+        try:
+            child_build_id = await create_build(conn, project, parent_build_id=build_id)
+            await clone_raw_artifacts(conn, project, build_id, child_build_id)
+            job = await create_job_exclusive(conn, project, RETRY_JOB_KIND, build_id=child_build_id)
+        except (ProjectNotFoundError, JobConflictError) as exc:
+            raise translate_registry_error(exc) from exc
+        # queue touched HERE only — a §27 replay or a 409 must be served even
+        # with Redis unreachable (the Queue dep is a lazy handle), same as
+        # _trigger. kind 'retry' rides the BUILD_TASK path via enqueue_build; the
+        # worker resumes child_build_id (already 'building', raw layer cloned).
+        await enqueue_build(await get_redis(), project, job.id)
+        return 202, success(job_accepted_dto(job), **response_meta(request))
+
+    if idempotency_key:
+        status, resp = await run_idempotent(
+            conn,
+            key=idempotency_key,
+            project=project,
+            endpoint="retryBuild",
+            req_hash=request_hash("POST", request.url.path, await request.body()),
+            produce=produce,
         )
         return JSONResponse(status_code=status, content=resp)
     status, resp = await produce()

@@ -322,4 +322,4 @@ graphRAG/
 
 ### 27.7 jobs 邊界
 - `pipeline_runs.build_id`：ingest 一律掛在 building 的 build（故 build_id 有值）；純來源驗證 job 可為 null。
-- **只重跑失敗項**：輸入＝前次 run 的 failed `item_ref` 集合；輸出邊界＝僅這些項重processed 併回同一 build_id；以 item_ref 去重確保冪等。
+- **只重跑失敗項（retry/lineage，DR-013 為準）**：輸入＝前次 run 的 failed `item_ref` 集合；以 item_ref 去重確保冪等。**輸出邊界＝開一個「新 build」承接，並記 `parent_build_id` 指回被重試的 build；父 build 的終態紀錄永不改寫（審計完整性——lineage 是子的指標，不是對父的編輯）**。子 build 重用父的成功產物、只重跑失敗項；完整重建走 `POST /projects/{p}/build`（非 retry）。僅終態 `failed` 的 build 可重試（否則 `409 BUILD_NOT_RETRYABLE`）。〔本節原記「併回同一 build_id」的就地模型已被 DR-013 打包契約回合(§26)取代為上述新-build 模型；契約凍結為準(DR-002)。落地切 RB1-retry-core(lineage+端點+documents clone;子 build 重跑 pipeline 收斂——ingest 以 content_hash 去重、clean 重切、graph 以下重導)與 RB1-retry-skip(逐項 compute-skip + graph-layer 重用,達成「只重跑失敗項」的省成本語意)。〕

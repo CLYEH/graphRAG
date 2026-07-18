@@ -80,6 +80,17 @@ EVAL_TASK = "run_eval_task"
 #: same string (api.routers.builds), so creator and reaper can't drift.
 EVAL_JOB_KIND = "eval"
 
+#: The ``jobs.kind`` a retry (RB1-retry, DR-013) stamps. It flows through the
+#: SAME ``BUILD_TASK`` path as build/ingest — the retry endpoint creates the
+#: child build (recording ``parent_build_id``) and clones the parent's raw
+#: layer IN-BAND, then attaches the child to the job (``build_id``) and enqueues
+#: with ``enqueue_build``, so the worker just RESUMES the ready-seeded child via
+#: ``run_build`` with no retry-specific dispatch. The reaper (below) treats every
+#: non-``eval`` kind as a build, so a crashed retry resumes correctly too. The
+#: distinct kind is for observability (Job.kind is a free §15 string), not
+#: control flow.
+RETRY_JOB_KIND = "retry"
+
 
 def _redis_settings() -> RedisSettings:
     return RedisSettings.from_dsn(get_settings().redis_url)
