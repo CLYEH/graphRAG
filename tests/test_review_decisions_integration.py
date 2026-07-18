@@ -508,7 +508,10 @@ async def test_decide_relation_keys_on_endpoint_ledger_keys(migrated: None) -> N
 
             ledger = (
                 await conn.execute(
-                    sa.select(review_ledger).where(review_ledger.c.target_kind == "relation")
+                    sa.select(review_ledger).where(
+                        review_ledger.c.project == project,
+                        review_ledger.c.target_kind == "relation",
+                    )
                 )
             ).one()
             expected = fingerprints.ledger_relation_signature(
