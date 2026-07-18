@@ -230,19 +230,29 @@ def build_server(project: str) -> FastMCP:
     @asynccontextmanager
     async def lifespan(_server: FastMCP) -> AsyncIterator[_Runtime]:
         settings = get_settings()
+        engine = create_async_engine(
+            settings.postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
+            poolclass=NullPool,
+        )
+        # policy BEFORE any store/model client (Codex #93 R5): when the
+        # registry policy is missing/invalid AND a client factory would also
+        # fail (e.g. no OPENAI_API_KEY), startup must surface the actionable
+        # typed PolicyError, not the masking client error. Only the engine
+        # exists at this point, so a load failure disposes exactly that.
+        try:
+            policy, exposure = await _load_runtime_config(engine, project)
+        except BaseException:
+            await engine.dispose()
+            raise
         context = ProjectContext(
             project=project,
-            engine=create_async_engine(
-                settings.postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
-                poolclass=NullPool,
-            ),
+            engine=engine,
             qdrant=vector_client(),
             neo4j=graph_driver(),
             embedder=embedding_model(),
             llm=chat_model(),
         )
         try:
-            policy, exposure = await _load_runtime_config(context.engine, project)
             yield _Runtime(context=context, policy=policy, exposure=exposure)
         finally:
             await context.aclose()

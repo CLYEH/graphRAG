@@ -87,6 +87,45 @@ async def test_registry_policy_failures_are_typed_and_loud(
         await load_runtime_config_from_registry(object(), "mixed")
 
 
+async def test_bad_policy_error_is_not_masked_by_client_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #93 R5: the lifespan must read the registry policy BEFORE wiring
+    any store/model client. When BOTH are broken (bad policy AND, say, no
+    OPENAI_API_KEY), the operator must see the actionable PolicyError — a
+    client factory that constructs first would mask it with its own error.
+    Revert-probe: move the policy load back below ProjectContext(...) and this
+    raises RuntimeError instead. The engine (the only client built pre-policy)
+    must still be disposed — a failing session start must not leak pools."""
+    from core.mcp import server as server_module
+
+    disposed: list[bool] = []
+
+    class _Engine:
+        async def dispose(self) -> None:
+            disposed.append(True)
+
+    def _would_mask(_: object = None) -> object:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    async def _bad_policy(engine: object, project: str) -> object:
+        raise PolicyError(f"project {project!r} has no query_policy block")
+
+    monkeypatch.setattr(server_module, "create_async_engine", lambda *a, **k: _Engine())
+    monkeypatch.setattr(server_module, "vector_client", _would_mask)
+    monkeypatch.setattr(server_module, "graph_driver", _would_mask)
+    monkeypatch.setattr(server_module, "embedding_model", _would_mask)
+    monkeypatch.setattr(server_module, "chat_model", _would_mask)
+    monkeypatch.setattr(server_module, "_load_runtime_config", _bad_policy)
+
+    server = build_server("demo")
+    assert server.settings.lifespan is not None
+    with pytest.raises(PolicyError, match="no query_policy block"):
+        async with server.settings.lifespan(server):
+            pass  # pragma: no cover — startup must fail before the yield
+    assert disposed == [True]  # the pre-policy engine was closed, not leaked
+
+
 def test_the_demo_policy_fixture_is_contract_valid() -> None:
     """The shared test fixture every MCP test seeds (DEMO_QUERY_POLICY —
     successor of the deleted projects/demo/config.yaml template) must itself
