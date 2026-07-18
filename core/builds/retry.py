@@ -58,39 +58,42 @@ async def clone_raw_artifacts(
 
     Does NOT commit — the caller (the retry endpoint) owns the transaction, so
     the child build row, this clone, and the job insert commit or roll back as
-    one. Returns the copied count. The child's ``clean`` stage re-chunks these
-    documents; ``ingest`` dedups them by ``content_hash`` on re-run.
+    one. Returns the copied count (0 = the parent failed at/before ingest, which
+    the endpoint refuses). The child's ``clean`` stage re-chunks these documents.
+
+    The copy is set-based (``INSERT ... SELECT gen_random_uuid(), …``): Postgres
+    duplicates the rows server-side with fresh ids, so ``POST /retry`` stays
+    memory-bounded no matter how large the corpus — the full ``raw`` payloads are
+    never streamed into API memory (Codex #100 P2).
     """
-    parent_docs = (
-        await conn.execute(
-            sa.select(
-                tables.documents.c.source_uri,
-                tables.documents.c.raw,
-                tables.documents.c.content_hash,
-                tables.documents.c.mime,
-                tables.documents.c.metadata,
-                tables.documents.c.status,
-                tables.documents.c.ingested_at,
-            ).where(tables.documents.c.build_id == parent_build_id)
+    src = tables.documents
+    copied = sa.select(
+        sa.func.gen_random_uuid(),
+        sa.literal(project, type_=src.c.project.type),
+        sa.literal(child_build_id, type_=src.c.build_id.type),
+        src.c.source_uri,
+        src.c.raw,
+        src.c.content_hash,
+        src.c.mime,
+        src.c.metadata,
+        src.c.status,
+        src.c.ingested_at,
+    ).where(src.c.build_id == parent_build_id)
+    result = await conn.execute(
+        src.insert().from_select(
+            [
+                "id",
+                "project",
+                "build_id",
+                "source_uri",
+                "raw",
+                "content_hash",
+                "mime",
+                "metadata",
+                "status",
+                "ingested_at",
+            ],
+            copied,
         )
-    ).all()
-
-    doc_rows: list[dict[str, object]] = [
-        {
-            "id": uuid.uuid4(),
-            "project": project,
-            "build_id": child_build_id,
-            "source_uri": doc.source_uri,
-            "raw": doc.raw,
-            "content_hash": doc.content_hash,
-            "mime": doc.mime,
-            "metadata": doc.metadata,
-            "status": doc.status,
-            "ingested_at": doc.ingested_at,
-        }
-        for doc in parent_docs
-    ]
-    if doc_rows:
-        await conn.execute(tables.documents.insert(), doc_rows)
-
-    return CloneCounts(documents=len(doc_rows))
+    )
+    return CloneCounts(documents=result.rowcount)
