@@ -414,6 +414,64 @@ describe("RunsTable", () => {
     expect(await screen.findByText(/document:r2/)).toBeInTheDocument();
   });
 
+  it("keeps loaded items and offers a retry when the next page fails (RB1)", async () => {
+    // a fetchNextPage() failure flips the query to isError but RETAINS the pages
+    // already loaded — the panel must keep showing them (the operator's failure
+    // details) and leave a retry control, not blank the diagnosis (Codex #102).
+    let itemsCall = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path.endsWith("/items")) {
+        itemsCall += 1;
+        return itemsCall === 1
+          ? Promise.resolve({
+              data: {
+                data: [{ id: "p1", item_kind: "document", item_ref: "keep-me", status: "failed" }],
+                meta: { ...META, next_cursor: "c2" },
+              },
+              error: undefined,
+            })
+          : // the SECOND page (load-more) fails
+            Promise.resolve({
+              data: undefined,
+              error: { error: { code: "STORE_UNAVAILABLE", message: "qdrant down" } },
+            });
+      }
+      if (path.endsWith("/steps"))
+        return Promise.resolve({
+          data: {
+            data: [
+              {
+                id: "s4444444-cccc-4ccc-8ccc-000000000004",
+                step_name: "graph",
+                status: "failed",
+                failed_count: 2,
+                skipped_count: 0,
+                input_count: 2,
+              },
+            ],
+            meta: META,
+          },
+          error: undefined,
+        });
+      return Promise.resolve({
+        data: { data: [build({ id: FAILED, status: "failed" })], meta: META },
+        error: undefined,
+      });
+    }) as never);
+    renderWithProviders(<RunsTable project="acme" />);
+
+    fireEvent.click((await screen.findAllByText(/版$/))[0]);
+    fireEvent.click(await screen.findByRole("button", { name: /graph/i }));
+    expect(await screen.findByText(/document:keep-me/)).toBeInTheDocument();
+    // the next page fails…
+    fireEvent.click(screen.getByRole("button", { name: /載入更多項目/ }));
+    expect(await screen.findByText(/載入下一頁失敗.*qdrant down/)).toBeInTheDocument();
+    // …but the already-loaded page-1 items are NOT discarded…
+    expect(screen.getByText(/document:keep-me/)).toBeInTheDocument();
+    // …and a retry control remains
+    expect(screen.getByRole("button", { name: /重試載入更多/ })).toBeInTheDocument();
+  });
+
   it("surfaces a step item's structured error when message is absent (RB1)", async () => {
     // the failure reason may ride the structured `error` object (frozen on
     // BuildStepItem), not the optional `message` — the diagnosis must not

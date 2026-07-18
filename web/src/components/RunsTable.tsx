@@ -307,7 +307,15 @@ function StepItems({
     failed: failedCount,
     skipped: skippedCount,
   };
-  const rows = items.isSuccess ? items.data.pages.flatMap((p) => p.rows) : [];
+  // Key on DATA presence, not `isSuccess`: a failed `fetchNextPage()` flips the
+  // query to `isError` but RETAINS the already-loaded pages — those must keep
+  // rendering, so an error on a LATER page never discards the earlier diagnosis
+  // (Codex #102). `!items.data` ⇒ nothing loaded yet (initial pending/error).
+  const loaded = items.data;
+  const rows = loaded ? loaded.pages.flatMap((p) => p.rows) : [];
+  // a next-page error (data present + error) is distinct from an initial-load
+  // error (no data) — the former keeps the list and offers a retry.
+  const nextPageError = loaded && items.isError;
   return (
     <div className="runs__item-panel">
       <div className="runs__item-tabs" role="group" aria-label="項目狀態篩選">
@@ -323,34 +331,46 @@ function StepItems({
           </button>
         ))}
       </div>
-      {items.isPending ? (
-        <p className="runs__muted">載入項目…</p>
-      ) : items.isError ? (
-        <p className="runs__muted runs__muted--error">無法讀取項目:{message(items.error)}</p>
+      {!loaded ? (
+        // nothing loaded yet: the initial fetch is pending or failed outright
+        items.isError ? (
+          <p className="runs__muted runs__muted--error">無法讀取項目:{message(items.error)}</p>
+        ) : (
+          <p className="runs__muted">載入項目…</p>
+        )
       ) : rows.length === 0 ? (
         <p className="runs__muted">此步驟沒有記錄的{ITEM_STATUS_LABEL[status]}項。</p>
       ) : (
+        <ul className="runs__items">
+          {rows.map((it) => {
+            // the reason may ride EITHER the optional message OR the structured
+            // `error` object (both frozen on BuildStepItem) — prefer the
+            // message, but fall back to the error rather than discarding the
+            // only "why" the operator has (Codex #102 R2).
+            const detail = it.message ?? (it.error ? JSON.stringify(it.error) : null);
+            return (
+              <li key={it.id} className="runs__item">
+                <span className={`runs__item-status runs__item-status--${it.status}`}>
+                  {it.status}
+                </span>{" "}
+                <span className="runs__item-ref" title={it.item_ref}>
+                  {it.item_kind}:{it.item_ref}
+                </span>
+                {detail ? <span className="runs__item-msg"> — {detail}</span> : null}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {/* load-more area, only once pages exist. A failed next-page keeps the
+          loaded rows above, shows the error inline, and leaves a retry control
+          (hasNextPage stays true — the failed fetch added no page) so the
+          operator can re-pull the same page (Codex #102). */}
+      {loaded && rows.length > 0 && (
         <>
-          <ul className="runs__items">
-            {rows.map((it) => {
-              // the reason may ride EITHER the optional message OR the structured
-              // `error` object (both frozen on BuildStepItem) — prefer the
-              // message, but fall back to the error rather than discarding the
-              // only "why" the operator has (Codex #102 R2).
-              const detail = it.message ?? (it.error ? JSON.stringify(it.error) : null);
-              return (
-                <li key={it.id} className="runs__item">
-                  <span className={`runs__item-status runs__item-status--${it.status}`}>
-                    {it.status}
-                  </span>{" "}
-                  <span className="runs__item-ref" title={it.item_ref}>
-                    {it.item_kind}:{it.item_ref}
-                  </span>
-                  {detail ? <span className="runs__item-msg"> — {detail}</span> : null}
-                </li>
-              );
-            })}
-          </ul>
+          {nextPageError && (
+            <p className="runs__muted runs__muted--error">載入下一頁失敗:{message(items.error)}</p>
+          )}
           {items.hasNextPage && (
             <button
               type="button"
@@ -358,7 +378,11 @@ function StepItems({
               disabled={items.isFetchingNextPage}
               onClick={() => items.fetchNextPage()}
             >
-              {items.isFetchingNextPage ? "載入中…" : "載入更多項目"}
+              {items.isFetchingNextPage
+                ? "載入中…"
+                : nextPageError
+                  ? "重試載入更多"
+                  : "載入更多項目"}
             </button>
           )}
         </>
