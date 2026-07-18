@@ -204,18 +204,20 @@ function FailureRecovery({ project, buildId }: { project: string; buildId: strin
         </ul>
       )}
 
-      {/* Hard failure honesty: a stage that CRASHED (store outage / bug) breaks
-          the orchestrator BEFORE it records that stage, so its cause lives only
-          in pipeline_runs.error — the /steps drill-down shows no failing step.
-          Say so and point at the job, rather than implying nothing failed
-          (surfacing the run-level error is a backend follow-up; Codex #102 R3). */}
-      {steps.isSuccess &&
-        !steps.data.some((s) => s.status === "failed" || (s.failed_count ?? 0) > 0) && (
-          <p className="runs__muted">
-            下鑽未見失敗步驟——此建置可能在某階段崩潰(儲存中斷或程式錯誤),原因記於 pipeline run
-            層級(尚未由下鑽曝露);可於下方「追蹤工作」以該次建置的 job id 查看錯誤。
-          </p>
-        )}
+      {/* The drill-down shows per-item outcomes only. The AUTHORITATIVE cause is
+          at the run level (pipeline_runs.error) and NOT exposed here — and it can
+          hide behind item failures: an earlier stage can tolerate failed items
+          (recorded as a 'failed' step) and a LATER stage still crash (recorded on
+          the run, never as a step). So this pointer is UNCONDITIONAL — never
+          gated on "no failed step", which would suppress the real later crash
+          behind the earlier item failure (Codex #102 R3/R4). Surfacing the run
+          error itself is a backend follow-up. */}
+      {steps.isSuccess && (
+        <p className="runs__muted">
+          下鑽為各步驟的逐項結果;此建置的確切失敗原因(項目失敗超過門檻,或某階段崩潰)記於 pipeline
+          run 層級——可於下方「追蹤工作」以該次建置的 job id 查看。
+        </p>
+      )}
 
       <div className="runs__retry">
         <button

@@ -105,8 +105,9 @@ describe("RunsTable", () => {
     fireEvent.click(screen.getByRole("button", { name: /graph/i }));
     expect(await screen.findByText(/document:hash-bad/)).toBeInTheDocument();
     expect(screen.getByText(/LLM schema invalid/)).toBeInTheDocument();
-    // a step DID fail, so the hard-failure ("no failing step") note must NOT show
-    expect(screen.queryByText(/下鑽未見失敗步驟/)).not.toBeInTheDocument();
+    // the run-level pointer is UNCONDITIONAL — it must show even when a step DID
+    // fail, so a LATER crash can't hide behind an earlier item failure (R4)
+    expect(screen.getByText(/確切失敗原因/)).toBeInTheDocument();
   });
 
   it("retries a failed build via POST /retry with an Idempotency-Key and surfaces the job (RB1)", async () => {
@@ -366,8 +367,10 @@ describe("RunsTable", () => {
 
   it("guides the operator when a hard failure left no failing step in the drill-down (RB1)", async () => {
     // a stage CRASH records only pipeline_runs.error and never a failed step, so
-    // the drill-down shows only successful steps — the UI must say the cause is
-    // at run level, not imply nothing failed (Codex #102 R3).
+    // the drill-down shows only successful steps — the UI must still point at the
+    // run level, not imply nothing failed. The pointer is UNCONDITIONAL: this
+    // no-failed-step case and the failed-step case above both show it, so a later
+    // crash can never hide behind an earlier item failure (Codex #102 R3/R4).
     stubDrilldown({
       steps: [
         {
@@ -383,8 +386,6 @@ describe("RunsTable", () => {
     renderWithProviders(<RunsTable project="acme" />);
 
     fireEvent.click((await screen.findAllByText(/版$/))[0]);
-    expect(await screen.findByText(/下鑽未見失敗步驟/)).toBeInTheDocument();
-    // and NOT shown when a step DID fail (the common per-item case) — the
-    // drill-down test above renders a failed step and asserts no such note.
+    expect(await screen.findByText(/確切失敗原因/)).toBeInTheDocument();
   });
 });

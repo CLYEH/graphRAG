@@ -219,12 +219,6 @@
   .runs__muted--error {
     color: #f87171;
   }
-  .runs__item-status--failed {
-    color: #f87171;
-  }
-  .runs__muted--ok {
-    color: #4ade80;
-  }
 }
 
 /* ---- RB1-fe: failure diagnosis + retry (inside a failed run's detail) ---- */
@@ -341,4 +335,16 @@
   color: #1e7e34;
   font-style: italic;
   margin-top: 6px;
+}
+
+/* Dark-mode overrides for the RB1-fe base rules ABOVE — must come AFTER them so
+   that at equal specificity the dark selector wins the cascade (the earlier
+   badge @media block can't, since these bases are declared later; Codex #102). */
+@media (prefers-color-scheme: dark) {
+  .runs__item-status--failed {
+    color: #f87171;
+  }
+  .runs__muted--ok {
+    color: #4ade80;
+  }
 }
