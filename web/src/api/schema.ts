@@ -1056,11 +1056,12 @@ export interface paths {
      * @description What an external agent platform needs to connect to this project's MCP
      *     server through the DR-012 gateway (`graphrag serve-mcp`): the
      *     streamable-HTTP URL (`http://<host>:<port>/mcp/<project>`), derived
-     *     from the server's GRAPHRAG_MCP_HTTP_HOST/PORT settings. `url` is null
-     *     exactly when the project name is not path-addressable (contains `/`,
-     *     or is `.`/`..` — the Console's isPathAddressable rule); such projects
-     *     are Console-only until renamed. Auth is `none` until §23 lands
-     *     (additive enum evolution).
+     *     from the server's GRAPHRAG_MCP_HTTP_HOST/PORT settings. Reachable only
+     *     for path-addressable projects (this route is path-keyed on `{project}`
+     *     exactly like the gateway), so a returned `url` is always non-null; a
+     *     non-path-addressable name is Console-only and the Console derives that
+     *     client-side from the name. Auth is `none` until §23 lands (additive
+     *     enum evolution).
      */
     get: operations["getMcpInfo"];
     put?: never;
@@ -1240,7 +1241,11 @@ export interface components {
     /**
      * @description v1.3 (RB1). Retry semantics are fixed (failed items only — a full
      *     re-run is `POST /projects/{project}/build`); the body carries only the
-     *     operator note.
+     *     operator note. Closed (additionalProperties:false): a control the fixed
+     *     semantics do not honor (e.g. `{"mode":"all"}`) is a validation error at
+     *     the contract boundary, never a silently-ignored request — the runtime
+     *     never has to choose between accepting-and-ignoring or rejecting a
+     *     contract-valid body.
      */
     RetryRequest: {
       /** @description Free-form operator note recorded on the retry build. */
@@ -1870,19 +1875,24 @@ export interface components {
       [key: string]: unknown;
     };
     /**
-     * @description The project's MCP connection surface through the DR-012 gateway
-     *     (v1.3). `url` is null exactly when the project name is not
-     *     path-addressable; `auth: none` is the §23 placeholder (additive enum
-     *     evolution when auth lands).
+     * @description The project's MCP connection surface through the DR-012 gateway (v1.3).
+     *     `url` is the streamable-HTTP endpoint, always present: this route is
+     *     itself path-keyed on `{project}`, so it is only reachable for
+     *     path-addressable projects — exactly the ones for which a gateway URL
+     *     exists. A non-path-addressable name (contains `/`, or is `.`/`..`)
+     *     cannot reach ANY of its `/projects/{project}/…` endpoints, so there is
+     *     no reachable case where `url` would be null; the Console flags such
+     *     projects as Console-only client-side from the name (the same
+     *     isPathAddressable rule), needing no server field. `auth: none` is the
+     *     §23 placeholder (additive enum evolution when auth lands).
      */
     McpInfo: {
       /** @constant */
       transport: "streamable-http";
       /** @enum {string} */
       auth: "none";
-      path_addressable: boolean;
       /** Format: uri */
-      url: string | null;
+      url: string;
     };
     ProjectResponse: {
       data: components["schemas"]["Project"];

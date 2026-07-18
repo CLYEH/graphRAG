@@ -910,6 +910,10 @@ def test_v13_retry_contract(spec: dict[str, Any]) -> None:
     accepted = retry["responses"]["202"]["content"]["application/json"]["schema"]
     assert accepted["$ref"].endswith("JobAcceptedResponse")
     assert set(defs["RetryRequest"]["properties"]) == {"reason"}  # no mode fork
+    # closed body: a `{"mode":"all"}` the fixed semantics can't honor is a
+    # validation error, not a silently-ignored control (the SourceUpdate
+    # precedent — a prose "fixed semantics" promise made structural)
+    assert defs["RetryRequest"].get("additionalProperties") is False
     parent = defs["Build"]["properties"]["parent_build_id"]
     assert parent["type"] == ["string", "null"]
     assert "parent_build_id" not in defs["Build"]["required"]  # additive
@@ -941,10 +945,17 @@ def test_v13_search_and_totals_are_additive(spec: dict[str, Any]) -> None:
 def test_v13_mcp_info_contract(spec: dict[str, Any]) -> None:
     """DR-013 rider (DR-012's deferred Console surface): the MCP info payload
     is fully closed — transport is const (one gateway shape), auth is the §23
-    placeholder enum (additive evolution), and `url` is REQUIRED-but-nullable
-    so "not path-addressable" is an explicit null, never an absent field."""
+    placeholder enum (additive evolution), and `url` is REQUIRED and non-null.
+    The endpoint is path-keyed on `{project}`, so it is only reachable for
+    path-addressable projects — the exact set for which a gateway url exists —
+    so a null-url / not-addressable branch would be unreachable by
+    construction and is deliberately NOT in the payload (Codex #94 R2: don't
+    advertise a state the endpoint's own shape can never return)."""
     info = spec["components"]["schemas"]["McpInfo"]
-    assert set(info["required"]) == {"transport", "auth", "path_addressable", "url"}
+    assert set(info["required"]) == {"transport", "auth", "url"}
     assert info["properties"]["transport"]["const"] == "streamable-http"
     assert info["properties"]["auth"]["enum"] == ["none"]
-    assert info["properties"]["url"]["type"] == ["string", "null"]
+    assert (
+        info["properties"]["url"]["type"] == "string"
+    )  # non-null: always reachable ⇒ always a url
+    assert "path_addressable" not in info["properties"]  # the unreachable branch is gone
