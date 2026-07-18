@@ -24,6 +24,7 @@ from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from core.builds.creation import mark_build_failed
 from core.builds.retry import clone_raw_artifacts
 from core.config import get_settings
 from core.stores import tables
@@ -128,6 +129,48 @@ async def _seed_entity(conn: AsyncConnection, project: str, build_id: uuid.UUID,
             created_by="llm",
         )
     )
+
+
+async def test_mark_build_failed_only_terminalizes_a_building_build(project: str) -> None:
+    # Codex #100 P1 R5 helper: the worker calls this to reclaim a pre-created
+    # retry child stranded 'building' on a preflight failure. It must flip a
+    # 'building' build to 'failed' but NEVER clobber an already-terminal build
+    # (the status='building' guard — a stale-lease race must not overwrite a
+    # 'ready'/'active' result).
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            await ensure_project(conn, project)
+            building = await _make_build(conn, project)  # status='building'
+            ready = cast(
+                "uuid.UUID",
+                (
+                    await conn.execute(
+                        tables.builds.insert()
+                        .values(project=project, status="ready")
+                        .returning(tables.builds.c.id)
+                    )
+                ).scalar_one(),
+            )
+            await conn.commit()
+
+            await mark_build_failed(conn, building)
+            await mark_build_failed(conn, ready)  # guarded: a no-op on a terminal build
+            await conn.commit()
+
+            status_by_id = {
+                r.id: r.status
+                for r in (
+                    await conn.execute(
+                        tables.builds.select().where(tables.builds.c.project == project)
+                    )
+                ).all()
+            }
+            assert status_by_id[building] == "failed"
+            assert status_by_id[ready] == "ready"  # untouched
+            await conn.rollback()
+    finally:
+        await engine.dispose()
 
 
 async def test_clone_copies_documents_with_fresh_ids_and_leaves_parent_untouched(

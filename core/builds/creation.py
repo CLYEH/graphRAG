@@ -72,3 +72,20 @@ async def create_build(
             raise ProjectNotFoundError(project) from exc
         raise
     return build_id
+
+
+async def mark_build_failed(conn: AsyncConnection, build_id: uuid.UUID) -> None:
+    """Terminalize a still-``building`` build as ``failed`` (idempotent — a no-op
+    if it is already terminal, guarded on ``status='building'``). Does NOT commit.
+
+    Used when a build that was created BEFORE its worker ran cannot proceed — an
+    RB1-retry child is pre-created ``building`` by the retry endpoint, so if the
+    worker's config preflight fails, failing only the job would strand the child
+    ``building`` forever (prune skips non-terminal builds and the RESTRICT FK then
+    blocks deleting the project). ``finished_at`` is the DB clock (single-source).
+    """
+    await conn.execute(
+        tables.builds.update()
+        .where(tables.builds.c.id == build_id, tables.builds.c.status == "building")
+        .values(status="failed", finished_at=sa.func.now())
+    )

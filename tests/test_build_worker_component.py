@@ -210,9 +210,17 @@ async def test_run_build_task_marks_job_failed_on_missing_project(
         marked["job"] = job_id
         marked["fields"] = fields
 
+    async def _lock_normal(conn: Any, job_id: uuid.UUID) -> Any:
+        return SimpleNamespace(build_id=None)  # a normal build has no build yet
+
+    async def _mark_failed(conn: Any, build_id: uuid.UUID) -> None:
+        marked["child_failed"] = build_id
+
     monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "get_project", _get_project)
     monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_normal)
+    monkeypatch.setattr(bw, "mark_build_failed", _mark_failed)
 
     jid = uuid.uuid4()
     result = await bw.run_build_task(
@@ -223,6 +231,7 @@ async def test_run_build_task_marks_job_failed_on_missing_project(
     assert marked["job"] == jid
     assert marked["fields"]["status"] == "failed"
     assert "does not exist" in marked["fields"]["error"]["message"]
+    assert "child_failed" not in marked  # a normal build has no attached build to fail
 
 
 async def test_run_build_task_marks_job_failed_on_malformed_config(
@@ -243,17 +252,70 @@ async def test_run_build_task_marks_job_failed_on_malformed_config(
     async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
         marked["fields"] = fields
 
+    async def _lock_normal(conn: Any, job_id: uuid.UUID) -> Any:
+        return SimpleNamespace(build_id=None)
+
+    async def _mark_failed(conn: Any, build_id: uuid.UUID) -> None:
+        marked["child_failed"] = build_id
+
     monkeypatch.setattr(bw, "job_lease", _fake_lease())
     monkeypatch.setattr(bw, "get_project", _get_project)
     monkeypatch.setattr(bw, "capture_config_snapshot", _capture_passthrough)
     monkeypatch.setattr(bw, "load_build_config", _load_config)
     monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "lock_job", _lock_normal)
+    monkeypatch.setattr(bw, "mark_build_failed", _mark_failed)
 
     result = await bw.run_build_task(_ctx(), "proj", str(uuid.uuid4()))
 
     assert result == "failed"
     assert marked["fields"]["status"] == "failed"
     assert "resolution must be a mapping" in marked["fields"]["error"]["message"]
+    assert "child_failed" not in marked
+
+
+async def test_run_build_task_fails_the_retry_child_on_preflight_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # RB1-retry (Codex #100 P1 R5): a retry child is pre-created 'building' by the
+    # endpoint and ATTACHED to the job (build_id set). If the worker's config
+    # preflight fails, failing only the job would strand the child 'building'
+    # forever (prune skips it, the RESTRICT FK blocks the project). So the child
+    # must be terminalized too. Discriminating: without _fail_preflight failing
+    # the attached build, "child_failed" is never recorded.
+    from core.builds.config import BuildConfigError
+
+    child = uuid.uuid4()
+    marked: dict[str, Any] = {}
+
+    async def _get_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(config={"resolution": "not-a-block"})
+
+    def _load_config(raw: Any) -> Any:
+        raise BuildConfigError("resolution must be a mapping")
+
+    async def _lock_retry(conn: Any, job_id: uuid.UUID) -> Any:
+        return SimpleNamespace(build_id=child)  # the pre-created retry child
+
+    async def _set_progress(conn: Any, job_id: uuid.UUID, **fields: Any) -> None:
+        marked["job_status"] = fields["status"]
+
+    async def _mark_failed(conn: Any, build_id: uuid.UUID) -> None:
+        marked["child_failed"] = build_id
+
+    monkeypatch.setattr(bw, "job_lease", _fake_lease())
+    monkeypatch.setattr(bw, "get_project", _get_project)
+    monkeypatch.setattr(bw, "capture_config_snapshot", _capture_passthrough)
+    monkeypatch.setattr(bw, "load_build_config", _load_config)
+    monkeypatch.setattr(bw, "lock_job", _lock_retry)
+    monkeypatch.setattr(bw, "set_progress", _set_progress)
+    monkeypatch.setattr(bw, "mark_build_failed", _mark_failed)
+
+    result = await bw.run_build_task(_ctx(), "proj", str(uuid.uuid4()))
+
+    assert result == "failed"
+    assert marked["job_status"] == "failed"  # the job is terminalized...
+    assert marked["child_failed"] == child  # ...AND so is the pre-created child
 
 
 async def test_run_build_task_noops_when_build_already_terminalized(
