@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 
 import { useBuildSteps, useBuilds, useRetryBuild, useStepItems } from "../api/queries";
 
-import type { Build } from "../api/queries";
+import type { Build, ItemDiagnosisStatus } from "../api/queries";
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
@@ -198,7 +198,15 @@ function FailureRecovery({ project, buildId }: { project: string; buildId: strin
                   {s.input_count ?? "—"}
                 </span>
               </button>
-              {openStep === s.id && <StepItems project={project} buildId={buildId} stepId={s.id} />}
+              {openStep === s.id && (
+                <StepItems
+                  project={project}
+                  buildId={buildId}
+                  stepId={s.id}
+                  failedCount={s.failed_count}
+                  skippedCount={s.skipped_count}
+                />
+              )}
             </li>
           ))}
         </ul>
@@ -250,57 +258,98 @@ function FailureRecovery({ project, buildId }: { project: string; buildId: strin
   );
 }
 
-// One step's recorded item outcomes (default verbosity = failed/skipped only).
-// item_ref is the stable §27.7 retry key that "retry failed only" re-enters.
+// The diagnosis outcomes this drill-down offers, with the operator words for
+// each. Keyed on ItemDiagnosisStatus so adding an outcome is a type error, not a
+// silently-missing tab (the UXA3 translation-layer discipline).
+const ITEM_STATUS_LABEL: Record<ItemDiagnosisStatus, string> = {
+  failed: "失敗",
+  skipped: "跳過",
+};
+
+// One step's recorded item outcomes. The list is ALWAYS status-filtered (see
+// useStepItems): under `sampled`/`all` verbosity the recorder also persists
+// successes, ordered by id, so an unfiltered page could bury the failures this
+// view exists to show. A 失敗/跳過 selector switches which diagnosis status is
+// fetched — the "separate strategy for skipped items" (Codex #102). item_ref is
+// the stable §27.7 retry key that "retry failed only" re-enters.
 function StepItems({
   project,
   buildId,
   stepId,
+  failedCount,
+  skippedCount,
 }: {
   project: string;
   buildId: string;
   stepId: string;
+  failedCount: number | null | undefined;
+  skippedCount: number | null | undefined;
 }) {
-  const items = useStepItems(project, buildId, stepId);
-  if (items.isPending) return <p className="runs__muted">載入項目…</p>;
-  if (items.isError)
-    return <p className="runs__muted runs__muted--error">無法讀取項目:{message(items.error)}</p>;
-  // paginated: render the loaded page(s) + a "load more", not the whole chain —
-  // a step's items can be corpus-sized (Codex #102)
-  const rows = items.data.pages.flatMap((p) => p.rows);
-  if (rows.length === 0) return <p className="runs__muted">此步驟沒有記錄的失敗/跳過項。</p>;
+  // default to 失敗 — the actionable "why it failed" this view is opened for
+  const [status, setStatus] = useState<ItemDiagnosisStatus>("failed");
+  const items = useStepItems(project, buildId, stepId, status);
+  // nullish = unmeasured (never ran), which the contract distinguishes from a
+  // real 0 — render "—" on the tab so it can't read as a measured empty (Codex #102)
+  const count: Record<ItemDiagnosisStatus, number | null | undefined> = {
+    failed: failedCount,
+    skipped: skippedCount,
+  };
+  const rows = items.isSuccess ? items.data.pages.flatMap((p) => p.rows) : [];
   return (
-    <>
-      <ul className="runs__items">
-        {rows.map((it) => {
-          // the failure reason may ride EITHER the optional message OR the
-          // structured `error` object (both frozen on BuildStepItem) — prefer
-          // the message, but fall back to the error rather than discarding the
-          // only "why it failed" the operator has (Codex #102 R2).
-          const detail = it.message ?? (it.error ? JSON.stringify(it.error) : null);
-          return (
-            <li key={it.id} className="runs__item">
-              <span className={`runs__item-status runs__item-status--${it.status}`}>
-                {it.status}
-              </span>{" "}
-              <span className="runs__item-ref" title={it.item_ref}>
-                {it.item_kind}:{it.item_ref}
-              </span>
-              {detail ? <span className="runs__item-msg"> — {detail}</span> : null}
-            </li>
-          );
-        })}
-      </ul>
-      {items.hasNextPage && (
-        <button
-          type="button"
-          className="runs__more"
-          disabled={items.isFetchingNextPage}
-          onClick={() => items.fetchNextPage()}
-        >
-          {items.isFetchingNextPage ? "載入中…" : "載入更多項目"}
-        </button>
+    <div className="runs__item-panel">
+      <div className="runs__item-tabs" role="group" aria-label="項目狀態篩選">
+        {(["failed", "skipped"] as ItemDiagnosisStatus[]).map((s) => (
+          <button
+            key={s}
+            type="button"
+            className={`runs__item-tab${status === s ? " runs__item-tab--on" : ""}`}
+            aria-pressed={status === s}
+            onClick={() => setStatus(s)}
+          >
+            {ITEM_STATUS_LABEL[s]} {count[s] ?? "—"}
+          </button>
+        ))}
+      </div>
+      {items.isPending ? (
+        <p className="runs__muted">載入項目…</p>
+      ) : items.isError ? (
+        <p className="runs__muted runs__muted--error">無法讀取項目:{message(items.error)}</p>
+      ) : rows.length === 0 ? (
+        <p className="runs__muted">此步驟沒有記錄的{ITEM_STATUS_LABEL[status]}項。</p>
+      ) : (
+        <>
+          <ul className="runs__items">
+            {rows.map((it) => {
+              // the reason may ride EITHER the optional message OR the structured
+              // `error` object (both frozen on BuildStepItem) — prefer the
+              // message, but fall back to the error rather than discarding the
+              // only "why" the operator has (Codex #102 R2).
+              const detail = it.message ?? (it.error ? JSON.stringify(it.error) : null);
+              return (
+                <li key={it.id} className="runs__item">
+                  <span className={`runs__item-status runs__item-status--${it.status}`}>
+                    {it.status}
+                  </span>{" "}
+                  <span className="runs__item-ref" title={it.item_ref}>
+                    {it.item_kind}:{it.item_ref}
+                  </span>
+                  {detail ? <span className="runs__item-msg"> — {detail}</span> : null}
+                </li>
+              );
+            })}
+          </ul>
+          {items.hasNextPage && (
+            <button
+              type="button"
+              className="runs__more"
+              disabled={items.isFetchingNextPage}
+              onClick={() => items.fetchNextPage()}
+            >
+              {items.isFetchingNextPage ? "載入中…" : "載入更多項目"}
+            </button>
+          )}
+        </>
       )}
-    </>
+    </div>
   );
 }

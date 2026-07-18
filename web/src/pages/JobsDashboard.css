@@ -266,8 +266,36 @@
   font-size: 12px;
 }
 
-.runs__items {
+/* the panel wraps the 失敗/跳過 selector + the filtered list; it carries the
+   left indent so the tabs align with the items below them */
+.runs__item-panel {
   margin: 2px 0 8px 12px;
+}
+
+.runs__item-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.runs__item-tab {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.runs__item-tab--on {
+  color: var(--text-h);
+  background: var(--social-bg);
+  border-color: var(--text-h);
+}
+
+.runs__items {
+  margin: 2px 0 8px;
 }
 
 .runs__item {
@@ -316,7 +344,7 @@
 }
 
 .runs__more {
-  margin: 4px 0 8px 12px;
+  margin: 4px 0 8px;
   padding: 4px 12px;
   border: 1px solid var(--border);
   border-radius: 4px;

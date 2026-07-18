@@ -110,6 +110,64 @@ describe("RunsTable", () => {
     expect(screen.getByText(/確切失敗原因/)).toBeInTheDocument();
   });
 
+  it("filters the drill-down to one diagnosis status and switches to skipped on demand (RB1)", async () => {
+    // Under `sampled`/`all` verbosity the recorder ALSO persists successes,
+    // ordered by id, so an UNFILTERED page could be all successes and bury the
+    // failures this view exists to show. The drill-down must always send
+    // `filter[status]` (default failed) and offer a SEPARATE fetch for skipped
+    // items (Codex #102). The stub keys on that filter — a missing/wrong filter
+    // renders NOTHING, so this is a real mutation probe, not a path-only stub.
+    vi.spyOn(api, "GET").mockImplementation(((
+      path: string,
+      opts?: { params?: { query?: { filter?: { status?: string } } } },
+    ) => {
+      if (path.endsWith("/items")) {
+        const s = opts?.params?.query?.filter?.status;
+        const items =
+          s === "failed"
+            ? [{ id: "if1", item_kind: "document", item_ref: "hash-fail", status: "failed" }]
+            : s === "skipped"
+              ? [{ id: "is1", item_kind: "document", item_ref: "hash-skip", status: "skipped" }]
+              : []; // no/unknown filter would let successes leak — here, nothing shows
+        return Promise.resolve({ data: { data: items, meta: META }, error: undefined });
+      }
+      if (path.endsWith("/steps"))
+        return Promise.resolve({
+          data: {
+            data: [
+              {
+                id: "s2222222-cccc-4ccc-8ccc-000000000002",
+                step_name: "graph",
+                status: "failed",
+                failed_count: 3,
+                skipped_count: 2,
+                input_count: 20,
+              },
+            ],
+            meta: META,
+          },
+          error: undefined,
+        });
+      return Promise.resolve({
+        data: { data: [build({ id: FAILED, status: "failed" })], meta: META },
+        error: undefined,
+      });
+    }) as never);
+    renderWithProviders(<RunsTable project="acme" />);
+
+    fireEvent.click((await screen.findAllByText(/版$/))[0]);
+    fireEvent.click(await screen.findByRole("button", { name: /graph/i }));
+    // default tab = 失敗: the failed item shows; the skipped one is NOT fetched
+    expect(await screen.findByText(/document:hash-fail/)).toBeInTheDocument();
+    expect(screen.queryByText(/document:hash-skip/)).not.toBeInTheDocument();
+    // the selector labels carry the step's nullable counts (失敗 3 / 跳過 2) —
+    // exact names so they don't also match the step-meta line's "跳過 2"
+    fireEvent.click(screen.getByRole("button", { name: "跳過 2" }));
+    // switching re-queries with filter[status]=skipped — the separate strategy
+    expect(await screen.findByText(/document:hash-skip/)).toBeInTheDocument();
+    expect(screen.queryByText(/document:hash-fail/)).not.toBeInTheDocument();
+  });
+
   it("retries a failed build via POST /retry with an Idempotency-Key and surfaces the job (RB1)", async () => {
     stubDrilldown({ steps: [] });
     const post = vi.spyOn(api, "POST").mockResolvedValue({

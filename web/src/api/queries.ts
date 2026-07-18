@@ -112,15 +112,30 @@ export function useBuildSteps(project: string, buildId: string | undefined) {
 
 const STEP_ITEMS_PAGE = 100;
 
-// RB1 §27.7 drill-down: one step's recorded item outcomes (default verbosity =
-// failed/skipped only), read when a step is expanded (stepId set). item_ref is
-// the stable retry key that "retry failed only" re-enters. PAGINATED (not a
-// cursor-exhausting loop): a step's items can be corpus-sized (thousands, or
-// millions under `sampled`/`all` verbosity), so the caller renders a page +
-// "load more" rather than downloading and retaining the whole chain (Codex #102).
-export function useStepItems(project: string, buildId: string, stepId: string | undefined) {
+// The two "did not succeed" outcomes this failure-diagnosis drill-down surfaces.
+// The drill-down is ALWAYS filtered to one of these: default verbosity records
+// only failed/skipped, but `sampled`/`all` verbosity ALSO persists successes
+// (status ∉ {failed,skipped}) and rows come back ordered by id, so an UNFILTERED
+// page could be all successes and bury the very failures this view exists to
+// show. A single `filter[status]` per query keeps diagnosis practical at every
+// verbosity; skipped items are reached by re-querying with "skipped" — the
+// caller's 失敗/跳過 selector (Codex #102).
+export type ItemDiagnosisStatus = "failed" | "skipped";
+
+// RB1 §27.7 drill-down: one step's recorded item outcomes for ONE diagnosis
+// status, read when a step is expanded (stepId set). item_ref is the stable
+// retry key that "retry failed only" re-enters. PAGINATED (not a cursor-
+// exhausting loop): a step's items can be corpus-sized (thousands, or millions
+// under `sampled`/`all` verbosity), so the caller renders a page + "load more"
+// rather than downloading and retaining the whole chain (Codex #102).
+export function useStepItems(
+  project: string,
+  buildId: string,
+  stepId: string | undefined,
+  status: ItemDiagnosisStatus,
+) {
   return useInfiniteQuery({
-    queryKey: ["stepItems", project, buildId, stepId],
+    queryKey: ["stepItems", project, buildId, stepId, status],
     enabled: isPathAddressable(project) && stepId !== undefined,
     initialPageParam: undefined as string | undefined,
     queryFn: async ({ pageParam }) => {
@@ -129,7 +144,9 @@ export function useStepItems(project: string, buildId: string, stepId: string | 
         {
           params: {
             path: { project, build_id: buildId, step_id: stepId as string },
-            query: { limit: STEP_ITEMS_PAGE, cursor: pageParam },
+            // filter[status]=<status> (deepObject) — the endpoint's one allowed
+            // facet; never send an unadopted sort/filter (400 loud, SS1a).
+            query: { limit: STEP_ITEMS_PAGE, cursor: pageParam, filter: { status } },
           },
         },
       );
