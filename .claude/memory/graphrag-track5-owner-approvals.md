@@ -13,11 +13,12 @@ SS1a 已落地(PR #92)。第 2 組 DR-002 打包契約回合=**CTR1 已 merge**(
 DESIGN §26 DR-013,openapi v1.2→1.3):SRC2/GOV2/GOV3/SS1b/RB1 端點 + MCP 資訊
 端點(`GET /projects/{p}/mcp`)一回合議定完畢,contract + test + codegen only。
 **各任務 runtime 落地**:SRC2(#95)、SS1b-api(#96)、GOV3-api(#97 ontology
-proposal accept/reject)、GOV2-api(#98 entity/relation approve-reject)皆已
-merge。SS1b/GOV3/GOV2 皆切 api/fe(治理中心 UI + low-confidence/missing-
-evidence 清單 + publish gate 與 GOV3-fe 同落地)。尚餘 RB1、SS1b-fe、GOV3-fe、
-GOV2-fe(契約已凍不再動);Console MCP URL/健康顯示 = SS1b-fe 或 GOV2-fe 落地
-時接 `GET /mcp` 端點。
+proposal accept/reject)、GOV2-api(#98 entity/relation approve-reject)、
+RB1-api(#99 build step/item drill-down)皆已 merge。SS1b/GOV3/GOV2/RB1 皆切
+api/fe;RB1 另切 RB1-retry(retry 編排)。尚餘 RB1-retry、SS1b-fe、GOV3-fe、
+GOV2-fe、RB1-fe(契約已凍不再動;治理中心 UI + low-confidence/missing-evidence
+清單 + publish gate 隨 GOV*-fe);Console MCP URL/健康顯示 = SS1b-fe 或 GOV2-fe
+落地時接 `GET /mcp` 端點。
 
 1. **CFG1 方向確認**:推翻 2026-07-10 雙源決策 — query-policy 統一單一 SoR
    (採建議:Postgres `projects.config`,MCP 啟動時讀 DB,`config.yaml` 退場)
