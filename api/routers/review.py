@@ -38,7 +38,13 @@ from api.idempotency import request_hash, run_idempotent
 from api.pagination import decode_id_cursor, encode_cursor
 from api.registry_errors import translate_registry_error
 from api.routers._query import reject_null_body, reject_unsupported_query, single_filter_value
-from api.schemas import ReviewDecisionRequest, merge_candidate_dto, ontology_proposal_dto
+from api.schemas import (
+    ReviewDecisionRequest,
+    entity_dto,
+    merge_candidate_dto,
+    ontology_proposal_dto,
+    relation_dto,
+)
 from core.graph.proposals import (
     InvalidProposalTransitionError,
     OntologyConfigIncompleteError,
@@ -48,9 +54,13 @@ from core.graph.proposals import (
 )
 from core.registry import ProjectNotFoundError, get_project
 from core.resolve.decisions import (
+    EntityNotFoundError,
     InvalidReviewTransitionError,
     MergeCandidateNotFoundError,
+    RelationNotFoundError,
+    decide_entity,
     decide_merge_candidate,
+    decide_relation,
 )
 from core.resolve.review import STATE_MACHINES
 from core.stores import tables
@@ -387,4 +397,155 @@ async def reject_ontology_proposal_endpoint(
         "rejectOntologyProposal",
         body,
         idempotency_key,
+    )
+
+
+# --- GOV2: entity / relation review (§17 unreviewed → approved|rejected) -------
+
+
+async def _decide_target(
+    request: Request,
+    conn: Any,
+    project: str,
+    target_id: uuid.UUID,
+    verb: str,
+    endpoint: str,
+    body: ReviewDecisionRequest | None,
+    idempotency_key: str | None,
+    *,
+    kind: str,
+) -> JSONResponse:
+    """Shared approve/reject for a build-scoped entity/relation (GOV2). Unlike
+    the proposal pool (not build-scoped), these resolve the ACTIVE build binding
+    — the decision targets the active build's row, and the ledger carries it
+    forward. ``kind`` selects the core decide + DTO; the endpoint stamps
+    meta.build_id."""
+    await reject_null_body(request)  # optional body, non-nullable when present (#53 R5)
+    reason = body.reason if body is not None else None
+    decide = decide_entity if kind == "entity" else decide_relation
+    id_kwarg = "entity_id" if kind == "entity" else "relation_id"
+    dto = entity_dto if kind == "entity" else relation_dto
+    not_found: type[Exception] = EntityNotFoundError if kind == "entity" else RelationNotFoundError
+
+    async def produce() -> tuple[int, dict[str, Any]]:
+        # every precheck INSIDE produce (#53 R2): a replayed decision must win
+        # even if the build/target has since changed
+        binding = await _bind(conn, project)
+        try:
+            row = await decide(
+                conn,
+                project=project,
+                build_id=binding.build_id,
+                verb=verb,
+                decided_by=_CONSOLE_DECIDER,
+                reason=reason,
+                **{id_kwarg: target_id},
+            )
+        except not_found as exc:
+            # GAP: no frozen entity/relation-not-found code — true 404, coarse code
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # no §17 refusal here: re-deciding an entity/relation APPENDS to the
+        # ledger and precedence resolves (the frozen contract's "never
+        # conflicts") — unlike merge candidates, there is no terminal state
+        return 200, success(dto(row), **response_meta(request), build_id=binding.build_id)
+
+    if idempotency_key:
+        status, resp = await run_idempotent(
+            conn,
+            key=idempotency_key,
+            project=project,
+            endpoint=endpoint,
+            req_hash=request_hash("POST", request.url.path, await request.body()),
+            produce=produce,
+        )
+        return JSONResponse(status_code=status, content=resp)
+    status, resp = await produce()
+    return JSONResponse(status_code=status, content=jsonable_encoder(resp))
+
+
+@router.post("/projects/{project}/entities/{entity_id}/approve")
+async def approve_entity_endpoint(
+    request: Request,
+    conn: Conn,
+    project: str,
+    entity_id: uuid.UUID,
+    body: ReviewDecisionRequest | None = None,
+    idempotency_key: _IdempotencyKey = None,
+) -> JSONResponse:
+    return await _decide_target(
+        request,
+        conn,
+        project,
+        entity_id,
+        "approve",
+        "approveEntity",
+        body,
+        idempotency_key,
+        kind="entity",
+    )
+
+
+@router.post("/projects/{project}/entities/{entity_id}/reject")
+async def reject_entity_endpoint(
+    request: Request,
+    conn: Conn,
+    project: str,
+    entity_id: uuid.UUID,
+    body: ReviewDecisionRequest | None = None,
+    idempotency_key: _IdempotencyKey = None,
+) -> JSONResponse:
+    return await _decide_target(
+        request,
+        conn,
+        project,
+        entity_id,
+        "reject",
+        "rejectEntity",
+        body,
+        idempotency_key,
+        kind="entity",
+    )
+
+
+@router.post("/projects/{project}/relations/{relation_id}/approve")
+async def approve_relation_endpoint(
+    request: Request,
+    conn: Conn,
+    project: str,
+    relation_id: uuid.UUID,
+    body: ReviewDecisionRequest | None = None,
+    idempotency_key: _IdempotencyKey = None,
+) -> JSONResponse:
+    return await _decide_target(
+        request,
+        conn,
+        project,
+        relation_id,
+        "approve",
+        "approveRelation",
+        body,
+        idempotency_key,
+        kind="relation",
+    )
+
+
+@router.post("/projects/{project}/relations/{relation_id}/reject")
+async def reject_relation_endpoint(
+    request: Request,
+    conn: Conn,
+    project: str,
+    relation_id: uuid.UUID,
+    body: ReviewDecisionRequest | None = None,
+    idempotency_key: _IdempotencyKey = None,
+) -> JSONResponse:
+    return await _decide_target(
+        request,
+        conn,
+        project,
+        relation_id,
+        "reject",
+        "rejectRelation",
+        body,
+        idempotency_key,
+        kind="relation",
     )

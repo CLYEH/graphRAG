@@ -76,18 +76,71 @@ class MergeCandidateNotFoundError(Exception):
 
 
 class InvalidReviewTransitionError(Exception):
-    """The §17 merge-candidate state machine refuses this move (e.g. deciding
-    an already-approved candidate). Carries what a client needs to see why."""
+    """A §17 review state machine refuses this move (e.g. deciding an
+    already-decided target). Carries what a client needs to see why —
+    ``subject`` names the reviewable kind ('merge candidate'/'entity'/
+    'relation'), ``current``/``verb`` drive the 400 details."""
 
-    def __init__(self, candidate_id: uuid.UUID, current: str, verb: str) -> None:
+    def __init__(self, subject: str, subject_id: uuid.UUID, current: str, verb: str) -> None:
         super().__init__(
-            f"merge candidate {candidate_id} is {current!r} — {verb!r} is not a legal "
-            "§17 transition (pending → approved|rejected|deferred; deferred → "
-            "approved|rejected; approved/rejected are terminal)"
+            f"{subject} {subject_id} is {current!r} — {verb!r} is not a legal §17 "
+            "transition (approved/rejected are terminal)"
         )
-        self.candidate_id = candidate_id
+        self.subject = subject
+        self.subject_id = subject_id
         self.current = current
         self.verb = verb
+
+
+class EntityNotFoundError(Exception):
+    """No such entity in this project's given build."""
+
+    def __init__(self, project: str, entity_id: uuid.UUID) -> None:
+        super().__init__(f"entity {entity_id} not found in project {project!r}")
+        self.project = project
+        self.entity_id = entity_id
+
+
+class RelationNotFoundError(Exception):
+    """No such relation in this project's given build."""
+
+    def __init__(self, project: str, relation_id: uuid.UUID) -> None:
+        super().__init__(f"relation {relation_id} not found in project {project!r}")
+        self.project = project
+        self.relation_id = relation_id
+
+
+#: entity/relation curator verbs (no defer — §17 has only approve|reject there).
+_REVIEW_VERB_TO_STATUS = {"approve": "approved", "reject": "rejected"}
+
+
+def _require_curator_decision(verb: str, decided_by: str) -> None:
+    """Shared guard for the entity/relation decide path: a known verb and a
+    non-empty curator principal that does not impersonate the pipeline (§27.3
+    precedence keys off ``decided_by``)."""
+    if verb not in _REVIEW_VERB_TO_STATUS:
+        raise ValueError(
+            f"unknown decision verb {verb!r} (choose from {sorted(_REVIEW_VERB_TO_STATUS)})"
+        )
+    if decided_by == AUTO_DECIDER or not decided_by:
+        raise ValueError(
+            f"decided_by {decided_by!r} is reserved/empty — curator entries must not "
+            "impersonate the pipeline (§27.3 precedence keys off it)"
+        )
+
+
+def _review_row_values(verb: str, current_status: str) -> dict[str, str]:
+    """The ``status``/``review_status`` an entity/relation row takes on a
+    curator decision — MIRRORS ``core.resolve.resolution``'s build-time
+    application so the ACTIVE build's row shows exactly what the NEXT build
+    re-derives from the ledger. reject excludes (both → rejected); approve marks
+    review_status=approved and RESTORES status to active iff the row was
+    excluded (rejected/needs_review), else leaves the lifecycle status alone."""
+    if verb == "reject":
+        return {"status": "rejected", "review_status": "rejected"}
+    if current_status in ("rejected", "needs_review"):
+        return {"status": "active", "review_status": "approved"}
+    return {"review_status": "approved"}
 
 
 _COLS = (
@@ -146,7 +199,7 @@ async def decide_merge_candidate(
         raise MergeCandidateNotFoundError(project, candidate_id)
     target = _VERB_TO_STATUS[verb]
     if not can_transition("merge_candidate", row.status, target):
-        raise InvalidReviewTransitionError(candidate_id, row.status, verb)
+        raise InvalidReviewTransitionError("merge candidate", candidate_id, row.status, verb)
 
     ents = tables.entities
     keys = {
@@ -200,3 +253,191 @@ async def decide_merge_candidate(
         )
     ).one()
     return MergeCandidate(*updated)
+
+
+_ENTITY_REVIEW_COLS = (
+    tables.entities.c.id,
+    tables.entities.c.project,
+    tables.entities.c.build_id,
+    tables.entities.c.type,
+    tables.entities.c.canonical_name,
+    tables.entities.c.entity_key,
+    tables.entities.c.attributes,
+    tables.entities.c.status,
+    tables.entities.c.review_status,
+    tables.entities.c.created_by,
+    tables.entities.c.created_at,
+    tables.entities.c.updated_at,
+)
+
+_RELATION_REVIEW_COLS = (
+    tables.relations.c.id,
+    tables.relations.c.project,
+    tables.relations.c.build_id,
+    tables.relations.c.src_entity_id,
+    tables.relations.c.dst_entity_id,
+    tables.relations.c.type,
+    tables.relations.c.attributes,
+    tables.relations.c.relation_signature,
+    tables.relations.c.status,
+    tables.relations.c.review_status,
+    tables.relations.c.created_by,
+    tables.relations.c.confidence,
+    tables.relations.c.created_at,
+    tables.relations.c.updated_at,
+)
+
+
+async def decide_entity(
+    conn: AsyncConnection,
+    *,
+    project: str,
+    build_id: uuid.UUID,
+    entity_id: uuid.UUID,
+    verb: str,
+    decided_by: str,
+    reason: str | None = None,
+) -> sa.Row[Any]:
+    """Record a curator's approve/reject on an entity (GOV2, §17).
+
+    Two writes in the caller's transaction: (1) the non-build-scoped
+    ``review_ledger`` CARRY-FORWARD entry keyed by the TYPE-FREE v2
+    ``ledger_entity_key`` (DR-011) — the SAME key ``resolve_build`` re-mints
+    from ``(canonical_name, disambiguator)``, so the decision survives the
+    entity being re-typed and applies on every future build (reject → excluded
+    from the projection, approve → adopted); (2) the ACTIVE build's row records
+    the resulting ``status``/``review_status`` so inspect views reflect it now.
+    The row is locked ``FOR UPDATE`` and the §17 transition checked under the
+    lock (two concurrent decides serialize on the row). Does NOT commit. Raises
+    ``EntityNotFoundError`` or ``ValueError`` (bad verb / reserved
+    ``decided_by``).
+
+    RE-DECIDING is allowed and APPENDS (the frozen contract: "re-deciding
+    appends (precedence resolves), never conflicts"): the ledger is append-only
+    and §27.3 resolves a key's decisions by latest manual ``decided_at`` — so a
+    curator corrects a bad approve/reject by deciding again, and every future
+    build re-applies the LATEST. This is why (unlike a merge candidate, whose
+    single-row status IS terminal) there is NO terminal-state refusal here."""
+    _require_curator_decision(verb, decided_by)
+    ents = tables.entities
+    row = (
+        await conn.execute(
+            sa.select(
+                ents.c.canonical_name, ents.c.disambiguator, ents.c.status, ents.c.review_status
+            )
+            .where(ents.c.id == entity_id, ents.c.project == project, ents.c.build_id == build_id)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if row is None:
+        raise EntityNotFoundError(project, entity_id)
+    target_key = fingerprints.ledger_entity_key(row.canonical_name, row.disambiguator)
+    decided_at = (await conn.execute(sa.select(sa.func.clock_timestamp()))).scalar_one()
+    await conn.execute(
+        tables.review_ledger.insert().values(
+            project=project,
+            target_kind="entity",
+            target_key=target_key,
+            fingerprint_version=fingerprints.LEDGER_FINGERPRINT_VERSION,
+            decision=verb,  # the raw verb — resolve's _decision branches on it
+            decided_by=decided_by,
+            decided_at=decided_at,
+            reason=reason,
+        )
+    )
+    updated = (
+        await conn.execute(
+            ents.update()
+            .where(ents.c.id == entity_id)
+            .values(**_review_row_values(verb, row.status), updated_at=decided_at)
+            .returning(*_ENTITY_REVIEW_COLS)
+        )
+    ).one()
+    return updated
+
+
+async def decide_relation(
+    conn: AsyncConnection,
+    *,
+    project: str,
+    build_id: uuid.UUID,
+    relation_id: uuid.UUID,
+    verb: str,
+    decided_by: str,
+    reason: str | None = None,
+) -> sa.Row[Any]:
+    """Record a curator's approve/reject on a relation (GOV2, §17).
+
+    Same shape as :func:`decide_entity`, but the type-free v2 ledger key is the
+    ``ledger_relation_signature`` over the ENDPOINTS' ledger keys — so the
+    decision first resolves ``src_entity_id``/``dst_entity_id`` to their
+    ``ledger_entity_key`` (exactly what ``resolve_build`` does), then mints
+    ``ledger_relation_signature(src_key, type, dst_key)``. That key is minted
+    from the endpoints, NOT the row's ``relation_signature`` column, so a row
+    whose signature is still NULL (pre-resolve) is still decided correctly — the
+    entry simply applies on the next build once the relation carries a
+    signature. Re-deciding APPENDS (precedence resolves — see
+    :func:`decide_entity`). Raises ``RelationNotFoundError``, ``ValueError``, or
+    ``LookupError`` (an endpoint entity is unmintable — unreachable behind the
+    composite FK)."""
+    _require_curator_decision(verb, decided_by)
+    rels = tables.relations
+    row = (
+        await conn.execute(
+            sa.select(
+                rels.c.src_entity_id,
+                rels.c.dst_entity_id,
+                rels.c.type,
+                rels.c.status,
+                rels.c.review_status,
+            )
+            .where(rels.c.id == relation_id, rels.c.project == project, rels.c.build_id == build_id)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if row is None:
+        raise RelationNotFoundError(project, relation_id)
+    # re-deciding APPENDS (see decide_entity) — no terminal-state refusal
+    ents = tables.entities
+    keys = {
+        r.id: fingerprints.ledger_entity_key(r.canonical_name, r.disambiguator)
+        for r in await conn.execute(
+            sa.select(ents.c.id, ents.c.canonical_name, ents.c.disambiguator).where(
+                ents.c.id.in_([row.src_entity_id, row.dst_entity_id]),
+                ents.c.project == project,
+                ents.c.build_id == build_id,
+            )
+        )
+    }
+    if set(keys) != {row.src_entity_id, row.dst_entity_id}:
+        # the composite FK makes this unreachable; if it fires, the endpoints'
+        # ledger identity is unmintable and recording the decision would be a lie
+        raise LookupError(
+            f"relation {relation_id}'s endpoints are missing from build {build_id} "
+            "— cannot mint the §27.3 relation ledger key"
+        )
+    target_key = fingerprints.ledger_relation_signature(
+        keys[row.src_entity_id], row.type, keys[row.dst_entity_id]
+    )
+    decided_at = (await conn.execute(sa.select(sa.func.clock_timestamp()))).scalar_one()
+    await conn.execute(
+        tables.review_ledger.insert().values(
+            project=project,
+            target_kind="relation",
+            target_key=target_key,
+            fingerprint_version=fingerprints.LEDGER_FINGERPRINT_VERSION,
+            decision=verb,
+            decided_by=decided_by,
+            decided_at=decided_at,
+            reason=reason,
+        )
+    )
+    updated = (
+        await conn.execute(
+            rels.update()
+            .where(rels.c.id == relation_id)
+            .values(**_review_row_values(verb, row.status), updated_at=decided_at)
+            .returning(*_RELATION_REVIEW_COLS)
+        )
+    ).one()
+    return updated

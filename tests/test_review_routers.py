@@ -26,7 +26,12 @@ from core.graph.proposals import (
     OntologyProposalNotFoundError,
 )
 from core.registry import ProjectNotFoundError
-from core.resolve.decisions import InvalidReviewTransitionError, MergeCandidateNotFoundError
+from core.resolve.decisions import (
+    EntityNotFoundError,
+    InvalidReviewTransitionError,
+    MergeCandidateNotFoundError,
+    RelationNotFoundError,
+)
 
 pytestmark = pytest.mark.contract
 
@@ -175,7 +180,9 @@ def test_decide_maps_the_gap_errors_and_passes_reason(
     assert r.json()["error"]["code"] == "VALIDATION_ERROR"
 
     async def refused(conn: Any, **kwargs: Any) -> Any:
-        raise InvalidReviewTransitionError(kwargs["candidate_id"], "approved", kwargs["verb"])
+        raise InvalidReviewTransitionError(
+            "merge candidate", kwargs["candidate_id"], "approved", kwargs["verb"]
+        )
 
     _stub(monkeypatch, "decide_merge_candidate", refused)
     r = client.post(f"/projects/p/merge-candidates/{cid}/defer")
@@ -376,3 +383,133 @@ def test_proposal_decide_rejects_null_body(
         headers={"Content-Type": "application/json"},
     )
     assert r.status_code == 400  # the #53 R5 shared guard
+
+
+# --- GOV2: entity / relation review -------------------------------------------
+
+
+def _entity_row(**over: Any) -> SimpleNamespace:
+    base: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "project": "p",
+        "build_id": _BUILD,
+        "type": "Person",
+        "canonical_name": "Alice",
+        "entity_key": "fpv1:person|alice",
+        "attributes": None,
+        "status": "active",
+        "review_status": "approved",
+        "created_by": "llm",
+        "created_at": _TS,
+        "updated_at": _TS,
+    }
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _relation_row(**over: Any) -> SimpleNamespace:
+    base: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "project": "p",
+        "build_id": _BUILD,
+        "src_entity_id": uuid.uuid4(),
+        "dst_entity_id": uuid.uuid4(),
+        "type": "WORKS_AT",
+        "attributes": None,
+        "relation_signature": "fpv1:alice|works_at|acme",
+        "status": "rejected",
+        "review_status": "rejected",
+        "created_by": "llm",
+        "confidence": 0.9,
+        "created_at": _TS,
+        "updated_at": _TS,
+    }
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_approve_entity_200_stamps_build_id_and_echoes_review_status(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # GOV2: entity approve returns the active build's updated row (review_status
+    # approved), stamps meta.build_id (build-scoped, unlike the proposal pool),
+    # and hands the verb to the core decide.
+    _bindable(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    async def fake_decide(conn: Any, *, verb: str, build_id: Any, **kw: Any) -> Any:
+        seen["verb"] = verb
+        seen["build_id"] = build_id
+        seen["entity_id"] = kw["entity_id"]
+        return _entity_row(review_status="approved")
+
+    _stub(monkeypatch, "decide_entity", fake_decide)
+    eid = uuid.uuid4()
+    r = client.post(f"/projects/p/entities/{eid}/approve")
+    assert r.status_code == 200
+    assert seen["verb"] == "approve" and seen["entity_id"] == eid
+    assert seen["build_id"] == _BUILD  # the active binding reached the decide
+    body = r.json()
+    assert body["data"]["review_status"] == "approved"
+    assert body["meta"]["build_id"] == str(_BUILD)
+
+
+def test_entity_decide_maps_not_found(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # a missing entity in the active build is a true 404 (coarse code). There is
+    # no §17-refusal path: re-deciding APPENDS (the frozen contract's "never
+    # conflicts"), so decide_entity never raises a transition error.
+    _bindable(monkeypatch)
+    eid = uuid.uuid4()
+
+    async def missing(conn: Any, **kw: Any) -> Any:
+        raise EntityNotFoundError("p", kw["entity_id"])
+
+    _stub(monkeypatch, "decide_entity", missing)
+    r = client.post(f"/projects/p/entities/{eid}/reject")
+    assert r.status_code == 404  # GAP: true status, coarse code
+
+
+def test_reject_relation_200_and_not_found(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bindable(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    async def fake_decide(conn: Any, *, verb: str, **kw: Any) -> Any:
+        seen["verb"] = verb
+        seen["relation_id"] = kw["relation_id"]
+        return _relation_row(status="rejected", review_status="rejected")
+
+    _stub(monkeypatch, "decide_relation", fake_decide)
+    rid = uuid.uuid4()
+    r = client.post(f"/projects/p/relations/{rid}/reject")
+    assert r.status_code == 200
+    assert seen["verb"] == "reject" and seen["relation_id"] == rid
+    data = r.json()["data"]
+    assert data["status"] == "rejected" and data["review_status"] == "rejected"
+    assert "evidence" not in data  # decide response is list-shaped, no evidence
+
+    async def missing(conn: Any, **kw: Any) -> Any:
+        raise RelationNotFoundError("p", kw["relation_id"])
+
+    _stub(monkeypatch, "decide_relation", missing)
+    r = client.post(f"/projects/p/relations/{rid}/approve")
+    assert r.status_code == 404
+
+
+def test_entity_relation_decide_rejects_null_body(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bindable(monkeypatch)
+
+    async def fail(conn: Any, **kw: Any) -> Any:
+        raise AssertionError("must not run on a null body")
+
+    _stub(monkeypatch, "decide_entity", fail)
+    _stub(monkeypatch, "decide_relation", fail)
+    for path in (
+        f"/projects/p/entities/{uuid.uuid4()}/approve",
+        f"/projects/p/relations/{uuid.uuid4()}/reject",
+    ):
+        r = client.post(path, content=b" null ", headers={"Content-Type": "application/json"})
+        assert r.status_code == 400, path  # the #53 R5 shared guard

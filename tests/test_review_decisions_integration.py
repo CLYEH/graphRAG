@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from pathlib import Path
+from typing import cast
 
 import pytest
 import sqlalchemy as sa
@@ -26,11 +27,22 @@ from core.config import get_settings
 from core.registry import create_project
 from core.resolve import fingerprints
 from core.resolve.decisions import (
+    EntityNotFoundError,
     InvalidReviewTransitionError,
     MergeCandidateNotFoundError,
+    RelationNotFoundError,
+    decide_entity,
     decide_merge_candidate,
+    decide_relation,
 )
-from core.stores.tables import builds, entities, merge_candidates, projects, review_ledger
+from core.stores.tables import (
+    builds,
+    entities,
+    merge_candidates,
+    projects,
+    relations,
+    review_ledger,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -319,4 +331,246 @@ async def test_racing_decides_converge_to_one_decision(migrated: None) -> None:
             await cleanup.execute(builds.delete().where(builds.c.project == project))
             await cleanup.execute(projects.delete().where(projects.c.name == project))
             await cleanup.commit()
+        await engine.dispose()
+
+
+async def _seed_entity(
+    conn: AsyncConnection, project: str, build_id: uuid.UUID, name: str, **over: object
+) -> uuid.UUID:
+    values: dict[str, object] = {
+        "project": project,
+        "build_id": build_id,
+        "type": "Person",
+        "canonical_name": name,
+        "entity_key": f"fpv1:person|{name.lower()}-{uuid.uuid4().hex[:6]}",
+        "status": "needs_review",
+        "review_status": "unreviewed",
+    }
+    values.update(over)
+    return cast(
+        "uuid.UUID",
+        (
+            await conn.execute(entities.insert().values(**values).returning(entities.c.id))
+        ).scalar_one(),
+    )
+
+
+async def test_decide_entity_writes_the_carryforward_key_and_updates_the_row(
+    migrated: None,
+) -> None:
+    """GOV2: an entity approve writes a review_ledger entry keyed by the EXACT
+    type-free v2 ledger_entity_key resolve re-mints (so it carries forward), and
+    updates the ACTIVE build's row — approve on a needs_review entity RESTORES
+    status=active + review_status=approved (mirrors resolution's application)."""
+    engine = _engine()
+    project = _proj()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=project)
+            build_id = (
+                await conn.execute(
+                    builds.insert().values(project=project, status="active").returning(builds.c.id)
+                )
+            ).scalar_one()
+            eid = await _seed_entity(conn, project, build_id, "區域探索廳", disambiguator="EXT-42")
+
+            updated = await decide_entity(
+                conn,
+                project=project,
+                build_id=build_id,
+                entity_id=eid,
+                verb="approve",
+                decided_by="console",
+                reason="valid exhibit",
+            )
+            # the row: needs_review → active, review_status → approved
+            assert updated.status == "active" and updated.review_status == "approved"
+
+            ledger = (
+                await conn.execute(
+                    sa.select(review_ledger).where(review_ledger.c.project == project)
+                )
+            ).one()
+            assert ledger.target_kind == "entity" and ledger.decision == "approve"
+            assert ledger.decided_by == "console" and ledger.reason == "valid exhibit"
+            assert ledger.fingerprint_version == fingerprints.LEDGER_FINGERPRINT_VERSION
+            # the KEY equals what resolve_build re-mints from (name, disambiguator)
+            key = fingerprints.ledger_entity_key("區域探索廳", "EXT-42")
+            assert ledger.target_key == key
+
+            # RE-DECIDING APPENDS, never conflicts (the frozen contract): a
+            # curator corrects the approve by rejecting — a SECOND ledger entry
+            # lands (later decided_at), the row flips to rejected, and §27.3
+            # precedence resolves the key to the latest manual decision (reject).
+            corrected = await decide_entity(
+                conn,
+                project=project,
+                build_id=build_id,
+                entity_id=eid,
+                verb="reject",
+                decided_by="console",
+            )
+            assert corrected.status == "rejected" and corrected.review_status == "rejected"
+            entries = (
+                await conn.execute(
+                    sa.select(review_ledger.c.decision, review_ledger.c.decided_at).where(
+                        review_ledger.c.project == project,
+                        review_ledger.c.target_kind == "entity",
+                        review_ledger.c.target_key == key,
+                    )
+                )
+            ).all()
+            assert sorted(e.decision for e in entries) == [
+                "approve",
+                "reject",
+            ]  # append, not update
+            from core.resolve.review import LedgerEntry, effective_decision
+
+            winner = effective_decision(
+                [
+                    LedgerEntry(
+                        decision=e.decision,
+                        decided_by="console",
+                        decided_at=e.decided_at,
+                        fingerprint_version=fingerprints.LEDGER_FINGERPRINT_VERSION,
+                    )
+                    for e in entries
+                ]
+            )
+            assert winner is not None and winner.decision == "reject"  # latest wins
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_decide_entity_reject_excludes_and_scopes_by_build(migrated: None) -> None:
+    """reject sets status=rejected + review_status=rejected (the C5 index filters
+    on status, so the row leaves the projection). An entity_id under a DIFFERENT
+    build is a not-found — never a cross-build decision."""
+    engine = _engine()
+    project = _proj()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=project)
+            active = (
+                await conn.execute(
+                    builds.insert().values(project=project, status="active").returning(builds.c.id)
+                )
+            ).scalar_one()
+            other = (
+                await conn.execute(
+                    builds.insert()
+                    .values(project=project, status="archived")
+                    .returning(builds.c.id)
+                )
+            ).scalar_one()
+            eid = await _seed_entity(conn, project, active, "Ghost")
+
+            with pytest.raises(EntityNotFoundError):  # right id, wrong build
+                await decide_entity(
+                    conn,
+                    project=project,
+                    build_id=other,
+                    entity_id=eid,
+                    verb="reject",
+                    decided_by="console",
+                )
+
+            rejected = await decide_entity(
+                conn,
+                project=project,
+                build_id=active,
+                entity_id=eid,
+                verb="reject",
+                decided_by="console",
+            )
+            assert rejected.status == "rejected" and rejected.review_status == "rejected"
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_decide_relation_keys_on_endpoint_ledger_keys(migrated: None) -> None:
+    """GOV2: a relation decision keys on ledger_relation_signature over the
+    ENDPOINTS' ledger keys (not the row's relation_signature), the EXACT key
+    resolve re-mints — so it survives an endpoint being re-typed. Curator
+    decided_by must not impersonate the pipeline."""
+    engine = _engine()
+    project = _proj()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=project)
+            build_id = (
+                await conn.execute(
+                    builds.insert().values(project=project, status="active").returning(builds.c.id)
+                )
+            ).scalar_one()
+            src = await _seed_entity(conn, project, build_id, "Alice", disambiguator="A1")
+            dst = await _seed_entity(conn, project, build_id, "Acme")
+            rid = (
+                await conn.execute(
+                    relations.insert()
+                    .values(
+                        project=project,
+                        build_id=build_id,
+                        src_entity_id=src,
+                        dst_entity_id=dst,
+                        type="WORKS_AT",
+                        relation_signature="fpv1:alice|works_at|acme",
+                        status="needs_review",
+                        review_status="unreviewed",
+                    )
+                    .returning(relations.c.id)
+                )
+            ).scalar_one()
+
+            updated = await decide_relation(
+                conn,
+                project=project,
+                build_id=build_id,
+                relation_id=rid,
+                verb="approve",
+                decided_by="console",
+            )
+            assert updated.status == "active" and updated.review_status == "approved"
+
+            ledger = (
+                await conn.execute(
+                    sa.select(review_ledger).where(
+                        review_ledger.c.project == project,
+                        review_ledger.c.target_kind == "relation",
+                    )
+                )
+            ).one()
+            expected = fingerprints.ledger_relation_signature(
+                fingerprints.ledger_entity_key("Alice", "A1"),
+                "WORKS_AT",
+                fingerprints.ledger_entity_key("Acme"),
+            )
+            assert ledger.target_key == expected
+
+            # a curator must never write decided_by="auto" (§27.3 precedence)
+            with pytest.raises(ValueError):
+                await decide_relation(
+                    conn,
+                    project=project,
+                    build_id=build_id,
+                    relation_id=rid,
+                    verb="approve",
+                    decided_by="auto",
+                )
+            with pytest.raises(RelationNotFoundError):
+                await decide_relation(
+                    conn,
+                    project=project,
+                    build_id=build_id,
+                    relation_id=uuid.uuid4(),
+                    verb="approve",
+                    decided_by="console",
+                )
+            await trans.rollback()
+    finally:
         await engine.dispose()
