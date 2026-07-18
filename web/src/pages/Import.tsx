@@ -787,13 +787,20 @@ function RunPipeline({
   // the just-added text source dooms the build (a bind-time-vs-invariant TOCTOU).
   // xlsx rows render to per-row TEXT documents (SRC1), so they hit the same
   // OntologyRequiredError as a text directory — both kinds arm the gate
-  const hasTextSource = (sources.data ?? []).some((s) => s.kind === "text" || s.kind === "xlsx");
+  // SRC2: a disabled source is excluded from the build (`_load_sources`
+  // enabled_only=True), so it must not arm ANY build-eligibility gate —
+  // otherwise disabling a broken/text source can't recover the build, defeating
+  // the whole point of soft-disable. Gate over the enabled subset only; the
+  // list rendering below still shows disabled rows so an operator can re-enable.
+  // A missing `enabled` (pre-SRC2 server) counts as enabled.
+  const buildableSources = (sources.data ?? []).filter((s) => s.enabled !== false);
+  const hasTextSource = buildableSources.some((s) => s.kind === "text" || s.kind === "xlsx");
   const ontologyBlocked = ontologyMissing && hasTextSource;
   // One unresolvable source (unwired kind / non-file scheme / missing structured
   // metadata — e.g. registered via CLI/API) fails every build at ingest. A
   // present-but-invalid ontology (ontologyInvalid) fails the worker preflight for
   // EVERY run — even structured-only — so it blocks unconditionally.
-  const unresolvable = (sources.data ?? []).filter((s) => !isResolvableSource(s));
+  const unresolvable = buildableSources.filter((s) => !isResolvableSource(s));
   const blocked = ontologyBlocked || ontologyInvalid || unresolvable.length > 0;
   // isError matters alongside isFetching: a FAILED refetch (e.g. right after an
   // add that DID commit server-side) leaves the previous list in data with

@@ -442,6 +442,35 @@ describe("Import", () => {
     expect(screen.getByRole("button", { name: "開始建置" })).toBeDisabled();
   });
 
+  it("does not block runs on a DISABLED unresolvable source (SRC2 recovery)", async () => {
+    // SRC2: soft-disable exists to recover from exactly this — a broken source
+    // (unwired kind / bad uri) registered via CLI/API. The build skips it
+    // (_load_sources enabled_only=True), so once disabled it must stop arming
+    // the unresolvable gate; otherwise disabling it can never unblock the build.
+    stubImportGets(
+      { ...project("acme"), config: { ontology: { entity_types: ["P"], relation_types: ["R"] } } },
+      [source({ kind: "url", uri: "https://example.com/feed", enabled: false })],
+    );
+    renderImport(projectRoute("acme", "import"));
+
+    await screen.findByText("https://example.com/feed"); // the row still lists (re-enable path)
+    expect(screen.queryByText(/can't be resolved by the pipeline/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeEnabled();
+  });
+
+  it("does not arm the ontology block for a DISABLED text source (SRC2)", async () => {
+    // a disabled text/xlsx source is not ingested, so it must not require an
+    // ontology — the gate mirrors the build's enabled_only view, not the raw list
+    stubImportGets(project("acme"), [
+      source({ kind: "text", uri: "file:///data/corpus/", enabled: false }),
+    ]);
+    renderImport(projectRoute("acme", "import"));
+
+    await screen.findByText("file:///data/corpus/");
+    expect(screen.queryByText(/no valid ontology configured/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "開始建置" })).toBeEnabled();
+  });
+
   it("blocks runs when an existing file uri would be silently reinterpreted", async () => {
     // a host-bearing (or query/hash-bearing) file uri doesn't raise — _local_path
     // reads only urlparse(uri).path, so the build would silently ingest /corpus
