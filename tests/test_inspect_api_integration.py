@@ -370,6 +370,70 @@ async def test_entities_paginate_by_id_desc(api: Api) -> None:
     assert r2.json()["meta"]["next_cursor"] is None
 
 
+async def test_entities_search_and_total_against_real_sql(api: Api) -> None:
+    # SS1b: `q` is a case-insensitive substring over canonical_name, and total
+    # is the EXACT count of the SEARCHED set (not the whole build). Cross-build
+    # scoping still holds — the archived entity is never counted or returned.
+    client, conn = api
+    project = await _make_project(client)
+    async with conn.begin_nested():
+        active = await _make_build(conn, project, "active")
+        archived = await _make_build(conn, project, "archived")
+        await _make_entity(conn, project, active, "區域探索廳")
+        await _make_entity(conn, project, active, "Ocean Hall")
+        await _make_entity(conn, project, active, "區域服務台")
+        await _make_entity(conn, project, archived, "區域探索廳")  # other build
+
+    # no search: total counts the whole active build (3), not 4
+    r = await client.get(f"/projects/{project}/entities")
+    assert r.json()["meta"]["total"] == 3
+    assert r.json()["meta"]["total_estimated"] is False
+
+    # search narrows BOTH the rows and the total to the matching set
+    r = await client.get(f"/projects/{project}/entities", params={"q": "區域"})
+    names = {e["canonical_name"] for e in r.json()["data"]}
+    assert names == {"區域探索廳", "區域服務台"}
+    assert r.json()["meta"]["total"] == 2  # the searched count, not 3
+
+    # case-INSENSITIVE: an opposite-case ASCII query still matches (this is the
+    # ilike-vs-like discriminator — a case-sensitive `like` would return 0)
+    r = await client.get(f"/projects/{project}/entities", params={"q": "OCEAN hall"})
+    assert {e["canonical_name"] for e in r.json()["data"]} == {"Ocean Hall"}
+    assert r.json()["meta"]["total"] == 1
+
+
+async def test_entities_search_treats_wildcards_as_literals(api: Api) -> None:
+    # SS1b: a LIKE metacharacter a user types (`%`, `_`) must match LITERALLY,
+    # never as a wildcard. Discriminating data: searching "a%b" must match only
+    # the literal "a%b", NOT "axyzb" — an unescaped `%a%b%` pattern WOULD match
+    # both (the `%` acting as a wildcard). The escaping is what makes `q` a
+    # substring search, not a pattern language.
+    client, conn = api
+    project = await _make_project(client)
+    async with conn.begin_nested():
+        active = await _make_build(conn, project, "active")
+        await _make_entity(conn, project, active, "a%b literal")
+        await _make_entity(conn, project, active, "axyzb wildcard")
+
+    r = await client.get(f"/projects/{project}/entities", params={"q": "a%b"})
+    assert {e["canonical_name"] for e in r.json()["data"]} == {"a%b literal"}
+    assert r.json()["meta"]["total"] == 1  # `%` was literal — "axyzb" not matched
+
+
+async def test_documents_search_over_source_uri(api: Api) -> None:
+    # SS1b: documents search their source_uri (the visible identifier).
+    client, conn = api
+    project = await _make_project(client)
+    async with conn.begin_nested():
+        active = await _make_build(conn, project, "active")
+        await _make_document(conn, project, active, source_uri="file:///corpus/a.txt")
+        await _make_document(conn, project, active, source_uri="file:///other/b.txt")
+
+    r = await client.get(f"/projects/{project}/documents", params={"q": "corpus"})
+    assert [d["source_uri"] for d in r.json()["data"]] == ["file:///corpus/a.txt"]
+    assert r.json()["meta"]["total"] == 1
+
+
 async def test_no_active_build_is_409_and_missing_project_404(api: Api) -> None:
     client, conn = api
     project = await _make_project(client)
