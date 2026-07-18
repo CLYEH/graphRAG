@@ -26,7 +26,7 @@ def _alembic_config() -> Config:
 
 def test_migration_chain_has_a_single_head() -> None:
     heads = ScriptDirectory.from_config(_alembic_config()).get_heads()
-    assert heads == ["0018_pipeline_runs_by_build"]
+    assert heads == ["0019_builds_parent_build_id"]
 
 
 def test_builds_columns_match_design_spec() -> None:
@@ -34,6 +34,7 @@ def test_builds_columns_match_design_spec() -> None:
         "id",
         "project",
         "status",
+        "parent_build_id",
         "config_hash",
         "source_hash",
         "started_at",

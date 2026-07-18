@@ -30,6 +30,7 @@ from collections.abc import Iterator
 from dataclasses import asdict
 from datetime import datetime
 
+import sqlalchemy as sa
 from llama_index.core.embeddings import BaseEmbedding
 from llama_index.core.llms import LLM
 from neo4j import AsyncSession
@@ -51,7 +52,7 @@ from core.registry.store import Source, list_sources
 from core.resolve.resolution import resolve_build
 from core.stores.graph import BuildScopedGraphProjector
 from core.stores.repo import BuildScopedWriter
-from core.stores.tables import STRUCTURED_MIME, documents
+from core.stores.tables import STRUCTURED_MIME, builds, documents
 from core.stores.vectors import BuildScopedVectorProjector
 from core.summarize.communities import summarize_build
 
@@ -105,9 +106,32 @@ def _all_payloads(sources: list[Source]) -> Iterator[DocumentPayload]:
         yield from resolve_source(source)
 
 
+async def _is_retry_build(conn: AsyncConnection, build_id: uuid.UUID) -> bool:
+    """Whether this build is an RB1-retry child (``builds.parent_build_id`` set).
+
+    A retry inherits the parent's documents (cloned in by the retry endpoint) as
+    its FROZEN corpus, so ingest must NOT re-read live sources — see ``_ingest_stage``.
+    """
+    parent = (
+        await conn.execute(sa.select(builds.c.parent_build_id).where(builds.c.id == build_id))
+    ).scalar_one_or_none()
+    return parent is not None
+
+
 def _ingest_stage() -> StageFn:
     async def ingest(conn: AsyncConnection, project: str, build_id: uuid.UUID) -> StageResult:
         writer = await BuildScopedWriter.for_building_build(conn, project, build_id)
+        # RB1-retry (DR-013): a retry child reprocesses the PARENT's corpus,
+        # cloned in as documents by the retry endpoint. Re-reading the project's
+        # CURRENT live sources would break retryBuild's "reuse the parent's
+        # artifacts" scope — a changed/removed source would fail the re-fetch or
+        # drift the content, and a source added after the parent build would add
+        # documents the parent never had. So a retry SKIPS source ingest; clean
+        # re-chunks the cloned documents. (A full re-run against live sources is
+        # POST /build, not retry.)
+        if await _is_retry_build(conn, build_id):
+            docs = await writer.fetch_all(documents)
+            return StageResult(outcomes=(), detail={"retry_reused_documents": len(docs)})
         sources = await _load_sources(conn, project)
         report = await ingest_documents(writer, _all_payloads(sources))
         return StageResult(

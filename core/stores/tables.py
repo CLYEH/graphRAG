@@ -65,6 +65,12 @@ builds = sa.Table(
         "project", sa.Text, sa.ForeignKey("projects.name", ondelete="RESTRICT"), nullable=False
     ),
     sa.Column("status", sa.Text, nullable=False, server_default=sa.text("'building'")),
+    # RB1-retry (DR-013): a retry opens a NEW build recording which build it
+    # retried, so the failed attempt's terminal record is never mutated —
+    # lineage is the child's pointer, not an edit. Deliberately NOT an FK to
+    # builds.id (same rationale as pipeline_runs.build_id below): prune (C9)
+    # isn't frozen and every ondelete would pre-decide it. NULL = not a retry.
+    sa.Column("parent_build_id", postgresql.UUID(as_uuid=True)),
     sa.Column("config_hash", sa.Text),
     sa.Column("source_hash", sa.Text),
     sa.Column("started_at", sa.TIMESTAMP(timezone=True)),

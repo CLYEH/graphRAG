@@ -36,6 +36,7 @@ async def create_build(
     *,
     config_hash: str | None = None,
     source_hash: str | None = None,
+    parent_build_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Insert a fresh ``building`` build for ``project`` and return its id.
 
@@ -44,7 +45,8 @@ async def create_build(
     commit — the caller (the orchestrator) owns the transaction boundary, like
     ``create_project``/``add_source``. ``started_at`` is the DB clock
     (``now()``, the single-clock-source rule) so the lifecycle's
-    ``started_at``-desc ordering stays monotonic.
+    ``started_at``-desc ordering stays monotonic. ``parent_build_id`` records
+    retry lineage (RB1-retry, DR-013) — NULL for a normal build.
     """
     if await get_project(conn, project) is None:
         raise ProjectNotFoundError(project)
@@ -55,6 +57,7 @@ async def create_build(
                 .values(
                     project=project,
                     status="building",
+                    parent_build_id=parent_build_id,
                     config_hash=config_hash,
                     source_hash=source_hash,
                     started_at=sa.func.now(),
@@ -69,3 +72,20 @@ async def create_build(
             raise ProjectNotFoundError(project) from exc
         raise
     return build_id
+
+
+async def mark_build_failed(conn: AsyncConnection, build_id: uuid.UUID) -> None:
+    """Terminalize a still-``building`` build as ``failed`` (idempotent — a no-op
+    if it is already terminal, guarded on ``status='building'``). Does NOT commit.
+
+    Used when a build that was created BEFORE its worker ran cannot proceed — an
+    RB1-retry child is pre-created ``building`` by the retry endpoint, so if the
+    worker's config preflight fails, failing only the job would strand the child
+    ``building`` forever (prune skips non-terminal builds and the RESTRICT FK then
+    blocks deleting the project). ``finished_at`` is the DB clock (single-source).
+    """
+    await conn.execute(
+        tables.builds.update()
+        .where(tables.builds.c.id == build_id, tables.builds.c.status == "building")
+        .values(status="failed", finished_at=sa.func.now())
+    )

@@ -45,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from sqlalchemy.pool import NullPool
 
 from core.builds.config import BuildConfigError, load_build_config
+from core.builds.creation import mark_build_failed
 from core.builds.lease import job_lease
 from core.builds.orchestrator import BuildNotResumableError, run_build
 from core.builds.stages import default_stages
@@ -79,6 +80,17 @@ EVAL_TASK = "run_eval_task"
 #: crash/lost-dispatch recovery must branch on it. The eval trigger stamps this
 #: same string (api.routers.builds), so creator and reaper can't drift.
 EVAL_JOB_KIND = "eval"
+
+#: The ``jobs.kind`` a retry (RB1-retry, DR-013) stamps. It flows through the
+#: SAME ``BUILD_TASK`` path as build/ingest — the retry endpoint creates the
+#: child build (recording ``parent_build_id``) and clones the parent's raw
+#: layer IN-BAND, then attaches the child to the job (``build_id``) and enqueues
+#: with ``enqueue_build``, so the worker just RESUMES the ready-seeded child via
+#: ``run_build`` with no retry-specific dispatch. The reaper (below) treats every
+#: non-``eval`` kind as a build, so a crashed retry resumes correctly too. The
+#: distinct kind is for observability (Job.kind is a free §15 string), not
+#: control flow.
+RETRY_JOB_KIND = "retry"
 
 
 def _redis_settings() -> RedisSettings:
@@ -454,7 +466,13 @@ async def run_build_task(ctx: dict[str, Any], project: str, job_id: str) -> str 
                 raw_config = await capture_config_snapshot(conn, build_job, proj.config)
             config = load_build_config(raw_config)
         except (LookupError, BuildConfigError) as exc:
-            await _fail_job(engine, build_job, exc)
+            # Terminalize the job AND any build already ATTACHED to it. A normal
+            # build has no build yet at preflight (run_build creates it after),
+            # but an RB1-retry child is pre-created 'building' by the endpoint —
+            # failing only the job would strand it 'building' forever (Codex #100
+            # P1 R5). This runs right after a lease acquire with no intervening
+            # await, so no replacement can exist; the write is safely unconditional.
+            await _fail_preflight(engine, build_job, exc)
             return "failed"
         async with ctx["neo4j"].session() as session:
             stages = default_stages(
@@ -496,8 +514,9 @@ async def _fail_job(engine: AsyncEngine, job_id: uuid.UUID, exc: Exception) -> N
     transaction), so a build that never reached the orchestrator still terminates
     the job instead of leaving it queued. Used only where this worker just acquired
     the lease with NO intervening await/stall, so no replacement can exist and the
-    write is safely unconditional: the build preflight, and the eval path-safety
-    refusal. Every eval failure that can span a heartbeat-lapse window — the preflight
+    write is safely unconditional: the eval path-safety refusal (the build preflight
+    now uses _fail_preflight, which ALSO terminalizes a pre-created retry child).
+    Every eval failure that can span a heartbeat-lapse window — the preflight
     LOADER failure (a large synchronous golden/policy load can block the loop past the
     TTL), the run, and the finalize — uses the lease-guarded _fail_eval instead, so a
     stale worker can't clobber a replacement's result."""
@@ -505,6 +524,23 @@ async def _fail_job(engine: AsyncEngine, job_id: uuid.UUID, exc: Exception) -> N
         await set_progress(
             conn, job_id, status="failed", finished_at=sa.func.now(), error=_failure_error(exc)
         )
+
+
+async def _fail_preflight(engine: AsyncEngine, job_id: uuid.UUID, exc: Exception) -> None:
+    """Preflight failure for a BUILD dispatch: terminalize the job like _fail_job,
+    AND terminalize any build already ATTACHED to the job. A normal build has no
+    build at preflight (run_build creates it after), so this is a no-op for it;
+    but an RB1-retry child is pre-created 'building' by the endpoint, so failing
+    only the job would strand the child 'building' forever (Codex #100 P1 R5).
+    Both writes share ONE transaction; safe unconditional (called right after a
+    lease acquire with no intervening await — no replacement can exist yet)."""
+    async with engine.begin() as conn:
+        job = await lock_job(conn, job_id)
+        await set_progress(
+            conn, job_id, status="failed", finished_at=sa.func.now(), error=_failure_error(exc)
+        )
+        if job is not None and job.build_id is not None:
+            await mark_build_failed(conn, job.build_id)
 
 
 async def _eval_leads(conn: AsyncConnection, eval_job: uuid.UUID, owner: str) -> bool:

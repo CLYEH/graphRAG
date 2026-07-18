@@ -189,6 +189,25 @@ class BuildRequest(BaseModel):
         return self
 
 
+class RetryRequest(BaseModel):
+    """The contract RetryRequest (DR-013) — parsed to its shape, then ``reason``
+    is loudly rejected while PRESENT until retry builds can record it. Same
+    situation as ``BuildRequest.reason`` (no note column exists yet); lifting the
+    rejection later is additive (no contract bump). ``extra="forbid"`` mirrors
+    the contract's ``additionalProperties:false`` (a control the fixed
+    failed-only semantics don't honor is a 400, never a silent no-op)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _reject_reason(self) -> RetryRequest:
+        if "reason" in self.model_fields_set:
+            raise ValueError("reason is not recorded on retry builds yet; omit it")
+        return self
+
+
 class ReviewDecisionRequest(BaseModel):
     """The contract ReviewDecisionRequest — an optional free-form reason,
     contract-nullable (unlike the BA2e trigger fields, ``reason`` here IS
@@ -360,6 +379,7 @@ def build_dto(b: BuildInfo) -> dict[str, Any]:
     return {
         "id": b.id,
         "project": b.project,
+        "parent_build_id": b.parent_build_id,
         "status": b.status,
         "config_hash": b.config_hash,
         "source_hash": b.source_hash,

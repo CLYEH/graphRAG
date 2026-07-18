@@ -69,6 +69,13 @@ def spy(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr("core.stores.vectors.BuildScopedVectorProjector.for_building_build", _proj)
     monkeypatch.setattr("core.stores.graph.BuildScopedGraphProjector.for_building_build", _proj)
 
+    # these hermetic stage tests run on a fake conn (no SQL) — the ingest stage's
+    # RB1-retry check hits the DB, so stub it to the non-retry path it exercises
+    async def _not_retry(conn: Any, build_id: uuid.UUID) -> bool:
+        return False
+
+    monkeypatch.setattr(stages_mod, "_is_retry_build", _not_retry)
+
     def _record(name: str, result: Any) -> Any:
         async def fn(*args: Any, **kwargs: Any) -> Any:
             calls[name] = SimpleNamespace(args=args, kwargs=kwargs)
