@@ -220,3 +220,171 @@
     color: #f87171;
   }
 }
+
+/* ---- RB1-fe: failure diagnosis + retry (inside a failed run's detail) ---- */
+.runs__recovery {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.runs__recovery-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.runs__steps,
+.runs__items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.runs__step {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  padding: 5px 8px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  color: var(--text-h);
+  font-size: 13px;
+}
+
+.runs__step:hover {
+  background: var(--social-bg);
+}
+
+.runs__step-meta {
+  color: var(--text);
+  font-size: 12px;
+}
+
+/* the step's own aggregate error (BuildStep.error) — a real failure cause, so
+   it reads in the error tone, not the muted meta tone */
+.runs__step-error {
+  margin: 2px 0 4px 8px;
+  font-size: 12px;
+  color: #c0392b;
+  overflow-wrap: anywhere;
+}
+
+/* the panel wraps the 失敗/跳過 selector + the filtered list; it carries the
+   left indent so the tabs align with the items below them */
+.runs__item-panel {
+  margin: 2px 0 8px 12px;
+}
+
+.runs__item-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.runs__item-tab {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.runs__item-tab--on {
+  color: var(--text-h);
+  background: var(--social-bg);
+  border-color: var(--text-h);
+}
+
+.runs__items {
+  margin: 2px 0 8px;
+}
+
+.runs__item {
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.runs__item-status {
+  font-weight: 600;
+}
+
+.runs__item-status--failed {
+  color: #c0392b;
+}
+
+.runs__item-status--skipped {
+  color: #b7791f;
+}
+
+.runs__item-ref {
+  font-family: var(--mono);
+  color: var(--text-h);
+}
+
+.runs__item-msg {
+  color: var(--text);
+}
+
+.runs__retry {
+  margin-top: 12px;
+}
+
+.runs__retry-btn {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--social-bg);
+  color: var(--text-h);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.runs__retry-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.runs__more {
+  margin: 4px 0 8px;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: none;
+  color: var(--text-h);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.runs__more:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.runs__muted--ok {
+  color: #1e7e34;
+  font-style: italic;
+  margin-top: 6px;
+}
+
+/* Dark-mode overrides for the RB1-fe base rules ABOVE — must come AFTER them so
+   that at equal specificity the dark selector wins the cascade (the earlier
+   badge @media block can't, since these bases are declared later; Codex #102). */
+@media (prefers-color-scheme: dark) {
+  .runs__item-status--failed {
+    color: #f87171;
+  }
+  .runs__step-error {
+    color: #f87171;
+  }
+  .runs__muted--ok {
+    color: #4ade80;
+  }
+}

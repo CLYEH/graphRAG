@@ -9,6 +9,8 @@ export type Project = components["schemas"]["Project"];
 export type Source = components["schemas"]["Source"];
 export type HealthReport = components["schemas"]["HealthReport"];
 export type Build = components["schemas"]["Build"];
+export type BuildStep = components["schemas"]["BuildStep"];
+export type BuildStepItem = components["schemas"]["BuildStepItem"];
 export type JobAccepted = components["schemas"]["JobAccepted"];
 export type Job = components["schemas"]["Job"];
 export type MergeCandidate = components["schemas"]["MergeCandidate"];
@@ -80,6 +82,109 @@ export function useBuilds(project: string | undefined) {
         cursor = data.meta.next_cursor ?? undefined;
       } while (cursor);
       return all;
+    },
+  });
+}
+
+// RB1 §27.7 drill-down: the build's pipeline steps (newest run first), read only
+// when a row is expanded (buildId set). Pages through all steps — a build has a
+// handful (6 §5 stages × its runs), so the loop terminates fast. Used to
+// diagnose WHERE a failed build failed before offering "retry failed only".
+export function useBuildSteps(project: string, buildId: string | undefined) {
+  return useQuery({
+    queryKey: ["buildSteps", project, buildId],
+    enabled: isPathAddressable(project) && buildId !== undefined,
+    queryFn: async () => {
+      const all: BuildStep[] = [];
+      let cursor: string | undefined;
+      do {
+        const { data, error } = await api.GET("/projects/{project}/builds/{build_id}/steps", {
+          params: { path: { project, build_id: buildId as string }, query: { limit: 200, cursor } },
+        });
+        if (error) throw new Error(error.error.message);
+        all.push(...data.data);
+        cursor = data.meta.next_cursor ?? undefined;
+      } while (cursor);
+      return all;
+    },
+  });
+}
+
+const STEP_ITEMS_PAGE = 100;
+
+// The two "did not succeed" outcomes this failure-diagnosis drill-down surfaces.
+// The drill-down is ALWAYS filtered to one of these: default verbosity records
+// only failed/skipped, but `sampled`/`all` verbosity ALSO persists successes
+// (status ∉ {failed,skipped}) and rows come back ordered by id, so an UNFILTERED
+// page could be all successes and bury the very failures this view exists to
+// show. A single `filter[status]` per query keeps diagnosis practical at every
+// verbosity; skipped items are reached by re-querying with "skipped" — the
+// caller's 失敗/跳過 selector (Codex #102).
+export type ItemDiagnosisStatus = "failed" | "skipped";
+
+// RB1 §27.7 drill-down: one step's recorded item outcomes for ONE diagnosis
+// status, read when a step is expanded (stepId set). item_ref is the stable
+// retry key that "retry failed only" re-enters. PAGINATED (not a cursor-
+// exhausting loop): a step's items can be corpus-sized (thousands, or millions
+// under `sampled`/`all` verbosity), so the caller renders a page + "load more"
+// rather than downloading and retaining the whole chain (Codex #102).
+export function useStepItems(
+  project: string,
+  buildId: string,
+  stepId: string | undefined,
+  status: ItemDiagnosisStatus,
+) {
+  return useInfiniteQuery({
+    queryKey: ["stepItems", project, buildId, stepId, status],
+    enabled: isPathAddressable(project) && stepId !== undefined,
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam }) => {
+      const { data, error } = await api.GET(
+        "/projects/{project}/builds/{build_id}/steps/{step_id}/items",
+        {
+          params: {
+            path: { project, build_id: buildId, step_id: stepId as string },
+            // filter[status]=<status> (deepObject) — the endpoint's one allowed
+            // facet; never send an unadopted sort/filter (400 loud, SS1a).
+            query: { limit: STEP_ITEMS_PAGE, cursor: pageParam, filter: { status } },
+          },
+        },
+      );
+      if (error) throw new Error(error.error.message);
+      return { rows: data.data, next: data.meta.next_cursor ?? undefined };
+    },
+    getNextPageParam: (last: { rows: BuildStepItem[]; next?: string }) => last.next,
+  });
+}
+
+// RB1-retry: opens a NEW build reprocessing a terminal `failed` build's failed
+// items (parent_build_id lineage; §27.7). 202 returns the job envelope; the
+// child build is created at accept time, so builds/health are invalidated to
+// surface it. `idempotencyKey` is a per-logical-attempt random key (the
+// trigger/eval discipline): a retry after a lost 202 replays the ORIGINAL job
+// instead of forking a second child or 409ing the still-running one.
+export function useRetryBuild(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      buildId,
+      idempotencyKey,
+    }: {
+      buildId: string;
+      idempotencyKey: string;
+    }) => {
+      const { data, error } = await api.POST("/projects/{project}/builds/{build_id}/retry", {
+        params: {
+          path: { project, build_id: buildId },
+          header: { "Idempotency-Key": idempotencyKey },
+        },
+      });
+      if (error) throw new Error(error.error.message);
+      return data.data;
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["builds", project] });
+      void queryClient.invalidateQueries({ queryKey: ["health", project] });
     },
   });
 }
