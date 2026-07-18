@@ -213,17 +213,23 @@ function FailureRecovery({ project, buildId }: { project: string; buildId: strin
       )}
 
       {/* The drill-down shows per-item outcomes only. The AUTHORITATIVE cause is
-          at the run level (pipeline_runs.error) and NOT exposed here — and it can
-          hide behind item failures: an earlier stage can tolerate failed items
-          (recorded as a 'failed' step) and a LATER stage still crash (recorded on
-          the run, never as a step). So this pointer is UNCONDITIONAL — never
-          gated on "no failed step", which would suppress the real later crash
-          behind the earlier item failure (Codex #102 R3/R4). Surfacing the run
-          error itself is a backend follow-up. */}
+          at the run level (pipeline_runs.error) and NOT exposed by the API — and
+          it can hide behind item failures: an earlier stage can tolerate failed
+          items (recorded as a 'failed' step) and a LATER stage still crash
+          (recorded on the run, never as a step). So this pointer is UNCONDITIONAL
+          — never gated on "no failed step", which would suppress the real later
+          crash behind the earlier item failure (Codex #102 R3/R4). It must NOT
+          point at the run's job id: the dashboard exposes only the BUILD id, the
+          job watcher takes a job id pasted from elsewhere, and neither the Build
+          schema nor any endpoint offers a build→job lookup or a jobs list — so a
+          "use the job id" instruction would send the operator to an identifier
+          this flow never supplies (a false affordance, Codex #102 P1). We state
+          the limitation honestly instead; surfacing the run error (or a build→job
+          lookup) is a backend follow-up (RB1-api). */}
       {steps.isSuccess && (
         <p className="runs__muted">
-          下鑽為各步驟的逐項結果;此建置的確切失敗原因(項目失敗超過門檻,或某階段崩潰)記於 pipeline
-          run 層級——可於下方「追蹤工作」以該次建置的 job id 查看。
+          下鑽為各步驟的逐項結果。此建置的確切失敗原因(項目失敗超過門檻,或某階段崩潰)記於 pipeline
+          run 層級,目前 Console 尚未呈現——於 Console 直接顯示 run 錯誤為後續增強 (RB1-api)。
         </p>
       )}
 

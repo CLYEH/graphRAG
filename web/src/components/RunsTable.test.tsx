@@ -444,6 +444,12 @@ describe("RunsTable", () => {
     renderWithProviders(<RunsTable project="acme" />);
 
     fireEvent.click((await screen.findAllByText(/版$/))[0]);
-    expect(await screen.findByText(/確切失敗原因/)).toBeInTheDocument();
+    const note = await screen.findByText(/確切失敗原因/);
+    // …but it must NOT send the operator to the run's job id: the dashboard
+    // exposes only the BUILD id and there is no build→job lookup or jobs list, so
+    // that identifier is unobtainable from this flow. The note states the Console
+    // limitation honestly instead of promising a false path (Codex #102 P1).
+    expect(note).toHaveTextContent(/尚未呈現|後續增強/);
+    expect(screen.queryByText(/job id/i)).not.toBeInTheDocument();
   });
 });
