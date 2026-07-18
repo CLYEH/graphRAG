@@ -22,6 +22,7 @@ from neo4j.exceptions import ServiceUnavailable
 
 from api.app import create_app
 from api.deps import db_conn
+from api.pagination import decode_id_cursor
 from core.builds.lifecycle import BuildInfo, PreflightReport
 
 pytestmark = pytest.mark.contract
@@ -253,3 +254,158 @@ def test_store_outage_during_the_probe_is_a_typed_503(
     for path in (f"/projects/p/builds/{_BUILD}/activate", f"/projects/p/builds/{_BUILD}/rollback"):
         r = client.post(path)
         assert (r.status_code, r.json()["error"]["code"]) == (503, "STORE_UNAVAILABLE")
+
+
+# --- RB1: step / item drill-down ----------------------------------------------
+
+
+def _step_row(**over: Any) -> SimpleNamespace:
+    base: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "step_name": "extract",
+        "status": "failed",
+        "started_at": _NOW,
+        "finished_at": _NOW,
+        "input_count": 10,
+        "output_count": 7,
+        "skipped_count": 0,
+        "failed_count": 3,
+        "error": {"kind": "PartialFailure"},
+    }
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _item_row(**over: Any) -> SimpleNamespace:
+    base: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "item_kind": "document",
+        "item_ref": "content-hash-abc",
+        "status": "failed",
+        "message": "unreadable",
+        "error": {"exc": "OSError"},
+    }
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_list_build_steps_shape_pagination_and_build_id(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # RB1: the step drill-down carries meta.build_id (the build named in the
+    # path), pages id-desc, and emits the full BuildStep shape with nullable
+    # counts as-is.
+    _project_exists(monkeypatch)
+    _known_build(monkeypatch, _build())
+    rows = [_step_row(), _step_row()]
+
+    async def fake_list(
+        conn: Any, project: str, build_id: Any, *, limit: int, after: Any, status: Any
+    ) -> Any:
+        return rows, rows[-1].id  # a next page exists
+
+    _stub(monkeypatch, "list_build_steps", fake_list)
+    r = client.get(f"/projects/p/builds/{_BUILD}/steps")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["meta"]["build_id"] == str(_BUILD)
+    assert decode_id_cursor(body["meta"]["next_cursor"]) == (rows[-1].id,)
+    step = body["data"][0]
+    assert step["step_name"] == "extract" and step["status"] == "failed"
+    assert step["failed_count"] == 3 and step["error"] == {"kind": "PartialFailure"}
+
+
+def test_list_build_steps_404_when_build_missing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a missing build is BUILD_NOT_FOUND (via _require_build) BEFORE any step read
+    _project_exists(monkeypatch)
+
+    async def no_build(conn: Any, project: str, build_id: Any) -> Any:
+        return None
+
+    _stub(monkeypatch, "get_build_info", no_build)
+    r = client.get(f"/projects/p/builds/{_BUILD}/steps")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "BUILD_NOT_FOUND"
+
+
+def test_list_build_steps_rejects_unsupported_filter(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _project_exists(monkeypatch)
+    _known_build(monkeypatch, _build())
+
+    async def fake_list(conn: Any, *a: Any, **kw: Any) -> Any:
+        return [], None
+
+    _stub(monkeypatch, "list_build_steps", fake_list)
+    # filter[status] is the implemented facet (passes); anything else fails loud
+    assert (
+        client.get(
+            f"/projects/p/builds/{_BUILD}/steps", params={"filter[status]": "failed"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(f"/projects/p/builds/{_BUILD}/steps", params={"filter[name]": "x"}).status_code
+        == 400
+    )
+    assert (
+        client.get(f"/projects/p/builds/{_BUILD}/steps", params={"sort": "name:asc"}).status_code
+        == 400
+    )
+
+
+def test_list_step_items_404_when_step_not_in_build(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a step that is not part of this build is a true 404 (the build exists, the
+    # step does not) — never an empty page that reads as "no items"
+    _project_exists(monkeypatch)
+    _known_build(monkeypatch, _build())
+
+    async def not_in_build(conn: Any, project: str, build_id: Any, step_id: Any) -> bool:
+        return False
+
+    ran = {"n": 0}
+
+    async def items_should_not_run(conn: Any, *a: Any, **kw: Any) -> Any:
+        ran["n"] += 1
+        return [], None
+
+    _stub(monkeypatch, "step_belongs_to_build", not_in_build)
+    _stub(monkeypatch, "list_step_items", items_should_not_run)
+    r = client.get(f"/projects/p/builds/{_BUILD}/steps/{uuid.uuid4()}/items")
+    assert r.status_code == 404
+    assert ran["n"] == 0  # the existence check short-circuits before the item read
+
+
+def test_list_step_items_shape_and_status_filter(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _project_exists(monkeypatch)
+    _known_build(monkeypatch, _build())
+
+    async def in_build(conn: Any, project: str, build_id: Any, step_id: Any) -> bool:
+        return True
+
+    seen: dict[str, Any] = {}
+
+    async def fake_items(
+        conn: Any, project: str, build_id: Any, step_id: Any, *, limit: int, after: Any, status: Any
+    ) -> Any:
+        seen["status"] = status
+        return [_item_row()], None
+
+    _stub(monkeypatch, "step_belongs_to_build", in_build)
+    _stub(monkeypatch, "list_step_items", fake_items)
+    sid = uuid.uuid4()
+    r = client.get(
+        f"/projects/p/builds/{_BUILD}/steps/{sid}/items", params={"filter[status]": "failed"}
+    )
+    assert r.status_code == 200
+    assert seen["status"] == "failed"  # the facet reached the read
+    item = r.json()["data"][0]
+    assert item["item_kind"] == "document" and item["item_ref"] == "content-hash-abc"
+    assert item["status"] == "failed" and item["message"] == "unreadable"

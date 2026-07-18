@@ -32,7 +32,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Header, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from neo4j.exceptions import DriverError, Neo4jError
@@ -45,8 +45,8 @@ from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
 from api.pagination import decode_id_cursor, encode_cursor
 from api.registry_errors import translate_registry_error
-from api.routers._query import reject_unsupported_query
-from api.schemas import build_dto, job_accepted_dto
+from api.routers._query import reject_unsupported_query, single_filter_value
+from api.schemas import build_dto, build_step_dto, build_step_item_dto, job_accepted_dto
 from api.workers.build_worker import EVAL_JOB_KIND, enqueue_eval
 from core.builds.lifecycle import (
     BuildInfo,
@@ -56,6 +56,11 @@ from core.builds.lifecycle import (
 )
 from core.config import get_settings
 from core.eval.idempotency import eval_inputs_fingerprint, policy_fingerprint_bytes
+from core.observability.reads import (
+    list_build_steps,
+    list_step_items,
+    step_belongs_to_build,
+)
 from core.registry import (
     JobConflictError,
     ProjectNotFoundError,
@@ -120,6 +125,68 @@ async def get_build_endpoint(
 ) -> dict[str, Any]:
     build = await _require_build(conn, project, build_id)
     return success(build_dto(build), **response_meta(request), build_id=build.id)
+
+
+@router.get("/projects/{project}/builds/{build_id}/steps")
+async def list_build_steps_endpoint(
+    request: Request,
+    conn: Conn,
+    project: str,
+    build_id: uuid.UUID,
+    limit: int = Query(50, ge=1, le=500),
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    # RB1 §27.7 drill-down: the build's pipeline steps. `status` is an OPEN
+    # vocabulary (no DDL CHECK — the C2–C7 writers own it), so the facet
+    # validates blankness only.
+    reject_unsupported_query(request, "id", allowed_filters=frozenset({"status"}))
+    status = single_filter_value(request, "status")
+    await _require_build(conn, project, build_id)  # project 404 then build 404
+    after = decode_id_cursor(cursor)[0] if cursor else None
+    steps, next_after = await list_build_steps(
+        conn, project, build_id, limit=limit, after=after, status=status
+    )
+    return success(
+        [build_step_dto(s) for s in steps],
+        **response_meta(request),
+        build_id=build_id,
+        paginated=True,
+        next_cursor=encode_cursor((next_after,)) if next_after is not None else None,
+    )
+
+
+@router.get("/projects/{project}/builds/{build_id}/steps/{step_id}/items")
+async def list_step_items_endpoint(
+    request: Request,
+    conn: Conn,
+    project: str,
+    build_id: uuid.UUID,
+    step_id: uuid.UUID,
+    limit: int = Query(50, ge=1, le=500),
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    # RB1 §27.7 drill-down: one step's recorded item outcomes. item.status is an
+    # OPEN vocabulary (failed/skipped are the frozen minimum, but sampled/all
+    # verbosity records successes too) — blankness-validated only.
+    reject_unsupported_query(request, "id", allowed_filters=frozenset({"status"}))
+    status = single_filter_value(request, "status")
+    await _require_build(conn, project, build_id)  # project 404 then build 404
+    if not await step_belongs_to_build(conn, project, build_id, step_id):
+        # GAP: no frozen step-not-found code (the build exists, the step does
+        # not) — a true 404 with the coarse code, exactly as inspect handles a
+        # missing document/chunk/entity under a valid build.
+        raise HTTPException(status_code=404, detail=f"step {step_id} not found in build {build_id}")
+    after = decode_id_cursor(cursor)[0] if cursor else None
+    items, next_after = await list_step_items(
+        conn, project, build_id, step_id, limit=limit, after=after, status=status
+    )
+    return success(
+        [build_step_item_dto(i) for i in items],
+        **response_meta(request),
+        build_id=build_id,
+        paginated=True,
+        next_cursor=encode_cursor((next_after,)) if next_after is not None else None,
+    )
 
 
 async def _promote(
