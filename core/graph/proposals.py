@@ -322,6 +322,15 @@ async def decide_ontology_proposal(
         # the appended type must keep the ontology buildable — guards a blank
         # type_name the DDL's `type_name <> ''` would still admit.
         _require_buildable(config)
+        # This read-modify-write is atomic under the projects-row lock held above
+        # (fresh config read FOR UPDATE → write in the same txn). The residual
+        # gap is CROSS-WRITER: `PATCH /projects` (update_project) overwrites the
+        # WHOLE config column from a client copy with NO version check, so a PATCH
+        # whose body was computed from a pre-accept read can clobber this type
+        # after we commit — the SAME versionless lost-update any two config
+        # writers race into (the FE save docstring notes it). The real fix is a
+        # config version token / optimistic concurrency on the PATCH, a frozen-
+        # contract change (DR-002) spanning every config writer, not GOV3 alone.
         await conn.execute(
             projects.update().where(projects.c.name == project).values(config=config)
         )
