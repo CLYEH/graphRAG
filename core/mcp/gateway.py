@@ -106,10 +106,14 @@ class McpGateway:
         except Exception as exc:  # noqa: BLE001 — startup failure must be reported, not raised past the protocol
             await send({"type": "lifespan.startup.failed", "message": str(exc)})
             return
-        await send({"type": "lifespan.startup.complete"})
         try:
             async with anyio.create_task_group() as tasks:
+                # the task group must EXIST before uvicorn starts dispatching
+                # requests — startup.complete is the green light, and a first
+                # /mcp/<project> in the gap would 500 on the not-yet-assigned
+                # group (Codex #93 R1)
                 self._tasks = tasks
+                await send({"type": "lifespan.startup.complete"})
                 message = await receive()
                 assert message["type"] == "lifespan.shutdown"
                 # release every host task — each exits its child lifespan in

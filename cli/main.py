@@ -130,7 +130,7 @@ async def _run(args: argparse.Namespace) -> int:
                 from core.mcp.policy import (
                     PolicyError,
                     load_query_policy,
-                    load_runtime_config_from_registry,
+                    load_query_policy_from_registry,
                 )
                 from core.stores.repo import active_build_id
 
@@ -142,7 +142,9 @@ async def _run(args: argparse.Namespace) -> int:
                         # the registry, the ONE policy SoR (CFG1)
                         policy = load_query_policy(args.config)
                     else:
-                        policy, _ = await load_runtime_config_from_registry(conn, args.project)
+                        # policy ONLY — eval never touches metadata exposure, and a
+                        # malformed exposure block must not block scoring (#93 R2)
+                        policy = await load_query_policy_from_registry(conn, args.project)
                         await conn.rollback()  # end the read txn like the build lookup below
                 except (GoldenError, PolicyError) as exc:
                     print(f"REFUSED: {exc}", file=sys.stderr)

@@ -73,6 +73,19 @@ async def test_registry_policy_failures_are_typed_and_loud(
     assert policy == query_policy_from_mapping(DEMO_QUERY_POLICY)
     assert exposure.fields == ()  # no metadata_exposure block → fail-closed empty
 
+    # #93 R2: a malformed metadata_exposure must not block a consumer that
+    # never uses exposure (CLI eval) — the policy-only loader succeeds where
+    # the composed loader (rightly) refuses
+    from core.mcp.policy import load_query_policy_from_registry
+    from core.metadata.schema import MetadataConfigError
+
+    rows["mixed"] = SimpleNamespace(
+        config={"query_policy": DEMO_QUERY_POLICY, "metadata_exposure": "not-a-mapping"}
+    )
+    assert await load_query_policy_from_registry(object(), "mixed") == policy
+    with pytest.raises(MetadataConfigError):
+        await load_runtime_config_from_registry(object(), "mixed")
+
 
 def test_the_demo_policy_fixture_is_contract_valid() -> None:
     """The shared test fixture every MCP test seeds (DEMO_QUERY_POLICY —

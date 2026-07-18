@@ -197,20 +197,9 @@ def hybrid_policy(
     )
 
 
-async def load_runtime_config_from_registry(
-    conn: Any, project: str
-) -> tuple[QueryPolicy, MetadataExposure]:
-    """Registry-sourced policy + exposure — the ONE SoR (CFG1).
-
-    Owner 2026-07-17 superseded the 2026-07-10 dual-source decision: the
-    Console API always read ``projects.config`` while MCP/CLI read
-    ``projects/<name>/config.yaml``, letting the same project diverge between
-    its human and agent surfaces. Every runtime consumer now reads the SAME
-    registry column through the SAME shared validators
-    (:func:`query_policy_from_mapping` / ``load_metadata_exposure``), so
-    divergence is structurally impossible. Failures stay typed
-    (:class:`PolicyError`) and fail loud — a project without a registry
-    ``query_policy`` block cannot serve queries, same rule as the file era.
+async def _registry_config(conn: Any, project: str) -> dict[str, Any]:
+    """The project's registry config mapping, policy-block-checked — the ONE
+    row lookup both registry loaders share (a second copy would drift).
 
     The import is deferred: ``core.registry`` pulls store modules this
     policy-vocabulary module must not depend on at import time.
@@ -226,4 +215,33 @@ async def load_runtime_config_from_registry(
             f"project {project!r} has no query_policy block in its registry config "
             "(PATCH /projects/{project} writes it; CFG1: the registry is the ONLY source)"
         )
+    return config
+
+
+async def load_query_policy_from_registry(conn: Any, project: str) -> QueryPolicy:
+    """Registry-sourced policy ONLY (CFG1) — for consumers that never touch
+    metadata exposure (the CLI ``eval``): a malformed ``metadata_exposure``
+    block must not block scoring a valid golden set + policy (Codex #93 R2:
+    validating what the consumer does not use turns an unrelated config error
+    into a false refusal)."""
+    config = await _registry_config(conn, project)
+    return query_policy_from_mapping(config["query_policy"])
+
+
+async def load_runtime_config_from_registry(
+    conn: Any, project: str
+) -> tuple[QueryPolicy, MetadataExposure]:
+    """Registry-sourced policy + exposure — the ONE SoR (CFG1).
+
+    Owner 2026-07-17 superseded the 2026-07-10 dual-source decision: the
+    Console API always read ``projects.config`` while MCP/CLI read
+    ``projects/<name>/config.yaml``, letting the same project diverge between
+    its human and agent surfaces. Every runtime consumer now reads the SAME
+    registry column through the SAME shared validators
+    (:func:`query_policy_from_mapping` / ``load_metadata_exposure``), so
+    divergence is structurally impossible. Failures stay typed
+    (:class:`PolicyError`) and fail loud — a project without a registry
+    ``query_policy`` block cannot serve queries, same rule as the file era.
+    """
+    config = await _registry_config(conn, project)
     return query_policy_from_mapping(config["query_policy"]), load_metadata_exposure(config)

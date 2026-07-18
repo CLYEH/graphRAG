@@ -136,6 +136,12 @@ async def test_routing_registry_and_isolation(harness: _Harness) -> None:
     async def lifespan_send(message: dict[str, Any]) -> None:
         events.append(message)
         if message["type"] == "lifespan.startup.complete":
+            # startup.complete is uvicorn's green light to dispatch requests:
+            # AT THE SEND INSTANT the child task group must already exist, or
+            # the first /mcp/<project> 500s on the unassigned group (Codex
+            # #93 R1). Asserted INSIDE send — an after-the-fact check races
+            # the lifespan task's next step and false-greens (probe-proven).
+            assert app._tasks is not None  # noqa: SLF001
             started.set()
 
     async with anyio.create_task_group() as tg:
