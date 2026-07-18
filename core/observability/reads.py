@@ -134,11 +134,17 @@ async def list_step_items(
     after: uuid.UUID | None = None,
     status: str | None = None,
 ) -> tuple[Sequence[sa.Row[Any]], uuid.UUID | None]:
-    """One page of a step's recorded item outcomes (id desc keyset). The step is
-    already known to belong to the build (:func:`step_belongs_to_build`); scope
-    by step_id. ``status`` narrows to e.g. failed items."""
+    """One page of a step's recorded item outcomes (id desc keyset). Scoped by
+    step_id AND the step belonging to ``(project, build_id)`` — this seam is
+    public, so it must enforce its own signature rather than trust a caller's
+    prior :func:`step_belongs_to_build` precheck (Codex #99 R3: a direct or
+    future retry caller passing a FOREIGN step_id must get nothing, not that
+    step's items). ``status`` narrows to e.g. failed items."""
     items = tables.pipeline_step_items
-    where: list[Any] = [items.c.step_id == step_id]
+    where: list[Any] = [
+        items.c.step_id == step_id,
+        items.c.step_id.in_(_build_step_ids(project, build_id)),  # the step must be the build's
+    ]
     if status is not None:
         where.append(items.c.status == status)
     if after is not None:

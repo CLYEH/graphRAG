@@ -134,6 +134,12 @@ async def test_steps_and_items_scope_to_the_build_and_filter_failed(project: str
                 conn, project, build_id, step.id, limit=50, status="failed"
             )
             assert {(i.item_ref, i.status) for i in failed} == {("hash-bad", "failed")}
+
+            # Codex #99 R3: the seam SELF-scopes — asking for THIS step's items
+            # under the WRONG build returns nothing (a foreign-build caller can't
+            # leak them), independent of any router precheck
+            leaked, _ = await list_step_items(conn, project, other_build, step.id, limit=50)
+            assert leaked == []
             await conn.rollback()
     finally:
         await engine.dispose()
