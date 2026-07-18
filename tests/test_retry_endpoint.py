@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 from api.app import create_app
 from api.deps import arq_redis_provider, db_conn
 from core.builds.lifecycle import BuildInfo
+from core.builds.retry import CloneCounts
 from core.registry import JobConflictError, ProjectNotFoundError
 
 pytestmark = pytest.mark.contract
@@ -92,9 +93,9 @@ def _stub_produce(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         captured["create_build_parent"] = parent_build_id
         return child_id
 
-    async def fake_clone(conn: Any, project: str, parent: Any, child: Any) -> Any:
+    async def fake_clone(conn: Any, project: str, parent: Any, child: Any) -> CloneCounts:
         captured["clone"] = (parent, child)
-        return None
+        return CloneCounts(documents=2)
 
     async def fake_create_job(conn: Any, project: str, kind: str, *, build_id: Any = None) -> Any:
         captured["kind"] = kind
@@ -155,6 +156,32 @@ def test_retry_non_failed_build_is_409_not_retryable(
     resp = client.post(_URL)
     assert (resp.status_code, resp.json()["error"]["code"]) == (409, "BUILD_NOT_RETRYABLE")
     assert resp.json()["error"]["details"]["status"] == status
+
+
+def test_retry_with_no_reusable_documents_is_409(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a parent that failed AT/BEFORE ingest committed 0 documents. Because a
+    # retry child SKIPS live-source ingest, letting it through would run the
+    # pipeline on an EMPTY corpus and reach 'ready' — masking the ingest failure
+    # (Codex #100 P1 R2). The endpoint must refuse when the clone reused nothing.
+    _stub_parent(monkeypatch)
+    captured = _stub_produce(monkeypatch)
+
+    async def empty_clone(conn: Any, project: str, parent: Any, child: Any) -> CloneCounts:
+        return CloneCounts(documents=0)
+
+    monkeypatch.setattr("api.routers.builds.clone_raw_artifacts", empty_clone)
+
+    # the job must NEVER be created for a no-document retry
+    def _fail_job(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("create_job_exclusive must not run for a 0-document retry")
+
+    monkeypatch.setattr("api.routers.builds.create_job_exclusive", _fail_job)
+    resp = client.post(_URL)
+    assert (resp.status_code, resp.json()["error"]["code"]) == (409, "BUILD_NOT_RETRYABLE")
+    assert resp.json()["error"]["details"]["documents"] == 0
+    assert "enqueued_job_id" not in captured  # nothing dispatched
 
 
 def test_retry_unknown_project_is_404(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

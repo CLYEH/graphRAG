@@ -167,6 +167,21 @@ async def test_retry_creates_lineaged_child_clones_docs_and_leaves_parent(api: A
     assert len(parent_docs) == 2
 
 
+async def test_retry_with_no_documents_is_refused_and_leaves_no_child(api: Api) -> None:
+    client, conn, enqueued = api
+    project = await _make_project(client)
+    # a parent that failed AT/BEFORE ingest committed 0 documents
+    parent = await _failed_build_with_docs(conn, project, docs=0)
+
+    r = await client.post(f"/projects/{project}/builds/{parent}/retry")
+    # nothing to reuse, and a retry skips live ingest → an empty 'ready' build is
+    # the failure mode; the endpoint refuses (Codex #100 P1 R2) and rolls back
+    assert (r.status_code, r.json()["error"]["code"]) == (409, "BUILD_NOT_RETRYABLE")
+    assert r.json()["error"]["details"]["documents"] == 0
+    assert await _building_children(conn, project, parent) == []  # no orphan child
+    assert enqueued == []
+
+
 async def test_retry_job_conflict_rolls_back_the_child_atomically(api: Api) -> None:
     client, conn, enqueued = api
     project = await _make_project(client)

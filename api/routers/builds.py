@@ -452,8 +452,9 @@ async def retry_build_endpoint(
     — the worker resumes the ready-seeded child, so the §5 pipeline reruns and
     converges. The parent's terminal record is never mutated (audit integrity —
     lineage is the child's pointer). Only a terminal ``failed`` build is
-    retryable (any other status → 409 ``BUILD_NOT_RETRYABLE``); a full re-run is
-    ``POST /build``.
+    retryable (any other status → 409 ``BUILD_NOT_RETRYABLE``), and a failed
+    build that committed no documents (it failed at/before ingest) is equally
+    not retryable — there is nothing to reuse; a full re-run is ``POST /build``.
 
     Mirrors the trigger/eval endpoints: one active job per project (409
     ``JOB_CONFLICT``), enqueue IN-BAND before the request commits (the class-12
@@ -496,7 +497,21 @@ async def retry_build_endpoint(
         # their registry errors through the same translator (symmetric 404/409).
         try:
             child_build_id = await create_build(conn, project, parent_build_id=build_id)
-            await clone_raw_artifacts(conn, project, build_id, child_build_id)
+            clone = await clone_raw_artifacts(conn, project, build_id, child_build_id)
+            # A parent that failed AT/BEFORE ingest committed no documents (the
+            # ingest stage is one all-or-nothing txn), so there is nothing to
+            # reuse — and because a retry child SKIPS live-source ingest, letting
+            # it through would run the pipeline on an EMPTY corpus and reach
+            # 'ready', silently masking the ingest failure (Codex #100 P1 R2).
+            # Refuse instead; the ApiError rolls the child + clone back.
+            if clone.documents == 0:
+                raise ApiError(
+                    ErrorCode.BUILD_NOT_RETRYABLE,
+                    f"build {build_id} committed no documents (it failed at or before "
+                    "ingest), so there is nothing to reuse; fix the sources and run a "
+                    "full build (POST /build)",
+                    details={"build_id": str(build_id), "documents": 0},
+                )
             job = await create_job_exclusive(conn, project, RETRY_JOB_KIND, build_id=child_build_id)
         except (ProjectNotFoundError, JobConflictError) as exc:
             raise translate_registry_error(exc) from exc
