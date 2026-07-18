@@ -454,9 +454,10 @@ def test_approve_entity_200_stamps_build_id_and_echoes_review_status(
     assert body["meta"]["build_id"] == str(_BUILD)
 
 
-def test_entity_decide_maps_not_found_and_transition_errors(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_entity_decide_maps_not_found(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # a missing entity in the active build is a true 404 (coarse code). There is
+    # no §17-refusal path: re-deciding APPENDS (the frozen contract's "never
+    # conflicts"), so decide_entity never raises a transition error.
     _bindable(monkeypatch)
     eid = uuid.uuid4()
 
@@ -466,14 +467,6 @@ def test_entity_decide_maps_not_found_and_transition_errors(
     _stub(monkeypatch, "decide_entity", missing)
     r = client.post(f"/projects/p/entities/{eid}/reject")
     assert r.status_code == 404  # GAP: true status, coarse code
-
-    async def refused(conn: Any, *, verb: str, **kw: Any) -> Any:
-        raise InvalidReviewTransitionError("entity", kw["entity_id"], "approved", verb)
-
-    _stub(monkeypatch, "decide_entity", refused)
-    r = client.post(f"/projects/p/entities/{eid}/approve")
-    assert r.status_code == 400
-    assert r.json()["error"]["details"] == {"status": "approved", "decision": "approve"}
 
 
 def test_reject_relation_200_and_not_found(

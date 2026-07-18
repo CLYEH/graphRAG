@@ -396,18 +396,49 @@ async def test_decide_entity_writes_the_carryforward_key_and_updates_the_row(
             assert ledger.decided_by == "console" and ledger.reason == "valid exhibit"
             assert ledger.fingerprint_version == fingerprints.LEDGER_FINGERPRINT_VERSION
             # the KEY equals what resolve_build re-mints from (name, disambiguator)
-            assert ledger.target_key == fingerprints.ledger_entity_key("區域探索廳", "EXT-42")
+            key = fingerprints.ledger_entity_key("區域探索廳", "EXT-42")
+            assert ledger.target_key == key
 
-            # §17: an approved entity is terminal — re-deciding refuses
-            with pytest.raises(InvalidReviewTransitionError):
-                await decide_entity(
-                    conn,
-                    project=project,
-                    build_id=build_id,
-                    entity_id=eid,
-                    verb="reject",
-                    decided_by="console",
+            # RE-DECIDING APPENDS, never conflicts (the frozen contract): a
+            # curator corrects the approve by rejecting — a SECOND ledger entry
+            # lands (later decided_at), the row flips to rejected, and §27.3
+            # precedence resolves the key to the latest manual decision (reject).
+            corrected = await decide_entity(
+                conn,
+                project=project,
+                build_id=build_id,
+                entity_id=eid,
+                verb="reject",
+                decided_by="console",
+            )
+            assert corrected.status == "rejected" and corrected.review_status == "rejected"
+            entries = (
+                await conn.execute(
+                    sa.select(review_ledger.c.decision, review_ledger.c.decided_at).where(
+                        review_ledger.c.project == project,
+                        review_ledger.c.target_kind == "entity",
+                        review_ledger.c.target_key == key,
+                    )
                 )
+            ).all()
+            assert sorted(e.decision for e in entries) == [
+                "approve",
+                "reject",
+            ]  # append, not update
+            from core.resolve.review import LedgerEntry, effective_decision
+
+            winner = effective_decision(
+                [
+                    LedgerEntry(
+                        decision=e.decision,
+                        decided_by="console",
+                        decided_at=e.decided_at,
+                        fingerprint_version=fingerprints.LEDGER_FINGERPRINT_VERSION,
+                    )
+                    for e in entries
+                ]
+            )
+            assert winner is not None and winner.decision == "reject"  # latest wins
             await trans.rollback()
     finally:
         await engine.dispose()

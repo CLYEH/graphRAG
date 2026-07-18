@@ -444,12 +444,9 @@ async def _decide_target(
         except not_found as exc:
             # GAP: no frozen entity/relation-not-found code — true 404, coarse code
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except InvalidReviewTransitionError as exc:
-            raise ApiError(
-                ErrorCode.VALIDATION_ERROR,  # GAP: no frozen review-conflict code
-                str(exc),
-                details={"status": exc.current, "decision": exc.verb},
-            ) from exc
+        # no §17 refusal here: re-deciding an entity/relation APPENDS to the
+        # ledger and precedence resolves (the frozen contract's "never
+        # conflicts") — unlike merge candidates, there is no terminal state
         return 200, success(dto(row), **response_meta(request), build_id=binding.build_id)
 
     if idempotency_key:

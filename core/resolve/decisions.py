@@ -308,10 +308,16 @@ async def decide_entity(
     from the projection, approve → adopted); (2) the ACTIVE build's row records
     the resulting ``status``/``review_status`` so inspect views reflect it now.
     The row is locked ``FOR UPDATE`` and the §17 transition checked under the
-    lock (two concurrent decides serialize — the loser gets a typed refusal, not
-    a double decision). Does NOT commit. Raises ``EntityNotFoundError``,
-    ``InvalidReviewTransitionError``, or ``ValueError`` (bad verb / reserved
-    ``decided_by``)."""
+    lock (two concurrent decides serialize on the row). Does NOT commit. Raises
+    ``EntityNotFoundError`` or ``ValueError`` (bad verb / reserved
+    ``decided_by``).
+
+    RE-DECIDING is allowed and APPENDS (the frozen contract: "re-deciding
+    appends (precedence resolves), never conflicts"): the ledger is append-only
+    and §27.3 resolves a key's decisions by latest manual ``decided_at`` — so a
+    curator corrects a bad approve/reject by deciding again, and every future
+    build re-applies the LATEST. This is why (unlike a merge candidate, whose
+    single-row status IS terminal) there is NO terminal-state refusal here."""
     _require_curator_decision(verb, decided_by)
     ents = tables.entities
     row = (
@@ -325,13 +331,6 @@ async def decide_entity(
     ).one_or_none()
     if row is None:
         raise EntityNotFoundError(project, entity_id)
-    target = _REVIEW_VERB_TO_STATUS[verb]
-    # validate on review_status (the §17 field): unreviewed is decidable,
-    # approved/rejected are terminal. `status` may be active/needs_review/… and
-    # is NOT the §17 gate — the machine accepts unreviewed as the pending state.
-    if not can_transition("entity_review", row.review_status, target):
-        raise InvalidReviewTransitionError("entity", entity_id, row.review_status, verb)
-
     target_key = fingerprints.ledger_entity_key(row.canonical_name, row.disambiguator)
     decided_at = (await conn.execute(sa.select(sa.func.clock_timestamp()))).scalar_one()
     await conn.execute(
@@ -377,9 +376,10 @@ async def decide_relation(
     from the endpoints, NOT the row's ``relation_signature`` column, so a row
     whose signature is still NULL (pre-resolve) is still decided correctly — the
     entry simply applies on the next build once the relation carries a
-    signature. Raises ``RelationNotFoundError``,
-    ``InvalidReviewTransitionError``, ``ValueError``, or ``LookupError`` (an
-    endpoint entity is unmintable — unreachable behind the composite FK)."""
+    signature. Re-deciding APPENDS (precedence resolves — see
+    :func:`decide_entity`). Raises ``RelationNotFoundError``, ``ValueError``, or
+    ``LookupError`` (an endpoint entity is unmintable — unreachable behind the
+    composite FK)."""
     _require_curator_decision(verb, decided_by)
     rels = tables.relations
     row = (
@@ -397,10 +397,7 @@ async def decide_relation(
     ).one_or_none()
     if row is None:
         raise RelationNotFoundError(project, relation_id)
-    target = _REVIEW_VERB_TO_STATUS[verb]
-    if not can_transition("relation_review", row.review_status, target):
-        raise InvalidReviewTransitionError("relation", relation_id, row.review_status, verb)
-
+    # re-deciding APPENDS (see decide_entity) — no terminal-state refusal
     ents = tables.entities
     keys = {
         r.id: fingerprints.ledger_entity_key(r.canonical_name, r.disambiguator)
