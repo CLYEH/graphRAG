@@ -110,6 +110,32 @@ describe("RunsTable", () => {
     expect(screen.getByText(/確切失敗原因/)).toBeInTheDocument();
   });
 
+  it("surfaces a step's aggregate error (BuildStep.error) alongside its meta (RB1)", async () => {
+    // an aggregate step failure (a whole-step PartialFailure) carries its cause
+    // on BuildStep.error — NOT on any item (failed_count 0). Discarding it would
+    // strand the operator with counts and no reason, and the run-level note
+    // below would then wrongly imply no cause is shown (Codex #102). It must
+    // render WITHOUT expanding the step (there are no item messages to find).
+    stubDrilldown({
+      steps: [
+        {
+          id: "s3333333-cccc-4ccc-8ccc-000000000003",
+          step_name: "extract",
+          status: "failed",
+          failed_count: 0,
+          skipped_count: 0,
+          input_count: 8,
+          error: { kind: "PartialFailure", detail: "3/8 shards timed out" },
+        },
+      ],
+    });
+    renderWithProviders(<RunsTable project="acme" />);
+
+    fireEvent.click((await screen.findAllByText(/版$/))[0]);
+    expect(await screen.findByText(/PartialFailure/)).toBeInTheDocument();
+    expect(screen.getByText(/3\/8 shards timed out/)).toBeInTheDocument();
+  });
+
   it("filters the drill-down to one diagnosis status and switches to skipped on demand (RB1)", async () => {
     // Under `sampled`/`all` verbosity the recorder ALSO persists successes,
     // ordered by id, so an UNFILTERED page could be all successes and bury the

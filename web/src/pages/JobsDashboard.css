@@ -266,6 +266,15 @@
   font-size: 12px;
 }
 
+/* the step's own aggregate error (BuildStep.error) — a real failure cause, so
+   it reads in the error tone, not the muted meta tone */
+.runs__step-error {
+  margin: 2px 0 4px 8px;
+  font-size: 12px;
+  color: #c0392b;
+  overflow-wrap: anywhere;
+}
+
 /* the panel wraps the 失敗/跳過 selector + the filtered list; it carries the
    left indent so the tabs align with the items below them */
 .runs__item-panel {
@@ -370,6 +379,9 @@
    badge @media block can't, since these bases are declared later; Codex #102). */
 @media (prefers-color-scheme: dark) {
   .runs__item-status--failed {
+    color: #f87171;
+  }
+  .runs__step-error {
     color: #f87171;
   }
   .runs__muted--ok {

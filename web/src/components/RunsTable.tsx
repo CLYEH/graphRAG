@@ -198,6 +198,14 @@ function FailureRecovery({ project, buildId }: { project: string; buildId: strin
                   {s.input_count ?? "—"}
                 </span>
               </button>
+              {/* the step's OWN structured error (BuildStep.error) is the cause
+                  of an AGGREGATE step failure — one that has no per-item message
+                  (e.g. a whole-step PartialFailure). Surface it alongside the
+                  meta rather than discarding it and sending the operator to a
+                  drill-down that holds no reason (Codex #102). */}
+              {s.error ? (
+                <p className="runs__step-error">階段錯誤:{JSON.stringify(s.error)}</p>
+              ) : null}
               {openStep === s.id && (
                 <StepItems
                   project={project}
@@ -212,24 +220,23 @@ function FailureRecovery({ project, buildId }: { project: string; buildId: strin
         </ul>
       )}
 
-      {/* The drill-down shows per-item outcomes only. The AUTHORITATIVE cause is
-          at the run level (pipeline_runs.error) and NOT exposed by the API — and
-          it can hide behind item failures: an earlier stage can tolerate failed
-          items (recorded as a 'failed' step) and a LATER stage still crash
-          (recorded on the run, never as a step). So this pointer is UNCONDITIONAL
-          — never gated on "no failed step", which would suppress the real later
-          crash behind the earlier item failure (Codex #102 R3/R4). It must NOT
-          point at the run's job id: the dashboard exposes only the BUILD id, the
-          job watcher takes a job id pasted from elsewhere, and neither the Build
-          schema nor any endpoint offers a build→job lookup or a jobs list — so a
-          "use the job id" instruction would send the operator to an identifier
-          this flow never supplies (a false affordance, Codex #102 P1). We state
-          the limitation honestly instead; surfacing the run error (or a build→job
-          lookup) is a backend follow-up (RB1-api). */}
+      {/* Now that per-step errors (BuildStep.error) and per-item outcomes are
+          both surfaced above, the ONE remaining unsurfaced cause is a run-level
+          crash: the pipeline can fail OUTSIDE any step (recorded on
+          pipeline_runs.error, never on a step) — and that can hide behind item
+          failures, so this pointer is UNCONDITIONAL, never gated on "no failed
+          step" (Codex #102 R3/R4). It must NOT point at the run's job id: the
+          dashboard exposes only the BUILD id, the job watcher takes a job id
+          pasted from elsewhere, and neither the Build schema nor any endpoint
+          offers a build→job lookup or a jobs list — a "use the job id"
+          instruction would be a false affordance (Codex #102 P1). We scope the
+          note to that run-level gap honestly; surfacing pipeline_runs.error (or a
+          build→job lookup) is a backend follow-up (RB1-api). */}
       {steps.isSuccess && (
         <p className="runs__muted">
-          下鑽為各步驟的逐項結果。此建置的確切失敗原因(項目失敗超過門檻,或某階段崩潰)記於 pipeline
-          run 層級,目前 Console 尚未呈現——於 Console 直接顯示 run 錯誤為後續增強 (RB1-api)。
+          下鑽為各步驟的逐項結果,步驟本身的錯誤(若有)顯示於各步驟列。此建置的確切失敗原因若為整個
+          pipeline run 在步驟之外崩潰,則記於 run 層級(pipeline_runs.error),目前 Console
+          尚未呈現——為後續增強(RB1-api)。
         </p>
       )}
 
