@@ -117,7 +117,11 @@ class TextExtractReport:
 
 
 async def extract_documents(
-    writer: BuildScopedWriter, llm: LLM, ontology: TextOntology
+    writer: BuildScopedWriter,
+    llm: LLM,
+    ontology: TextOntology,
+    *,
+    extract_only: frozenset[str] | None = None,
 ) -> TextExtractReport:
     """Extract entities/relations from this build's text documents via LLM.
 
@@ -126,6 +130,16 @@ async def extract_documents(
     nothing twice. A document whose ANY chunk fails (LLM error / non-JSON) is
     a ``failed`` item and later documents still run (§22); the §27.7 retry
     re-runs the whole document and converges on what already landed.
+
+    RB1-retry-skip: on a retry child, ``extract_only`` is the set of document
+    content_hashes that FAILED graph extraction in the parent (from
+    ``retry_failed_only``). Every OTHER text document succeeded in the parent and
+    its graph artifacts were cloned into this child, so re-calling the LLM on it
+    would re-incur cost AND risk drift — a nondeterministic LLM adding rows the
+    dedup index can't block. Such documents are skipped with NO LLM call and NO
+    item outcome (they are not this run's work items, exactly like the structured
+    rows the mime filter drops). ``None`` (a normal build) extracts every text
+    document unchanged.
     """
     state = BuildGraphState()
     await state.preload(writer)
@@ -141,6 +155,8 @@ async def extract_documents(
     for doc in await writer.fetch_all(tables.documents):
         if doc.mime not in _TEXT_MIMES:
             continue  # structured rows are C3a's; not this step's work items
+        if extract_only is not None and doc.content_hash not in extract_only:
+            continue  # RB1-retry-skip: succeeded in the parent, artifacts cloned
         chunks = sorted(
             await writer.fetch_all(tables.chunks, tables.chunks.c.document_id == doc.id),
             key=lambda row: row.ordinal,

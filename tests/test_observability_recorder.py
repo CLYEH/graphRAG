@@ -83,6 +83,19 @@ def test_duplicate_item_refs_dedupe_first_kept() -> None:
     assert len(_persistable(outcomes, "all")) == 2  # dedup applies in every mode
 
 
+def test_graph_step_name_matches_the_orchestrator_stage() -> None:
+    """RB1-retry-skip's failed-set reader (``reads.latest_run_graph_items``)
+    filters ``pipeline_steps`` on ``reads.GRAPH_STEP_NAME``. It MUST equal the
+    orchestrator's §5 'graph' stage name: a rename of that stage
+    (``orchestrator._STAGE_ORDER``) that didn't update the constant would silently
+    read ZERO failed docs, re-extract nothing, and produce a graph-less retry that
+    looks successful — the exact class of silent break the lockstep exists to catch."""
+    from core.builds.orchestrator import _STAGE_ORDER
+    from core.observability.reads import GRAPH_STEP_NAME
+
+    assert GRAPH_STEP_NAME in _STAGE_ORDER
+
+
 def test_dedupe_keeps_first_when_no_failure() -> None:
     """Without a failed occurrence the first-seen row wins (deterministic)."""
     outcomes = (
