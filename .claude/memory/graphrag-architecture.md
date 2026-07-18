@@ -16,7 +16,7 @@ graphRAG（GitHub: CLYEH/graphRAG，預設 branch main）是一套「多專案 h
 - 骨幹框架：LlamaIndex（PropertyGraph 建圖、實體解析、text-to-SQL、向量、router、LLM/embedding 抽象已含 OpenAI+Claude）
 - LLM：抽象層，至少支援 OpenAI + Claude（用 LlamaIndex 內建抽象，可能就不需另疊 LiteLLM）。**預設用 OpenAI**（抽取/推理預設 gpt-5.4-nano，可設定；embedding text-embedding-3-large），仍可切換 Claude
 - 儲存：polyglot 三引擎 — Postgres（SQL/結構化）+ Qdrant（向量）+ Neo4j（圖）
-- 架構：monorepo，一專案一資料夾一 MCP server process（隔離最清楚）
+- 架構：monorepo，一專案一「邏輯」MCP server；**CFG1/DR-012(2026-07-18)後由單一 gateway process 供應全部專案**：`graphrag serve-mcp` → `http://<host>:<port>/mcp/<project>`（registry 驅動 lazy-mount，新專案建完即可連,免重啟）；query_policy 的 SoR＝Postgres `projects.config`（config.yaml 退場）
 - 資料型態：結構化 + 非結構化混合
 - 圖 schema：混合 ontology（核心 schema + 允許 LLM 提議新型別）
 - 檢索：完整 hybrid — vector（語意）+ graph（多跳遍歷 + 全域摘要/community summary）+ SQL（結構化精確查詢）
