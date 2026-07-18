@@ -30,6 +30,13 @@ GitHub 為準;立案或了結後從本檔劃掉):
   lifespan 中 client factory(qdrant/neo4j/embedder/llm)建構失敗時 engine
   不 dispose(NullPool 故無實質洩漏);policy 失敗路徑已修(R5),此半邊
   順手補即可。
+- **config 樂觀併發 / version token**(DR-002 級,#84 R10 起立案,#97 R3 新增
+  參與者):`PATCH /projects` 整欄覆寫 config 無版本檢查,跨寫者(別 tab/CLI、
+  或 GOV3 accept 寫 ontology)在一次 save 的 read 與 PATCH 之間互相 clobber=
+  版本 token 凍結契約缺口。GOV3 accept 已在鎖下 atomic read-modify-write,但
+  後續版本無感的 PATCH 仍可蓋掉被接受型別(proposal 終態 accepted 但型別不在
+  config)。真解=config version/If-Match 樂觀併發,跨全部 config 寫者,自成一
+  DR-002 任務。
 - **MCP auth**:CFG1 gateway 不帶 auth(owner 2026-07-17 預設同意);對外
   曝露後 §23 placeholder 會變真需求,屆時是 DR-002 相關 owner 決策
   (凍結 enum 無 auth 錯誤碼)。

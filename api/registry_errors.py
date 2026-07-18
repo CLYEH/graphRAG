@@ -17,6 +17,7 @@ only the two lines below change.
 from __future__ import annotations
 
 from api.errors import ApiError, ErrorCode
+from core.graph.proposals import OntologyProposalNotFoundError
 from core.registry import (
     JobConflictError,
     JobNotFoundError,
@@ -41,6 +42,12 @@ def translate_registry_error(exc: Exception) -> ApiError:
             ErrorCode.SOURCE_NOT_FOUND,
             str(exc),
             details={"project": exc.project, "source_id": str(exc.source_id)},
+        )
+    if isinstance(exc, OntologyProposalNotFoundError):
+        return ApiError(
+            ErrorCode.PROPOSAL_NOT_FOUND,
+            str(exc),
+            details={"project": exc.project, "proposal_id": str(exc.proposal_id)},
         )
     if isinstance(exc, JobConflictError):
         return ApiError(

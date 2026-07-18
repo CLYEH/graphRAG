@@ -158,6 +158,22 @@ def _construct[T](path: str, build: Callable[[], T]) -> T:
         raise BuildConfigError(f"{path}: {exc}") from exc
 
 
+def ensure_ontology_buildable(config: Mapping[str, Any]) -> None:
+    """Raise :class:`BuildConfigError` unless ``config`` carries an ontology
+    block the build would ACCEPT (present, complete, valid vocabulary/policy).
+
+    The SAME gate :func:`_load_ontology` runs at build time, exposed as a public
+    entry point for GOV3's accept path: accepting a proposal ADDS a type to the
+    configured ontology, and must refuse (rather than 200-then-brick the next
+    build) if the resulting block is not runnable. GOV3's module cannot import
+    the loader at import scope (``core.builds.config`` imports
+    ``core.graph.proposals``), so it calls this lazily. An ABSENT ontology is
+    rejected too: there is nothing valid to add a type to."""
+    ontology, _ = _load_ontology(config)
+    if ontology is None:
+        raise BuildConfigError("ontology block is absent")
+
+
 def _load_ontology(raw: Mapping[str, Any]) -> tuple[TextOntology | None, str]:
     if "ontology" not in raw:  # omitted → no ontology; explicit null → _mapping rejects it
         return None, _DEFAULT_PROPOSAL_POLICY

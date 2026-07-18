@@ -20,6 +20,12 @@ from fastapi.testclient import TestClient
 from api.app import create_app
 from api.deps import db_conn
 from api.pagination import decode_id_cursor
+from core.graph.proposals import (
+    InvalidProposalTransitionError,
+    OntologyConfigIncompleteError,
+    OntologyProposalNotFoundError,
+)
+from core.registry import ProjectNotFoundError
 from core.resolve.decisions import InvalidReviewTransitionError, MergeCandidateNotFoundError
 
 pytestmark = pytest.mark.contract
@@ -195,3 +201,178 @@ def test_decide_rejects_null_body_and_unknown_fields(
     assert r.status_code == 400  # the #53 R5 class, via the shared guard
     r = client.post(f"/projects/p/merge-candidates/{cid}/approve", json={"verdict": "yes"})
     assert r.status_code == 400  # extra=forbid
+
+
+# --- GOV3: ontology proposal pool ---------------------------------------------
+
+
+def _proposal(**over: Any) -> SimpleNamespace:
+    base: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "project": "p",
+        "kind": "entity",
+        "type_name": "Exhibit",
+        "proposal_key": "fpv1:entity|exhibit",
+        "fingerprint_version": 1,
+        "example": "區域探索廳",
+        "chunk_ref": "doc-h:0",
+        "status": "proposed",
+        "decided_by": None,
+        "decided_at": None,
+        "reason": None,
+        "created_at": _TS,
+    }
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _present_project(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def present(conn: Any, name: str) -> Any:
+        return SimpleNamespace(name=name)
+
+    _stub(monkeypatch, "get_project", present)
+
+
+def test_list_proposals_shape_pagination_and_no_build_id(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the pool is NOT build-scoped — the list carries no meta.build_id (unlike
+    # merge-candidates), pages by id desc, and emits the full contract shape
+    # with nullable decision fields as null.
+    _present_project(monkeypatch)
+    rows = [_proposal(), _proposal()]
+
+    async def fake_list(conn: Any, project: str, *, limit: int, after: Any, status: Any) -> Any:
+        return rows, rows[-1].id  # a next page exists
+
+    _stub(monkeypatch, "list_ontology_proposals", fake_list)
+    r = client.get("/projects/p/ontology-proposals")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["meta"]["build_id"] is None  # pool is not build-scoped
+    assert decode_id_cursor(body["meta"]["next_cursor"]) == (rows[-1].id,)
+    dto = body["data"][0]
+    assert dto["kind"] == "entity" and dto["status"] == "proposed"
+    assert dto["decided_by"] is None and dto["decided_at"] is None  # nullable, present
+
+
+def test_list_proposals_404_when_project_missing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def missing(conn: Any, name: str) -> None:
+        return None
+
+    _stub(monkeypatch, "get_project", missing)
+    r = client.get("/projects/x/ontology-proposals")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "PROJECT_NOT_FOUND"
+
+
+def test_list_proposals_status_filter_passes_the_vocabulary(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # filter[status] reads the §17 ontology-proposal machine, so a legal status
+    # reaches the query and an out-of-vocabulary one is rejected (400) before it.
+    _present_project(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    async def fake_list(conn: Any, project: str, *, limit: int, after: Any, status: Any) -> Any:
+        seen["status"] = status
+        return [], None
+
+    _stub(monkeypatch, "list_ontology_proposals", fake_list)
+    assert (
+        client.get(
+            "/projects/p/ontology-proposals", params={"filter[status]": "accepted"}
+        ).status_code
+        == 200
+    )
+    assert seen["status"] == "accepted"
+    # an unknown status is not in the machine → rejected loud, never queried
+    r = client.get("/projects/p/ontology-proposals", params={"filter[status]": "bogus"})
+    assert r.status_code == 400
+
+
+def test_accept_proposal_200_and_echoes_accepted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake_decide(
+        conn: Any, *, project: str, proposal_id: Any, verb: str, **kw: Any
+    ) -> Any:
+        seen["verb"] = verb
+        return _proposal(status="accepted", decided_by="console", decided_at=_TS)
+
+    _stub(monkeypatch, "decide_ontology_proposal", fake_decide)
+    pid = uuid.uuid4()
+    r = client.post(f"/projects/p/ontology-proposals/{pid}/accept")
+    assert r.status_code == 200
+    assert seen["verb"] == "accept"  # the endpoint's verb reached the decision
+    assert r.json()["data"]["status"] == "accepted"
+
+
+def test_reject_proposal_maps_verb_and_errors(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PROPOSAL_NOT_FOUND (the new v1.3 code) and the §17 refusal (400) map
+    # through the shared translation point / GAP mapping.
+    pid = uuid.uuid4()
+
+    async def not_found(conn: Any, *, project: str, proposal_id: Any, **kw: Any) -> Any:
+        raise OntologyProposalNotFoundError(project, proposal_id)
+
+    _stub(monkeypatch, "decide_ontology_proposal", not_found)
+    r = client.post(f"/projects/p/ontology-proposals/{pid}/reject")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "PROPOSAL_NOT_FOUND"
+
+    async def missing_project(conn: Any, *, project: str, proposal_id: Any, **kw: Any) -> Any:
+        raise ProjectNotFoundError(project)
+
+    _stub(monkeypatch, "decide_ontology_proposal", missing_project)
+    r = client.post(f"/projects/p/ontology-proposals/{pid}/reject")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "PROJECT_NOT_FOUND"
+
+    async def refused(conn: Any, *, project: str, proposal_id: Any, verb: str, **kw: Any) -> Any:
+        raise InvalidProposalTransitionError(proposal_id, "accepted", verb)
+
+    _stub(monkeypatch, "decide_ontology_proposal", refused)
+    r = client.post(f"/projects/p/ontology-proposals/{pid}/reject")
+    assert r.status_code == 400
+    assert r.json()["error"]["details"] == {"status": "accepted", "decision": "reject"}
+
+
+def test_accept_refused_on_incomplete_ontology_is_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Codex #97 R1: accept into a project whose ontology config can't absorb the
+    # type is a 400 (the curator fixes the ontology, then re-accepts) — never a
+    # 200 that silently bricks the next build.
+    pid = uuid.uuid4()
+
+    async def incomplete(conn: Any, *, project: str, proposal_id: Any, **kw: Any) -> Any:
+        raise OntologyConfigIncompleteError(project, "ontology missing")
+
+    _stub(monkeypatch, "decide_ontology_proposal", incomplete)
+    r = client.post(f"/projects/p/ontology-proposals/{pid}/accept")
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert r.json()["error"]["details"]["project"] == "p"
+
+
+def test_proposal_decide_rejects_null_body(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fail(conn: Any, **kw: Any) -> Any:
+        raise AssertionError("must not run on a null body")
+
+    _stub(monkeypatch, "decide_ontology_proposal", fail)
+    pid = uuid.uuid4()
+    r = client.post(
+        f"/projects/p/ontology-proposals/{pid}/accept",
+        content=b" null ",
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 400  # the #53 R5 shared guard
