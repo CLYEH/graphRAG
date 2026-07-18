@@ -75,7 +75,7 @@ class _Harness:
         return SimpleNamespace(name=name) if name in self.registry else None
 
 
-async def _request(app: Any, path: str) -> tuple[int, bytes]:
+async def _request(app: Any, path: str, raw_path: bytes | None = None) -> tuple[int, bytes]:
     messages: list[dict[str, Any]] = []
 
     async def send(message: dict[str, Any]) -> None:
@@ -84,7 +84,14 @@ async def _request(app: Any, path: str) -> tuple[int, bytes]:
     async def receive() -> dict[str, Any]:  # pragma: no cover — no request body reads
         return {"type": "http.request", "body": b""}
 
-    await app({"type": "http", "path": path, "method": "POST", "headers": []}, receive, send)
+    scope = {
+        "type": "http",
+        "path": path,
+        "raw_path": raw_path if raw_path is not None else path.encode("utf-8"),
+        "method": "POST",
+        "headers": [],
+    }
+    await app(scope, receive, send)
     status = next(m["status"] for m in messages if m["type"] == "http.response.start")
     body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
     return status, body
@@ -174,6 +181,16 @@ async def test_routing_registry_and_isolation(harness: _Harness) -> None:
         await _request(app, "/mcp/nmmst/sub")
         assert harness.build_calls == ["nmmst"]
         assert child.scopes[1]["path"] == "/sub"
+
+        # an ENCODED slash must not smuggle a segment boundary: /mcp/a%2Fb
+        # decodes to project "a/b" (not path-addressable → 404), NEVER to
+        # project "a" with child path /b — even when "a" exists (Codex #93
+        # R3: wrong-project serving). The literal /mcp/nmmst/b above already
+        # pins that a REAL sub-path still routes.
+        harness.registry.add("a")
+        status, body = await _request(app, "/mcp/a/b", raw_path=b"/mcp/a%2Fb")
+        assert status == 404, body
+        assert "a" not in harness.children  # the wrong project was never mounted
 
         # a project created AFTER startup serves on its first request
         harness.registry.add("fresh")

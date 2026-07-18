@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+from urllib.parse import unquote
 
 import anyio
 from anyio.abc import TaskGroup, TaskStatus
@@ -40,7 +41,11 @@ from sqlalchemy.pool import NullPool
 from core.config import get_settings
 from core.mcp.server import build_server
 
-_MCP_PATH = re.compile(r"^/mcp/([^/]+)(/.*)?$")
+#: matched against the RAW (undecoded) path: a percent-encoded slash
+#: (%2F) must stay INSIDE its segment — matching the decoded path would let
+#: /mcp/a%2Fb smuggle itself into project `a` + child path /b and serve the
+#: WRONG project's server (Codex #93 R3)
+_MCP_PATH_RAW = re.compile(rb"^/mcp/([^/]+)(/.*)?$")
 
 
 def _json_response(status: int, payload: dict[str, Any]) -> tuple[int, bytes]:
@@ -70,13 +75,24 @@ class McpGateway:
             return
         if scope["type"] != "http":
             raise RuntimeError(f"unsupported ASGI scope type {scope['type']!r}")
-        match = _MCP_PATH.match(scope["path"])
+        raw_path = scope.get("raw_path") or scope["path"].encode("utf-8")
+        match = _MCP_PATH_RAW.match(raw_path)
         if match is None:
             await self._send_json(
                 send, 404, {"error": "unknown path — projects are served at /mcp/<project>"}
             )
             return
-        project, rest = match.group(1), match.group(2) or "/"
+        # decode the SEGMENT (not the whole path): an encoded slash decodes
+        # into the name here and is rejected below, never re-split as a path
+        project = unquote(match.group(1).decode("utf-8", "replace"))
+        rest = unquote((match.group(2) or b"/").decode("utf-8", "replace"))
+        if "/" in project:
+            await self._send_json(
+                send,
+                404,
+                {"error": f"project {project!r} is not in the registry (or not path-addressable)"},
+            )
+            return
         app = await self._app_for(project)
         if app is None:
             await self._send_json(
