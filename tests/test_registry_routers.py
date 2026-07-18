@@ -26,6 +26,7 @@ from core.registry import (
     ProjectHasBuildsError,
     ProjectNotFoundError,
     Source,
+    SourceNotFoundError,
 )
 
 pytestmark = pytest.mark.contract
@@ -197,3 +198,124 @@ def test_add_source_rejects_reserved_managed_key(
     assert error["code"] == "VALIDATION_ERROR"
     assert error["details"]["reserved_key"] == MANAGED_FILES_KEY
     assert called["n"] == 0  # rejected before touching the store
+
+
+def _present_project(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def present(conn: Any, name: str) -> Project:
+        return _PROJECT
+
+    _stub(monkeypatch, "sources", "get_project", present)
+
+
+def test_update_source_200_disables_and_echoes_enabled(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SRC2: PATCH sets enabled and returns the updated source; the DTO must
+    # carry `enabled` so the Console can reflect the disabled state.
+    _present_project(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    async def update_ok(conn: Any, project: str, source_id: Any, *, enabled: bool) -> Source:
+        seen["enabled"] = enabled
+        return Source(
+            id=source_id,
+            project=project,
+            kind="file",
+            uri="u",
+            metadata={},
+            added_at=_TS,
+            enabled=enabled,
+        )
+
+    _stub(monkeypatch, "sources", "update_source", update_ok)
+    sid = str(uuid.uuid4())
+    r = client.patch(f"/projects/p/sources/{sid}", json={"enabled": False})
+    assert r.status_code == 200
+    assert seen["enabled"] is False  # the body value reached the store call
+    data = r.json()["data"]
+    assert data["enabled"] is False
+    assert "project" not in data  # path context, not echoed (sibling convention)
+
+
+def test_update_source_404_when_source_missing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a project that EXISTS but has no such source is SOURCE_NOT_FOUND (the new
+    # v1.3 code), distinct from PROJECT_NOT_FOUND — the client can tell which
+    # half of the path was wrong.
+    _present_project(monkeypatch)
+
+    async def update_missing(conn: Any, project: str, source_id: Any, *, enabled: bool) -> Source:
+        raise SourceNotFoundError(project, source_id)
+
+    _stub(monkeypatch, "sources", "update_source", update_missing)
+    r = client.patch(f"/projects/p/sources/{uuid.uuid4()}", json={"enabled": True})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "SOURCE_NOT_FOUND"
+
+
+def test_update_source_404_when_project_missing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a missing PROJECT is PROJECT_NOT_FOUND, pre-checked before the source
+    # update runs (sibling-endpoint convention) — never a misleading 404 code.
+    async def missing(conn: Any, name: str) -> None:
+        return None
+
+    ran = {"n": 0}
+
+    async def update_should_not_run(
+        conn: Any, project: str, source_id: Any, *, enabled: bool
+    ) -> Source:
+        ran["n"] += 1
+        return _SOURCE
+
+    _stub(monkeypatch, "sources", "get_project", missing)
+    _stub(monkeypatch, "sources", "update_source", update_should_not_run)
+    r = client.patch(f"/projects/x/sources/{uuid.uuid4()}", json={"enabled": False})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "PROJECT_NOT_FOUND"
+    assert ran["n"] == 0  # pre-check short-circuits before the store call
+
+
+def test_update_source_rejects_unknown_field(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SRC2 immutability is structural: uri/kind are not in SourceUpdate, and
+    # extra="forbid" (the contract's additionalProperties:false) makes a
+    # smuggled `uri` a 422 — never a silently-ignored no-op.
+    _present_project(monkeypatch)
+
+    async def update_should_not_run(
+        conn: Any, project: str, source_id: Any, *, enabled: bool
+    ) -> Source:
+        raise AssertionError("must not reach the store on an invalid body")
+
+    _stub(monkeypatch, "sources", "update_source", update_should_not_run)
+    r = client.patch(
+        f"/projects/p/sources/{uuid.uuid4()}", json={"enabled": False, "uri": "file:///new"}
+    )
+    # the app reshapes FastAPI's body-validation 422 into the frozen envelope
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize("bad", ["false", "0", 0, 1, "true"])
+def test_update_source_rejects_non_boolean_enabled(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, bad: Any
+) -> None:
+    # SRC2: the contract types `enabled` a JSON boolean; strict validation must
+    # reject a coercible non-boolean (`"false"`/`0`/…) rather than silently
+    # flip the source's state on a malformed payload — the runtime boundary
+    # equals the contract, not Pydantic's lax default.
+    _present_project(monkeypatch)
+
+    async def update_should_not_run(
+        conn: Any, project: str, source_id: Any, *, enabled: bool
+    ) -> Source:
+        raise AssertionError("must not reach the store on a non-boolean enabled")
+
+    _stub(monkeypatch, "sources", "update_source", update_should_not_run)
+    r = client.patch(f"/projects/p/sources/{uuid.uuid4()}", json={"enabled": bad})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"

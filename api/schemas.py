@@ -68,6 +68,25 @@ class SourceCreate(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class SourceUpdate(BaseModel):
+    """SRC2 (DR-013): soft-disable only. ``extra="forbid"`` mirrors the
+    contract's ``additionalProperties:false`` — ``uri``/``kind`` are immutable,
+    so a client cannot even express a uri rewrite (corpus swap = disable old +
+    register new).
+
+    ``enabled`` is STRICT: the frozen contract types it a JSON ``boolean``, and
+    this endpoint's whole job is flipping that state — Pydantic's default lax
+    coercion would silently disable/enable a source on a malformed ``"false"``/
+    ``0``/``"0"`` payload the contract rejects. Strict keeps the runtime
+    boundary equal to the contract (a non-boolean is a 400, not a coerced
+    mutation). It is the first request-body boolean, so this sets the precedent
+    rather than diverging from a sibling."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(strict=True)
+
+
 class DocumentMetadataContextInput(BaseModel):
     """The contract DocumentMetadataContext on upload (DR-010): a CLOSED core
     (``title``/``document_type``) plus an OPEN ``attributes`` bag whose keys the
@@ -294,6 +313,7 @@ def source_dto(s: Source) -> dict[str, Any]:
         "id": s.id,
         "kind": s.kind,
         "uri": s.uri,
+        "enabled": s.enabled,
         "metadata": s.metadata,
         "added_at": s.added_at,
     }

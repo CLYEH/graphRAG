@@ -48,6 +48,7 @@ class Source:
     uri: str
     metadata: dict[str, Any]
     added_at: datetime
+    enabled: bool = True
 
 
 class ProjectExistsError(Exception):
@@ -145,6 +146,7 @@ _SOURCE_COLS = (
     tables.sources.c.uri,
     tables.sources.c.metadata,
     tables.sources.c.added_at,
+    tables.sources.c.enabled,
 )
 
 #: Reserved, SERVER-OWNED key under which an upload stashes its per-file DR-010
@@ -455,18 +457,60 @@ async def list_sources(
     *,
     limit: int,
     after: tuple[datetime, uuid.UUID] | None = None,
+    enabled_only: bool = False,
 ) -> tuple[list[Source], tuple[datetime, uuid.UUID] | None]:
     """One page of a project's sources, newest first (added_at desc, id desc
-    tiebreak). Same keyset contract as list_projects."""
+    tiebreak). Same keyset contract as list_projects.
+
+    ``enabled_only`` (SRC2): the build/ingest path passes True so a disabled
+    source is excluded from FUTURE builds; the Console listing passes False (the
+    default) so an operator still sees disabled sources to re-enable them."""
     key = sa.tuple_(tables.sources.c.added_at, tables.sources.c.id)
     query = (
         sa.select(*_SOURCE_COLS)
         .where(tables.sources.c.project == project)
         .order_by(tables.sources.c.added_at.desc(), tables.sources.c.id.desc())
     )
+    if enabled_only:
+        query = query.where(tables.sources.c.enabled.is_(True))
     if after is not None:
         query = query.where(key < sa.tuple_(sa.literal(after[0]), sa.literal(after[1])))
     rows = (await conn.execute(query.limit(limit + 1))).all()
     src = [Source(*r) for r in rows[:limit]]
     next_after = (src[-1].added_at, src[-1].id) if len(rows) > limit and src else None
     return src, next_after
+
+
+class SourceNotFoundError(LookupError):
+    """update_source on a (project, source_id) that does not exist."""
+
+    def __init__(self, project: str, source_id: uuid.UUID) -> None:
+        super().__init__(f"source {source_id} not found in project {project!r}")
+        self.project = project
+        self.source_id = source_id
+
+
+async def update_source(
+    conn: AsyncConnection,
+    project: str,
+    source_id: uuid.UUID,
+    *,
+    enabled: bool,
+) -> Source:
+    """Soft-disable / re-enable a source (SRC2, GAPS G2 option 2) — the ONLY
+    mutable field. ``uri``/``kind`` are immutable (corpus swap = disable old +
+    register new, so historical provenance is never rewritten); the contract's
+    SourceUpdate cannot even express a uri change. Scoped by (project, id) so a
+    source_id from another project is a not-found, not a cross-project write.
+    Raises SourceNotFoundError if no such source exists."""
+    row = (
+        await conn.execute(
+            tables.sources.update()
+            .where(tables.sources.c.project == project, tables.sources.c.id == source_id)
+            .values(enabled=enabled)
+            .returning(*_SOURCE_COLS)
+        )
+    ).one_or_none()
+    if row is None:
+        raise SourceNotFoundError(project, source_id)
+    return Source(*row)

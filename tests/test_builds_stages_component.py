@@ -242,7 +242,12 @@ async def test_ingest_pages_sources_and_flatmaps_payloads(
         added_at=datetime(2026, 1, 1),
     )
 
-    async def _list_sources(conn: Any, project: str, *, limit: int, after: Any = None) -> Any:
+    seen: dict[str, Any] = {}
+
+    async def _list_sources(
+        conn: Any, project: str, *, limit: int, after: Any = None, enabled_only: bool = False
+    ) -> Any:
+        seen["enabled_only"] = enabled_only
         return ([src], None) if after is None else ([], None)
 
     monkeypatch.setattr(stages_mod, "list_sources", _list_sources)
@@ -254,3 +259,7 @@ async def test_ingest_pages_sources_and_flatmaps_payloads(
     # ingest_documents received the flattened payloads; report mapped through.
     assert list(spy["ingest"].args[1]) == [SimpleNamespace(raw="doc")]
     assert result.detail == {"sources": 1, "documents": 1}
+    # SRC2: the build must load ONLY enabled sources — a disabled source is
+    # excluded from future builds (regression guard: dropping the flag would
+    # silently re-ingest disabled corpus).
+    assert seen["enabled_only"] is True

@@ -847,6 +847,10 @@ sources = sa.Table(
     sa.Column(
         "added_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
     ),
+    # SRC2 (DR-013): soft-disable. A disabled source is excluded from future
+    # ingests/builds; existing projections are never rewritten. Default true so
+    # pre-SRC2 rows keep the prior always-ingested behavior.
+    sa.Column("enabled", sa.Boolean, nullable=False, server_default=sa.text("true")),
     sa.CheckConstraint("uri <> ''", name="sources_uri_nonempty"),
 )
 

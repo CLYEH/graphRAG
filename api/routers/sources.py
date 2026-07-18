@@ -7,6 +7,7 @@ to PROJECT_NOT_FOUND via the single translation point.
 
 from __future__ import annotations
 
+import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, Query, Request
@@ -20,13 +21,15 @@ from api.idempotency import request_hash, run_idempotent
 from api.pagination import decode_source_cursor, encode_cursor
 from api.registry_errors import translate_registry_error
 from api.routers._query import reject_unsupported_query
-from api.schemas import SourceCreate, source_dto
+from api.schemas import SourceCreate, SourceUpdate, source_dto
 from core.registry import (
     MANAGED_FILES_KEY,
     ProjectNotFoundError,
+    SourceNotFoundError,
     add_source,
     get_project,
     list_sources,
+    update_source,
 )
 
 router = APIRouter(tags=["sources"])
@@ -108,3 +111,25 @@ async def add_source_endpoint(
         return JSONResponse(status_code=status, content=resp)
     status, resp = await produce()
     return JSONResponse(status_code=status, content=jsonable_encoder(resp))
+
+
+@router.patch("/projects/{project}/sources/{source_id}")
+async def update_source_endpoint(
+    request: Request,
+    conn: Conn,
+    project: str,
+    source_id: uuid.UUID,
+    body: SourceUpdate,
+) -> JSONResponse:
+    """SRC2 soft-disable / re-enable (GAPS G2 option 2). A missing project is a
+    PROJECT_NOT_FOUND (pre-checked, like the sibling endpoints); a project that
+    exists but has no such source is a SOURCE_NOT_FOUND. No Idempotency-Key: a
+    PATCH to a fixed enabled value is naturally idempotent (mirrors
+    updateProject)."""
+    await _require_project(conn, project)
+    try:
+        s = await update_source(conn, project, source_id, enabled=body.enabled)
+    except SourceNotFoundError as exc:
+        raise translate_registry_error(exc) from exc
+    resp = success(source_dto(s), **response_meta(request))
+    return JSONResponse(status_code=200, content=jsonable_encoder(resp))

@@ -24,6 +24,7 @@ from core.registry import (
     ProjectHasActiveJobsError,
     ProjectHasBuildsError,
     ProjectNotFoundError,
+    SourceNotFoundError,
 )
 from core.stores.repo import NoActiveBuildError
 
@@ -35,6 +36,12 @@ def translate_registry_error(exc: Exception) -> ApiError:
         return ApiError(ErrorCode.PROJECT_NOT_FOUND, str(exc), details={"project": exc.name})
     if isinstance(exc, JobNotFoundError):
         return ApiError(ErrorCode.JOB_NOT_FOUND, str(exc), details={"job_id": exc.job_id})
+    if isinstance(exc, SourceNotFoundError):
+        return ApiError(
+            ErrorCode.SOURCE_NOT_FOUND,
+            str(exc),
+            details={"project": exc.project, "source_id": str(exc.source_id)},
+        )
     if isinstance(exc, JobConflictError):
         return ApiError(
             ErrorCode.JOB_CONFLICT,
