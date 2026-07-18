@@ -298,3 +298,24 @@ def test_update_source_rejects_unknown_field(
     # the app reshapes FastAPI's body-validation 422 into the frozen envelope
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize("bad", ["false", "0", 0, 1, "true"])
+def test_update_source_rejects_non_boolean_enabled(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, bad: Any
+) -> None:
+    # SRC2: the contract types `enabled` a JSON boolean; strict validation must
+    # reject a coercible non-boolean (`"false"`/`0`/…) rather than silently
+    # flip the source's state on a malformed payload — the runtime boundary
+    # equals the contract, not Pydantic's lax default.
+    _present_project(monkeypatch)
+
+    async def update_should_not_run(
+        conn: Any, project: str, source_id: Any, *, enabled: bool
+    ) -> Source:
+        raise AssertionError("must not reach the store on a non-boolean enabled")
+
+    _stub(monkeypatch, "sources", "update_source", update_should_not_run)
+    r = client.patch(f"/projects/p/sources/{uuid.uuid4()}", json={"enabled": bad})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
