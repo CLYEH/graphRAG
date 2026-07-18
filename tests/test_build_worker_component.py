@@ -541,7 +541,7 @@ async def test_run_eval_task_fails_loud_when_eval_inputs_drifted(
     # the TOCTOU: the same bytes it fingerprints are the bytes the parse would score.
     monkeypatch.setattr(
         "core.eval.idempotency.read_and_fingerprint_eval_inputs",
-        lambda root: ("live-DIFFERENT", b"golden", b"policy"),
+        lambda root, policy_bytes: ("live-DIFFERENT", b"golden"),
     )
     # mocked so that WITHOUT the drift guard preflight passes and run_eval fires on the
     # drifted inputs (the revert path this probe guards against); **kw tolerates the
