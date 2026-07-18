@@ -167,6 +167,28 @@ async def test_retry_creates_lineaged_child_clones_docs_and_leaves_parent(api: A
     assert len(parent_docs) == 2
 
 
+async def test_retry_idempotent_replay_returns_the_stored_job(api: Api) -> None:
+    # #53 R2 / Codex #100 P2 R2: the prechecks live INSIDE produce, so a keyed
+    # replay returns the stored 202 without re-running them or creating a second
+    # child. (The specific pruned-parent replay Codex flagged needs C9 prune to
+    # construct; this pins that the replay path itself is intact after the move.)
+    client, conn, enqueued = api
+    project = await _make_project(client)
+    parent = await _failed_build_with_docs(conn, project, docs=1)
+    headers = {"Idempotency-Key": "retry-k1"}
+
+    r1 = await client.post(f"/projects/{project}/builds/{parent}/retry", headers=headers)
+    assert r1.status_code == 202
+    job1 = r1.json()["data"]["job_id"]
+
+    r2 = await client.post(f"/projects/{project}/builds/{parent}/retry", headers=headers)
+    assert r2.status_code == 202
+    assert r2.json()["data"]["job_id"] == job1  # replayed the SAME stored job
+    # the replay created no second child and dispatched no second job
+    assert len(await _building_children(conn, project, parent)) == 1
+    assert enqueued == [(project, uuid.UUID(job1))]
+
+
 async def test_retry_with_no_documents_is_refused_and_leaves_no_child(api: Api) -> None:
     client, conn, enqueued = api
     project = await _make_project(client)

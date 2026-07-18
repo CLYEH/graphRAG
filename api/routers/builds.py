@@ -459,9 +459,10 @@ async def retry_build_endpoint(
     Mirrors the trigger/eval endpoints: one active job per project (409
     ``JOB_CONFLICT``), enqueue IN-BAND before the request commits (the class-12
     window), 202 + the job envelope, watchable via ``GET /jobs/{id}/events``.
-    The child build, its document clone, and the job insert share the request's
-    ONE transaction: a ``JOB_CONFLICT`` rolls back the child + clone atomically
-    (no orphan ``building`` build stranded without a job).
+    The child build, the job insert, and the document clone share the request's
+    ONE transaction; the exclusive-job guard is taken BEFORE the clone, so a
+    ``JOB_CONFLICT`` rolls back just the child row (never a full corpus copy) and
+    leaves no orphan ``building`` build stranded without a job.
 
     NOTE (RB1-retry-core): the child reruns EVERY stage and converges — the
     per-item compute-skip that reruns ONLY the failed items (and reuses the
@@ -477,33 +478,43 @@ async def retry_build_endpoint(
     # rejection RetryRequest already does on `reason`)
     await reject_null_body(request)
 
-    # The 404/409 gates run BEFORE produce so a bad/non-retryable build answers
-    # synchronously (and a §27 replay for a build that isn't retryable 409s
-    # rather than replaying). The parent's status is immutable once terminal, so
-    # re-checking on an idempotent replay stays consistent.
-    parent = await _require_build(conn, project, build_id)
-    if parent.status != "failed":
-        raise ApiError(
-            ErrorCode.BUILD_NOT_RETRYABLE,
-            f"build {build_id} is {parent.status!r}, not a terminal 'failed' build; "
-            "only a failed build can be retried",
-            details={"build_id": str(build_id), "status": parent.status},
-        )
-
     async def produce() -> tuple[int, dict[str, Any]]:
-        # child + clone + job in this ONE txn: create_job_exclusive raising
-        # JobConflictError rolls the child + clone back with it (no orphan). Both
-        # create_build (project vanished under us) and create_job_exclusive map
-        # their registry errors through the same translator (symmetric 404/409).
+        # Every precheck INSIDE produce (#53 R2 ordering rule): a replayed retry
+        # must return its stored 202 even if the parent build has since been
+        # pruned (idempotency_keys survive project churn) — a FRESH request still
+        # gets the synchronous 404/409 here (Codex #100 P2 R2).
+        parent = await _require_build(conn, project, build_id)
+        if parent.status != "failed":
+            raise ApiError(
+                ErrorCode.BUILD_NOT_RETRYABLE,
+                f"build {build_id} is {parent.status!r}, not a terminal 'failed' build; "
+                "only a failed build can be retried",
+                details={"build_id": str(build_id), "status": parent.status},
+            )
+        # Serialize concurrent same-project retries on the projects row BEFORE
+        # create_build takes its FK FOR KEY SHARE: two retries could otherwise
+        # each hold FOR KEY SHARE and then deadlock competing for
+        # create_job_exclusive's FOR UPDATE (a 500 instead of a clean 409). This
+        # is the SAME lock create_job_exclusive re-takes, so the loser blocks
+        # here, then finds the winner's active job and gets JOB_CONFLICT — the
+        # lock order _trigger already uses (projects-row FOR UPDATE first).
+        await get_project(conn, project, for_update=True)
         try:
             child_build_id = await create_build(conn, project, parent_build_id=build_id)
+            # Take the single-active-job guard BEFORE the (potentially large)
+            # clone, so a JOB_CONFLICT — or the loser of two concurrent retries —
+            # rolls back just the child row, never a full corpus INSERT..SELECT
+            # (Codex #100 P2 R1). Both create_build (project vanished under us)
+            # and create_job_exclusive map their registry errors through the same
+            # translator (symmetric 404/409); the whole txn is atomic (no orphan).
+            job = await create_job_exclusive(conn, project, RETRY_JOB_KIND, build_id=child_build_id)
             clone = await clone_raw_artifacts(conn, project, build_id, child_build_id)
             # A parent that failed AT/BEFORE ingest committed no documents (the
             # ingest stage is one all-or-nothing txn), so there is nothing to
             # reuse — and because a retry child SKIPS live-source ingest, letting
             # it through would run the pipeline on an EMPTY corpus and reach
             # 'ready', silently masking the ingest failure (Codex #100 P1 R2).
-            # Refuse instead; the ApiError rolls the child + clone back.
+            # Refuse instead; the ApiError rolls the child + job + clone back.
             if clone.documents == 0:
                 raise ApiError(
                     ErrorCode.BUILD_NOT_RETRYABLE,
@@ -512,7 +523,6 @@ async def retry_build_endpoint(
                     "full build (POST /build)",
                     details={"build_id": str(build_id), "documents": 0},
                 )
-            job = await create_job_exclusive(conn, project, RETRY_JOB_KIND, build_id=child_build_id)
         except (ProjectNotFoundError, JobConflictError) as exc:
             raise translate_registry_error(exc) from exc
         # queue touched HERE only — a §27 replay or a 409 must be served even

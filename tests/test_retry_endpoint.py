@@ -172,16 +172,12 @@ def test_retry_with_no_reusable_documents_is_409(
         return CloneCounts(documents=0)
 
     monkeypatch.setattr("api.routers.builds.clone_raw_artifacts", empty_clone)
-
-    # the job must NEVER be created for a no-document retry
-    def _fail_job(*a: Any, **kw: Any) -> Any:
-        raise AssertionError("create_job_exclusive must not run for a 0-document retry")
-
-    monkeypatch.setattr("api.routers.builds.create_job_exclusive", _fail_job)
     resp = client.post(_URL)
     assert (resp.status_code, resp.json()["error"]["code"]) == (409, "BUILD_NOT_RETRYABLE")
     assert resp.json()["error"]["details"]["documents"] == 0
-    assert "enqueued_job_id" not in captured  # nothing dispatched
+    # the ApiError rolls the whole txn back (job created before the clone check),
+    # and the guard is before enqueue, so nothing is dispatched
+    assert "enqueued_job_id" not in captured
 
 
 def test_retry_unknown_project_is_404(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -210,7 +206,7 @@ def test_retry_overlapping_job_is_409_conflict(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _stub_parent(monkeypatch)
-    _stub_produce(monkeypatch)
+    captured = _stub_produce(monkeypatch)
 
     async def conflict(conn: Any, project: str, kind: str, *, build_id: Any = None) -> Any:
         raise JobConflictError(project, uuid.uuid4())
@@ -218,6 +214,9 @@ def test_retry_overlapping_job_is_409_conflict(
     monkeypatch.setattr("api.routers.builds.create_job_exclusive", conflict)
     resp = client.post(_URL)
     assert (resp.status_code, resp.json()["error"]["code"]) == (409, "JOB_CONFLICT")
+    # the exclusive-job guard is taken BEFORE the (potentially large) clone, so a
+    # conflict never performs the corpus copy (Codex #100 P2 R1)
+    assert "clone" not in captured
 
 
 def test_retry_project_vanished_at_job_creation_is_404(
