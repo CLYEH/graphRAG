@@ -188,10 +188,17 @@ async def create_project(
     return Project(*row)
 
 
-async def get_project(conn: AsyncConnection, name: str) -> Project | None:
-    row = (
-        await conn.execute(sa.select(*_PROJECT_COLS).where(tables.projects.c.name == name))
-    ).one_or_none()
+async def get_project(
+    conn: AsyncConnection, name: str, *, for_update: bool = False
+) -> Project | None:
+    """``for_update=True`` takes the projects-row lock (FOR UPDATE — the same
+    lock ``create_job_exclusive`` and the config PATCH serialize on) in the
+    SAME statement as the read, so the returned config cannot change until the
+    caller's transaction ends. A missing project takes no lock."""
+    query = sa.select(*_PROJECT_COLS).where(tables.projects.c.name == name)
+    if for_update:
+        query = query.with_for_update()
+    row = (await conn.execute(query)).one_or_none()
     return Project(*row) if row is not None else None
 
 

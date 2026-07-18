@@ -97,8 +97,16 @@ async def run_idempotent(
     endpoint: str,
     req_hash: str,
     produce: Producer,
+    rekey: Callable[[], str | None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    """Replay, reject, or run-and-store — see the module docstring."""
+    """Replay, reject, or run-and-store — see the module docstring.
+
+    ``rekey`` (Codex #93 R7): an endpoint whose ``produce`` re-reads its
+    inputs under a row lock hands the post-lock request hash here — after a
+    winning produce, the STORED identity becomes that accepted hash, so later
+    replay/conflict decisions match what the work was actually pinned to,
+    never the pre-lock read a racing write could skew. Returning None keeps
+    ``req_hash`` (produce didn't reach its locked read — it raised before)."""
     idem = tables.idempotency_keys
     ttl = int(get_settings().idempotency_ttl_hours)
 
@@ -143,7 +151,9 @@ async def run_idempotent(
     # 4. won the reservation → run, store the encoded result, return it
     status, body = await produce()
     encoded: dict[str, Any] = jsonable_encoder(body)
-    await conn.execute(
-        idem.update().where(idem.c.key == key).values(response=encoded, status=status)
-    )
+    values: dict[str, Any] = {"response": encoded, "status": status}
+    accepted_hash = rekey() if rekey is not None else None
+    if accepted_hash is not None:
+        values["request_hash"] = accepted_hash
+    await conn.execute(idem.update().where(idem.c.key == key).values(**values))
     return status, encoded

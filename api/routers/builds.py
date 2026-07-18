@@ -281,18 +281,22 @@ async def run_build_eval_endpoint(
     the stale inputs — a changed fingerprint is the §27 key-reused-with-a-different-
     request conflict (client uses a fresh key), never a silent stale replay."""
 
-    # TWO fingerprints, two roles (Codex #93 R2). The UNLOCKED read below feeds
-    # only the idempotency REQUEST HASH — it must exist before produce (a §27
-    # replay skips produce entirely) and merely scopes which requests are "the
-    # same"; a PATCH racing it changes the request identity, which is fine.
-    # The PIN written to the job is recomputed inside produce UNDER
-    # create_job_exclusive's projects-row lock: a PATCH committing between the
-    # unlocked read and the lock would otherwise pin the OLD policy while the
-    # worker's dispatch read sees the NEW one — deterministically failing the
-    # job as "drift" no client caused. Locked pin ⇒ the job is internally
-    # consistent; a PATCH after the 202 is genuine drift and still refuses.
-    async def _policy_bytes() -> bytes:
-        registry_row = await get_project(conn, project)
+    # ONE accepted fingerprint (Codex #93 R7, completing R2's split). The
+    # UNLOCKED read below still feeds the INITIAL request hash — it must exist
+    # before produce (a §27 replay/conflict is decided without running it).
+    # But the identity the record KEEPS is finalized inside produce: the
+    # fingerprint is recomputed UNDER the projects-row lock (taken by
+    # get_project for_update=True, the same lock create_job_exclusive re-takes
+    # and the config PATCH serializes on — idem-row → projects-row order,
+    # matching the trigger endpoints, no lock inversion), the job pin gets
+    # that value, and run_idempotent's rekey stores the hash DERIVED FROM IT.
+    # Record ≡ pin, so a PATCH committing between the unlocked read and the
+    # lock can no longer make the record claim an identity the job wasn't
+    # scored under (retry-under-the-accepted-policy would 409 instead of
+    # replaying; a policy flipped BACK would silently replay a job scored
+    # against different inputs).
+    async def _policy_bytes(*, for_update: bool = False) -> bytes:
+        registry_row = await get_project(conn, project, for_update=for_update)
         config = (
             registry_row.config
             if registry_row is not None and isinstance(registry_row.config, dict)
@@ -300,21 +304,38 @@ async def run_build_eval_endpoint(
         )
         return policy_fingerprint_bytes(config)
 
+    raw_body = await request.body()
+
+    def _req_hash(fingerprint: str) -> str:
+        # per (build, golden-set fingerprint): the build_id is in request.url.path;
+        # the golden set + query policy content is folded as the "body" so a changed
+        # golden set flips the hash (no stale replay). The ACTUAL request body is
+        # folded too — the endpoint is bodyless, but FastAPI still accepts one, and
+        # the sibling bodyless endpoints (rollback) hash await request.body(); a
+        # stray/different body on a reused key must be a §27 conflict, not a silent
+        # replay. The fingerprint (a hex digest / sentinel, never containing \0)
+        # leads, then a \0 delimiter, then the raw body — an unambiguous split, so
+        # no (fingerprint, body) pair can alias another.
+        return request_hash("POST", request.url.path, fingerprint.encode() + b"\0" + raw_body)
+
     fingerprint = eval_inputs_fingerprint(
         Path(get_settings().projects_dir), project, await _policy_bytes()
     )
+    accepted: dict[str, str] = {}
 
     async def produce() -> tuple[int, dict[str, Any]]:
+        # lock FIRST, then fingerprint: everything below sees one frozen config
+        locked_fingerprint = eval_inputs_fingerprint(
+            Path(get_settings().projects_dir), project, await _policy_bytes(for_update=True)
+        )
         try:
             job = await create_job_exclusive(conn, project, EVAL_JOB_KIND, build_id=build_id)
         except (ProjectNotFoundError, JobConflictError) as exc:
             raise translate_registry_error(exc) from exc
-        # the pin: re-fingerprinted UNDER the row lock (same txn as the job
-        # insert — atomic AND consistent with what dispatch will read)
-        locked_fingerprint = eval_inputs_fingerprint(
-            Path(get_settings().projects_dir), project, await _policy_bytes()
-        )
+        # the pin AND the kept §27 identity: the SAME under-lock value (atomic
+        # with the job insert, consistent with what dispatch will read)
         await set_eval_inputs_fingerprint(conn, job.id, locked_fingerprint)
+        accepted["hash"] = _req_hash(locked_fingerprint)
         # queue touched HERE only — a §27 replay or a 409 must be served even
         # with Redis unreachable (the Queue dep is a lazy handle), same as _trigger
         await enqueue_eval(await get_redis(), project, job.id, build_id)
@@ -326,21 +347,10 @@ async def run_build_eval_endpoint(
             key=idempotency_key,
             project=project,
             endpoint="runBuildEval",
-            # per (build, golden-set fingerprint): the build_id is in request.url.path;
-            # the golden set + query policy content is folded as the "body" so a changed
-            # golden set flips the hash (no stale replay). The ACTUAL request body is
-            # folded too — the endpoint is bodyless, but FastAPI still accepts one, and
-            # the sibling bodyless endpoints (rollback) hash await request.body(); a
-            # stray/different body on a reused key must be a §27 conflict, not a silent
-            # replay. The fingerprint (a hex digest / sentinel, never containing \0)
-            # leads, then a \0 delimiter, then the raw body — an unambiguous split, so
-            # no (fingerprint, body) pair can alias another.
-            req_hash=request_hash(
-                "POST",
-                request.url.path,
-                fingerprint.encode() + b"\0" + await request.body(),
-            ),
+            req_hash=_req_hash(fingerprint),
             produce=produce,
+            # the record keeps the ACCEPTED identity (see the block comment)
+            rekey=lambda: accepted.get("hash"),
         )
         return JSONResponse(status_code=status, content=resp)
     status, resp = await produce()
