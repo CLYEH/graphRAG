@@ -257,15 +257,24 @@ function StepItems({
   return (
     <>
       <ul className="runs__items">
-        {rows.map((it) => (
-          <li key={it.id} className="runs__item">
-            <span className={`runs__item-status runs__item-status--${it.status}`}>{it.status}</span>{" "}
-            <span className="runs__item-ref" title={it.item_ref}>
-              {it.item_kind}:{it.item_ref}
-            </span>
-            {it.message ? <span className="runs__item-msg"> — {it.message}</span> : null}
-          </li>
-        ))}
+        {rows.map((it) => {
+          // the failure reason may ride EITHER the optional message OR the
+          // structured `error` object (both frozen on BuildStepItem) — prefer
+          // the message, but fall back to the error rather than discarding the
+          // only "why it failed" the operator has (Codex #102 R2).
+          const detail = it.message ?? (it.error ? JSON.stringify(it.error) : null);
+          return (
+            <li key={it.id} className="runs__item">
+              <span className={`runs__item-status runs__item-status--${it.status}`}>
+                {it.status}
+              </span>{" "}
+              <span className="runs__item-ref" title={it.item_ref}>
+                {it.item_kind}:{it.item_ref}
+              </span>
+              {detail ? <span className="runs__item-msg"> — {detail}</span> : null}
+            </li>
+          );
+        })}
       </ul>
       {items.hasNextPage && (
         <button

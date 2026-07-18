@@ -326,4 +326,39 @@ describe("RunsTable", () => {
     fireEvent.click(screen.getByRole("button", { name: /載入更多項目/ }));
     expect(await screen.findByText(/document:r2/)).toBeInTheDocument();
   });
+
+  it("surfaces a step item's structured error when message is absent (RB1)", async () => {
+    // the failure reason may ride the structured `error` object (frozen on
+    // BuildStepItem), not the optional `message` — the diagnosis must not
+    // discard it (Codex #102 R2). With only `it.message`, this shows nothing.
+    stubDrilldown({
+      steps: [
+        {
+          id: "s1111111-cccc-4ccc-8ccc-00000000000a",
+          step_name: "graph",
+          status: "failed",
+          failed_count: 1,
+          skipped_count: 0,
+          input_count: 5,
+        },
+      ],
+      items: [
+        {
+          id: "i1111111-dddd-4ddd-8ddd-00000000000a",
+          item_kind: "document",
+          item_ref: "hash-x",
+          status: "failed",
+          message: null,
+          error: { kind: "ParseError", detail: "non-JSON extraction output" },
+        },
+      ],
+    });
+    renderWithProviders(<RunsTable project="acme" />);
+
+    fireEvent.click((await screen.findAllByText(/版$/))[0]);
+    fireEvent.click(await screen.findByRole("button", { name: /graph/i }));
+    // the structured error is surfaced (not swallowed with only status + ref)
+    expect(await screen.findByText(/ParseError/)).toBeInTheDocument();
+    expect(screen.getByText(/non-JSON extraction output/)).toBeInTheDocument();
+  });
 });
