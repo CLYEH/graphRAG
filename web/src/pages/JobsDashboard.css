@@ -219,4 +219,110 @@
   .runs__muted--error {
     color: #f87171;
   }
+  .runs__item-status--failed {
+    color: #f87171;
+  }
+  .runs__muted--ok {
+    color: #4ade80;
+  }
+}
+
+/* ---- RB1-fe: failure diagnosis + retry (inside a failed run's detail) ---- */
+.runs__recovery {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.runs__recovery-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.runs__steps,
+.runs__items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.runs__step {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  padding: 5px 8px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  color: var(--text-h);
+  font-size: 13px;
+}
+
+.runs__step:hover {
+  background: var(--social-bg);
+}
+
+.runs__step-meta {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.runs__items {
+  margin: 2px 0 8px 12px;
+}
+
+.runs__item {
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.runs__item-status {
+  font-weight: 600;
+}
+
+.runs__item-status--failed {
+  color: #c0392b;
+}
+
+.runs__item-status--skipped {
+  color: #b7791f;
+}
+
+.runs__item-ref {
+  font-family: var(--mono);
+  color: var(--text-h);
+}
+
+.runs__item-msg {
+  color: var(--text);
+}
+
+.runs__retry {
+  margin-top: 12px;
+}
+
+.runs__retry-btn {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--social-bg);
+  color: var(--text-h);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.runs__retry-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.runs__muted--ok {
+  color: #1e7e34;
+  font-style: italic;
+  margin-top: 6px;
 }
