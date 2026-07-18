@@ -473,6 +473,22 @@ class BuildScopedRepo:
             query = query.where(predicate)
         return (await self._execute(query)).fetchall()
 
+    async def fetch_count(self, table: sa.Table, *where: sa.ColumnExpressionArgument[bool]) -> int:
+        """The exact count of scoped rows under the same predicates a
+        :meth:`fetch_page` would read (SS1b totals). Same narrowing-only
+        discipline: the build scope is already in the query and every caller
+        predicate is raw-SQL-checked before it narrows — a total that counted a
+        different row set than the page returns would be a lie, so it MUST share
+        the scope + predicates, differing only in projecting ``count(*)`` and
+        dropping the order/limit."""
+        query = self._select(table)  # scope filters already applied
+        for predicate in where:
+            _reject_raw_sql(predicate)
+            query = query.where(predicate)
+        # wrap AFTER the predicates bind to the real table columns, then count
+        counted = sa.select(sa.func.count()).select_from(query.subquery())
+        return int((await self._execute(counted)).scalar_one())
+
     async def fetch_page(
         self,
         table: sa.Table,

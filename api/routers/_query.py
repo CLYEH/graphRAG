@@ -21,6 +21,8 @@ def reject_unsupported_query(
     request: Request,
     sort_field: str | None,
     allowed_filters: frozenset[str] = frozenset(),
+    *,
+    search: bool = False,
 ) -> None:
     """Reject a non-default ``sort`` or any unsupported ``filter``.
     ``sort_field`` names the single-column desc default an explicit ``sort``
@@ -31,7 +33,20 @@ def reject_unsupported_query(
     everything else — a field outside the set, a malformed bracket spelling,
     or the bare non-deepObject ``filter=...`` (which used to pass the
     ``filter[`` prefix check unseen and silently no-op, GAPS O4's evidence)
-    — is rejected, never ignored."""
+    — is rejected, never ignored.
+
+    ``search`` (SS1b): whether this endpoint implements the ``q`` search param.
+    When False, a present ``q`` is rejected the same way an unsupported filter
+    is — the contract declares ``q`` on only some lists, so a ``q`` an endpoint
+    cannot honor must fail loud, never be silently ignored (the same
+    false-affordance discipline as GAPS O4). A search endpoint reads ``q``
+    itself (FastAPI validates its length)."""
+    if not search and request.query_params.get("q") is not None:
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            "search (q) is not supported on this list",
+            details={"q": request.query_params["q"]},
+        )
     for key in request.query_params:
         if key != "filter" and not key.startswith("filter["):
             continue

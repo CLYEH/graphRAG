@@ -74,6 +74,15 @@ LIFECYCLE_STATUS: tuple[str, ...] = ("active", "deprecated", "merged", "rejected
 REVIEW_STATUS: tuple[str, ...] = ("unreviewed", "approved", "rejected")
 
 
+def _escape_like(value: str) -> str:
+    """Escape a user search term for a LIKE/ILIKE pattern (SS1b). ``%``/``_``
+    are SQL wildcards and ``\\`` the default escape char — without escaping,
+    a literal ``%`` a user typed would match anything (a surprising superset)
+    and ``\\`` could form an escape sequence. Backslash first so the escapes we
+    add are not themselves re-escaped."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @router.get("/projects/{project}/documents")
 async def list_documents_endpoint(
     request: Request,
@@ -81,17 +90,26 @@ async def list_documents_endpoint(
     project: str,
     limit: int = Query(50, ge=1, le=500),
     cursor: str | None = None,
+    q: str | None = Query(None, min_length=1, max_length=256),
 ) -> dict[str, Any]:
-    reject_unsupported_query(request, "id", allowed_filters=frozenset({"status"}))
+    reject_unsupported_query(request, "id", allowed_filters=frozenset({"status"}), search=True)
     # documents.status is an OPEN vocabulary (no DDL CHECK — the ingest
     # pipeline owns it), so the facet validates blankness only
     status = single_filter_value(request, "status")
     binding = await _bind(conn, project)
     repo = BuildScopedRepo.bound_to(conn, binding)
     docs = tables.documents
-    where = []
+    # SS1b: `q` searches source_uri (the document's visible identifier); content
+    # search is the deferred metadata-indexing follow-up. Applied to BOTH the
+    # page and the count so total matches the filtered set (a search restricts
+    # the row set, so total must reflect it, not the unfiltered table).
+    filters = []
     if status is not None:
-        where.append(docs.c.status == status)
+        filters.append(docs.c.status == status)
+    if q is not None:
+        filters.append(docs.c.source_uri.ilike(f"%{_escape_like(q)}%", escape="\\"))
+    total = await repo.fetch_count(docs, *filters)
+    where = [*filters]
     if cursor:
         (after_id,) = decode_id_cursor(cursor)
         where.append(docs.c.id < after_id)
@@ -104,6 +122,7 @@ async def list_documents_endpoint(
         build_id=binding.build_id,
         paginated=True,
         next_cursor=next_cursor,
+        total=total,
     )
 
 
@@ -178,9 +197,10 @@ async def list_entities_endpoint(
     project: str,
     limit: int = Query(50, ge=1, le=500),
     cursor: str | None = None,
+    q: str | None = Query(None, min_length=1, max_length=256),
 ) -> dict[str, Any]:
     reject_unsupported_query(
-        request, "id", allowed_filters=frozenset({"type", "status", "review_status"})
+        request, "id", allowed_filters=frozenset({"type", "status", "review_status"}), search=True
     )
     etype = single_filter_value(request, "type")
     status = single_filter_value(request, "status", vocabulary=LIFECYCLE_STATUS)
@@ -188,13 +208,19 @@ async def list_entities_endpoint(
     binding = await _bind(conn, project)
     repo = BuildScopedRepo.bound_to(conn, binding)
     ents = tables.entities
-    where = []
+    # SS1b: `q` searches canonical_name (substring, case-insensitive). Applied to
+    # both the count and the page so total reflects the searched set.
+    filters = []
     if etype is not None:
-        where.append(ents.c.type == etype)
+        filters.append(ents.c.type == etype)
     if status is not None:
-        where.append(ents.c.status == status)
+        filters.append(ents.c.status == status)
     if review_status is not None:
-        where.append(ents.c.review_status == review_status)
+        filters.append(ents.c.review_status == review_status)
+    if q is not None:
+        filters.append(ents.c.canonical_name.ilike(f"%{_escape_like(q)}%", escape="\\"))
+    total = await repo.fetch_count(ents, *filters)
+    where = [*filters]
     if cursor:
         (after_id,) = decode_id_cursor(cursor)
         where.append(ents.c.id < after_id)
@@ -205,6 +231,7 @@ async def list_entities_endpoint(
         [entity_dto(r) for r in page],
         **response_meta(request),
         build_id=binding.build_id,
+        total=total,
         paginated=True,
         next_cursor=next_cursor,
     )

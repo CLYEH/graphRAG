@@ -95,11 +95,13 @@ def _bindable(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _FakeRepo:
-    """Captures fetch_page/fetch_all args and serves scripted rows."""
+    """Captures fetch_page/fetch_all/fetch_count args and serves scripted rows."""
 
     pages: Sequence[Any] = ()
     rows: Sequence[Any] = ()
+    total: int = 0
     calls: list[dict[str, Any]] = []
+    count_calls: list[dict[str, Any]] = []
 
     @classmethod
     def bound_to(cls, conn: Any, binding: Any) -> _FakeRepo:
@@ -112,10 +114,15 @@ class _FakeRepo:
     async def fetch_all(self, table: Any, *where: Any) -> Sequence[Any]:
         return type(self).rows
 
+    async def fetch_count(self, table: Any, *where: Any) -> int:
+        type(self).count_calls.append({"where": where})
+        return type(self).total
+
 
 @pytest.fixture()
 def repo(monkeypatch: pytest.MonkeyPatch) -> type[_FakeRepo]:
     _FakeRepo.pages, _FakeRepo.rows, _FakeRepo.calls = (), (), []
+    _FakeRepo.total, _FakeRepo.count_calls = 0, []
     _stub(monkeypatch, "BuildScopedRepo", _FakeRepo)
     return _FakeRepo
 
@@ -452,6 +459,66 @@ def test_entities_and_relations_paginate_like_documents(
     # SS1a facet, so the reject pin uses a non-allowlisted field instead
     assert client.get("/projects/p/entities", params={"sort": "name:asc"}).status_code == 400
     assert client.get("/projects/p/relations", params={"filter[weight]": "x"}).status_code == 400
+
+
+def test_entities_list_emits_exact_total(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # SS1b: a list frame carries the matching-row total so the Console can show
+    # "N results" without walking every page. It is EXACT (total_estimated
+    # false — the estimate path is the deferred large-table follow-up).
+    _bindable(monkeypatch)
+    repo.pages = (_entity_row(), _entity_row())
+    repo.total = 42
+    body = client.get("/projects/p/entities").json()
+    assert body["meta"]["total"] == 42
+    assert body["meta"]["total_estimated"] is False
+
+
+def test_entities_search_filters_page_and_count_together(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # SS1b: `q` searches canonical_name and MUST narrow both the page and the
+    # count — a total that ignored `q` would claim more results than the search
+    # returns. Pin that the same search predicate reached fetch_count and
+    # fetch_page (one predicate each beyond the keyset).
+    _bindable(monkeypatch)
+    repo.pages = (_entity_row(),)
+    repo.total = 1
+    r = client.get("/projects/p/entities", params={"q": "區域"})
+    assert r.status_code == 200
+    # the count saw the search predicate (no cursor → search is its only filter)
+    assert len(repo.count_calls[0]["where"]) == 1
+    # the page saw the SAME search predicate (no cursor here either)
+    assert len(repo.calls[0]["where"]) == 1
+
+
+def test_documents_search_is_supported_but_relations_and_chunks_reject_q(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # SS1b/contract: `q` is declared only on entities+documents. An endpoint
+    # that cannot honor `q` must reject it LOUD (400), never silently ignore it
+    # (the GAPS-O4 false-affordance discipline) — otherwise a client believes a
+    # search took effect over the whole list.
+    _bindable(monkeypatch)
+    repo.pages = (_doc_row(),)
+    repo.total = 1
+    assert client.get("/projects/p/documents", params={"q": "corpus"}).status_code == 200
+    for path in ("/projects/p/relations", "/projects/p/chunks"):
+        r = client.get(path, params={"q": "x"})
+        assert r.status_code == 400, path
+        assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_blank_and_overlong_q_are_rejected(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # the contract types `q` minLength 1 / maxLength 256; FastAPI enforces both,
+    # reshaped to the frozen 400 envelope — an empty search is a client bug, not
+    # a match-everything.
+    _bindable(monkeypatch)
+    assert client.get("/projects/p/entities", params={"q": ""}).status_code == 400
+    assert client.get("/projects/p/entities", params={"q": "x" * 257}).status_code == 400
 
 
 def test_cursor_types_are_distinct_per_resource() -> None:
