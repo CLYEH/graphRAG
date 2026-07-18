@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   DetailScopeGoneError,
@@ -26,8 +26,10 @@ import type { ReactNode } from "react";
 //   NAMED condition with configuration guidance, not a generic failure;
 // * hops beyond the policy ceiling are REJECTED (not clamped) — the page sends
 //   what the operator chose and surfaces the server's own rejection;
-// * entity lists have NO server-side search — the left filter runs over LOADED
-//   pages only and says so (FE3's false-affordance lesson);
+// * entity lists support a REAL server-side search (SS1b): the left column sends
+//   `q` (substring over canonical_name) to GET /entities and shows the server's
+//   exact match total over the whole active build — not a client-side filter
+//   over loaded pages (the FE3 false-affordance is retired here);
 // * Relation.evidence[] rides ONLY the detail GET — clicking an edge fetches.
 //
 // Known gap (deliberate v2 scope): the SVG node/edge selection is pointer-only
@@ -37,8 +39,27 @@ import type { ReactNode } from "react";
 
 type Selection = { kind: "node" | "edge"; id: string };
 
+// The server caps `q` at 256 chars (contracts/openapi.yaml Q param /
+// inspect.py list_entities_endpoint). Enforce the SAME cap on the input so a
+// long paste can't send an over-length q — that 400 would drive list.isError,
+// and GraphBody's error return removes the search box, stranding the user with
+// no way to shorten the term (Codex #101 P2).
+const ENTITY_SEARCH_MAX = 256;
+
 function message(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
+}
+
+// Debounce the search box so typing fires ONE server-side search after the user
+// pauses, not one request per keystroke (SS1b). The trailing edge is what we
+// want — search the final term, not every prefix.
+function useDebounced<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(id);
+  }, [value, delayMs]);
+  return debounced;
 }
 
 export function Graph() {
@@ -61,7 +82,12 @@ function GraphBody({ project }: { project: string }) {
   const [centerId, setCenterId] = useState<string | undefined>(undefined);
   const [hops, setHops] = useState(1);
   const [selected, setSelected] = useState<Selection | null>(null);
-  const list = useEntities(project);
+  // SS1b: the left column is a SERVER-SIDE search over the whole active build.
+  // The raw box value drives the input; its debounced value is the query `q` the
+  // list re-fetches on (a new q is a new keyset from page 1).
+  const [search, setSearch] = useState("");
+  const q = useDebounced(search.trim(), 300);
+  const list = useEntities(project, q || undefined);
   const sub = useSubgraph(project, centerId, hops);
   const entityDetail = useEntity(project, selected?.kind === "node" ? selected.id : undefined);
   const relationDetail = useRelation(project, selected?.kind === "edge" ? selected.id : undefined);
@@ -154,6 +180,9 @@ function GraphBody({ project }: { project: string }) {
           list={list}
           keepsRows={keepsRows}
           centerId={centerId}
+          search={search}
+          appliedQuery={q}
+          onSearch={setSearch}
           onCenter={(id) => {
             setCenterId(id);
             setSelected({ kind: "node", id });
@@ -175,84 +204,97 @@ function GraphBody({ project }: { project: string }) {
   );
 }
 
-// ---- left: entity list + honest client-side filter ---------------------------
+// ---- left: entity list + honest server-side search (SS1b) --------------------
 
 function EntityColumn({
   list,
   keepsRows,
   centerId,
+  search,
+  appliedQuery,
+  onSearch,
   onCenter,
 }: {
   list: ReturnType<typeof useEntities>;
   keepsRows: boolean;
   centerId: string | undefined;
+  search: string;
+  appliedQuery: string;
+  onSearch: (value: string) => void;
   onCenter: (id: string) => void;
 }) {
-  const [filter, setFilter] = useState("");
-
-  if (list.isPending) return <div className="graph__col">Loading entities…</div>;
-  // Same cached-rows discipline as the FE3 lists: a refetch re-verifies the
-  // active build, so until it answers the rows are unverified; a next-page
-  // fetch extends the pinned build and keeps the list. (The scope-gone isError
-  // case never reaches here — GraphBody fails the WHOLE page closed on it.)
-  if (list.isFetching && !list.isFetchingNextPage)
-    return <div className="graph__col">Loading entities…</div>;
-
-  // (the build-splice case never reaches here — GraphBody fails the page closed)
   const rows = (list.data?.pages ?? []).flatMap((p) => p.rows);
-  if (rows.length === 0) return <div className="graph__col">No entities in the active build.</div>;
-
-  const needle = filter.trim().toLowerCase();
-  const shown = needle
-    ? rows.filter(
-        (e) =>
-          e.canonical_name.toLowerCase().includes(needle) || e.type.toLowerCase().includes(needle),
-      )
-    : rows;
+  // SS1b: the endpoint reports an EXACT match count over the whole active build
+  // (page 1's meta.total), not a loaded-rows count — the honest number to show.
+  const total = list.data?.pages[0]?.total;
+  // A new search re-fetches from page 1 (its own query key). While it is in
+  // flight the list body shows a pending state, but the input stays MOUNTED so
+  // the term never disappears mid-search — unlike a whole-column "Loading…".
+  // A load-more (isFetchingNextPage) keeps the current rows and is NOT pending.
+  const searching = list.isPending || (list.isFetching && !list.isFetchingNextPage);
+  // the label reflects the query the SHOWN rows/total answer (the debounced,
+  // applied `q`), NOT the raw box value — otherwise, in the ≤300ms before the
+  // debounce fires, it would claim "matches for <typed>" beside the PREVIOUS
+  // query's results (a brief false affordance this codebase is strict about).
+  const term = appliedQuery;
 
   return (
     <div className="graph__col" aria-label="entities">
       <label className="graph__field">
-        過濾
+        搜尋
         <input
           type="search"
-          value={filter}
-          placeholder="名稱或型別…"
-          onChange={(e) => setFilter(e.target.value)}
+          value={search}
+          maxLength={ENTITY_SEARCH_MAX}
+          placeholder="canonical_name…"
+          onChange={(e) => onSearch(e.target.value)}
         />
       </label>
-      {/* the API has no entity search — say exactly what this filter covers */}
+      {/* SS1b: a REAL server-side search over the WHOLE active build (GET
+          /entities `q` over canonical_name) — the count is the exact match
+          total, not "loaded pages". The FE3 over-loaded-pages caveat is gone. */}
       <p className="graph__muted">
-        只過濾已載入的 {rows.length} 個知識點——要擴大範圍先按「載入更多」。
+        {searching
+          ? "搜尋中…"
+          : term
+            ? `符合「${term}」的知識點:${total ?? rows.length} 個`
+            : `active build 全部知識點:${total ?? rows.length} 個`}
       </p>
-      <ul className="graph__entities">
-        {shown.map((e) => (
-          <li key={e.id}>
-            {/* the subgraph endpoint only accepts ACTIVE seeds (repo.active_entity_ids
-                — Codex, #75): a merged/rejected row is still real build content worth
-                LISTING, but clicking it could only 404, so it is disabled and says why */}
-            <button
-              type="button"
-              className={`graph__entity${e.id === centerId ? " graph__entity--center" : ""}`}
-              disabled={e.status !== "active"}
-              title={
-                e.status !== "active"
-                  ? `status ${e.status} — only active entities can seed a subgraph`
-                  : undefined
-              }
-              onClick={() => onCenter(e.id)}
-            >
-              <span className="graph__entity-name">{e.canonical_name}</span>
-              <span className="graph__entity-type">
-                {e.status !== "active" ? `${e.type} · ${e.status}` : e.type}
-              </span>
-            </button>
-          </li>
-        ))}
-        {shown.length === 0 && <li className="graph__muted">已載入的知識點中沒有符合的。</li>}
-      </ul>
+      {searching ? (
+        <p className="graph__muted">Loading…</p>
+      ) : rows.length === 0 ? (
+        <p className="graph__muted">
+          {term ? "沒有符合的知識點。" : "No entities in the active build."}
+        </p>
+      ) : (
+        <ul className="graph__entities">
+          {rows.map((e) => (
+            <li key={e.id}>
+              {/* the subgraph endpoint only accepts ACTIVE seeds (repo.active_entity_ids
+                  — Codex, #75): a merged/rejected row is still real build content worth
+                  LISTING, but clicking it could only 404, so it is disabled and says why */}
+              <button
+                type="button"
+                className={`graph__entity${e.id === centerId ? " graph__entity--center" : ""}`}
+                disabled={e.status !== "active"}
+                title={
+                  e.status !== "active"
+                    ? `status ${e.status} — only active entities can seed a subgraph`
+                    : undefined
+                }
+                onClick={() => onCenter(e.id)}
+              >
+                <span className="graph__entity-name">{e.canonical_name}</span>
+                <span className="graph__entity-type">
+                  {e.status !== "active" ? `${e.type} · ${e.status}` : e.type}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
       {keepsRows && <p className="graph__line--error">載入更多失敗:{message(list.error)}</p>}
-      {list.hasNextPage && (
+      {list.hasNextPage && !searching && (
         <button
           type="button"
           className="graph__more"

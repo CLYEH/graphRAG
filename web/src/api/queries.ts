@@ -547,8 +547,11 @@ export function useTrigger(project: string) {
 const INSPECT_PAGE = 50;
 
 /** One page of a build-scoped list: its rows, the build that served them, and the
- *  cursor to the next page (absent = last page). */
-export type InspectPage<T> = { rows: T[]; buildId: string | null; next?: string };
+ *  cursor to the next page (absent = last page). ``total`` is the exact match
+ *  count when the endpoint reports it (SS1b: entities/documents with server-side
+ *  ``q``), absent otherwise — so an honest "N matches" can replace a loaded-rows
+ *  count. */
+export type InspectPage<T> = { rows: T[]; buildId: string | null; next?: string; total?: number };
 
 /** An API failure that keeps the frozen error CODE. The list pages are only valid while
  *  the build that served them is still active, and the code is what says whether it is. */
@@ -607,13 +610,18 @@ export function isScopeNeutral(error: unknown): boolean {
 function useInspectList<T>(
   key: string,
   project: string | undefined,
-  fetchPage: (project: string, cursor?: string) => Promise<InspectPage<T>>,
+  fetchPage: (project: string, cursor?: string, q?: string) => Promise<InspectPage<T>>,
+  q?: string,
 ) {
   return useInfiniteQuery({
-    queryKey: [key, project],
+    // q is part of the key: a new search is a new query (its own cache entry +
+    // cursor chain), so changing q re-fetches from page 1, and load-more keeps
+    // the same q. Lists without server-side search pass q=undefined (unchanged
+    // key shape). Callers that don't search leave q undefined.
+    queryKey: [key, project, q],
     enabled: project !== undefined && isPathAddressable(project),
     initialPageParam: undefined as string | undefined,
-    queryFn: ({ pageParam }) => fetchPage(project as string, pageParam),
+    queryFn: ({ pageParam }) => fetchPage(project as string, pageParam, q),
     getNextPageParam: (last: InspectPage<T>) => last.next,
   });
 }
@@ -879,9 +887,10 @@ export function useSaveChunking(project: string) {
 //   missing → 400 with details.query_policy="missing" (a condition the page
 //   must name, not blur into a generic failure); hops beyond max_graph_hops
 //   are REJECTED, not clamped.
-// * Entity lists support NO server-side search (reject_unsupported_query) —
-//   any left-column filter is a client-side filter over LOADED pages and must
-//   say so (the FE3 false-affordance lesson).
+// * Entity lists NOW support server-side search (SS1b): GET /entities takes a
+//   `q` substring over canonical_name and reports an exact `total`, so the left
+//   column is a REAL search over the whole active build (not the FE3 client-side
+//   over-loaded-pages filter) — the affordance is honest, no caveat needed.
 // * Relation.evidence[] rides ONLY the detail GET — clicking an edge is a
 //   real fetch, exactly like Document.raw in FE3.
 
@@ -889,16 +898,27 @@ export type Entity = components["schemas"]["Entity"];
 export type Relation = components["schemas"]["Relation"];
 export type GraphContext = components["schemas"]["GraphContext"];
 
-async function fetchEntities(project: string, cursor?: string): Promise<InspectPage<Entity>> {
+async function fetchEntities(
+  project: string,
+  cursor?: string,
+  q?: string,
+): Promise<InspectPage<Entity>> {
   const { data, error } = await api.GET("/projects/{project}/entities", {
-    params: { path: { project }, query: { limit: INSPECT_PAGE, cursor } },
+    // SS1b: q is server-side substring search over canonical_name. Send it only
+    // when non-empty — an empty string would be a distinct (no-op) search key.
+    params: { path: { project }, query: { limit: INSPECT_PAGE, cursor, q: q || undefined } },
   });
   if (error) throw apiError(error);
-  return { rows: data.data, buildId: data.meta.build_id, next: data.meta.next_cursor ?? undefined };
+  return {
+    rows: data.data,
+    buildId: data.meta.build_id,
+    next: data.meta.next_cursor ?? undefined,
+    total: data.meta.total ?? undefined,
+  };
 }
 
-export const useEntities = (project: string | undefined) =>
-  useInspectList("entities", project, fetchEntities);
+export const useEntities = (project: string | undefined, q?: string) =>
+  useInspectList("entities", project, fetchEntities, q);
 
 export function useEntity(project: string | undefined, id: string | undefined) {
   return useQuery({

@@ -209,29 +209,50 @@ describe("Graph", () => {
     expect(screen.getByText("active", { selector: "dd" })).toBeInTheDocument();
   });
 
-  it("labels the left filter as covering LOADED entities only, and filters client-side", async () => {
-    // The API has no entity search (reject_unsupported_query) — an unlabelled
-    // filter box would read as a corpus search and silently lie about anything
-    // beyond the loaded pages (FE3's false-affordance lesson).
-    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
-      Promise.resolve(
-        path.includes("subgraph") || path.includes("_id}")
-          ? { data: { data: subgraph(), meta: META }, error: undefined }
-          : {
-              data: {
-                data: [
-                  entity(),
-                  entity({ id: E2, canonical_name: "Charles Babbage", entity_key: "person:cb" }),
-                ],
-                meta: META,
-              },
-              error: undefined,
-            },
-      )) as never);
+  it("searches server-side (SS1b): sends q to GET /entities and shows the exact match total", async () => {
+    // SS1b rewired the left column from a client-side over-loaded-pages filter to
+    // a REAL server-side search. DISCRIMINATING setup: the searched row (Charles)
+    // is NOT in the initial (no-q) load — a client-side filter over the loaded
+    // rows [Ada] by "charles" would show NOTHING, so Charles appearing PROVES the
+    // term went to the server and the rows came back from it. The count shown is
+    // the SERVER's exact total, not a loaded-pages caveat.
+    const get = vi.spyOn(api, "GET").mockImplementation(((path: string, opts?: unknown) => {
+      if (path.includes("subgraph") || path.includes("_id}"))
+        return Promise.resolve({ data: { data: subgraph(), meta: META }, error: undefined });
+      const q = (opts as { params?: { query?: { q?: string } } } | undefined)?.params?.query?.q;
+      const rows = q
+        ? [entity({ id: E2, canonical_name: "Charles Babbage", entity_key: "person:cb" })]
+        : [entity()];
+      return Promise.resolve({
+        data: { data: rows, meta: { ...META, total: rows.length } },
+        error: undefined,
+      });
+    }) as never);
     renderGraph();
 
-    expect(await screen.findByText(/只過濾已載入的 2 個知識點/)).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("過濾"), { target: { value: "charles" } });
+    // the honest count is the SERVER's total over the whole active build
+    expect(await screen.findByText(/active build 全部知識點:1 個/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /ada lovelace/i })).toBeInTheDocument();
+    // the box caps at the server's q max_length (256): a longer paste would 400
+    // and GraphBody's error return would hide the box, stranding the user (P2)
+    expect(screen.getByLabelText("搜尋")).toHaveAttribute("maxlength", "256");
+
+    fireEvent.change(screen.getByLabelText("搜尋"), { target: { value: "charles" } });
+
+    // the debounced term reaches the SERVER as ?q=charles (not a client filter)
+    await waitFor(() =>
+      expect(
+        get.mock.calls.some(
+          (c) =>
+            String(c[0]).endsWith("/entities") &&
+            (c[1] as { params?: { query?: { q?: string } } } | undefined)?.params?.query?.q ===
+              "charles",
+        ),
+      ).toBe(true),
+    );
+    // ...and the list renders the server's narrowed response + its exact total —
+    // Charles was never in the client's loaded rows, so this is not a local filter
+    expect(await screen.findByText(/符合「charles」的知識點:1 個/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /charles babbage/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /ada lovelace/i })).not.toBeInTheDocument();
   });
