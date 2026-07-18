@@ -75,6 +75,12 @@ async def _no_fingerprint_pin(conn: Any, job_id: uuid.UUID) -> None:
     return None
 
 
+async def _registry_project(conn: object, name: str) -> object:
+    """CFG1: run_eval_task reads the policy from the registry — the fake row
+    carries an empty config; the parse itself is stubbed per test."""
+    return SimpleNamespace(config={})
+
+
 def _fake_lease(calls: dict[str, Any] | None = None, *, acquired: bool = True) -> Any:
     # stand-in for job_lease: records (job_id, owner) and yields `acquired`.
     @asynccontextmanager
@@ -346,7 +352,8 @@ async def test_run_eval_task_terminalizes_on_store_error_never_strands_running(
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
-    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr(bw, "get_project", _registry_project)
+    monkeypatch.setattr("core.mcp.policy.query_policy_from_mapping", lambda block: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _boom)
 
@@ -402,7 +409,8 @@ async def test_run_eval_task_no_ops_when_lease_lost_before_marking_running(
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
-    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr(bw, "get_project", _registry_project)
+    monkeypatch.setattr("core.mcp.policy.query_policy_from_mapping", lambda block: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
 
@@ -539,7 +547,8 @@ async def test_run_eval_task_fails_loud_when_eval_inputs_drifted(
     # drifted inputs (the revert path this probe guards against); **kw tolerates the
     # worker passing the already-read text= on the pinned path.
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path, **kw: "GOLDEN")
-    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path, **kw: "POLICY")
+    monkeypatch.setattr(bw, "get_project", _registry_project)
+    monkeypatch.setattr("core.mcp.policy.query_policy_from_mapping", lambda block: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
 
@@ -582,8 +591,8 @@ async def test_run_eval_task_pinned_eval_parses_the_fingerprinted_bytes_not_a_re
         seen["golden"] = text  # the loader must be handed the fingerprinted bytes, not re-read
         return "GOLDEN"
 
-    def _capture_policy(path: Any, *, text: str | None = None) -> str:
-        seen["policy"] = text
+    def _capture_policy_block(block: Any) -> str:
+        seen["policy"] = block  # the SAME registry read the fingerprint hashed (CFG1)
         return "POLICY"
 
     monkeypatch.setattr(bw, "job_lease", _fake_lease())
@@ -593,14 +602,20 @@ async def test_run_eval_task_pinned_eval_parses_the_fingerprinted_bytes_not_a_re
     monkeypatch.setattr(bw, "is_cancel_requested", _never_cancelled)
     monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _pinned_matches)
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
-    # the ONE read: fingerprint MATCHES the pin (no drift), and carries the exact bytes the
-    # loaders must parse — the same in-memory bytes that were fingerprinted, never a path re-read.
+
+    async def _project_with_policy(conn: object, name: str) -> object:
+        return SimpleNamespace(config={"query_policy": {"pinned": True}})
+
+    monkeypatch.setattr(bw, "get_project", _project_with_policy)
+    # the ONE golden read: fingerprint MATCHES the pin (no drift) and carries the exact
+    # bytes the loader must parse — the same in-memory bytes that were fingerprinted,
+    # never a path re-read; the policy side is the registry block captured below.
     monkeypatch.setattr(
         "core.eval.idempotency.read_and_fingerprint_eval_inputs",
-        lambda root: ("MATCH", b"golden-YAML", b"policy-YAML"),
+        lambda root, policy_bytes: ("MATCH", b"golden-YAML"),
     )
     monkeypatch.setattr("core.eval.golden.load_golden", _capture_golden)
-    monkeypatch.setattr("core.mcp.policy.load_query_policy", _capture_policy)
+    monkeypatch.setattr("core.mcp.policy.query_policy_from_mapping", _capture_policy_block)
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
     monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
@@ -608,8 +623,9 @@ async def test_run_eval_task_pinned_eval_parses_the_fingerprinted_bytes_not_a_re
     result = await bw.run_eval_task(_ctx(), "proj", str(uuid.uuid4()), str(uuid.uuid4()))
 
     assert result == "done"
-    # the loaders parsed the SINGLE read's bytes (decoded), never re-opened the path (text=None)
-    assert seen == {"golden": "golden-YAML", "policy": "policy-YAML"}
+    # golden parsed from the SINGLE read's bytes (never a path re-read); policy parsed
+    # from the SAME registry block the fingerprint serialized
+    assert seen == {"golden": "golden-YAML", "policy": {"pinned": True}}
 
 
 async def test_run_eval_task_rejects_project_name_escaping_projects_dir(
@@ -719,7 +735,8 @@ async def test_run_eval_task_noops_when_job_already_terminal(
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", _load_golden)
-    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr(bw, "get_project", _registry_project)
+    monkeypatch.setattr("core.mcp.policy.query_policy_from_mapping", lambda block: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
     monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
@@ -768,7 +785,8 @@ async def test_run_eval_task_cancel_during_run_finalizes_cancelled(
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
-    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr(bw, "get_project", _registry_project)
+    monkeypatch.setattr("core.mcp.policy.query_policy_from_mapping", lambda block: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
     monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
@@ -831,7 +849,8 @@ async def test_run_eval_task_cancelled_eval_never_persists_the_report(
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
-    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr(bw, "get_project", _registry_project)
+    monkeypatch.setattr("core.mcp.policy.query_policy_from_mapping", lambda block: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
     monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
@@ -872,7 +891,8 @@ async def test_run_eval_task_completed_eval_persists_the_report_in_finalize(
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
-    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr(bw, "get_project", _registry_project)
+    monkeypatch.setattr("core.mcp.policy.query_policy_from_mapping", lambda block: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
     monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)
@@ -931,7 +951,8 @@ async def test_run_eval_task_stale_worker_does_not_overwrite_after_lease_handoff
     monkeypatch.setattr(bw, "get_settings", lambda: SimpleNamespace(projects_dir="proj_root"))
     monkeypatch.setattr(bw, "get_eval_inputs_fingerprint", _no_fingerprint_pin)
     monkeypatch.setattr("core.eval.golden.load_golden", lambda path: "GOLDEN")
-    monkeypatch.setattr("core.mcp.policy.load_query_policy", lambda path: "POLICY")
+    monkeypatch.setattr(bw, "get_project", _registry_project)
+    monkeypatch.setattr("core.mcp.policy.query_policy_from_mapping", lambda block: "POLICY")
     monkeypatch.setattr("core.eval.runner.models_needed", lambda g, p: (False, False))
     monkeypatch.setattr("core.eval.runner.run_eval", _run_eval)
     monkeypatch.setattr("core.eval.runner.persist_build_eval", _persist)

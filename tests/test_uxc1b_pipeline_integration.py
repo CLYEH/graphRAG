@@ -40,7 +40,7 @@ from core.eval.golden import load_golden
 from core.eval.runner import run_eval
 from core.index.indexing import index_build
 from core.ingest.documents import ingest_documents
-from core.mcp.policy import load_query_policy
+from core.mcp.policy import query_policy_from_mapping
 from core.metadata.schema import load_metadata_exposure
 from core.query.metadata_enrich import enrich_response_metadata
 from core.query.semantic import semantic_search
@@ -54,11 +54,11 @@ from core.stores.vectors import (
     collection_for,
     vector_client,
 )
+from tests.conftest import DEMO_QUERY_POLICY
 
 pytestmark = pytest.mark.integration
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-_DEMO_CONFIG = REPO_ROOT / "projects" / "demo" / "config.yaml"
 
 #: One project schema serving three UNRELATED domains — the generality gate: the
 #: same code handles all three, none named in a code path.
@@ -290,7 +290,7 @@ async def test_upload_build_eval_activate_metadata_flows_end_to_end(
             # 3) EVAL — the same core path the CLI walks; writes builds.eval.
             # 4) ACTIVATE — a scored first build activates (gate vacuous).
             golden = load_golden(_golden_file(tmp_path))
-            policy = load_query_policy(_DEMO_CONFIG)
+            policy = query_policy_from_mapping(DEMO_QUERY_POLICY)  # CFG1: registry-era fixture
             driver = graph_driver()
             try:
                 async with driver.session() as session:

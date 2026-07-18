@@ -55,7 +55,7 @@ from core.builds.lifecycle import (
     list_builds_page,
 )
 from core.config import get_settings
-from core.eval.idempotency import eval_inputs_fingerprint
+from core.eval.idempotency import eval_inputs_fingerprint, policy_fingerprint_bytes
 from core.registry import (
     JobConflictError,
     ProjectNotFoundError,
@@ -288,7 +288,17 @@ async def run_build_eval_endpoint(
     # idempotency-keyed inputs. (Computed before produce so it exists for both paths; on
     # an idempotent REPLAY produce is skipped and no new job is pinned — correct, the
     # first accept's job carries it.)
-    fingerprint = eval_inputs_fingerprint(Path(get_settings().projects_dir), project)
+    # CFG1: the policy component of the fingerprint reads the registry (the
+    # ONE SoR) — same canonical serialization the worker hashes at dispatch
+    registry_row = await get_project(conn, project)
+    registry_config = (
+        registry_row.config
+        if registry_row is not None and isinstance(registry_row.config, dict)
+        else {}
+    )
+    fingerprint = eval_inputs_fingerprint(
+        Path(get_settings().projects_dir), project, policy_fingerprint_bytes(registry_config)
+    )
 
     async def produce() -> tuple[int, dict[str, Any]]:
         try:

@@ -11,7 +11,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import yaml
 
 from core.mcp.policy import PolicyError
 from core.mcp.server import build_server
@@ -32,25 +31,58 @@ _FROZEN_TOOLS = {
 
 
 async def test_the_server_exposes_exactly_the_frozen_tool_set() -> None:
-    server = build_server("demo", REPO_ROOT / "projects" / "demo" / "config.yaml")
+    server = build_server("demo")
     tools = await server.list_tools()
     assert {tool.name for tool in tools} == _FROZEN_TOOLS
 
 
-def test_an_invalid_policy_kills_the_server_at_build_time(tmp_path: Path) -> None:
-    """Fail loud at startup: a policy violating the frozen contract must stop
-    the server from EXISTING, not surface later mid-query."""
-    bad = tmp_path / "config.yaml"
-    bad.write_text(yaml.safe_dump({"query_policy": {"schema_version": "1.0"}}), "utf-8")
+async def test_registry_policy_failures_are_typed_and_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CFG1 moved the fail-loud gate from build time to SESSION start (the
+    registry is read per lifespan): a missing project, a config without the
+    policy block, and a contract-invalid block must each raise the typed
+    PolicyError BEFORE the session serves a single query — never a
+    half-configured server. The valid path returns the same policy the
+    Console API validates (one SoR, shared validator by construction)."""
+    from types import SimpleNamespace
+
+    from core.mcp.policy import load_runtime_config_from_registry, query_policy_from_mapping
+    from tests.conftest import DEMO_QUERY_POLICY
+
+    rows: dict[str, object] = {}
+
+    async def fake_get_project(conn: object, name: str) -> object | None:
+        return rows.get(name)
+
+    monkeypatch.setattr("core.registry.get_project", fake_get_project)
+
+    with pytest.raises(PolicyError, match="not in the registry"):
+        await load_runtime_config_from_registry(object(), "ghost")
+
+    rows["bare"] = SimpleNamespace(config={})
+    with pytest.raises(PolicyError, match="no query_policy block"):
+        await load_runtime_config_from_registry(object(), "bare")
+
+    rows["broken"] = SimpleNamespace(config={"query_policy": {"schema_version": "1.0"}})
     with pytest.raises(PolicyError):
-        build_server("broken", bad)
+        await load_runtime_config_from_registry(object(), "broken")
+
+    rows["demo"] = SimpleNamespace(config={"query_policy": DEMO_QUERY_POLICY})
+    policy, exposure = await load_runtime_config_from_registry(object(), "demo")
+    assert policy == query_policy_from_mapping(DEMO_QUERY_POLICY)
+    assert exposure.fields == ()  # no metadata_exposure block → fail-closed empty
 
 
-def test_the_shipped_demo_config_is_contract_valid() -> None:
-    """The template a new project copies must itself pass the gate it
-    documents — a broken example would teach broken configs."""
-    server = build_server("demo", REPO_ROOT / "projects" / "demo" / "config.yaml")
-    assert server.name == "graphrag-demo"
+def test_the_demo_policy_fixture_is_contract_valid() -> None:
+    """The shared test fixture every MCP test seeds (DEMO_QUERY_POLICY —
+    successor of the deleted projects/demo/config.yaml template) must itself
+    pass the frozen gate — a broken fixture would teach broken configs."""
+    from core.mcp.policy import query_policy_from_mapping
+    from tests.conftest import DEMO_QUERY_POLICY
+
+    query_policy_from_mapping(DEMO_QUERY_POLICY)
+    assert build_server("demo").name == "graphrag-demo"
 
 
 async def test_bounded_tools_degrade_typed_at_the_wall_clock_deadline() -> None:

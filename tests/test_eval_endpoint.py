@@ -30,6 +30,19 @@ _BUILD = uuid.uuid4()
 _URL = f"/projects/demo/builds/{_BUILD}/eval"
 
 
+@pytest.fixture(autouse=True)
+def _stub_registry_project(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CFG1: the accept-time fingerprint reads the registry for its policy
+    component — these hermetic tests run on fake conns, so the read is
+    stubbed to 'no project row' (empty policy bytes; the fingerprint only
+    needs stability here, and the job path already fakes its own errors)."""
+
+    async def none_project(conn: object, name: str) -> None:
+        return None
+
+    monkeypatch.setattr("api.routers.builds.get_project", none_project)
+
+
 @pytest.fixture()
 def client() -> Iterator[TestClient]:
     app = create_app()
@@ -123,7 +136,9 @@ def test_eval_pins_the_accept_time_inputs_fingerprint(
     resp = client.post(_URL)
     assert resp.status_code == 202
     assert created["pinned_job_id"] == created["job_id_created"]
-    expected = eval_inputs_fingerprint(Path(get_settings().projects_dir), "demo")
+    # the stubbed registry has no project row → empty policy bytes (CFG1:
+    # the policy component of the fingerprint is the registry block)
+    expected = eval_inputs_fingerprint(Path(get_settings().projects_dir), "demo", b"")
     assert created["pinned_fingerprint"] == expected
 
 

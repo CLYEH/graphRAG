@@ -61,6 +61,37 @@ def _gate_on_services() -> None:
     pytest.skip(msg)
 
 
+#: the demo query_policy the old projects/demo/config.yaml template shipped —
+#: kept as a shared test fixture now that the registry is the ONE policy SoR
+#: (CFG1); contract-validity is pinned in test_mcp_server.py
+DEMO_QUERY_POLICY: dict[str, object] = {
+    "schema_version": "1.0",
+    "default_mode": "hybrid",
+    "max_top_k": 20,
+    "max_graph_hops": 3,
+    "max_sql_rows": 100,
+    "max_latency_ms": 10000,
+    "require_sources": True,
+    "expose_debug": True,
+    "text_to_sql": {
+        "enabled": False,
+        "readonly": True,
+        "allowed_tables": [],
+        "blocked_keywords": ["insert", "update", "delete", "drop", "alter", "truncate"],
+        "max_rows": 100,
+        "timeout_ms": 5000,
+    },
+    "text_to_cypher": {
+        "enabled": False,
+        "readonly": True,
+        "allowed_clauses": ["MATCH", "WHERE", "RETURN", "LIMIT"],
+        "blocked": ["CREATE", "MERGE", "DELETE", "SET", "REMOVE", "CALL"],
+        "max_rows": 100,
+        "timeout_ms": 5000,
+    },
+}
+
+
 @pytest.fixture(scope="session")
 def require_services() -> None:
     """Skip an integration test unless the docker compose stack is reachable."""

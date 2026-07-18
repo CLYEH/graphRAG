@@ -61,7 +61,16 @@ def _parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help="project config with query_policy (default: projects/<project>/config.yaml)",
+        help="OVERRIDE policy file (default: the registry projects.config — CFG1 one SoR)",
+    )
+
+    serve_mcp = sub.add_parser(
+        "serve-mcp",
+        help="serve EVERY project's MCP over streamable HTTP at /mcp/<project> (CFG1 gateway)",
+    )
+    serve_mcp.add_argument("--host", default=None, help="bind host (default: core.config)")
+    serve_mcp.add_argument(
+        "--port", type=int, default=None, help="bind port (default: core.config)"
     )
 
     prune = sub.add_parser("prune", help="GC builds beyond the retention window")
@@ -118,13 +127,23 @@ async def _run(args: argparse.Namespace) -> int:
                 from core.eval.golden import GoldenError, load_golden
                 from core.eval.runner import models_needed, run_eval
                 from core.llm.factory import LLMNotConfiguredError, chat_model, embedding_model
-                from core.mcp.policy import PolicyError, load_query_policy
+                from core.mcp.policy import (
+                    PolicyError,
+                    load_query_policy,
+                    load_runtime_config_from_registry,
+                )
                 from core.stores.repo import active_build_id
 
                 root = Path("projects") / args.project
                 try:
                     golden = load_golden(args.golden or root / "eval" / "golden.yaml")
-                    policy = load_query_policy(args.config or root / "config.yaml")
+                    if args.config:
+                        # explicit file override — the escape hatch; DEFAULT is
+                        # the registry, the ONE policy SoR (CFG1)
+                        policy = load_query_policy(args.config)
+                    else:
+                        policy, _ = await load_runtime_config_from_registry(conn, args.project)
+                        await conn.rollback()  # end the read txn like the build lookup below
                 except (GoldenError, PolicyError) as exc:
                     print(f"REFUSED: {exc}", file=sys.stderr)
                     return 1
@@ -189,9 +208,29 @@ def _print_report(report: lifecycle.PreflightReport) -> int:
     return 1
 
 
+def _serve_mcp(args: argparse.Namespace) -> int:
+    """CFG1 gateway: every project at ``/mcp/<project>`` on ONE port —
+    uvicorn hosts the ASGI dispatcher; host/port ride core.config unless
+    overridden. Runs until interrupted (it IS the server, not a lifecycle
+    command, so it branches before ``_run``'s store plumbing)."""
+    import uvicorn
+
+    from core.mcp.gateway import build_gateway
+
+    settings = get_settings()
+    uvicorn.run(
+        build_gateway(),
+        host=args.host or settings.mcp_http_host,
+        port=args.port or settings.mcp_http_port,
+    )
+    return 0
+
+
 def main() -> None:
     """Console-script entrypoint."""
     args = _parser().parse_args()
+    if args.command == "serve-mcp":
+        sys.exit(_serve_mcp(args))
     sys.exit(asyncio.run(_run(args)))
 
 

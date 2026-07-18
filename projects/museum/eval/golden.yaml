@@ -1,0 +1,20 @@
+# 教學專案的 golden set(§20):activation 的 eval gate 讀這裡。
+# 這三題只斷言檢索結果文字含有語料中必然存在的詞(answer_regex → 1/0),
+# 是煙霧測試等級的門檻——真專案應該加上 must_contain_entities / must_cite_sources。
+schema_version: "1.0"
+cases:
+  - question: "深海探索廳的深潛器叫什麼名字?"
+    mode: semantic
+    expects:
+      answer_regex: "海淵一號"
+    min_score: 0.5
+  - question: "黑潮對台灣有什麼影響?"
+    mode: semantic
+    expects:
+      answer_regex: "黑潮"
+    min_score: 0.5
+  - question: "小抹是什麼動物的標本?"
+    mode: semantic
+    expects:
+      answer_regex: "抹香鯨|小抹"
+    min_score: 0.5

@@ -1,6 +1,8 @@
 """Project query-policy loading (§21, DR-002; C8).
 
-A project's ``config.yaml`` carries its ``query_policy`` block. That block is
+A project's registry config (``projects.config`` — the ONE SoR since CFG1/DR-012;
+the file loaders below remain for the CLI's explicit ``--config`` override) carries
+its ``query_policy`` block. That block is
 validated against the FROZEN ``contracts/query_policy.schema.json`` before any
 value is trusted — the schema is the contract, this module only carries it to
 runtime (an invalid policy fails LOUD at server startup, never mid-query).
@@ -108,11 +110,11 @@ def load_query_policy(config_path: Path, *, text: str | None = None) -> QueryPol
     """Load + validate ``query_policy`` from a project's ``config.yaml``.
 
     The file loader owns only the file/YAML/presence concerns; validation and
-    typing are :func:`query_policy_from_mapping`'s (shared with the Console
-    API, which reads the block from the ``projects.config`` registry column —
-    owner decision 2026-07-10: registry is the Console-side policy source,
-    strict, no invented defaults; the file stays the MCP/CLI source).
-    Every failure is a :class:`PolicyError` naming what broke.
+    typing are :func:`query_policy_from_mapping`'s — the same validator every
+    registry consumer runs. Since CFG1/DR-012 the registry
+    (``projects.config``) is the ONE policy SoR; this loader remains solely
+    for the CLI's explicit ``--config`` override escape hatch. Every failure
+    is a :class:`PolicyError` naming what broke.
 
     ``text`` supplies the file's ALREADY-READ content (``config_path`` is used only
     for error messages then): the eval worker reads golden + policy ONCE for its drift
@@ -128,24 +130,6 @@ def load_query_policy(config_path: Path, *, text: str | None = None) -> QueryPol
     if not isinstance(raw, dict) or "query_policy" not in raw:
         raise PolicyError(f"project config {config_path} has no query_policy block")
     return query_policy_from_mapping(raw["query_policy"])
-
-
-def load_metadata_exposure_from_file(config_path: Path) -> MetadataExposure:
-    """Load the project's ``metadata_exposure`` allowlist from ``config.yaml``
-    (the MCP/CLI source, dual to the Console's ``projects.config`` — same split
-    as :func:`load_query_policy`). An absent block is the FAIL-CLOSED empty
-    allowlist (DR-010 rule 7 — nothing exposed by default); a malformed block
-    fails LOUD at server startup (:class:`~core.metadata.schema.MetadataConfigError`),
-    never half-armed mid-query."""
-    try:
-        raw = yaml.safe_load(config_path.read_text("utf-8"))
-    except FileNotFoundError:
-        return MetadataExposure(fields=())
-    except yaml.YAMLError as exc:
-        raise PolicyError(f"project config is not valid YAML: {exc}") from exc
-    if not isinstance(raw, dict):
-        return MetadataExposure(fields=())
-    return load_metadata_exposure(raw)
 
 
 def query_policy_from_mapping(document: Any) -> QueryPolicy:
@@ -211,3 +195,35 @@ def hybrid_policy(
         expose_debug=policy.expose_debug,
         max_latency_ms=min(budget, policy.max_latency_ms),
     )
+
+
+async def load_runtime_config_from_registry(
+    conn: Any, project: str
+) -> tuple[QueryPolicy, MetadataExposure]:
+    """Registry-sourced policy + exposure — the ONE SoR (CFG1).
+
+    Owner 2026-07-17 superseded the 2026-07-10 dual-source decision: the
+    Console API always read ``projects.config`` while MCP/CLI read
+    ``projects/<name>/config.yaml``, letting the same project diverge between
+    its human and agent surfaces. Every runtime consumer now reads the SAME
+    registry column through the SAME shared validators
+    (:func:`query_policy_from_mapping` / ``load_metadata_exposure``), so
+    divergence is structurally impossible. Failures stay typed
+    (:class:`PolicyError`) and fail loud — a project without a registry
+    ``query_policy`` block cannot serve queries, same rule as the file era.
+
+    The import is deferred: ``core.registry`` pulls store modules this
+    policy-vocabulary module must not depend on at import time.
+    """
+    from core.registry import get_project
+
+    row = await get_project(conn, project)
+    if row is None:
+        raise PolicyError(f"project {project!r} is not in the registry")
+    config = row.config if isinstance(row.config, dict) else {}
+    if "query_policy" not in config:
+        raise PolicyError(
+            f"project {project!r} has no query_policy block in its registry config "
+            "(PATCH /projects/{project} writes it; CFG1: the registry is the ONLY source)"
+        )
+    return query_policy_from_mapping(config["query_policy"]), load_metadata_exposure(config)

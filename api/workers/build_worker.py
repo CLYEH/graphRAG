@@ -131,10 +131,10 @@ async def run_eval_task(
     project out of every future job via ``create_job_exclusive``. The caller
     re-runs — eval is idempotent (it just re-writes ``builds.eval``)."""
     from core.eval.golden import load_golden
-    from core.eval.idempotency import read_and_fingerprint_eval_inputs
+    from core.eval.idempotency import policy_fingerprint_bytes, read_and_fingerprint_eval_inputs
     from core.eval.inputs import eval_input_paths
     from core.eval.runner import models_needed, persist_build_eval, run_eval
-    from core.mcp.policy import load_query_policy
+    from core.mcp.policy import query_policy_from_mapping
 
     engine = ctx["engine"]
     eval_job = uuid.UUID(job_id)
@@ -189,7 +189,17 @@ async def run_eval_task(
             # the job like any other deterministic refusal, never strands it.
             async with engine.connect() as conn:
                 pinned_fingerprint = await get_eval_inputs_fingerprint(conn, eval_job)
-            golden_path, policy_path = eval_input_paths(root)
+                # CFG1: the policy lives in the registry — ONE read serves the
+                # fingerprint AND the parse below (a second read would reopen
+                # the very TOCTOU the drift guard closes, registry edition)
+                registry_row = await get_project(conn, project)
+            registry_config = (
+                registry_row.config
+                if registry_row is not None and isinstance(registry_row.config, dict)
+                else {}
+            )
+            policy_bytes = policy_fingerprint_bytes(registry_config)
+            (golden_path,) = eval_input_paths(root)
             if pinned_fingerprint is not None:
                 # Read the inputs ONCE and both fingerprint AND parse THOSE bytes: a
                 # separate re-read for parsing would reopen a TOCTOU — an edit landing
@@ -197,8 +207,8 @@ async def run_eval_task(
                 # pinned fingerprint, defeating the guard. (An unpinned job — created before
                 # the pin existed — has no drift guard, so nothing to keep consistent: it
                 # reads+parses normally in the else.)
-                live_fingerprint, golden_bytes, policy_bytes = read_and_fingerprint_eval_inputs(
-                    root
+                live_fingerprint, golden_bytes = read_and_fingerprint_eval_inputs(
+                    root, policy_bytes
                 )
                 if live_fingerprint != pinned_fingerprint:
                     raise ValueError(
@@ -206,10 +216,12 @@ async def run_eval_task(
                         "was accepted; re-trigger it so the report scores the intended inputs"
                     )
                 golden = load_golden(golden_path, text=golden_bytes.decode("utf-8"))
-                policy = load_query_policy(policy_path, text=policy_bytes.decode("utf-8"))
             else:
                 golden = load_golden(golden_path)
-                policy = load_query_policy(policy_path)
+            # the SAME registry read the fingerprint hashed — parse it, never
+            # re-read (PolicyError on a missing/invalid block is a preflight
+            # refusal that terminalizes the job loud, same as the file era)
+            policy = query_policy_from_mapping(registry_config.get("query_policy"))
             needs_embedder, needs_llm = models_needed(golden, policy)
             embedder = ctx["embedder"] if needs_embedder else None
             llm = ctx["llm"] if needs_llm else None

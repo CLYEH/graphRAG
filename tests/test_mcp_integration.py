@@ -32,8 +32,9 @@ from core.resolve import fingerprints
 from core.stores.graph import graph_driver
 from core.stores.repo import BuildScopedWriter
 from core.stores.tables import builds, entities
+from core.stores.tables import projects as projects_table
 from core.stores.vectors import vector_client
-from tests.conftest import ensure_project
+from tests.conftest import DEMO_QUERY_POLICY, ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -91,6 +92,14 @@ async def _activate_build(project: str, *, entity_name: str) -> uuid.UUID:
     engine = _engine()
     async with engine.connect() as conn:
         await ensure_project(conn, project)
+        # CFG1: the registry is the ONE policy SoR — the live MCP session
+        # reads projects.config, so the seed writes the policy THERE (the
+        # exact read path production sessions take; no config.yaml anywhere)
+        await conn.execute(
+            projects_table.update()
+            .where(projects_table.c.name == project)
+            .values(config={"query_policy": DEMO_QUERY_POLICY})
+        )
         build_id: uuid.UUID = (
             await conn.execute(
                 builds.insert().values(project=project, status="building").returning(builds.c.id)
@@ -187,7 +196,7 @@ async def test_a_registered_tool_calls_through_on_live_stores(
         server_module, "embedding_model", lambda: cast(BaseEmbedding, _FakeEmbedder())
     )
     await _activate_build(context.project, entity_name="Acme")
-    server = build_server(context.project, REPO_ROOT / "projects" / "demo" / "config.yaml")
+    server = build_server(context.project)
     # dispatch through a REAL in-memory protocol session: Server.run enters
     # the lifespan per session and parks the runtime on the session's request
     # context (Codex #58 P1 made the runtime session-scoped, so tools are only
