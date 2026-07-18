@@ -244,6 +244,87 @@ async def test_text_source_without_ontology_fails_the_build_at_graph(
         await engine.dispose()
 
 
+async def test_retry_build_ingest_skips_live_sources(
+    stores: tuple[AsyncQdrantClient, AsyncSession], tmp_path: Path
+) -> None:
+    """RB1-retry (Codex #100 P1): a retry child reprocesses the PARENT's corpus
+    (cloned in as documents), so its ingest stage must NOT re-read the project's
+    current live sources — otherwise a source added/changed after the failed
+    parent would drift the child out of the promised "reuse the parent's
+    artifacts" scope (or fail the re-fetch). Discriminating setup: a live CSV
+    source is registered (a normal build ingests it as 2 documents — see
+    test_structured_build), and the retry child is pre-seeded with ONE unrelated
+    cloned document. If ingest re-read sources for a retry (the bug), the child
+    would gain the CSV's 2 rows; the assertion that ONLY the clone remains fails."""
+    client, session = stores
+    engine = _engine()
+    project = _proj()
+    try:
+        csv = await _write_csv(tmp_path)
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+            # a live source a NON-retry ingest would turn into documents
+            await add_source(
+                conn,
+                project,
+                uri=csv.as_uri(),
+                kind="structured",
+                metadata={"table": "people", "pk_column": "id"},
+            )
+            parent = (
+                await conn.execute(
+                    tables.builds.insert()
+                    .values(project=project, status="failed")
+                    .returning(tables.builds.c.id)
+                )
+            ).scalar_one()
+            # a retry CHILD (parent_build_id set) pre-seeded with ONE cloned doc
+            child = (
+                await conn.execute(
+                    tables.builds.insert()
+                    .values(project=project, status="building", parent_build_id=parent)
+                    .returning(tables.builds.c.id)
+                )
+            ).scalar_one()
+            await conn.execute(
+                tables.documents.insert().values(
+                    project=project,
+                    build_id=child,
+                    source_uri="file:///cloned.txt",
+                    raw="cloned body",
+                    content_hash="cloned-hash",
+                    mime="text/plain",
+                    status="ingested",
+                )
+            )
+
+        # run ONLY the ingest stage against the retry child
+        ingest = _stages_for(_STRUCTURED_CONFIG, client, session).ingest
+        async with engine.connect() as conn, conn.begin():
+            result = await ingest(conn, project, child)
+
+        # ingest reused the frozen cloned corpus, reading NO live source
+        assert result.detail == {"retry_reused_documents": 1}
+        assert result.outcomes == ()
+        async with engine.connect() as conn:
+            hashes = (
+                (
+                    await conn.execute(
+                        sa.select(tables.documents.c.content_hash).where(
+                            tables.documents.c.build_id == child
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        # exactly the clone — the CSV's rows were never ingested into the child
+        assert list(hashes) == ["cloned-hash"]
+    finally:
+        await _cleanup(engine, client, session, project)
+        await engine.dispose()
+
+
 async def test_xlsx_source_ingests_per_row_text_documents(
     stores: tuple[AsyncQdrantClient, AsyncSession], tmp_path: Path
 ) -> None:

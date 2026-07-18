@@ -9,10 +9,11 @@ build_id-scoped artifact tables key rows by a standalone ``id`` PK (DR-006), so
 **Why only documents (not chunks / the graph layer).** The child re-runs the §5
 pipeline (convergent-idempotency resume):
 
-* ``ingest`` dedups by ``content_hash`` within the build (core.ingest.documents),
-  so the cloned documents are recorded ``skipped`` and handed to ``clean`` — the
-  parent's ingested corpus is reused, and a source removed/disabled since the
-  parent build still survives into the retry (it isn't re-fetched away).
+* ``ingest`` is SKIPPED for a retry (``core.builds.stages._is_retry_build``): the
+  cloned documents ARE the frozen corpus, and re-reading the project's current
+  live sources would break retryBuild's "reuse the parent's artifacts" scope — a
+  changed/removed source would fail the re-fetch or drift the content, and a
+  source added after the parent build would add documents the parent never had.
 * ``clean`` re-chunks each cloned document FRESH under the child build_id. This
   is why chunks are NOT cloned: ``clean_document`` REFUSES to mix two chunkings
   of one document (``InconsistentChunksError``), so a cloned chunk set plus a
