@@ -31,6 +31,11 @@ class ErrorCode(StrEnum):
     STORE_UNAVAILABLE = "STORE_UNAVAILABLE"
     RATE_LIMITED = "RATE_LIMITED"
     INTERNAL = "INTERNAL"
+    # v1.3 (DR-013, additive): precise not-found codes for the new source/
+    # proposal surfaces + the retry state refusal (mirrors BUILD_NOT_READY).
+    SOURCE_NOT_FOUND = "SOURCE_NOT_FOUND"
+    PROPOSAL_NOT_FOUND = "PROPOSAL_NOT_FOUND"
+    BUILD_NOT_RETRYABLE = "BUILD_NOT_RETRYABLE"
 
 
 #: code → HTTP status. Every ErrorCode MUST appear (a lockstep test asserts
@@ -50,6 +55,9 @@ _HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.STORE_UNAVAILABLE: 503,
     ErrorCode.RATE_LIMITED: 429,
     ErrorCode.INTERNAL: 500,
+    ErrorCode.SOURCE_NOT_FOUND: 404,
+    ErrorCode.PROPOSAL_NOT_FOUND: 404,
+    ErrorCode.BUILD_NOT_RETRYABLE: 409,
 }
 
 

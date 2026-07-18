@@ -41,6 +41,11 @@ _FROZEN_ERROR_CODES = frozenset(
         "STORE_UNAVAILABLE",
         "RATE_LIMITED",
         "INTERNAL",
+        # v1.3 (DR-013, additive): precise not-found codes for the new
+        # source/proposal surfaces + the retry state refusal.
+        "SOURCE_NOT_FOUND",
+        "PROPOSAL_NOT_FOUND",
+        "BUILD_NOT_RETRYABLE",
     }
 )
 _FROZEN_WARNING_CODES = frozenset(
@@ -69,6 +74,19 @@ _FROZEN_PATHS = frozenset(
         "/projects/{project}/builds/{build_id}/activate",
         "/projects/{project}/builds/{build_id}/rollback",
         "/projects/{project}/builds/{build_id}/eval",
+        # v1.3 (DR-013 packaged round)
+        "/projects/{project}/sources/{source_id}",
+        "/projects/{project}/builds/{build_id}/retry",
+        "/projects/{project}/builds/{build_id}/steps",
+        "/projects/{project}/builds/{build_id}/steps/{step_id}/items",
+        "/projects/{project}/entities/{entity_id}/approve",
+        "/projects/{project}/entities/{entity_id}/reject",
+        "/projects/{project}/relations/{relation_id}/approve",
+        "/projects/{project}/relations/{relation_id}/reject",
+        "/projects/{project}/ontology-proposals",
+        "/projects/{project}/ontology-proposals/{proposal_id}/accept",
+        "/projects/{project}/ontology-proposals/{proposal_id}/reject",
+        "/projects/{project}/mcp",
         "/jobs/{job_id}",
         "/jobs/{job_id}/cancel",
         "/jobs/{job_id}/events",
@@ -107,6 +125,10 @@ _LIST_PATHS = frozenset(
         "/projects/{project}/entities",
         "/projects/{project}/relations",
         "/projects/{project}/merge-candidates",
+        # v1.3 (DR-013)
+        "/projects/{project}/ontology-proposals",
+        "/projects/{project}/builds/{build_id}/steps",
+        "/projects/{project}/builds/{build_id}/steps/{step_id}/items",
     }
 )
 
@@ -536,8 +558,13 @@ def test_contract_is_versioned(spec: dict[str, Any]) -> None:
     1.1 → 1.2 (2026-07-15, DESIGN §26 DR-010): added POST
     /projects/{project}/builds/{build_id}/eval + POST /projects/{project}/uploads
     and the document metadata envelope.
+    1.2 → 1.3 (2026-07-18, DESIGN §26 DR-013): the Track 5 packaged round —
+    source soft-disable (SRC2), entity/relation + ontology-proposal review
+    (GOV2/GOV3), build retry lineage + step/item drill-down (RB1), server-side
+    search + page totals (SS1b), and the MCP connection-info endpoint (DR-012
+    rider).
     """
-    assert spec["info"]["version"] == "1.2"
+    assert spec["info"]["version"] == "1.3"
 
 
 def test_frozen_endpoint_surface(spec: dict[str, Any]) -> None:
@@ -640,9 +667,10 @@ def test_write_endpoints_accept_idempotency_key(spec: dict[str, Any]) -> None:
         writes.add(path)
         assert "IdempotencyKey" in refs, path
         assert "409" in op["responses"], path
-    # v1.2 (DR-010) adds upload + build-eval writes:
-    # create/source/ingest/upload/build/activate/rollback/eval/cancel + 3 reviews.
-    assert len(writes) == 12
+    # v1.2 (DR-010): create/source/ingest/upload/build/activate/rollback/eval/
+    # cancel + 3 merge reviews = 12. v1.3 (DR-013) adds 7: entity approve/
+    # reject, relation approve/reject, proposal accept/reject, build retry.
+    assert len(writes) == 19
 
 
 def test_sse_job_event_contract(spec: dict[str, Any]) -> None:
@@ -801,3 +829,122 @@ def test_document_metadata_envelope_shape(spec: dict[str, Any]) -> None:
     accepted = schemas["UploadedFileAccepted"]
     assert "metadata" in accepted["required"]
     assert accepted["properties"]["metadata"]["$ref"].endswith("/DocumentMetadataEnvelope")
+
+
+def test_v13_source_lifecycle_contract(spec: dict[str, Any]) -> None:
+    """DR-013/SRC2 (GAPS G2 option 2): the ONLY mutable source field is
+    `enabled` — `uri`/`kind` immutability is structural (not properties of the
+    update schema), so a client cannot even EXPRESS a uri rewrite; corpus swap
+    is disable-old + register-new and historical provenance survives."""
+    defs = spec["components"]["schemas"]
+    update = defs["SourceUpdate"]
+    assert update["required"] == ["enabled"]  # an empty PATCH body is a client bug
+    assert set(update["properties"]) == {"enabled"}  # uri/kind not expressible
+    # ...and a smuggled extra key is a VALIDATION error at the schema boundary,
+    # not a silently-dropped no-op (the DocumentMetadataInput precedent)
+    assert update["additionalProperties"] is False
+    # the response side gains `enabled` additively: NOT required, so pre-SRC2
+    # responses (field absent = enabled) stay conforming until the runtime lands
+    source = defs["Source"]
+    assert source["properties"]["enabled"]["type"] == "boolean"
+    assert "enabled" not in source["required"]
+    patch = spec["paths"]["/projects/{project}/sources/{source_id}"]["patch"]
+    assert patch["requestBody"]["required"] is True
+
+
+def test_v13_review_endpoints_share_the_decision_request(spec: dict[str, Any]) -> None:
+    """DR-013/GOV2+GOV3: all six new review writes reuse the ONE
+    ReviewDecisionRequest body (§17 vocabulary lives in the PATH, mirroring the
+    merge-candidate shape — no per-kind body forks to drift), and each returns
+    its subject's envelope so the Console can refresh in place."""
+    expected = {
+        "/projects/{project}/entities/{entity_id}/approve": "EntityResponse",
+        "/projects/{project}/entities/{entity_id}/reject": "EntityResponse",
+        "/projects/{project}/relations/{relation_id}/approve": "RelationResponse",
+        "/projects/{project}/relations/{relation_id}/reject": "RelationResponse",
+        "/projects/{project}/ontology-proposals/{proposal_id}/accept": "OntologyProposalResponse",
+        "/projects/{project}/ontology-proposals/{proposal_id}/reject": "OntologyProposalResponse",
+    }
+    for path, wrapper in expected.items():
+        op = spec["paths"][path]["post"]
+        body = op["requestBody"]["content"]["application/json"]["schema"]
+        assert body["$ref"].endswith("ReviewDecisionRequest"), path
+        ok = op["responses"]["200"]["content"]["application/json"]["schema"]
+        assert ok["$ref"].endswith(wrapper), path
+
+
+def test_v13_ontology_proposal_enums_match_the_ddl(spec: dict[str, Any]) -> None:
+    """DR-013/GOV3: the proposal `kind`/`status` vocabularies are CLOSED in the
+    DDL (CheckConstraints) — the contract enums must stay in lockstep with the
+    SoR's own constraint text (two gates, one corpus: parse the DDL rather than
+    restating it)."""
+    import re
+
+    import sqlalchemy as sa
+
+    from core.stores.tables import ontology_proposals
+
+    def ddl_vocab(constraint_name: str) -> set[str]:
+        for c in ontology_proposals.constraints:
+            if isinstance(c, sa.CheckConstraint) and c.name == constraint_name:
+                return set(re.findall(r"'([^']+)'", str(c.sqltext)))
+        raise AssertionError(f"constraint {constraint_name} not found")
+
+    defs = spec["components"]["schemas"]
+    assert set(defs["OntologyProposal"]["properties"]["kind"]["enum"]) == ddl_vocab(
+        "ontology_proposals_kind_valid"
+    )
+    assert set(defs["OntologyProposalStatus"]["enum"]) == ddl_vocab(
+        "ontology_proposals_status_valid"
+    )
+
+
+def test_v13_retry_contract(spec: dict[str, Any]) -> None:
+    """DR-013/RB1: retry is a JOB accept (202, same envelope as triggerBuild —
+    one watch path for every long operation) whose semantics are fixed
+    (failed-only; a full re-run is POST /build), so the body carries only the
+    operator note; lineage is the CHILD's nullable parent pointer — the
+    parent's terminal record is never mutated (no writable field exists)."""
+    defs = spec["components"]["schemas"]
+    retry = spec["paths"]["/projects/{project}/builds/{build_id}/retry"]["post"]
+    accepted = retry["responses"]["202"]["content"]["application/json"]["schema"]
+    assert accepted["$ref"].endswith("JobAcceptedResponse")
+    assert set(defs["RetryRequest"]["properties"]) == {"reason"}  # no mode fork
+    parent = defs["Build"]["properties"]["parent_build_id"]
+    assert parent["type"] == ["string", "null"]
+    assert "parent_build_id" not in defs["Build"]["required"]  # additive
+    # drill-down items carry the STABLE retry key — required, never nullable
+    item = defs["BuildStepItem"]
+    assert {"item_kind", "item_ref", "status"} <= set(item["required"])
+
+
+def test_v13_search_and_totals_are_additive(spec: dict[str, Any]) -> None:
+    """DR-013/SS1b: `q` is declared on exactly the endpoints whose runtime will
+    honor it (an undeclared `q` is the same loud rejection as an unsupported
+    filter — never silently ignored), and PageMeta's totals are OPTIONAL and
+    nullable so every pre-v1.3 list response stays conforming (null = unknown,
+    never zero)."""
+    with_q = {
+        path
+        for path, method, op in _operations(spec)
+        if method == "get"
+        and any(p.get("$ref", "").endswith("/Q") for p in op.get("parameters", []))
+    }
+    assert with_q == {"/projects/{project}/documents", "/projects/{project}/entities"}
+    meta = spec["components"]["schemas"]["PageMeta"]
+    assert meta["properties"]["total"]["type"] == ["integer", "null"]
+    assert meta["properties"]["total_estimated"]["type"] == "boolean"
+    assert "total" not in meta["required"]
+    assert "total_estimated" not in meta["required"]
+
+
+def test_v13_mcp_info_contract(spec: dict[str, Any]) -> None:
+    """DR-013 rider (DR-012's deferred Console surface): the MCP info payload
+    is fully closed — transport is const (one gateway shape), auth is the §23
+    placeholder enum (additive evolution), and `url` is REQUIRED-but-nullable
+    so "not path-addressable" is an explicit null, never an absent field."""
+    info = spec["components"]["schemas"]["McpInfo"]
+    assert set(info["required"]) == {"transport", "auth", "path_addressable", "url"}
+    assert info["properties"]["transport"]["const"] == "streamable-http"
+    assert info["properties"]["auth"]["enum"] == ["none"]
+    assert info["properties"]["url"]["type"] == ["string", "null"]
