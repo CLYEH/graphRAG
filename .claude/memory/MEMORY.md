@@ -1,6 +1,7 @@
 # Memory Index
 
 - [PR 標題一律英文](graphrag-pr-titles-english.md) — owner 2026-07-17 指示;`<TASK-ID>: <english summary>`,body/commit 維持慣例
+- [RB1-retry-skip 設計定案](graphrag-rb1-retry-skip-design.md) — owner 2026-07-19 定案:pin 父設定(凍語料完備)+ v1 最小刀(只跳成功文件 graph LLM)+ 選擇性 clone(整圖 clone 會生鬼影)關鍵洞見;檔案級計畫+測試計畫齊,待實作(RB1 切片 B-2)
 - [Track 5 owner 全數核准](graphrag-track5-owner-approvals.md) — 2026-07-17「全部同意」;CFG1(#93)、SS1a(#92)、CTR1(#94,DR-013,v1.3)、SRC2(#95)、SS1b-api(#96)、GOV3-api(#97)、GOV2-api(#98)、RB1-api(#99 drill-down)、RB1-retry-core(#100 lineage+端點+documents clone,Codex 5 輪)、SS1b-fe(#101 Graph 伺服器 q 搜尋)、RB1-fe(#102 失敗診斷 UI,Codex 9 輪)runtime 皆已 merge;尚餘 RB1-retry-skip(逐項 compute-skip) + GOV3-fe/GOV2-fe
 - [Memory 去蕪存菁指示](graphrag-memory-pruning-directive.md) — owner 2026-07-17:retro 附帶 memory 盤點(過時拿掉/重要保存);首輪全掃 2026-07-18 執行完畢,之後 stale 即修
 - [懸置 follow-ups 集中帳](graphrag-open-followups.md) — useCancelJob 冪等鍵/ontology 首次設定 UI/UXC2 codegen binary/教學位置/MCP auth 將成真需求/policy.py text= 孤兒參數/server.py dispose 不對稱/untracked data/config 樂觀併發/run-level 失敗成因未曝露到 Console(RB1-api)
