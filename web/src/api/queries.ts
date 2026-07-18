@@ -110,32 +110,33 @@ export function useBuildSteps(project: string, buildId: string | undefined) {
   });
 }
 
+const STEP_ITEMS_PAGE = 100;
+
 // RB1 §27.7 drill-down: one step's recorded item outcomes (default verbosity =
 // failed/skipped only), read when a step is expanded (stepId set). item_ref is
-// the stable retry key that "retry failed only" re-enters.
+// the stable retry key that "retry failed only" re-enters. PAGINATED (not a
+// cursor-exhausting loop): a step's items can be corpus-sized (thousands, or
+// millions under `sampled`/`all` verbosity), so the caller renders a page +
+// "load more" rather than downloading and retaining the whole chain (Codex #102).
 export function useStepItems(project: string, buildId: string, stepId: string | undefined) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: ["stepItems", project, buildId, stepId],
     enabled: isPathAddressable(project) && stepId !== undefined,
-    queryFn: async () => {
-      const all: BuildStepItem[] = [];
-      let cursor: string | undefined;
-      do {
-        const { data, error } = await api.GET(
-          "/projects/{project}/builds/{build_id}/steps/{step_id}/items",
-          {
-            params: {
-              path: { project, build_id: buildId, step_id: stepId as string },
-              query: { limit: 200, cursor },
-            },
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam }) => {
+      const { data, error } = await api.GET(
+        "/projects/{project}/builds/{build_id}/steps/{step_id}/items",
+        {
+          params: {
+            path: { project, build_id: buildId, step_id: stepId as string },
+            query: { limit: STEP_ITEMS_PAGE, cursor: pageParam },
           },
-        );
-        if (error) throw new Error(error.error.message);
-        all.push(...data.data);
-        cursor = data.meta.next_cursor ?? undefined;
-      } while (cursor);
-      return all;
+        },
+      );
+      if (error) throw new Error(error.error.message);
+      return { rows: data.data, next: data.meta.next_cursor ?? undefined };
     },
+    getNextPageParam: (last: { rows: BuildStepItem[]; next?: string }) => last.next,
   });
 }
 

@@ -189,9 +189,13 @@ function FailureRecovery({ project, buildId }: { project: string; buildId: strin
                 onClick={() => setOpenStep(openStep === s.id ? null : s.id)}
               >
                 <span className="runs__step-name">{s.step_name}</span>
+                {/* BuildStep counts are nullable: null = the step never ran /
+                    unmeasured, which the contract distinguishes from a measured
+                    0 — render "—" so an unobserved count never reads as a real
+                    zero and misleads the diagnosis (Codex #102) */}
                 <span className="runs__step-meta">
-                  {s.status} · 失敗 {s.failed_count ?? 0} · 跳過 {s.skipped_count ?? 0} · 輸入{" "}
-                  {s.input_count ?? 0}
+                  {s.status} · 失敗 {s.failed_count ?? "—"} · 跳過 {s.skipped_count ?? "—"} · 輸入{" "}
+                  {s.input_count ?? "—"}
                 </span>
               </button>
               {openStep === s.id && <StepItems project={project} buildId={buildId} stepId={s.id} />}
@@ -207,8 +211,16 @@ function FailureRecovery({ project, buildId }: { project: string; buildId: strin
           disabled={retry.isPending}
           onClick={onRetry}
         >
-          {retry.isPending ? "建立重試中…" : "只重試失敗項"}
+          {retry.isPending ? "建立重試中…" : "重試此建置"}
         </button>
+        {/* HONEST label: the retry endpoint currently opens a new build that
+            reuses the ingested corpus but RE-RUNS every downstream stage — it is
+            NOT yet selective (the per-item "only failed" compute-skip is the
+            deferred RB1-retry-skip slice), so a "只重試失敗項" label would promise
+            selectivity it doesn't deliver and hide the re-run cost (Codex #102). */}
+        <p className="runs__muted">
+          開新建置重試此語料;目前會重跑成功項(逐項只重試失敗項為後續優化)。
+        </p>
         {retry.isError && (
           <p className="runs__muted runs__muted--error">重試失敗:{message(retry.error)}</p>
         )}
@@ -238,18 +250,33 @@ function StepItems({
   if (items.isPending) return <p className="runs__muted">載入項目…</p>;
   if (items.isError)
     return <p className="runs__muted runs__muted--error">無法讀取項目:{message(items.error)}</p>;
-  if (items.data.length === 0) return <p className="runs__muted">此步驟沒有記錄的失敗/跳過項。</p>;
+  // paginated: render the loaded page(s) + a "load more", not the whole chain —
+  // a step's items can be corpus-sized (Codex #102)
+  const rows = items.data.pages.flatMap((p) => p.rows);
+  if (rows.length === 0) return <p className="runs__muted">此步驟沒有記錄的失敗/跳過項。</p>;
   return (
-    <ul className="runs__items">
-      {items.data.map((it) => (
-        <li key={it.id} className="runs__item">
-          <span className={`runs__item-status runs__item-status--${it.status}`}>{it.status}</span>{" "}
-          <span className="runs__item-ref" title={it.item_ref}>
-            {it.item_kind}:{it.item_ref}
-          </span>
-          {it.message ? <span className="runs__item-msg"> — {it.message}</span> : null}
-        </li>
-      ))}
-    </ul>
+    <>
+      <ul className="runs__items">
+        {rows.map((it) => (
+          <li key={it.id} className="runs__item">
+            <span className={`runs__item-status runs__item-status--${it.status}`}>{it.status}</span>{" "}
+            <span className="runs__item-ref" title={it.item_ref}>
+              {it.item_kind}:{it.item_ref}
+            </span>
+            {it.message ? <span className="runs__item-msg"> — {it.message}</span> : null}
+          </li>
+        ))}
+      </ul>
+      {items.hasNextPage && (
+        <button
+          type="button"
+          className="runs__more"
+          disabled={items.isFetchingNextPage}
+          onClick={() => items.fetchNextPage()}
+        >
+          {items.isFetchingNextPage ? "載入中…" : "載入更多項目"}
+        </button>
+      )}
+    </>
   );
 }

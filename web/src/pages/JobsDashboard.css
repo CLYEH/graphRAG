@@ -321,6 +321,22 @@
   cursor: default;
 }
 
+.runs__more {
+  margin: 4px 0 8px 12px;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: none;
+  color: var(--text-h);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.runs__more:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .runs__muted--ok {
   color: #1e7e34;
   font-style: italic;

@@ -119,7 +119,7 @@ describe("RunsTable", () => {
     renderWithProviders(<RunsTable project="acme" />);
 
     fireEvent.click((await screen.findAllByText(/版$/))[0]);
-    fireEvent.click(await screen.findByRole("button", { name: "只重試失敗項" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重試此建置" }));
 
     // posts to /retry for THIS build, carrying an Idempotency-Key (safe retry)
     await waitFor(() => expect(post).toHaveBeenCalled());
@@ -149,7 +149,7 @@ describe("RunsTable", () => {
     renderWithProviders(<RunsTable project="acme" />);
 
     fireEvent.click((await screen.findAllByText(/版$/))[0]);
-    fireEvent.click(await screen.findByRole("button", { name: "只重試失敗項" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重試此建置" }));
 
     expect(await screen.findByText(/重試失敗:build committed no documents/)).toBeInTheDocument();
   });
@@ -178,7 +178,7 @@ describe("RunsTable", () => {
     renderWithProviders(<RunsTable project="acme" />);
 
     fireEvent.click((await screen.findAllByText(/版$/))[0]);
-    const btn = await screen.findByRole("button", { name: "只重試失敗項" });
+    const btn = await screen.findByRole("button", { name: "重試此建置" });
     fireEvent.click(btn);
     await screen.findByText(/重試失敗:down/); // first attempt failed → key retained
     fireEvent.click(btn); // retry the SAME intent
@@ -206,7 +206,7 @@ describe("RunsTable", () => {
     renderWithProviders(<RunsTable project="acme" />);
 
     fireEvent.click((await screen.findAllByText(/版$/))[0]);
-    const btn = await screen.findByRole("button", { name: "只重試失敗項" });
+    const btn = await screen.findByRole("button", { name: "重試此建置" });
     fireEvent.click(btn);
     await screen.findByText(/已建立重試工作/); // first retry succeeded → key reset
     fireEvent.click(btn); // a second, genuine re-retry
@@ -244,5 +244,86 @@ describe("RunsTable", () => {
     fireEvent.click((await screen.findAllByText(/版$/))[0]);
     expect(await screen.findByText("重試自")).toBeInTheDocument();
     expect(screen.getByText("b0000000-0000-4000-8000-000000000000")).toBeInTheDocument();
+  });
+
+  it("renders unmeasured (null) step counts as — not 0 (RB1)", async () => {
+    // a step that never ran reports NULL counts; the contract distinguishes null
+    // from a measured 0, so rendering 0 would fake "0 failures observed" and
+    // mislead the diagnosis — show "—" for null (Codex #102).
+    stubDrilldown({
+      steps: [
+        {
+          id: "s1111111-cccc-4ccc-8ccc-000000000009",
+          step_name: "summarize",
+          status: "pending",
+          failed_count: null,
+          skipped_count: null,
+          input_count: null,
+        },
+      ],
+    });
+    renderWithProviders(<RunsTable project="acme" />);
+
+    fireEvent.click((await screen.findAllByText(/版$/))[0]);
+    expect(await screen.findByText(/失敗 — · 跳過 — · 輸入 —/)).toBeInTheDocument();
+  });
+
+  it("paginates step items with load-more instead of exhausting the chain (RB1)", async () => {
+    // a step can hold corpus-sized items; the drill-down must render a PAGE + a
+    // load-more, not download the whole cursor chain up front (Codex #102).
+    let itemsCall = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path.endsWith("/items")) {
+        itemsCall += 1;
+        return Promise.resolve(
+          itemsCall === 1
+            ? {
+                data: {
+                  data: [{ id: "it1", item_kind: "document", item_ref: "r1", status: "failed" }],
+                  meta: { ...META, next_cursor: "c2" },
+                },
+                error: undefined,
+              }
+            : {
+                data: {
+                  data: [{ id: "it2", item_kind: "document", item_ref: "r2", status: "skipped" }],
+                  meta: META,
+                },
+                error: undefined,
+              },
+        );
+      }
+      if (path.endsWith("/steps"))
+        return Promise.resolve({
+          data: {
+            data: [
+              {
+                id: "s1",
+                step_name: "graph",
+                status: "failed",
+                failed_count: 1,
+                skipped_count: 1,
+                input_count: 2,
+              },
+            ],
+            meta: META,
+          },
+          error: undefined,
+        });
+      return Promise.resolve({
+        data: { data: [build({ id: FAILED, status: "failed" })], meta: META },
+        error: undefined,
+      });
+    }) as never);
+    renderWithProviders(<RunsTable project="acme" />);
+
+    fireEvent.click((await screen.findAllByText(/版$/))[0]);
+    fireEvent.click(await screen.findByRole("button", { name: /graph/i }));
+    // only page 1 is fetched up front — NOT the whole chain
+    expect(await screen.findByText(/document:r1/)).toBeInTheDocument();
+    expect(screen.queryByText(/document:r2/)).not.toBeInTheDocument();
+    // load-more pulls the next page
+    fireEvent.click(screen.getByRole("button", { name: /載入更多項目/ }));
+    expect(await screen.findByText(/document:r2/)).toBeInTheDocument();
   });
 });
