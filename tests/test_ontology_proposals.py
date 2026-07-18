@@ -13,6 +13,7 @@ import re
 import pytest
 import sqlalchemy as sa
 
+from core.builds.config import BuildConfigError, ensure_ontology_buildable
 from core.graph.documents import TypeProposal
 from core.graph.proposals import PROPOSAL_POLICIES, persist_proposals
 from core.resolve.fingerprints import FINGERPRINT_VERSION, proposal_key
@@ -97,6 +98,48 @@ def test_status_vocabulary_is_in_lockstep_with_the_state_machine() -> None:
         assert f"'{state}'" in check  # every machine state is storable
     check_states = set(re.findall(r"'([a-z_]+)'", check))
     assert check_states == machine_states  # and nothing extra is storable
+
+
+# --- GOV3 accept-gate = the build's OWN loader (no drift possible) -------------
+
+
+def test_ensure_ontology_buildable_accepts_a_complete_block() -> None:
+    """The GOV3 accept gate is the build's OWN ontology loader (Codex #97 R1:
+    reused, not re-implemented), so a block the build runs is accepted."""
+    ensure_ontology_buildable({"ontology": {"entity_types": ["Person"], "relation_types": ["R"]}})
+    # a valid proposal_policy rides along fine
+    ensure_ontology_buildable(
+        {"ontology": {"entity_types": ["P"], "relation_types": ["R"], "proposal_policy": "auto"}}
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},  # ontology absent — nothing valid to add a type to
+        {"chunking": {"max_chars": 500}},  # config exists but no ontology block
+        {"ontology": {"entity_types": ["Person"]}},  # relation_types missing
+        {"ontology": {"relation_types": ["R"]}},  # entity_types missing
+        {"ontology": {"entity_types": [], "relation_types": ["R"]}},  # empty list
+        {"ontology": {"entity_types": ["  "], "relation_types": ["R"]}},  # blank string
+        {"ontology": {"entity_types": [5], "relation_types": ["R"]}},  # non-string
+        {"ontology": {"entity_types": "Person", "relation_types": ["R"]}},  # not a list
+        {"ontology": None},  # explicit null
+        # the two corners a hand-rolled entity/relation-only predicate would MISS
+        # (Codex #97 R1): both type lists valid, but an unknown key / bad policy
+        # — the build still rejects these, so accept must too, or it 200s-then-bricks
+        {"ontology": {"entity_types": ["P"], "relation_types": ["R"], "junk": 1}},
+        {"ontology": {"entity_types": ["P"], "relation_types": ["R"], "proposal_policy": "bogus"}},
+    ],
+)
+def test_ensure_ontology_buildable_refuses_what_the_build_refuses(config: object) -> None:
+    """Because the accept gate IS ``_load_ontology`` (via the public wrapper),
+    every block the next build would reject — including an unknown key or a bad
+    proposal_policy while BOTH type lists are valid — refuses here too. Reusing
+    the loader makes drift structurally impossible (no second predicate to keep
+    in sync)."""
+    with pytest.raises(BuildConfigError):
+        ensure_ontology_buildable(config)  # type: ignore[arg-type]
 
 
 # --- persist_proposals policy gate ---------------------------------------------

@@ -186,6 +186,23 @@ class InvalidProposalTransitionError(Exception):
         self.verb = verb
 
 
+class OntologyConfigIncompleteError(Exception):
+    """Accept cannot land the type: the project's configured ontology is
+    missing/incomplete, so adding the accepted type alone would leave a block
+    the next build rejects. Accept ADDS to an existing valid ontology — it does
+    not create one. (Reachable because ``PATCH /projects`` does not validate
+    config: an ontology block can be removed/malformed while a proposal is still
+    pending.)"""
+
+    def __init__(self, project: str, detail: str) -> None:
+        super().__init__(
+            f"cannot accept into project {project!r}: {detail}. Configure a valid ontology "
+            "(non-empty entity_types AND relation_types) before accepting proposals."
+        )
+        self.project = project
+        self.detail = detail
+
+
 async def list_ontology_proposals(
     conn: AsyncConnection,
     project: str,
@@ -272,13 +289,26 @@ async def decide_ontology_proposal(
 
     if verb == "accept":
         config: dict[str, Any] = dict(locked.config) if isinstance(locked.config, dict) else {}
-        block = dict(config["ontology"]) if isinstance(config.get("ontology"), dict) else {}
+        ontology = config.get("ontology")
+        block = dict(ontology) if isinstance(ontology, dict) else {}
         list_key = "entity_types" if row.kind == "entity" else "relation_types"
         types = list(block.get(list_key) or [])
         if row.type_name not in types:  # dedup — accepting a type twice is a no-op add
             types.append(row.type_name)
         block[list_key] = types
         config["ontology"] = block
+        # accept ADDS to an existing valid ontology; a config PATCH (which does
+        # NOT validate) can remove/malform the block while a proposal is pending,
+        # so the result might be a block the next build rejects — writing it would
+        # 200-then-silently-brick the build. Validate through the BUILD's OWN
+        # loader (not a re-implemented predicate that could drift, Codex #97 R1)
+        # and refuse LOUD. Lazy import: core.builds.config imports THIS module.
+        from core.builds.config import BuildConfigError, ensure_ontology_buildable
+
+        try:
+            ensure_ontology_buildable(config)
+        except BuildConfigError as exc:
+            raise OntologyConfigIncompleteError(project, str(exc)) from exc
         await conn.execute(
             projects.update().where(projects.c.name == project).values(config=config)
         )

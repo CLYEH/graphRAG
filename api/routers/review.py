@@ -41,6 +41,7 @@ from api.routers._query import reject_null_body, reject_unsupported_query, singl
 from api.schemas import ReviewDecisionRequest, merge_candidate_dto, ontology_proposal_dto
 from core.graph.proposals import (
     InvalidProposalTransitionError,
+    OntologyConfigIncompleteError,
     OntologyProposalNotFoundError,
     decide_ontology_proposal,
     list_ontology_proposals,
@@ -321,6 +322,15 @@ async def _decide_proposal(
                 ErrorCode.VALIDATION_ERROR,  # GAP: no frozen review-conflict code
                 str(exc),
                 details={"status": exc.current, "decision": exc.verb},
+            ) from exc
+        except OntologyConfigIncompleteError as exc:
+            # accept refused: the project's ontology config can't absorb the type
+            # (removed/malformed since the proposal was raised). 400 with the
+            # actionable detail — the curator fixes the ontology, then re-accepts.
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,  # GAP: no frozen config-conflict code
+                str(exc),
+                details={"project": exc.project, "reason": exc.detail},
             ) from exc
         return 200, success(ontology_proposal_dto(proposal), **response_meta(request))
 

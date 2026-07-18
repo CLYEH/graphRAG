@@ -22,6 +22,7 @@ from api.deps import db_conn
 from api.pagination import decode_id_cursor
 from core.graph.proposals import (
     InvalidProposalTransitionError,
+    OntologyConfigIncompleteError,
     OntologyProposalNotFoundError,
 )
 from core.registry import ProjectNotFoundError
@@ -341,6 +342,24 @@ def test_reject_proposal_maps_verb_and_errors(
     r = client.post(f"/projects/p/ontology-proposals/{pid}/reject")
     assert r.status_code == 400
     assert r.json()["error"]["details"] == {"status": "accepted", "decision": "reject"}
+
+
+def test_accept_refused_on_incomplete_ontology_is_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Codex #97 R1: accept into a project whose ontology config can't absorb the
+    # type is a 400 (the curator fixes the ontology, then re-accepts) — never a
+    # 200 that silently bricks the next build.
+    pid = uuid.uuid4()
+
+    async def incomplete(conn: Any, *, project: str, proposal_id: Any, **kw: Any) -> Any:
+        raise OntologyConfigIncompleteError(project, "ontology missing")
+
+    _stub(monkeypatch, "decide_ontology_proposal", incomplete)
+    r = client.post(f"/projects/p/ontology-proposals/{pid}/accept")
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert r.json()["error"]["details"]["project"] == "p"
 
 
 def test_proposal_decide_rejects_null_body(

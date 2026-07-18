@@ -23,12 +23,13 @@ from core.config import get_settings
 from core.graph.documents import TypeProposal
 from core.graph.proposals import (
     InvalidProposalTransitionError,
+    OntologyConfigIncompleteError,
     OntologyProposalNotFoundError,
     decide_ontology_proposal,
     list_ontology_proposals,
     persist_proposals,
 )
-from core.registry import ProjectNotFoundError, create_project, get_project
+from core.registry import ProjectNotFoundError, create_project, get_project, update_project
 from core.resolve.fingerprints import proposal_key
 from core.stores.tables import ontology_proposals
 
@@ -251,6 +252,70 @@ async def test_reject_leaves_config_untouched_and_scopes_by_project(migrated: No
             assert proj is not None
             # relation_types unchanged — a rejected type never enters the vocabulary
             assert proj.config["ontology"]["relation_types"] == ["WORKS_AT"]
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "broken_config",
+    [
+        {"chunking": {"max_chars": 500}},  # ontology dropped entirely
+        {"ontology": {"entity_types": ["Person"]}},  # relation_types missing
+        # both type lists still valid, but the block is one the build rejects —
+        # the corners a hand-rolled entity/relation-only check would miss (#97 R1)
+        {"ontology": {"entity_types": ["P"], "relation_types": ["R"], "junk": 1}},
+        {"ontology": {"entity_types": ["P"], "relation_types": ["R"], "proposal_policy": "bogus"}},
+    ],
+)
+async def test_accept_refuses_when_the_ontology_config_is_unbuildable(
+    migrated: None, broken_config: dict[str, object]
+) -> None:
+    """Codex #97 R1 / the silent-brick class: a config PATCH (which does NOT
+    validate) can remove OR malform the ontology block while a proposal is
+    pending. Accept validates through the build's OWN loader, so it refuses loud
+    for EVERY block the next build would reject — including ones whose type lists
+    are valid but that carry an unknown key or a bad proposal_policy — not
+    200-then-brick. The proposal stays proposed and the config is untouched;
+    reject (which never touches config) still works."""
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(
+                conn,
+                name=project,
+                config={"ontology": {"entity_types": ["Person"], "relation_types": ["WORKS_AT"]}},
+            )
+            await persist_proposals(
+                conn, project, [TypeProposal("entity", "Exhibit", "區域", "chunk:a:0")]
+            )
+            (proposed,) = (await list_ontology_proposals(conn, project, limit=10))[0]
+
+            # a curator edits the config into a state the build can't run
+            await update_project(conn, project, config=dict(broken_config))
+
+            with pytest.raises(OntologyConfigIncompleteError):
+                await decide_ontology_proposal(
+                    conn,
+                    project=project,
+                    proposal_id=proposed.id,
+                    verb="accept",
+                    decided_by="console",
+                )
+            # nothing was written: the proposal is still proposed, config untouched
+            (still,) = (await list_ontology_proposals(conn, project, limit=10))[0]
+            assert still.status == "proposed"
+            proj = await get_project(conn, project)
+            assert proj is not None and proj.config == broken_config
+
+            # REJECT is unaffected — it never touches config, so a broken ontology
+            # doesn't block declining the type
+            rejected = await decide_ontology_proposal(
+                conn, project=project, proposal_id=proposed.id, verb="reject", decided_by="console"
+            )
+            assert rejected.status == "rejected"
             await trans.rollback()
     finally:
         await engine.dispose()
