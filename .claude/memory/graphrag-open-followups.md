@@ -40,3 +40,10 @@ GitHub 為準;立案或了結後從本檔劃掉):
 - **MCP auth**:CFG1 gateway 不帶 auth(owner 2026-07-17 預設同意);對外
   曝露後 §23 placeholder 會變真需求,屆時是 DR-002 相關 owner 決策
   (凍結 enum 無 auth 錯誤碼)。
+- **run-level 失敗成因未曝露到 Console**(RB1-fe #102 P1+step-error 兩輪浮現,
+  DR-002 級):`pipeline_runs.error`(整個 run 於「步驟之外」崩潰的權威成因)
+  沒有任何讀端點曝露,且 `Build` schema 無 `job_id`、無 jobs 清單/build→job
+  查詢端點,故失敗建置的 job id 從 Console 這條流「取不到」。RB1-fe 已把逐步驟
+  `BuildStep.error` 與逐項結果都呈現,並把 run-level 說明誠實界定為「唯一仍未
+  呈現者」;真解需後端契約變更(RB1-api 加 run-error 投影欄位,或 build→job
+  lookup + `GET /jobs` 清單),自成 DR-002 任務。RB1-fe 說明已標 (RB1-api)。

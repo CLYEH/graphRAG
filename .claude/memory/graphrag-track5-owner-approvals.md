@@ -19,11 +19,14 @@ documents clone;Codex 5 輪:retry 跳 live-source ingest/0-doc 拒/set-based clo
 job-guard 先於 clone+gates 入 produce+FOR UPDATE 鎖序/preflight 失敗終結子 build)
 皆已 merge。SS1b-fe(#101 Graph 左欄 client-side 過濾→伺服器 q 搜尋+精確 total+
 debounced+maxLength=256;browser QA 過)亦已 merge=SS1b 收官(#96+#101)。
+RB1-fe(#102 RunsTable 失敗診斷:step/item 下鑽+安全 retry+lineage)亦已
+merge=RB1 FE 切片收官;**Codex 9 輪**(R4 note-suppression+CSS-cascade、
+filter[status]、P1 job-id 假承諾、step-error、next-page-error),每輪 fix+
+mutation-probe 判別測試+re-stamp,教訓見 lesson catalog #102。
 SS1b/GOV3/GOV2/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip。
 尚餘 RB1-retry-skip(逐項 compute-skip=真省成本+凍語料完備)、GOV3-fe、
-GOV2-fe、RB1-fe(契約已凍不再動;治理中心 UI + low-confidence/missing-evidence
-清單 + publish gate 隨 GOV*-fe);Console MCP URL/健康顯示 = GOV2-fe
-落地時接 `GET /mcp` 端點。
+GOV2-fe(治理中心 UI + low-confidence/missing-evidence 清單 + publish gate);
+Console MCP URL/健康顯示 = GOV2-fe 落地時接 `GET /mcp` 端點。
 
 1. **CFG1 方向確認**:推翻 2026-07-10 雙源決策 — query-policy 統一單一 SoR
    (採建議:Postgres `projects.config`,MCP 啟動時讀 DB,`config.yaml` 退場)
