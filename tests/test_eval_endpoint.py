@@ -187,3 +187,39 @@ def test_eval_folds_the_request_body_into_the_idempotency_hash(
     client.post(_URL, headers=headers, content=b"one")
     assert seen[0] != seen[1]  # a different body ⇒ a different hash (no stale replay)
     assert seen[0] == seen[2]  # a genuine duplicate (same body) still hashes the same
+
+
+def test_pin_is_recomputed_under_the_job_lock(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#93 R2: a PATCH committing between the unlocked request-hash read and
+    create_job_exclusive's projects-row lock must not poison the pin — the
+    stored pin derives from the LOCKED re-read, so the accepted job is
+    internally consistent with what the worker's dispatch read will see
+    (the unlocked read only scopes the idempotency request hash)."""
+    from core.eval.idempotency import policy_fingerprint_bytes
+
+    created = _created_job(monkeypatch)
+    _capture_enqueue(monkeypatch)
+
+    calls = {"n": 0}
+    old_cfg = {"query_policy": {"max_top_k": 1}}
+    new_cfg = {"query_policy": {"max_top_k": 2}}
+
+    async def racing_project(conn: Any, name: str) -> Any:
+        # first read (request hash, unlocked) sees the OLD policy; every read
+        # after the lock sees the NEW one — the simulated racing PATCH
+        calls["n"] += 1
+        return SimpleNamespace(config=old_cfg if calls["n"] == 1 else new_cfg)
+
+    monkeypatch.setattr("api.routers.builds.get_project", racing_project)
+    resp = client.post(_URL)
+    assert resp.status_code == 202
+    expected_locked = eval_inputs_fingerprint(
+        Path(get_settings().projects_dir), "demo", policy_fingerprint_bytes(new_cfg)
+    )
+    stale = eval_inputs_fingerprint(
+        Path(get_settings().projects_dir), "demo", policy_fingerprint_bytes(old_cfg)
+    )
+    assert created["pinned_fingerprint"] == expected_locked
+    assert created["pinned_fingerprint"] != stale  # the discriminating half
