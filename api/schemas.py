@@ -439,6 +439,29 @@ def merge_candidate_dto(row: Any) -> dict[str, Any]:
     }
 
 
+def ontology_proposal_dto(row: Any) -> dict[str, Any]:
+    """The contract OntologyProposal shape from a pool row / core's
+    OntologyProposal dataclass (same attribute names). Required columns are NOT
+    NULL; example/chunk_ref/decided_by/decided_at/reason/created_at are
+    contract-NULLABLE → emitted as-is (null is legal). ``project`` rides along
+    like the sibling MergeCandidate (both carry it)."""
+    return {
+        "id": row.id,
+        "project": row.project,
+        "kind": row.kind,
+        "type_name": row.type_name,
+        "proposal_key": row.proposal_key,
+        "fingerprint_version": row.fingerprint_version,
+        "example": row.example,
+        "chunk_ref": row.chunk_ref,
+        "status": row.status,
+        "decided_by": row.decided_by,
+        "decided_at": row.decided_at,
+        "reason": row.reason,
+        "created_at": row.created_at,
+    }
+
+
 def entity_dto(row: Any) -> dict[str, Any]:
     """The contract Entity shape from a scoped ``entities`` row. Per-field
     nullability audit (the #55 rule): every required field's column is NOT
