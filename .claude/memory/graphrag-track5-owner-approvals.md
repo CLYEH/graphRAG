@@ -17,10 +17,12 @@ proposal accept/reject)、GOV2-api(#98 entity/relation approve-reject)、
 RB1-api(#99 build step/item drill-down)、RB1-retry-core(#100 lineage+端點+
 documents clone;Codex 5 輪:retry 跳 live-source ingest/0-doc 拒/set-based clone/
 job-guard 先於 clone+gates 入 produce+FOR UPDATE 鎖序/preflight 失敗終結子 build)
-皆已 merge。SS1b/GOV3/GOV2/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip。
-尚餘 RB1-retry-skip(逐項 compute-skip=真省成本+凍語料完備)、SS1b-fe、GOV3-fe、
+皆已 merge。SS1b-fe(#101 Graph 左欄 client-side 過濾→伺服器 q 搜尋+精確 total+
+debounced+maxLength=256;browser QA 過)亦已 merge=SS1b 收官(#96+#101)。
+SS1b/GOV3/GOV2/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip。
+尚餘 RB1-retry-skip(逐項 compute-skip=真省成本+凍語料完備)、GOV3-fe、
 GOV2-fe、RB1-fe(契約已凍不再動;治理中心 UI + low-confidence/missing-evidence
-清單 + publish gate 隨 GOV*-fe);Console MCP URL/健康顯示 = SS1b-fe 或 GOV2-fe
+清單 + publish gate 隨 GOV*-fe);Console MCP URL/健康顯示 = GOV2-fe
 落地時接 `GET /mcp` 端點。
 
 1. **CFG1 方向確認**:推翻 2026-07-10 雙源決策 — query-policy 統一單一 SoR
