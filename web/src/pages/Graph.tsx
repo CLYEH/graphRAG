@@ -39,6 +39,13 @@ import type { ReactNode } from "react";
 
 type Selection = { kind: "node" | "edge"; id: string };
 
+// The server caps `q` at 256 chars (contracts/openapi.yaml Q param /
+// inspect.py list_entities_endpoint). Enforce the SAME cap on the input so a
+// long paste can't send an over-length q — that 400 would drive list.isError,
+// and GraphBody's error return removes the search box, stranding the user with
+// no way to shorten the term (Codex #101 P2).
+const ENTITY_SEARCH_MAX = 256;
+
 function message(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
 }
@@ -238,6 +245,7 @@ function EntityColumn({
         <input
           type="search"
           value={search}
+          maxLength={ENTITY_SEARCH_MAX}
           placeholder="canonical_name…"
           onChange={(e) => onSearch(e.target.value)}
         />

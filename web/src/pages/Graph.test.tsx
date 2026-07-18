@@ -233,6 +233,9 @@ describe("Graph", () => {
     // the honest count is the SERVER's total over the whole active build
     expect(await screen.findByText(/active build 全部知識點:1 個/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /ada lovelace/i })).toBeInTheDocument();
+    // the box caps at the server's q max_length (256): a longer paste would 400
+    // and GraphBody's error return would hide the box, stranding the user (P2)
+    expect(screen.getByLabelText("搜尋")).toHaveAttribute("maxlength", "256");
 
     fireEvent.change(screen.getByLabelText("搜尋"), { target: { value: "charles" } });
 
