@@ -9,20 +9,27 @@ These tables are NOT DR-006 build-scoped (they hang off pipeline_runs, which is
 the control-plane run record, not the build projection), so the build-scoped
 repo layer rejects them — reads go through the raw connection here. Scoping is
 by the run's ``(project, build_id)``: a step belongs to a build iff its run
-does, and an item belongs to a build iff its step does. Keyset pagination
-mirrors BA3 (id desc, opaque cursor).
+does, and an item belongs to a build iff its step does. Keyset pagination is
+opaque-cursor (BA3): steps page NEWEST RUN FIRST — ``(run started_at desc,
+step id desc)`` — items id desc (one step is one run, no cross-run order).
 """
 
 from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.stores import tables
+
+#: sentinel for a run with no ``started_at`` (would be NULL) — sorts as the
+#: OLDEST run so NULLs land last in the newest-run-first order without NULLS-
+#: LAST comparison special-casing in the keyset.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 _STEP_COLS = (
     tables.pipeline_steps.c.id,
@@ -49,8 +56,9 @@ _ITEM_COLS = (
 
 def _build_step_ids(project: str, build_id: uuid.UUID) -> sa.Select[Any]:
     """The step ids belonging to ``(project, build_id)`` — a step is the build's
-    iff its run is. Used both to scope the item reads and to answer "does this
-    step belong to this build" without a second join spelled out each time."""
+    iff its run is. Backs :func:`step_belongs_to_build` (the item drill-down's
+    existence precheck); :func:`list_build_steps` inlines the same join to also
+    order by the run's timestamp."""
     runs = tables.pipeline_runs
     steps = tables.pipeline_steps
     return (
@@ -66,24 +74,40 @@ async def list_build_steps(
     build_id: uuid.UUID,
     *,
     limit: int,
-    after: uuid.UUID | None = None,
+    after: tuple[datetime, uuid.UUID] | None = None,
     status: str | None = None,
-) -> tuple[Sequence[sa.Row[Any]], uuid.UUID | None]:
-    """One page of a build's pipeline steps (id desc keyset). ``status`` narrows
-    to one step status (open vocabulary — the caller validates blankness)."""
+) -> tuple[Sequence[sa.Row[Any]], tuple[datetime, uuid.UUID] | None]:
+    """One page of a build's pipeline steps, NEWEST RUN FIRST (the frozen
+    contract's order). A build can hold MORE than one run (a retry/resume, RB1's
+    whole point), so ordering by the random ``pipeline_steps.id`` would interleave
+    runs and surface a stale run's steps before the latest failure. Order by the
+    run's ``started_at`` desc (NULL → epoch sentinel, sorts oldest) with
+    ``step.id`` desc as the stable tie-break; the keyset carries both.
+    ``status`` narrows to one step status (open vocabulary — blankness only)."""
+    runs = tables.pipeline_runs
     steps = tables.pipeline_steps
-    where: list[Any] = [steps.c.id.in_(_build_step_ids(project, build_id))]
+    run_started = sa.func.coalesce(runs.c.started_at, _EPOCH).label("run_started_at")
+    query = (
+        sa.select(*_STEP_COLS, run_started)
+        .select_from(steps.join(runs, steps.c.run_id == runs.c.id))
+        .where(runs.c.project == project, runs.c.build_id == build_id)
+    )
     if status is not None:
-        where.append(steps.c.status == status)
+        query = query.where(steps.c.status == status)
     if after is not None:
-        where.append(steps.c.id < after)
-    rows = (
-        await conn.execute(
-            sa.select(*_STEP_COLS).where(*where).order_by(steps.c.id.desc()).limit(limit + 1)
+        after_ts, after_id = after
+        # DESC keyset: the next page is everything strictly "less" than the
+        # cursor in (run_started desc, step.id desc) — a row-value comparison,
+        # both components non-null (coalesced), so no NULL special-casing.
+        query = query.where(
+            sa.tuple_(sa.func.coalesce(runs.c.started_at, _EPOCH), steps.c.id)
+            < sa.tuple_(sa.literal(after_ts), sa.literal(after_id))
         )
+    rows = (
+        await conn.execute(query.order_by(run_started.desc(), steps.c.id.desc()).limit(limit + 1))
     ).all()
     page = rows[:limit]
-    next_after = page[-1].id if len(rows) > limit and page else None
+    next_after = (page[-1].run_started_at, page[-1].id) if len(rows) > limit and page else None
     return page, next_after
 
 

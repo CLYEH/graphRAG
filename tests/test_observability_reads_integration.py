@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -133,6 +134,70 @@ async def test_steps_and_items_scope_to_the_build_and_filter_failed(project: str
                 conn, project, build_id, step.id, limit=50, status="failed"
             )
             assert {(i.item_ref, i.status) for i in failed} == {("hash-bad", "failed")}
+            await conn.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def _make_run_with_step(
+    conn: AsyncConnection,
+    project: str,
+    build_id: uuid.UUID,
+    started_at: datetime,
+    step_name: str,
+    step_id: uuid.UUID,
+) -> None:
+    run_id = (
+        await conn.execute(
+            tables.pipeline_runs.insert()
+            .values(
+                project=project,
+                build_id=build_id,
+                kind="build",
+                status="done",
+                started_at=started_at,
+            )
+            .returning(tables.pipeline_runs.c.id)
+        )
+    ).scalar_one()
+    await conn.execute(
+        tables.pipeline_steps.insert().values(
+            id=step_id, run_id=run_id, step_name=step_name, status="done"
+        )
+    )
+
+
+async def test_steps_order_newest_run_first_across_runs(project: str) -> None:
+    """Codex #99 R1: a build with MORE than one run (a retry/resume) must list
+    the NEWEST run's steps first — the frozen contract order. Ordering by the
+    random pipeline_steps.id would interleave runs; the run's started_at drives
+    it. DISCRIMINATING setup: give the OLD run's step a HIGHER uuid than the NEW
+    run's, so a (buggy) id-desc order would put OLD first — the assertion below
+    (NEW first) then can ONLY pass via the run-timestamp order."""
+    engine = _engine()
+    hi = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")  # old run's step
+    lo = uuid.UUID("00000000-0000-4000-8000-000000000000")  # new run's step
+    try:
+        async with engine.connect() as conn:
+            await ensure_project(conn, project)
+            build_id = await _make_build(conn, project)
+            await _make_run_with_step(
+                conn, project, build_id, datetime(2026, 1, 1, tzinfo=UTC), "old-run-step", hi
+            )
+            await _make_run_with_step(
+                conn, project, build_id, datetime(2026, 6, 1, tzinfo=UTC), "new-run-step", lo
+            )
+            await conn.commit()
+
+            steps, _ = await list_build_steps(conn, project, build_id, limit=50)
+            assert [s.step_name for s in steps] == ["new-run-step", "old-run-step"]
+
+            # the keyset round-trips: page size 1 returns the newest, and its
+            # cursor fetches the older next (never re-returns the newest)
+            first, cursor = await list_build_steps(conn, project, build_id, limit=1)
+            assert [s.step_name for s in first] == ["new-run-step"] and cursor is not None
+            second, cursor2 = await list_build_steps(conn, project, build_id, limit=1, after=cursor)
+            assert [s.step_name for s in second] == ["old-run-step"] and cursor2 is None
             await conn.rollback()
     finally:
         await engine.dispose()

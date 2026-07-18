@@ -61,6 +61,14 @@ def decode_source_cursor(token: str) -> tuple[datetime, uuid.UUID]:
     return added_at, sid
 
 
+def decode_step_cursor(token: str) -> tuple[datetime, uuid.UUID]:
+    """RB1 build-step drill-down pages NEWEST RUN FIRST — the keyset is the run's
+    (coalesced) started_at plus the step id tie-break, so the cursor is a
+    (datetime, uuid) pair like sources' (BA3/RB1)."""
+    run_started_at, step_id = _decode(token, (datetime, uuid.UUID))
+    return run_started_at, step_id
+
+
 def decode_id_cursor(token: str) -> tuple[uuid.UUID]:
     """Documents/entities/relations page by (id desc) — documents carry no
     created_at and entities/relations only a NULLABLE one, so id is the stable

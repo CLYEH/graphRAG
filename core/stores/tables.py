@@ -184,6 +184,13 @@ pipeline_runs = sa.Table(
     ),
 )
 
+# RB1 drill-down + retry-failed-only both scope by (project, build_id): the
+# steps/items reads and the retry merge look runs up this way, so index it
+# rather than scan every historical run.
+pipeline_runs_by_build = sa.Index(
+    "pipeline_runs_by_build", pipeline_runs.c.project, pipeline_runs.c.build_id
+)
+
 pipeline_steps = sa.Table(
     "pipeline_steps",
     metadata,

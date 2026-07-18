@@ -22,7 +22,7 @@ from neo4j.exceptions import ServiceUnavailable
 
 from api.app import create_app
 from api.deps import db_conn
-from api.pagination import decode_id_cursor
+from api.pagination import decode_step_cursor
 from core.builds.lifecycle import BuildInfo, PreflightReport
 
 pytestmark = pytest.mark.contract
@@ -298,18 +298,20 @@ def test_list_build_steps_shape_pagination_and_build_id(
     _project_exists(monkeypatch)
     _known_build(monkeypatch, _build())
     rows = [_step_row(), _step_row()]
+    # the keyset is (run started_at, step id) — newest run first (RB1/Codex #99)
+    next_key = (_NOW, rows[-1].id)
 
     async def fake_list(
         conn: Any, project: str, build_id: Any, *, limit: int, after: Any, status: Any
     ) -> Any:
-        return rows, rows[-1].id  # a next page exists
+        return rows, next_key  # a next page exists
 
     _stub(monkeypatch, "list_build_steps", fake_list)
     r = client.get(f"/projects/p/builds/{_BUILD}/steps")
     assert r.status_code == 200
     body = r.json()
     assert body["meta"]["build_id"] == str(_BUILD)
-    assert decode_id_cursor(body["meta"]["next_cursor"]) == (rows[-1].id,)
+    assert decode_step_cursor(body["meta"]["next_cursor"]) == next_key
     step = body["data"][0]
     assert step["step_name"] == "extract" and step["status"] == "failed"
     assert step["failed_count"] == 3 and step["error"] == {"kind": "PartialFailure"}

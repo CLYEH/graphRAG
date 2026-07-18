@@ -43,7 +43,7 @@ from api.deps import Conn, Queue, neo4j_driver, qdrant_client, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
-from api.pagination import decode_id_cursor, encode_cursor
+from api.pagination import decode_id_cursor, decode_step_cursor, encode_cursor
 from api.registry_errors import translate_registry_error
 from api.routers._query import reject_unsupported_query, single_filter_value
 from api.schemas import build_dto, build_step_dto, build_step_item_dto, job_accepted_dto
@@ -142,7 +142,7 @@ async def list_build_steps_endpoint(
     reject_unsupported_query(request, "id", allowed_filters=frozenset({"status"}))
     status = single_filter_value(request, "status")
     await _require_build(conn, project, build_id)  # project 404 then build 404
-    after = decode_id_cursor(cursor)[0] if cursor else None
+    after = decode_step_cursor(cursor) if cursor else None
     steps, next_after = await list_build_steps(
         conn, project, build_id, limit=limit, after=after, status=status
     )
@@ -151,7 +151,7 @@ async def list_build_steps_endpoint(
         **response_meta(request),
         build_id=build_id,
         paginated=True,
-        next_cursor=encode_cursor((next_after,)) if next_after is not None else None,
+        next_cursor=encode_cursor(next_after) if next_after is not None else None,
     )
 
 
