@@ -30,13 +30,13 @@ from core.config import get_settings
 from core.eval.golden import load_golden
 from core.eval.runner import run_eval
 from core.index.indexing import index_build
-from core.mcp.policy import load_query_policy
+from core.mcp.policy import query_policy_from_mapping
 from core.resolve import fingerprints
 from core.stores import tables
 from core.stores.graph import BuildScopedGraphProjector, graph_driver
 from core.stores.repo import BuildScopedWriter, resolve_eval_binding
 from core.stores.vectors import BuildScopedVectorProjector, vector_client
-from tests.conftest import ensure_project
+from tests.conftest import DEMO_QUERY_POLICY, ensure_project
 
 pytestmark = pytest.mark.integration
 
@@ -209,7 +209,7 @@ async def test_run_eval_scores_a_projected_build_and_persists(project: str, tmp_
             await conn.commit()
 
             golden = load_golden(_golden_file(tmp_path))
-            policy = load_query_policy(REPO_ROOT / "projects" / "demo" / "config.yaml")
+            policy = query_policy_from_mapping(DEMO_QUERY_POLICY)  # CFG1: registry-era fixture
             report = await run_eval(
                 conn,
                 qdrant,

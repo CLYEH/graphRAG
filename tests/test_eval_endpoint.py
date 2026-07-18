@@ -30,6 +30,19 @@ _BUILD = uuid.uuid4()
 _URL = f"/projects/demo/builds/{_BUILD}/eval"
 
 
+@pytest.fixture(autouse=True)
+def _stub_registry_project(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CFG1: the accept-time fingerprint reads the registry for its policy
+    component — these hermetic tests run on fake conns, so the read is
+    stubbed to 'no project row' (empty policy bytes; the fingerprint only
+    needs stability here, and the job path already fakes its own errors)."""
+
+    async def none_project(conn: object, name: str, *, for_update: bool = False) -> None:
+        return None
+
+    monkeypatch.setattr("api.routers.builds.get_project", none_project)
+
+
 @pytest.fixture()
 def client() -> Iterator[TestClient]:
     app = create_app()
@@ -123,7 +136,9 @@ def test_eval_pins_the_accept_time_inputs_fingerprint(
     resp = client.post(_URL)
     assert resp.status_code == 202
     assert created["pinned_job_id"] == created["job_id_created"]
-    expected = eval_inputs_fingerprint(Path(get_settings().projects_dir), "demo")
+    # the stubbed registry has no project row → empty policy bytes (CFG1:
+    # the policy component of the fingerprint is the registry block)
+    expected = eval_inputs_fingerprint(Path(get_settings().projects_dir), "demo", b"")
     assert created["pinned_fingerprint"] == expected
 
 
@@ -172,3 +187,96 @@ def test_eval_folds_the_request_body_into_the_idempotency_hash(
     client.post(_URL, headers=headers, content=b"one")
     assert seen[0] != seen[1]  # a different body ⇒ a different hash (no stale replay)
     assert seen[0] == seen[2]  # a genuine duplicate (same body) still hashes the same
+
+
+def test_pin_is_recomputed_under_the_job_lock(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#93 R2: a PATCH committing between the unlocked request-hash read and
+    create_job_exclusive's projects-row lock must not poison the pin — the
+    stored pin derives from the LOCKED re-read, so the accepted job is
+    internally consistent with what the worker's dispatch read will see
+    (the unlocked read only scopes the idempotency request hash)."""
+    from core.eval.idempotency import policy_fingerprint_bytes
+
+    created = _created_job(monkeypatch)
+    _capture_enqueue(monkeypatch)
+
+    calls = {"n": 0}
+    old_cfg = {"query_policy": {"max_top_k": 1}}
+    new_cfg = {"query_policy": {"max_top_k": 2}}
+
+    async def racing_project(conn: Any, name: str, **kw: Any) -> Any:
+        # first read (request hash, unlocked) sees the OLD policy; every read
+        # after the lock sees the NEW one — the simulated racing PATCH
+        calls["n"] += 1
+        return SimpleNamespace(config=old_cfg if calls["n"] == 1 else new_cfg)
+
+    monkeypatch.setattr("api.routers.builds.get_project", racing_project)
+    resp = client.post(_URL)
+    assert resp.status_code == 202
+    expected_locked = eval_inputs_fingerprint(
+        Path(get_settings().projects_dir), "demo", policy_fingerprint_bytes(new_cfg)
+    )
+    stale = eval_inputs_fingerprint(
+        Path(get_settings().projects_dir), "demo", policy_fingerprint_bytes(old_cfg)
+    )
+    assert created["pinned_fingerprint"] == expected_locked
+    assert created["pinned_fingerprint"] != stale  # the discriminating half
+
+
+def test_the_kept_idempotency_identity_is_the_locked_pin(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#93 R7: a PATCH committing between the unlocked request-hash read and
+    the projects-row lock must not leave the §27 record claiming an identity
+    the job wasn't scored under — the record's KEPT hash (run_idempotent's
+    rekey) must be derived from the LOCKED fingerprint, the exact value pinned
+    on the job. Then a retry under the accepted policy REPLAYS, and a policy
+    flipped BACK conflicts — never a silent replay of a job scored against
+    different inputs. Revert-probe: drop the rekey (keep the record on the
+    unlocked hash) and the kept identity stays derived from the stale OLD
+    config, failing the second assertion."""
+    from fastapi.encoders import jsonable_encoder
+
+    from api.idempotency import request_hash
+    from core.eval.idempotency import policy_fingerprint_bytes
+
+    created = _created_job(monkeypatch)
+    _capture_enqueue(monkeypatch)
+
+    calls = {"n": 0}
+    old_cfg = {"query_policy": {"max_top_k": 1}}
+    new_cfg = {"query_policy": {"max_top_k": 2}}
+
+    async def racing_project(conn: Any, name: str, **kw: Any) -> Any:
+        # the unlocked read sees the OLD policy; the under-lock read sees the
+        # NEW one — the simulated PATCH landing in between
+        calls["n"] += 1
+        return SimpleNamespace(config=old_cfg if calls["n"] == 1 else new_cfg)
+
+    monkeypatch.setattr("api.routers.builds.get_project", racing_project)
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_idempotent(
+        conn: Any, *, req_hash: str, produce: Any, rekey: Any = None, **kw: Any
+    ) -> tuple[int, dict[str, Any]]:
+        captured["initial"] = req_hash
+        status, body = await produce()
+        # what the real §27 machinery KEEPS after a winning produce
+        captured["kept"] = (rekey() if rekey is not None else None) or req_hash
+        return status, jsonable_encoder(body)
+
+    monkeypatch.setattr("api.routers.builds.run_idempotent", fake_run_idempotent)
+    resp = client.post(_URL, headers={"Idempotency-Key": "k-r7"})
+    assert resp.status_code == 202
+
+    root = Path(get_settings().projects_dir)
+    fp_old = eval_inputs_fingerprint(root, "demo", policy_fingerprint_bytes(old_cfg))
+    fp_new = eval_inputs_fingerprint(root, "demo", policy_fingerprint_bytes(new_cfg))
+    # the initial identity is the unlocked read (it must exist pre-produce)...
+    assert captured["initial"] == request_hash("POST", _URL, fp_old.encode() + b"\0" + b"")
+    # ...but the KEPT identity is the under-lock one — exactly the job's pin
+    assert captured["kept"] == request_hash("POST", _URL, fp_new.encode() + b"\0" + b"")
+    assert created["pinned_fingerprint"] == fp_new

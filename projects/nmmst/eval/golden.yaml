@@ -1,0 +1,24 @@
+# 海科館 pilot golden set — 煙霧測試等級(檢索結果含關鍵詞),
+# 四案分別覆蓋:導覽/人文展品、FAQ 服務資訊、區域知識、物種知識。
+schema_version: "1.0"
+cases:
+  - question: "達悟族拼板舟是什麼?"
+    mode: semantic
+    expects:
+      answer_regex: "拼板舟|達悟"
+    min_score: 0.5
+  - question: "海科館的開館時間是幾點?"
+    mode: semantic
+    expects:
+      answer_regex: "09:00|週二至週日"
+    min_score: 0.5
+  - question: "八斗子的自然景觀有什麼特色?"
+    mode: semantic
+    expects:
+      answer_regex: "八斗子"
+    min_score: 0.5
+  - question: "圓眼燕魚分布在哪些海域?"
+    mode: semantic
+    expects:
+      answer_regex: "印度|太平洋"
+    min_score: 0.5

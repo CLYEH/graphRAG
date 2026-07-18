@@ -11,7 +11,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import yaml
 
 from core.mcp.policy import PolicyError
 from core.mcp.server import build_server
@@ -32,25 +31,110 @@ _FROZEN_TOOLS = {
 
 
 async def test_the_server_exposes_exactly_the_frozen_tool_set() -> None:
-    server = build_server("demo", REPO_ROOT / "projects" / "demo" / "config.yaml")
+    server = build_server("demo")
     tools = await server.list_tools()
     assert {tool.name for tool in tools} == _FROZEN_TOOLS
 
 
-def test_an_invalid_policy_kills_the_server_at_build_time(tmp_path: Path) -> None:
-    """Fail loud at startup: a policy violating the frozen contract must stop
-    the server from EXISTING, not surface later mid-query."""
-    bad = tmp_path / "config.yaml"
-    bad.write_text(yaml.safe_dump({"query_policy": {"schema_version": "1.0"}}), "utf-8")
+async def test_registry_policy_failures_are_typed_and_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CFG1 moved the fail-loud gate from build time to SESSION start (the
+    registry is read per lifespan): a missing project, a config without the
+    policy block, and a contract-invalid block must each raise the typed
+    PolicyError BEFORE the session serves a single query — never a
+    half-configured server. The valid path returns the same policy the
+    Console API validates (one SoR, shared validator by construction)."""
+    from types import SimpleNamespace
+
+    from core.mcp.policy import load_runtime_config_from_registry, query_policy_from_mapping
+    from tests.conftest import DEMO_QUERY_POLICY
+
+    rows: dict[str, object] = {}
+
+    async def fake_get_project(conn: object, name: str) -> object | None:
+        return rows.get(name)
+
+    monkeypatch.setattr("core.registry.get_project", fake_get_project)
+
+    with pytest.raises(PolicyError, match="not in the registry"):
+        await load_runtime_config_from_registry(object(), "ghost")
+
+    rows["bare"] = SimpleNamespace(config={})
+    with pytest.raises(PolicyError, match="no query_policy block"):
+        await load_runtime_config_from_registry(object(), "bare")
+
+    rows["broken"] = SimpleNamespace(config={"query_policy": {"schema_version": "1.0"}})
     with pytest.raises(PolicyError):
-        build_server("broken", bad)
+        await load_runtime_config_from_registry(object(), "broken")
+
+    rows["demo"] = SimpleNamespace(config={"query_policy": DEMO_QUERY_POLICY})
+    policy, exposure = await load_runtime_config_from_registry(object(), "demo")
+    assert policy == query_policy_from_mapping(DEMO_QUERY_POLICY)
+    assert exposure.fields == ()  # no metadata_exposure block → fail-closed empty
+
+    # #93 R2: a malformed metadata_exposure must not block a consumer that
+    # never uses exposure (CLI eval) — the policy-only loader succeeds where
+    # the composed loader (rightly) refuses
+    from core.mcp.policy import load_query_policy_from_registry
+    from core.metadata.schema import MetadataConfigError
+
+    rows["mixed"] = SimpleNamespace(
+        config={"query_policy": DEMO_QUERY_POLICY, "metadata_exposure": "not-a-mapping"}
+    )
+    assert await load_query_policy_from_registry(object(), "mixed") == policy
+    with pytest.raises(MetadataConfigError):
+        await load_runtime_config_from_registry(object(), "mixed")
 
 
-def test_the_shipped_demo_config_is_contract_valid() -> None:
-    """The template a new project copies must itself pass the gate it
-    documents — a broken example would teach broken configs."""
-    server = build_server("demo", REPO_ROOT / "projects" / "demo" / "config.yaml")
-    assert server.name == "graphrag-demo"
+async def test_bad_policy_error_is_not_masked_by_client_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #93 R5: the lifespan must read the registry policy BEFORE wiring
+    any store/model client. When BOTH are broken (bad policy AND, say, no
+    OPENAI_API_KEY), the operator must see the actionable PolicyError — a
+    client factory that constructs first would mask it with its own error.
+    Revert-probe: move the policy load back below ProjectContext(...) and this
+    raises RuntimeError instead. The engine (the only client built pre-policy)
+    must still be disposed — a failing session start must not leak pools."""
+    from core.mcp import server as server_module
+
+    disposed: list[bool] = []
+
+    class _Engine:
+        async def dispose(self) -> None:
+            disposed.append(True)
+
+    def _would_mask(_: object = None) -> object:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    async def _bad_policy(engine: object, project: str) -> object:
+        raise PolicyError(f"project {project!r} has no query_policy block")
+
+    monkeypatch.setattr(server_module, "create_async_engine", lambda *a, **k: _Engine())
+    monkeypatch.setattr(server_module, "vector_client", _would_mask)
+    monkeypatch.setattr(server_module, "graph_driver", _would_mask)
+    monkeypatch.setattr(server_module, "embedding_model", _would_mask)
+    monkeypatch.setattr(server_module, "chat_model", _would_mask)
+    monkeypatch.setattr(server_module, "_load_runtime_config", _bad_policy)
+
+    server = build_server("demo")
+    assert server.settings.lifespan is not None
+    with pytest.raises(PolicyError, match="no query_policy block"):
+        async with server.settings.lifespan(server):
+            pass  # pragma: no cover — startup must fail before the yield
+    assert disposed == [True]  # the pre-policy engine was closed, not leaked
+
+
+def test_the_demo_policy_fixture_is_contract_valid() -> None:
+    """The shared test fixture every MCP test seeds (DEMO_QUERY_POLICY —
+    successor of the deleted projects/demo/config.yaml template) must itself
+    pass the frozen gate — a broken fixture would teach broken configs."""
+    from core.mcp.policy import query_policy_from_mapping
+    from tests.conftest import DEMO_QUERY_POLICY
+
+    query_policy_from_mapping(DEMO_QUERY_POLICY)
+    assert build_server("demo").name == "graphrag-demo"
 
 
 async def test_bounded_tools_degrade_typed_at_the_wall_clock_deadline() -> None:

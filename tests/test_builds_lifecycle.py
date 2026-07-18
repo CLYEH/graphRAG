@@ -66,11 +66,21 @@ def test_print_report_exit_codes(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_cli_surface_is_the_frozen_14_set() -> None:
     """§14 names the CLI verbs — the parser exposes exactly the lifecycle
-    subset owned by C9 (build/ingest land with their own tracks)."""
+    subset owned by C9 (build/ingest land with their own tracks), plus
+    serve-mcp (CFG1/DR-012: the gateway entrypoint — a serving command, not
+    a lifecycle verb, branching before the lifecycle plumbing)."""
     sub = next(
         a for a in _parser()._actions if isinstance(a, __import__("argparse")._SubParsersAction)
     )
-    assert set(sub.choices) == {"builds", "activate", "rollback", "diff", "eval", "prune"}
+    assert set(sub.choices) == {
+        "builds",
+        "activate",
+        "rollback",
+        "diff",
+        "eval",
+        "prune",
+        "serve-mcp",
+    }
 
 
 async def test_prune_refuses_a_zero_window() -> None:

@@ -26,7 +26,22 @@ from core.mcp import server as server_module
 from core.mcp.server import TRANSPORTS, build_server, run_server
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-_DEMO_CONFIG = REPO_ROOT / "projects" / "demo" / "config.yaml"
+
+
+# CFG1: policy rides the registry — hermetic tests stub the registry loader
+# with the shared contract-valid fixture (conftest.DEMO_QUERY_POLICY)
+def _stub_registry_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.mcp.policy import query_policy_from_mapping
+    from core.metadata.schema import MetadataExposure
+    from tests.conftest import DEMO_QUERY_POLICY
+
+    policy = query_policy_from_mapping(DEMO_QUERY_POLICY)
+
+    async def fake_load(engine: object, project: str) -> object:
+        return policy, MetadataExposure(fields=())
+
+    monkeypatch.setattr(server_module, "_load_runtime_config", fake_load)
+
 
 #: the frozen §9 tool set every transport must expose identically
 _TOOLS = {
@@ -66,7 +81,7 @@ def test_run_server_maps_the_vocabulary_and_fails_loud() -> None:
 def test_http_binding_comes_from_core_config() -> None:
     # host/port ride core.config (never os.environ) into the FastMCP settings
     # the streamable-http runner binds
-    server = build_server("demo", _DEMO_CONFIG)
+    server = build_server("demo")
     assert server.settings.host == get_settings().mcp_http_host
     assert server.settings.port == get_settings().mcp_http_port
 
@@ -94,8 +109,9 @@ async def test_streamable_http_serves_the_full_tool_set_in_process(
     monkeypatch.setattr(server_module, "graph_driver", lambda: _Closeable())
     monkeypatch.setattr(server_module, "embedding_model", lambda: object())
     monkeypatch.setattr(server_module, "chat_model", lambda: object())
+    _stub_registry_policy(monkeypatch)
 
-    server = build_server("demo", _DEMO_CONFIG)
+    server = build_server("demo")
     app = server.streamable_http_app()
     # with the localhost default, the SDK auto-enables DNS-rebinding
     # protection whose Host allowlist admits only the configured binding — any
@@ -153,8 +169,9 @@ async def test_http_sessions_get_isolated_runtimes(
     monkeypatch.setattr(server_module, "graph_driver", lambda: _Store())
     monkeypatch.setattr(server_module, "embedding_model", lambda: object())
     monkeypatch.setattr(server_module, "chat_model", lambda: object())
+    _stub_registry_policy(monkeypatch)
 
-    server = build_server("demo", _DEMO_CONFIG)
+    server = build_server("demo")
 
     @server.tool()
     async def runtime_probe() -> str:  # test-only: which runtime does this session see?

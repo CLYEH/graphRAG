@@ -11,6 +11,7 @@ the golden-set-fingerprint half so the request hash changes when the inputs do.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -33,27 +34,48 @@ def _fingerprint_of_reads(reads: Iterable[tuple[str, bytes]]) -> str:
     return digest.hexdigest()
 
 
-def read_and_fingerprint_eval_inputs(root: Path) -> tuple[str, bytes, bytes]:
-    """Read a project's eval inputs (golden set + query policy) EXACTLY ONCE and return
-    ``(fingerprint, golden_bytes, policy_bytes)``, so the worker's drift check and its
-    parse score the SAME bytes. A separate re-read for parsing (``load_golden`` /
-    ``load_query_policy`` reading the paths again) would reopen a TOCTOU: an edit landing
-    between the fingerprint and the parse would be scored under the stale accept-time
-    fingerprint, defeating the drift guard. Reads with ``read_bytes`` (raw — matching the
-    accept-time fingerprint's read exactly), so a present, readable input's digest equals
-    the pinned one; a missing/unreadable input raises ``OSError`` here, which the worker
-    preflight terminalizes as a failed job (an eval can't run without its inputs anyway).
-    The digest format is ``_fingerprint_of_reads``, identical to the accept-time path."""
-    golden_path, policy_path = eval_input_paths(root)
+#: label for the registry-sourced policy component inside the fingerprint —
+#: NOT a filename: CFG1 moved the policy out of config.yaml, and the label
+#: change (config.yaml → this) deliberately flips every pre-CFG1 fingerprint
+#: (the inputs' SOURCE changed, so replaying a pre-migration key must not
+#: hit a post-migration run)
+POLICY_COMPONENT_LABEL = "registry:query_policy"
+
+
+def policy_fingerprint_bytes(config: object) -> bytes:
+    """The canonical bytes of a registry config's ``query_policy`` block —
+    the ONE serialization the accept-time fingerprint and the worker's drift
+    check both hash (CFG1: the registry is the policy SoR; file bytes are
+    gone). Canonical = sorted keys, tight separators, UTF-8 — dict ordering
+    or whitespace can never flip the digest. A missing/non-mapping block
+    contributes empty bytes: the fingerprint stays stable and distinct (the
+    eval job itself refuses to RUN without a valid policy, loud)."""
+    if not isinstance(config, dict) or not isinstance(config.get("query_policy"), dict):
+        return b""
+    return json.dumps(
+        config["query_policy"], sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def read_and_fingerprint_eval_inputs(root: Path, policy_bytes: bytes) -> tuple[str, bytes]:
+    """Read the golden set EXACTLY ONCE, join the caller's registry-policy bytes,
+    and return ``(fingerprint, golden_bytes)`` — the worker's drift check and its
+    parse score the SAME content. The golden set stays a FILE (``eval/golden.yaml``);
+    the policy component is the caller's SINGLE registry read serialized by
+    :func:`policy_fingerprint_bytes` (CFG1) — passing bytes in keeps this module
+    connection-free and makes re-read TOCTOU structurally impossible on both
+    components. A missing/unreadable golden file raises ``OSError``, which the
+    worker preflight terminalizes as a failed job. Digest format =
+    ``_fingerprint_of_reads``, identical to the accept-time path."""
+    golden_path = eval_input_paths(root)[0]
     golden_bytes = golden_path.read_bytes()
-    policy_bytes = policy_path.read_bytes()
     fingerprint = _fingerprint_of_reads(
-        [(golden_path.name, golden_bytes), (policy_path.name, policy_bytes)]
+        [(golden_path.name, golden_bytes), (POLICY_COMPONENT_LABEL, policy_bytes)]
     )
-    return fingerprint, golden_bytes, policy_bytes
+    return fingerprint, golden_bytes
 
 
-def eval_inputs_fingerprint(projects_dir: Path, project: str) -> str:
+def eval_inputs_fingerprint(projects_dir: Path, project: str, policy_bytes: bytes) -> str:
     """A stable content fingerprint of a project's eval inputs (golden set + query
     policy). Hashes the raw file bytes of the SAME files the run reads
     (``eval_input_paths`` — the single layout definition both share), so ANY content
@@ -75,7 +97,7 @@ def eval_inputs_fingerprint(projects_dir: Path, project: str) -> str:
     if root is None:
         return "unsafe-project"
     reads: list[tuple[str, bytes]] = []
-    for path in eval_input_paths(root):
+    for path in eval_input_paths(root):  # golden set only (policy = registry, CFG1)
         try:
             # Both filesystem calls are inside the guard: is_file() re-raises on a
             # non-searchable dir, read_bytes() on an unreadable file — either would
@@ -84,4 +106,5 @@ def eval_inputs_fingerprint(projects_dir: Path, project: str) -> str:
         except OSError:
             data = b"\0unreadable\0"  # stable sentinel; the job is the sole loud path
         reads.append((path.name, data))
+    reads.append((POLICY_COMPONENT_LABEL, policy_bytes))
     return _fingerprint_of_reads(reads)

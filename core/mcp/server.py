@@ -14,8 +14,9 @@ enum), while ``explain_retrieval`` returns the hybrid §16 response verbatim
 Every call re-binds to the ACTIVE build (DR-001, via
 :meth:`~core.mcp.context.ProjectContext.bound` — activation between calls is
 picked up; no store client is ever touched directly, DR-006). The query
-policy is loaded and contract-validated ONCE at startup (fail loud —
-:class:`~core.mcp.policy.PolicyError`); ceilings are caller-reconciled here
+policy is loaded from the REGISTRY at each session's lifespan start and
+contract-validated (fail loud — :class:`~core.mcp.policy.PolicyError`;
+CFG1: ``projects.config`` is the one SoR); ceilings are caller-reconciled here
 (the C6b contract) before any mode function sees them. Tool arguments arrive
 from an UNTRUSTED agent: the transport layer type-checks them
 (FastMCP/pydantic), and the mode functions re-validate at their own doors
@@ -27,8 +28,9 @@ no-code agent platform consumes MCP over HTTP), selected at RUN time via
 additivity the original stdio-only note promised. HTTP binds
 ``core.config``'s ``mcp_http_host``/``mcp_http_port`` (localhost by default —
 wider exposure is an operator opt-in while §23 auth remains a placeholder).
-Entry point: ``projects/<name>/mcp_entrypoint.py`` calls :func:`build_server`
-and :func:`run_server`.
+Entry point: ``graphrag serve-mcp`` (CFG1 gateway — one process, every
+project at ``/mcp/<project>``); :func:`build_server` also serves stdio
+one-project runs.
 """
 
 from __future__ import annotations
@@ -38,7 +40,6 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Final, cast
 
 from mcp.server.fastmcp import FastMCP
@@ -54,8 +55,7 @@ from core.mcp.context import ProjectContext
 from core.mcp.policy import (
     QueryPolicy,
     hybrid_policy,
-    load_metadata_exposure_from_file,
-    load_query_policy,
+    load_runtime_config_from_registry,
 )
 from core.metadata.schema import MetadataExposure
 from core.query.global_reports import global_summary as run_global
@@ -208,20 +208,45 @@ class _Runtime:
     exposure: MetadataExposure = field(default_factory=lambda: MetadataExposure(fields=()))
 
 
-def build_server(project: str, config_path: Path) -> FastMCP:
-    """One project's MCP server, policy-validated at build time (fail loud)."""
-    policy = load_query_policy(config_path)
-    exposure = load_metadata_exposure_from_file(config_path)
+async def _load_runtime_config(engine: Any, project: str) -> tuple[QueryPolicy, MetadataExposure]:
+    """One connection, one registry read (CFG1) — the lifespan's policy seam,
+    module-level so hermetic tests can stub the WHOLE acquisition (fake
+    engines carry no ``connect``)."""
+    async with engine.connect() as conn:
+        return await load_runtime_config_from_registry(conn, project)
+
+
+def build_server(project: str) -> FastMCP:
+    """One project's MCP server — policy read from the REGISTRY per session.
+
+    CFG1: ``projects.config`` is the ONE policy SoR (owner 2026-07-17,
+    superseding the 2026-07-10 dual-source decision) — no ``config.yaml``.
+    The load moved from build time to LIFESPAN start, which the SDK enters
+    once per protocol session: a policy edit applies to the NEXT session,
+    and a project with a missing/invalid registry policy fails that
+    session's startup loud (typed :class:`~core.mcp.policy.PolicyError`),
+    never half-serves."""
 
     @asynccontextmanager
     async def lifespan(_server: FastMCP) -> AsyncIterator[_Runtime]:
         settings = get_settings()
+        engine = create_async_engine(
+            settings.postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
+            poolclass=NullPool,
+        )
+        # policy BEFORE any store/model client (Codex #93 R5): when the
+        # registry policy is missing/invalid AND a client factory would also
+        # fail (e.g. no OPENAI_API_KEY), startup must surface the actionable
+        # typed PolicyError, not the masking client error. Only the engine
+        # exists at this point, so a load failure disposes exactly that.
+        try:
+            policy, exposure = await _load_runtime_config(engine, project)
+        except BaseException:
+            await engine.dispose()
+            raise
         context = ProjectContext(
             project=project,
-            engine=create_async_engine(
-                settings.postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
-                poolclass=NullPool,
-            ),
+            engine=engine,
             qdrant=vector_client(),
             neo4j=graph_driver(),
             embedder=embedding_model(),

@@ -105,11 +105,9 @@ class Settings(BaseSettings):
     upload_max_total_bytes: int = 50_000_000
 
     # UXC1b eval (tunable 🔧, DR-010): root of the per-project on-disk files the
-    # eval job reads — the project's golden set (``<projects_dir>/<project>/eval/
-    # golden.yaml``) and query policy (``<projects_dir>/<project>/config.yaml``),
-    # the same paths the CLI ``eval`` walks. CFG1 will unify this with the
-    # ``projects.config`` registry source; until then the API eval endpoint runs
-    # the CLI's exact core path.
+    # eval job reads — since CFG1/DR-012 the ONLY file input is the golden set
+    # (``<projects_dir>/<project>/eval/golden.yaml``; the query policy lives in
+    # the ``projects.config`` registry), the same path the CLI ``eval`` walks.
     projects_dir: str = "projects"
 
     # LLM (default provider: OpenAI — DESIGN.md §3; abstraction = LlamaIndex LLM)
