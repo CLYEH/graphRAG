@@ -63,6 +63,34 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/projects/{project}/sources/{source_id}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        source_id: components["parameters"]["SourceIdPath"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    /**
+     * Update a source's lifecycle state (v1.3, SRC2 — GAPS G2 option 2)
+     * @description Soft-disable / re-enable only. `uri` and `kind` are IMMUTABLE — swapping
+     *     corpus = disable the old source + register a new one, so historical builds'
+     *     provenance is never rewritten (the BA9 canonical-uri spirit). A disabled
+     *     source is excluded from FUTURE ingests/builds; existing documents, chunks
+     *     and evidence produced from it are untouched. Unknown source →
+     *     404 SOURCE_NOT_FOUND.
+     */
+    patch: operations["updateSource"];
+    trace?: never;
+  };
   "/projects/{project}/ingest": {
     parameters: {
       query?: never;
@@ -244,6 +272,88 @@ export interface paths {
      *     recomputing.
      */
     post: operations["runBuildEval"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/projects/{project}/builds/{build_id}/retry": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        build_id: components["parameters"]["BuildIdPath"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Retry a failed build's failed items as a NEW build (v1.3, RB1)
+     * @description Opens a NEW build recording `parent_build_id = {build_id}`, reusing the
+     *     parent's successful artifacts and re-running ONLY its failed items
+     *     (§27.7 `retry_failed_only`). The parent's terminal record is never
+     *     mutated (audit integrity) — lineage is the child's pointer, not an edit.
+     *     A full re-run is `POST /projects/{project}/build`, not this. Only a
+     *     terminal `failed` build can be retried: any other status →
+     *     409 BUILD_NOT_RETRYABLE. Async: `202` + job envelope, same shape as
+     *     `triggerBuild`; one active job per project (409 JOB_CONFLICT).
+     */
+    post: operations["retryBuild"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/projects/{project}/builds/{build_id}/steps": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        build_id: components["parameters"]["BuildIdPath"];
+      };
+      cookie?: never;
+    };
+    /**
+     * Per-step drill-down for a build (v1.3, RB1)
+     * @description The build's pipeline steps (§27.7 observability), newest run first —
+     *     the failure-diagnosis surface behind "retry failed only". Counts are
+     *     nullable: a step that never ran reports nulls, never fabricated zeros.
+     */
+    get: operations["listBuildSteps"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/projects/{project}/builds/{build_id}/steps/{step_id}/items": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        build_id: components["parameters"]["BuildIdPath"];
+        step_id: components["parameters"]["StepIdPath"];
+      };
+      cookie?: never;
+    };
+    /**
+     * Per-item drill-down for one build step (v1.3, RB1)
+     * @description The step's recorded item outcomes (§27.7; default verbosity records
+     *     failed/skipped only — `item_ref` is the stable retry key: document =
+     *     content_hash, entity = entity_key). `filter[status]` narrows to e.g.
+     *     failed items; unsupported filters are rejected loud (SS1a discipline).
+     */
+    get: operations["listStepItems"];
+    put?: never;
+    post?: never;
     delete?: never;
     options?: never;
     head?: never;
@@ -464,6 +574,56 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/projects/{project}/entities/{entity_id}/approve": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        entity_id: components["parameters"]["EntityIdPath"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Approve an entity (v1.3, GOV2 — recorded in review_ledger, DR-003)
+     * @description §17 entity review: `needs_review → approved`. The decision keys on the
+     *     type-free v2 ledger fingerprint (DR-011 `ledger_entity_key`), so it
+     *     carries across builds; re-deciding appends (precedence resolves), never
+     *     conflicts.
+     */
+    post: operations["approveEntity"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/projects/{project}/entities/{entity_id}/reject": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        entity_id: components["parameters"]["EntityIdPath"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Reject an entity (v1.3, GOV2 — recorded in review_ledger, DR-003)
+     * @description §17 entity review: `needs_review → rejected`; the rejected key is
+     *     excluded from future projections (DR-003 carry-forward).
+     */
+    post: operations["rejectEntity"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/projects/{project}/relations": {
     parameters: {
       query?: never;
@@ -497,6 +657,54 @@ export interface paths {
     get: operations["getRelation"];
     put?: never;
     post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/projects/{project}/relations/{relation_id}/approve": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        relation_id: components["parameters"]["RelationIdPath"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Approve a relation (v1.3, GOV2 — recorded in review_ledger, DR-003)
+     * @description §17 relation review: `needs_review → approved`. Keys on the type-free
+     *     v2 `ledger_relation_signature` (DR-011); carries across builds.
+     */
+    post: operations["approveRelation"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/projects/{project}/relations/{relation_id}/reject": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        relation_id: components["parameters"]["RelationIdPath"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Reject a relation (v1.3, GOV2 — recorded in review_ledger, DR-003)
+     * @description §17 relation review: `needs_review → rejected`; the rejected signature
+     *     is excluded from future projections (DR-003 carry-forward).
+     */
+    post: operations["rejectRelation"];
     delete?: never;
     options?: never;
     head?: never;
@@ -595,6 +803,81 @@ export interface paths {
     put?: never;
     /** Defer a merge decision (stays in the review queue) */
     post: operations["deferMergeCandidate"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/projects/{project}/ontology-proposals": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+      };
+      cookie?: never;
+    };
+    /**
+     * List LLM-proposed ontology types awaiting review (v1.3, GOV3)
+     * @description The C3c ontology proposal POOL (§17: `proposed → accepted|rejected`) —
+     *     types the extractor observed that are not in the CONFIGURED ontology.
+     *     Distinct from editing configured types (`PATCH /projects/{project}`
+     *     config). One pool row per proposed type per project (stable
+     *     `proposal_key`).
+     */
+    get: operations["listOntologyProposals"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/projects/{project}/ontology-proposals/{proposal_id}/accept": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        proposal_id: components["parameters"]["ProposalIdPath"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Accept a proposed ontology type (v1.3, GOV3)
+     * @description §17: `proposed → accepted` — the type joins the project's configured
+     *     ontology (the same config the extractor reads next build). Unknown
+     *     proposal → 404 PROPOSAL_NOT_FOUND.
+     */
+    post: operations["acceptOntologyProposal"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/projects/{project}/ontology-proposals/{proposal_id}/reject": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        proposal_id: components["parameters"]["ProposalIdPath"];
+      };
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Reject a proposed ontology type (v1.3, GOV3)
+     * @description §17: `proposed → rejected` — the pool row keeps the decision (stable
+     *     `proposal_key`), so the same type is not re-proposed for re-review.
+     */
+    post: operations["rejectOntologyProposal"];
     delete?: never;
     options?: never;
     head?: never;
@@ -759,6 +1042,36 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/projects/{project}/mcp": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+      };
+      cookie?: never;
+    };
+    /**
+     * The project's MCP connection info (v1.3, DR-012 rider)
+     * @description What an external agent platform needs to connect to this project's MCP
+     *     server through the DR-012 gateway (`graphrag serve-mcp`): the
+     *     streamable-HTTP URL (`http://<host>:<port>/mcp/<project>`), derived
+     *     from the server's GRAPHRAG_MCP_HTTP_HOST/PORT settings. Reachable only
+     *     for path-addressable projects (this route is path-keyed on `{project}`
+     *     exactly like the gateway), so a returned `url` is always non-null; a
+     *     non-path-addressable name is Console-only and the Console derives that
+     *     client-side from the name. Auth is `none` until §23 lands (additive
+     *     enum evolution).
+     */
+    get: operations["getMcpInfo"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -789,6 +1102,18 @@ export interface components {
       elapsed_ms: number;
       /** @description Opaque cursor for the next page; null on the last page. */
       next_cursor: string | null;
+      /**
+       * @description Total matching rows (v1.3, SS1b). Null when the endpoint did not
+       *     compute one (the pre-v1.3 behavior, still valid) — clients must
+       *     treat null as "unknown", never as zero.
+       */
+      total?: number | null;
+      /**
+       * @description True when `total` is a planner estimate rather than an exact count
+       *     (large tables answer from statistics to keep lists fast). Absent or
+       *     false ⇒ `total`, when non-null, is exact.
+       */
+      total_estimated?: boolean;
     };
     /**
      * @description Frozen error-code enum (DESIGN §27.2; additive-only).
@@ -807,7 +1132,10 @@ export interface components {
       | "QUERY_TIMEOUT"
       | "STORE_UNAVAILABLE"
       | "RATE_LIMITED"
-      | "INTERNAL";
+      | "INTERNAL"
+      | "SOURCE_NOT_FOUND"
+      | "PROPOSAL_NOT_FOUND"
+      | "BUILD_NOT_RETRYABLE";
     /**
      * @description The full frozen shape is always present — details is null rather than absent,
      *     so error consumers never branch on missing fields.
@@ -872,6 +1200,13 @@ export interface components {
       /** @description Connector kind (e.g. file, directory, url, database). */
       kind?: string;
       uri: string;
+      /**
+       * @description v1.3 (SRC2): false = soft-disabled — excluded from future
+       *     ingests/builds; provenance of existing artifacts untouched. Absent
+       *     means enabled (pre-SRC2 responses); servers always emit it once the
+       *     SRC2 runtime lands.
+       */
+      enabled?: boolean;
       metadata?: {
         [key: string]: unknown;
       };
@@ -885,12 +1220,35 @@ export interface components {
         [key: string]: unknown;
       };
     };
+    /**
+     * @description v1.3 (SRC2, GAPS G2 option 2): lifecycle only. `uri` and `kind` are
+     *     deliberately NOT properties here — they are immutable (corpus swap =
+     *     disable old + register new; historical provenance is never rewritten).
+     *     additionalProperties:false makes that structural at the raw-HTTP
+     *     boundary too: a smuggled `uri` is a validation error, not a no-op.
+     */
+    SourceUpdate: {
+      enabled: boolean;
+    };
     IngestRequest: {
       /** @description Restrict ingestion to these sources; omit for all. */
       source_ids?: string[];
     };
     BuildRequest: {
       /** @description Free-form operator note recorded on the build. */
+      reason?: string | null;
+    };
+    /**
+     * @description v1.3 (RB1). Retry semantics are fixed (failed items only — a full
+     *     re-run is `POST /projects/{project}/build`); the body carries only the
+     *     operator note. Closed (additionalProperties:false): a control the fixed
+     *     semantics do not honor (e.g. `{"mode":"all"}`) is a validation error at
+     *     the contract boundary, never a silently-ignored request — the runtime
+     *     never has to choose between accepting-and-ignoring or rejecting a
+     *     contract-valid body.
+     */
+    RetryRequest: {
+      /** @description Free-form operator note recorded on the retry build. */
       reason?: string | null;
     };
     /**
@@ -1036,6 +1394,14 @@ export interface components {
       /** Format: uuid */
       id: string;
       project: string;
+      /**
+       * Format: uuid
+       * @description v1.3 (RB1): set on a retry build — the terminal `failed` build this
+       *     one re-runs failed items of. Null for ordinary builds. Lineage is
+       *     this pointer on the CHILD; the parent's terminal record is never
+       *     mutated.
+       */
+      parent_build_id?: string | null;
       status: components["schemas"]["BuildStatus"];
       config_hash?: string | null;
       source_hash?: string | null;
@@ -1257,6 +1623,46 @@ export interface components {
       /** Format: date-time */
       updated_at?: string | null;
     };
+    /**
+     * @description One pipeline step of a build (v1.3, RB1 — §27.7 observability). Counts
+     *     are nullable: a step that never ran reports nulls, never fabricated
+     *     zeros. `status` is an open vocabulary (no frozen enum — §4/§18 freeze
+     *     no step-status set); minimum vocabulary includes `failed`.
+     */
+    BuildStep: {
+      /** Format: uuid */
+      id: string;
+      step_name: string;
+      status: string;
+      /** Format: date-time */
+      started_at?: string | null;
+      /** Format: date-time */
+      finished_at?: string | null;
+      input_count?: number | null;
+      output_count?: number | null;
+      skipped_count?: number | null;
+      failed_count?: number | null;
+      error?: {
+        [key: string]: unknown;
+      } | null;
+    };
+    /**
+     * @description One recorded item outcome of a step (v1.3, RB1). `item_ref` is the
+     *     STABLE retry key (§27.7: document = content_hash, entity = entity_key)
+     *     — what "retry failed only" re-enters. `status` minimum vocabulary is
+     *     `failed|skipped` (default verbosity records only those).
+     */
+    BuildStepItem: {
+      /** Format: uuid */
+      id: string;
+      item_kind: string;
+      item_ref: string;
+      status: string;
+      message?: string | null;
+      error?: {
+        [key: string]: unknown;
+      } | null;
+    };
     /** @enum {string} */
     MergeCandidateStatus: "pending" | "approved" | "rejected" | "deferred";
     MergeCandidate: {
@@ -1293,6 +1699,39 @@ export interface components {
     };
     ReviewDecisionRequest: {
       reason?: string | null;
+    };
+    /** @enum {string} */
+    OntologyProposalStatus: "proposed" | "accepted" | "rejected";
+    /**
+     * @description One LLM-proposed ontology type awaiting review (v1.3, GOV3 — the C3c
+     *     proposal pool; §17 `proposed → accepted|rejected`). One pool row per
+     *     proposed type per project, keyed by the stable `proposal_key`.
+     */
+    OntologyProposal: {
+      /** Format: uuid */
+      id: string;
+      project?: string;
+      /**
+       * @description What the proposed type would type (mirrors the DDL CHECK).
+       * @enum {string}
+       */
+      kind: "entity" | "relation";
+      /** @description The type as first observed. */
+      type_name: string;
+      /** @description Stable fingerprint fpv(norm(kind)|norm(type_name)). */
+      proposal_key: string;
+      fingerprint_version?: number;
+      /** @description First observed name/quote. */
+      example?: string | null;
+      /** @description First observed source (content-stable string). */
+      chunk_ref?: string | null;
+      status: components["schemas"]["OntologyProposalStatus"];
+      decided_by?: string | null;
+      /** Format: date-time */
+      decided_at?: string | null;
+      reason?: string | null;
+      /** Format: date-time */
+      created_at?: string | null;
     };
     GraphNode: {
       /** Format: uuid */
@@ -1435,6 +1874,26 @@ export interface components {
     } & {
       [key: string]: unknown;
     };
+    /**
+     * @description The project's MCP connection surface through the DR-012 gateway (v1.3).
+     *     `url` is the streamable-HTTP endpoint, always present: this route is
+     *     itself path-keyed on `{project}`, so it is only reachable for
+     *     path-addressable projects — exactly the ones for which a gateway URL
+     *     exists. A non-path-addressable name (contains `/`, or is `.`/`..`)
+     *     cannot reach ANY of its `/projects/{project}/…` endpoints, so there is
+     *     no reachable case where `url` would be null; the Console flags such
+     *     projects as Console-only client-side from the name (the same
+     *     isPathAddressable rule), needing no server field. `auth: none` is the
+     *     §23 placeholder (additive enum evolution when auth lands).
+     */
+    McpInfo: {
+      /** @constant */
+      transport: "streamable-http";
+      /** @enum {string} */
+      auth: "none";
+      /** Format: uri */
+      url: string;
+    };
     ProjectResponse: {
       data: components["schemas"]["Project"];
       meta: components["schemas"]["Meta"];
@@ -1533,12 +1992,32 @@ export interface components {
       data: components["schemas"]["EvalReport"];
       meta: components["schemas"]["Meta"];
     };
+    OntologyProposalResponse: {
+      data: components["schemas"]["OntologyProposal"];
+      meta: components["schemas"]["Meta"];
+    };
+    OntologyProposalListResponse: {
+      data: components["schemas"]["OntologyProposal"][];
+      meta: components["schemas"]["PageMeta"];
+    };
+    BuildStepListResponse: {
+      data: components["schemas"]["BuildStep"][];
+      meta: components["schemas"]["PageMeta"];
+    };
+    BuildStepItemListResponse: {
+      data: components["schemas"]["BuildStepItem"][];
+      meta: components["schemas"]["PageMeta"];
+    };
+    McpInfoResponse: {
+      data: components["schemas"]["McpInfo"];
+      meta: components["schemas"]["Meta"];
+    };
   };
   responses: {
     /**
      * @description Error envelope. Status → code mapping: 400 `VALIDATION_ERROR`/`QUERY_UNSAFE` ·
-     *     404 `PROJECT_NOT_FOUND`/`BUILD_NOT_FOUND`/`JOB_NOT_FOUND` · 409
-     *     `IDEMPOTENCY_CONFLICT`/`JOB_CONFLICT`/`BUILD_NOT_READY`/`NO_ACTIVE_BUILD` ·
+     *     404 `PROJECT_NOT_FOUND`/`BUILD_NOT_FOUND`/`JOB_NOT_FOUND`/`SOURCE_NOT_FOUND`/`PROPOSAL_NOT_FOUND` · 409
+     *     `IDEMPOTENCY_CONFLICT`/`JOB_CONFLICT`/`BUILD_NOT_READY`/`NO_ACTIVE_BUILD`/`BUILD_NOT_RETRYABLE` ·
      *     429 `RATE_LIMITED` · 503 `STORE_UNAVAILABLE` · 504 `QUERY_TIMEOUT` · 500 `INTERNAL`.
      *     The upload endpoint also returns 413 (total size over the limit) and 415
      *     (body not multipart/form-data); like a 405, these carry no dedicated code and
@@ -1585,6 +2064,9 @@ export interface components {
     EntityIdPath: string;
     RelationIdPath: string;
     CandidateIdPath: string;
+    SourceIdPath: string;
+    ProposalIdPath: string;
+    StepIdPath: string;
     /** @description Page size (default 50 🔧). */
     Limit: number;
     /** @description Opaque cursor from `meta.next_cursor`; omit for the first page. */
@@ -1595,6 +2077,14 @@ export interface components {
     Filter: {
       [key: string]: string;
     };
+    /**
+     * @description Server-side search (v1.3, SS1b). Matches over the endpoint's documented
+     *     searchable fields; combines AND-wise with `filter[...]`. Declared only
+     *     on endpoints that support it — like unsupported filters, a `q` an
+     *     endpoint cannot honor is rejected loud (400 VALIDATION_ERROR), never
+     *     silently ignored.
+     */
+    Q: string;
     /**
      * @description Client-generated key (≤255 chars). Same key + same request hash replays the
      *     stored original response; same key + different request hash → `409
@@ -1822,6 +2312,34 @@ export interface operations {
         };
       };
       409: components["responses"]["Conflict"];
+      default: components["responses"]["Error"];
+    };
+  };
+  updateSource: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        source_id: components["parameters"]["SourceIdPath"];
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["SourceUpdate"];
+      };
+    };
+    responses: {
+      /** @description Source updated. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["SourceResponse"];
+        };
+      };
       default: components["responses"]["Error"];
     };
   };
@@ -2111,6 +2629,109 @@ export interface operations {
       default: components["responses"]["Error"];
     };
   };
+  retryBuild: {
+    parameters: {
+      query?: never;
+      header?: {
+        /**
+         * @description Client-generated key (≤255 chars). Same key + same request hash replays the
+         *     stored original response; same key + different request hash → `409
+         *     IDEMPOTENCY_CONFLICT`. Keys expire after the configured TTL (default 24h 🔧).
+         */
+        "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+      };
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        build_id: components["parameters"]["BuildIdPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: {
+      content: {
+        "application/json": components["schemas"]["RetryRequest"];
+      };
+    };
+    responses: {
+      /** @description Retry build job accepted. */
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["JobAcceptedResponse"];
+        };
+      };
+      409: components["responses"]["Conflict"];
+      default: components["responses"]["Error"];
+    };
+  };
+  listBuildSteps: {
+    parameters: {
+      query?: {
+        /** @description Page size (default 50 🔧). */
+        limit?: components["parameters"]["Limit"];
+        /** @description Opaque cursor from `meta.next_cursor`; omit for the first page. */
+        cursor?: components["parameters"]["Cursor"];
+        /** @description `field:asc` or `field:desc`. */
+        sort?: components["parameters"]["Sort"];
+        /** @description Field filters as `filter[field]=value` (deepObject style). */
+        filter?: components["parameters"]["Filter"];
+      };
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        build_id: components["parameters"]["BuildIdPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Build steps page. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["BuildStepListResponse"];
+        };
+      };
+      default: components["responses"]["Error"];
+    };
+  };
+  listStepItems: {
+    parameters: {
+      query?: {
+        /** @description Page size (default 50 🔧). */
+        limit?: components["parameters"]["Limit"];
+        /** @description Opaque cursor from `meta.next_cursor`; omit for the first page. */
+        cursor?: components["parameters"]["Cursor"];
+        /** @description `field:asc` or `field:desc`. */
+        sort?: components["parameters"]["Sort"];
+        /** @description Field filters as `filter[field]=value` (deepObject style). */
+        filter?: components["parameters"]["Filter"];
+      };
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        build_id: components["parameters"]["BuildIdPath"];
+        step_id: components["parameters"]["StepIdPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Step items page. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["BuildStepItemListResponse"];
+        };
+      };
+      default: components["responses"]["Error"];
+    };
+  };
   getJob: {
     parameters: {
       query?: never;
@@ -2199,6 +2820,14 @@ export interface operations {
         sort?: components["parameters"]["Sort"];
         /** @description Field filters as `filter[field]=value` (deepObject style). */
         filter?: components["parameters"]["Filter"];
+        /**
+         * @description Server-side search (v1.3, SS1b). Matches over the endpoint's documented
+         *     searchable fields; combines AND-wise with `filter[...]`. Declared only
+         *     on endpoints that support it — like unsupported filters, a `q` an
+         *     endpoint cannot honor is rejected loud (400 VALIDATION_ERROR), never
+         *     silently ignored.
+         */
+        q?: components["parameters"]["Q"];
       };
       header?: never;
       path: {
@@ -2342,6 +2971,14 @@ export interface operations {
         sort?: components["parameters"]["Sort"];
         /** @description Field filters as `filter[field]=value` (deepObject style). */
         filter?: components["parameters"]["Filter"];
+        /**
+         * @description Server-side search (v1.3, SS1b). Matches over the endpoint's documented
+         *     searchable fields; combines AND-wise with `filter[...]`. Declared only
+         *     on endpoints that support it — like unsupported filters, a `q` an
+         *     endpoint cannot honor is rejected loud (400 VALIDATION_ERROR), never
+         *     silently ignored.
+         */
+        q?: components["parameters"]["Q"];
       };
       header?: never;
       path: {
@@ -2384,6 +3021,78 @@ export interface operations {
           "application/json": components["schemas"]["EntityResponse"];
         };
       };
+      default: components["responses"]["Error"];
+    };
+  };
+  approveEntity: {
+    parameters: {
+      query?: never;
+      header?: {
+        /**
+         * @description Client-generated key (≤255 chars). Same key + same request hash replays the
+         *     stored original response; same key + different request hash → `409
+         *     IDEMPOTENCY_CONFLICT`. Keys expire after the configured TTL (default 24h 🔧).
+         */
+        "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+      };
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        entity_id: components["parameters"]["EntityIdPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: {
+      content: {
+        "application/json": components["schemas"]["ReviewDecisionRequest"];
+      };
+    };
+    responses: {
+      /** @description Decision recorded. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["EntityResponse"];
+        };
+      };
+      409: components["responses"]["Conflict"];
+      default: components["responses"]["Error"];
+    };
+  };
+  rejectEntity: {
+    parameters: {
+      query?: never;
+      header?: {
+        /**
+         * @description Client-generated key (≤255 chars). Same key + same request hash replays the
+         *     stored original response; same key + different request hash → `409
+         *     IDEMPOTENCY_CONFLICT`. Keys expire after the configured TTL (default 24h 🔧).
+         */
+        "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+      };
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        entity_id: components["parameters"]["EntityIdPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: {
+      content: {
+        "application/json": components["schemas"]["ReviewDecisionRequest"];
+      };
+    };
+    responses: {
+      /** @description Decision recorded. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["EntityResponse"];
+        };
+      };
+      409: components["responses"]["Conflict"];
       default: components["responses"]["Error"];
     };
   };
@@ -2440,6 +3149,78 @@ export interface operations {
           "application/json": components["schemas"]["RelationResponse"];
         };
       };
+      default: components["responses"]["Error"];
+    };
+  };
+  approveRelation: {
+    parameters: {
+      query?: never;
+      header?: {
+        /**
+         * @description Client-generated key (≤255 chars). Same key + same request hash replays the
+         *     stored original response; same key + different request hash → `409
+         *     IDEMPOTENCY_CONFLICT`. Keys expire after the configured TTL (default 24h 🔧).
+         */
+        "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+      };
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        relation_id: components["parameters"]["RelationIdPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: {
+      content: {
+        "application/json": components["schemas"]["ReviewDecisionRequest"];
+      };
+    };
+    responses: {
+      /** @description Decision recorded. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["RelationResponse"];
+        };
+      };
+      409: components["responses"]["Conflict"];
+      default: components["responses"]["Error"];
+    };
+  };
+  rejectRelation: {
+    parameters: {
+      query?: never;
+      header?: {
+        /**
+         * @description Client-generated key (≤255 chars). Same key + same request hash replays the
+         *     stored original response; same key + different request hash → `409
+         *     IDEMPOTENCY_CONFLICT`. Keys expire after the configured TTL (default 24h 🔧).
+         */
+        "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+      };
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        relation_id: components["parameters"]["RelationIdPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: {
+      content: {
+        "application/json": components["schemas"]["ReviewDecisionRequest"];
+      };
+    };
+    responses: {
+      /** @description Decision recorded. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["RelationResponse"];
+        };
+      };
+      409: components["responses"]["Conflict"];
       default: components["responses"]["Error"];
     };
   };
@@ -2606,6 +3387,110 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["MergeCandidateResponse"];
+        };
+      };
+      409: components["responses"]["Conflict"];
+      default: components["responses"]["Error"];
+    };
+  };
+  listOntologyProposals: {
+    parameters: {
+      query?: {
+        /** @description Page size (default 50 🔧). */
+        limit?: components["parameters"]["Limit"];
+        /** @description Opaque cursor from `meta.next_cursor`; omit for the first page. */
+        cursor?: components["parameters"]["Cursor"];
+        /** @description `field:asc` or `field:desc`. */
+        sort?: components["parameters"]["Sort"];
+        /** @description Field filters as `filter[field]=value` (deepObject style). */
+        filter?: components["parameters"]["Filter"];
+      };
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Ontology proposals page. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["OntologyProposalListResponse"];
+        };
+      };
+      default: components["responses"]["Error"];
+    };
+  };
+  acceptOntologyProposal: {
+    parameters: {
+      query?: never;
+      header?: {
+        /**
+         * @description Client-generated key (≤255 chars). Same key + same request hash replays the
+         *     stored original response; same key + different request hash → `409
+         *     IDEMPOTENCY_CONFLICT`. Keys expire after the configured TTL (default 24h 🔧).
+         */
+        "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+      };
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        proposal_id: components["parameters"]["ProposalIdPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: {
+      content: {
+        "application/json": components["schemas"]["ReviewDecisionRequest"];
+      };
+    };
+    responses: {
+      /** @description Decision recorded. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["OntologyProposalResponse"];
+        };
+      };
+      409: components["responses"]["Conflict"];
+      default: components["responses"]["Error"];
+    };
+  };
+  rejectOntologyProposal: {
+    parameters: {
+      query?: never;
+      header?: {
+        /**
+         * @description Client-generated key (≤255 chars). Same key + same request hash replays the
+         *     stored original response; same key + different request hash → `409
+         *     IDEMPOTENCY_CONFLICT`. Keys expire after the configured TTL (default 24h 🔧).
+         */
+        "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+      };
+      path: {
+        project: components["parameters"]["ProjectPath"];
+        proposal_id: components["parameters"]["ProposalIdPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: {
+      content: {
+        "application/json": components["schemas"]["ReviewDecisionRequest"];
+      };
+    };
+    responses: {
+      /** @description Decision recorded. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["OntologyProposalResponse"];
         };
       };
       409: components["responses"]["Conflict"];
@@ -2879,6 +3764,29 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["EvalResponse"];
+        };
+      };
+      default: components["responses"]["Error"];
+    };
+  };
+  getMcpInfo: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project: components["parameters"]["ProjectPath"];
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description MCP connection info. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["McpInfoResponse"];
         };
       };
       default: components["responses"]["Error"];
