@@ -1,6 +1,6 @@
 ---
 name: graphrag-track5-owner-approvals
-description: owner 2026-07-17「全部同意」— CFG1(#93 已 merge)+DR-002 打包回合(待做)+SS1a(#92 已 merge);⚠️ 旗標解除
+description: owner 2026-07-17「全部同意」— CFG1(#93)+DR-002 打包契約回合 CTR1(#94/DR-013)+SS1a(#92)皆已 merge,餘各任務 runtime;⚠️ 旗標解除
 metadata: 
   node_type: memory
   type: project
@@ -8,10 +8,12 @@ metadata:
 ---
 
 Owner 2026-07-17 對 Track 5 待決事項回覆「全部同意」,三組核准全數生效。
-**執行狀態(2026-07-18)**:第 1 組 CFG1 已依驗收形狀落地(PR #93 merge,
-DESIGN §26 DR-012;`graphrag serve-mcp` 起單一 gateway);第 3 組 SS1a 已落地
-(PR #92)。**尚待執行的只剩第 2 組 DR-002 打包契約回合**(含 Console MCP
-URL/健康顯示——需要曝露 gateway 設定的端點,隨打包回合議定)。
+**執行狀態(2026-07-18)**:第 1 組 CFG1 已落地(PR #93,DR-012);第 3 組
+SS1a 已落地(PR #92)。第 2 組 DR-002 打包契約回合=**CTR1 已 merge**(PR #94,
+DESIGN §26 DR-013,openapi v1.2→1.3):SRC2/GOV2/GOV3/SS1b/RB1 端點 + MCP 資訊
+端點(`GET /projects/{p}/mcp`)一回合議定完畢,contract + test + codegen only。
+**尚待執行的只剩各任務的 runtime 落地**(SRC2/GOV2/GOV3/SS1b/RB1 逐一,契約已凍
+不再動);Console MCP URL/健康顯示 = SS1b 或 GOV2 落地時接 `GET /mcp` 端點。
 
 1. **CFG1 方向確認**:推翻 2026-07-10 雙源決策 — query-policy 統一單一 SoR
    (採建議:Postgres `projects.config`,MCP 啟動時讀 DB,`config.yaml` 退場)
