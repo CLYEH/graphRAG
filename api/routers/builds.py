@@ -138,8 +138,12 @@ async def list_build_steps_endpoint(
 ) -> dict[str, Any]:
     # RB1 §27.7 drill-down: the build's pipeline steps. `status` is an OPEN
     # vocabulary (no DDL CHECK — the C2–C7 writers own it), so the facet
-    # validates blankness only.
-    reject_unsupported_query(request, "id", allowed_filters=frozenset({"status"}))
+    # validates blankness only. The order is COMPOUND (newest run first =
+    # run started_at desc, step id desc), so — like chunks' compound order — NO
+    # explicit sort can restate it: sort_field=None rejects every sort loud
+    # rather than 200 an `id:desc` the endpoint does not actually honor (Codex
+    # #99 R2 / the GAPS-O4 false-affordance rule).
+    reject_unsupported_query(request, None, allowed_filters=frozenset({"status"}))
     status = single_filter_value(request, "status")
     await _require_build(conn, project, build_id)  # project 404 then build 404
     after = decode_step_cursor(cursor) if cursor else None

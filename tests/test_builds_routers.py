@@ -357,6 +357,12 @@ def test_list_build_steps_rejects_unsupported_filter(
         client.get(f"/projects/p/builds/{_BUILD}/steps", params={"sort": "name:asc"}).status_code
         == 400
     )
+    # the order is COMPOUND (newest run first) — even `id:desc` is rejected, not
+    # 200'd as a sort the endpoint doesn't honor (Codex #99 R2, GAPS-O4)
+    assert (
+        client.get(f"/projects/p/builds/{_BUILD}/steps", params={"sort": "id:desc"}).status_code
+        == 400
+    )
 
 
 def test_list_step_items_404_when_step_not_in_build(
