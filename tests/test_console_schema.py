@@ -50,12 +50,14 @@ def test_sources_columns_match_contract() -> None:
         "uri",
         "metadata",
         "added_at",
+        "enabled",  # SRC2 (DR-013)
     }
     assert sources.c.id.primary_key
     assert not sources.c.project.nullable
     assert not sources.c.uri.nullable
     assert not sources.c.metadata.nullable
     assert sources.c.kind.nullable  # contract Source requires only [id, uri]
+    assert not sources.c.enabled.nullable  # NOT NULL + server_default true (no backfill)
 
 
 def test_sources_project_fk_cascades() -> None:

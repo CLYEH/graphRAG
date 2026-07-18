@@ -97,7 +97,14 @@ def test_dtos_project_the_contract_shape() -> None:
     sid = uuid.uuid4()
     s = Source(id=sid, project="proj", kind="file", uri="u", metadata={"m": 1}, added_at=ts)
     dto = source_dto(s)
-    assert dto == {"id": sid, "kind": "file", "uri": "u", "metadata": {"m": 1}, "added_at": ts}
+    assert dto == {
+        "id": sid,
+        "kind": "file",
+        "uri": "u",
+        "enabled": True,  # SRC2 (DR-013): the soft-disable flag is always emitted
+        "metadata": {"m": 1},
+        "added_at": ts,
+    }
     assert "project" not in dto  # contract Source is project-free (it's path context)
 
 

@@ -26,6 +26,7 @@ from core.registry import (
     ProjectExistsError,
     ProjectHasBuildsError,
     ProjectNotFoundError,
+    SourceNotFoundError,
     add_source,
     create_job_exclusive,
     create_project,
@@ -36,6 +37,7 @@ from core.registry import (
     list_sources,
     set_eval_inputs_fingerprint,
     update_project,
+    update_source,
     upsert_managed_source,
 )
 from core.stores.tables import (
@@ -168,6 +170,49 @@ async def test_add_source_requires_project_and_lists(migrated: None) -> None:
             listed, after = await list_sources(conn, name, limit=10)
             assert [x.id for x in listed] == [s.id]
             assert after is None
+            assert listed[0].enabled is True  # SRC2: sources start enabled
+            await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_update_source_soft_disable_and_scoping(migrated: None) -> None:
+    """SRC2 (GAPS G2): update_source flips `enabled`, scopes by (project, id)
+    so another project's source_id is a not-found (never a cross-project
+    write), and the disabled row still LISTS (default) but is excluded from the
+    enabled_only view the build path uses. uri/kind stay put (immutable)."""
+    engine = _engine()
+    name, other = _proj(), _proj()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await create_project(conn, name=name)
+            await create_project(conn, name=other)
+            s = await add_source(conn, name, uri="file:///d", kind="file")
+
+            # unknown source id → SOURCE_NOT_FOUND
+            with pytest.raises(SourceNotFoundError):
+                await update_source(conn, name, uuid.uuid4(), enabled=False)
+            # the source exists, but under a DIFFERENT project → still not found
+            # (scoped by (project, id): no cross-project write)
+            with pytest.raises(SourceNotFoundError):
+                await update_source(conn, other, s.id, enabled=False)
+
+            disabled = await update_source(conn, name, s.id, enabled=False)
+            assert disabled.enabled is False
+            assert disabled.uri == "file:///d" and disabled.kind == "file"  # immutable
+
+            # default listing still shows it (operator can re-enable)...
+            listed, _ = await list_sources(conn, name, limit=10)
+            assert [x.id for x in listed] == [s.id]
+            # ...but the build path (enabled_only) excludes it
+            build_view, _ = await list_sources(conn, name, limit=10, enabled_only=True)
+            assert build_view == []
+
+            re_enabled = await update_source(conn, name, s.id, enabled=True)
+            assert re_enabled.enabled is True
+            build_view2, _ = await list_sources(conn, name, limit=10, enabled_only=True)
+            assert [x.id for x in build_view2] == [s.id]
             await trans.rollback()
     finally:
         await engine.dispose()

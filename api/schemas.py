@@ -68,6 +68,17 @@ class SourceCreate(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class SourceUpdate(BaseModel):
+    """SRC2 (DR-013): soft-disable only. ``extra="forbid"`` mirrors the
+    contract's ``additionalProperties:false`` — ``uri``/``kind`` are immutable,
+    so a client cannot even express a uri rewrite (corpus swap = disable old +
+    register new)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
 class DocumentMetadataContextInput(BaseModel):
     """The contract DocumentMetadataContext on upload (DR-010): a CLOSED core
     (``title``/``document_type``) plus an OPEN ``attributes`` bag whose keys the
@@ -294,6 +305,7 @@ def source_dto(s: Source) -> dict[str, Any]:
         "id": s.id,
         "kind": s.kind,
         "uri": s.uri,
+        "enabled": s.enabled,
         "metadata": s.metadata,
         "added_at": s.added_at,
     }

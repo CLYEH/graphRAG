@@ -78,11 +78,17 @@ class OntologyRequiredError(ValueError):
 
 
 async def _load_sources(conn: AsyncConnection, project: str) -> list[Source]:
-    """Every registered source for the project (pages the keyset list)."""
+    """Every ENABLED registered source for the project (pages the keyset list).
+
+    SRC2: a soft-disabled source is excluded from the build — corpus swap =
+    disable old + register new, and the build ingests only what is currently
+    enabled. Historical builds are build_id-scoped projections, untouched."""
     out: list[Source] = []
     after: tuple[datetime, uuid.UUID] | None = None
     while True:
-        page, after = await list_sources(conn, project, limit=_SOURCE_PAGE, after=after)
+        page, after = await list_sources(
+            conn, project, limit=_SOURCE_PAGE, after=after, enabled_only=True
+        )
         out.extend(page)
         if after is None:
             return out

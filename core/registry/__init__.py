@@ -36,6 +36,7 @@ from core.registry.store import (
     ProjectHasBuildsError,
     ProjectNotFoundError,
     Source,
+    SourceNotFoundError,
     add_source,
     create_project,
     delete_project,
@@ -43,6 +44,7 @@ from core.registry.store import (
     list_projects,
     list_sources,
     update_project,
+    update_source,
     upsert_managed_source,
 )
 
@@ -57,6 +59,7 @@ __all__ = [
     "ProjectHasBuildsError",
     "ProjectNotFoundError",
     "Source",
+    "SourceNotFoundError",
     "add_source",
     "capture_config_snapshot",
     "count_active_jobs",
@@ -80,5 +83,6 @@ __all__ = [
     "set_eval_inputs_fingerprint",
     "set_progress",
     "update_project",
+    "update_source",
     "upsert_managed_source",
 ]
