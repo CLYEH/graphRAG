@@ -288,27 +288,40 @@ async def decide_ontology_proposal(
         raise InvalidProposalTransitionError(proposal_id, row.status, verb)
 
     if verb == "accept":
+        # Lazy import: core.builds.config imports THIS module (the cycle is only
+        # at module scope). The gate is the BUILD's OWN loader, not a
+        # re-implemented predicate that could drift (Codex #97 R1).
+        from core.builds.config import BuildConfigError, ensure_ontology_buildable
+
         config: dict[str, Any] = dict(locked.config) if isinstance(locked.config, dict) else {}
-        ontology = config.get("ontology")
-        block = dict(ontology) if isinstance(ontology, dict) else {}
+
+        def _require_buildable(cfg: dict[str, Any]) -> None:
+            try:
+                ensure_ontology_buildable(cfg)
+            except BuildConfigError as exc:
+                raise OntologyConfigIncompleteError(project, str(exc)) from exc
+
+        # accept ADDS a type to an EXISTING valid ontology. Validate the CURRENT
+        # config FIRST — before any read/normalization — so an incomplete or
+        # malformed block is REFUSED, never silently repaired by the append
+        # (Codex #97 R2): reading `block.get(list_key) or []` would turn a
+        # missing list into `[type]` and a string like "Person" into character
+        # labels, adopting a config the build would reject. A config PATCH can
+        # leave that state (it does not validate) while a proposal is pending.
+        _require_buildable(config)
+        # now known-valid: config["ontology"][list_key] is a non-empty list of
+        # strings (a missing/blank list would have failed the gate above), so
+        # this reads the REAL list — never a normalized fabrication.
+        block = dict(config["ontology"])
         list_key = "entity_types" if row.kind == "entity" else "relation_types"
-        types = list(block.get(list_key) or [])
+        types = list(block[list_key])
         if row.type_name not in types:  # dedup — accepting a type twice is a no-op add
             types.append(row.type_name)
         block[list_key] = types
         config["ontology"] = block
-        # accept ADDS to an existing valid ontology; a config PATCH (which does
-        # NOT validate) can remove/malform the block while a proposal is pending,
-        # so the result might be a block the next build rejects — writing it would
-        # 200-then-silently-brick the build. Validate through the BUILD's OWN
-        # loader (not a re-implemented predicate that could drift, Codex #97 R1)
-        # and refuse LOUD. Lazy import: core.builds.config imports THIS module.
-        from core.builds.config import BuildConfigError, ensure_ontology_buildable
-
-        try:
-            ensure_ontology_buildable(config)
-        except BuildConfigError as exc:
-            raise OntologyConfigIncompleteError(project, str(exc)) from exc
+        # the appended type must keep the ontology buildable — guards a blank
+        # type_name the DDL's `type_name <> ''` would still admit.
+        _require_buildable(config)
         await conn.execute(
             projects.update().where(projects.c.name == project).values(config=config)
         )

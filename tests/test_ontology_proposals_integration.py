@@ -261,9 +261,15 @@ async def test_reject_leaves_config_untouched_and_scopes_by_project(migrated: No
     "broken_config",
     [
         {"chunking": {"max_chars": 500}},  # ontology dropped entirely
-        {"ontology": {"entity_types": ["Person"]}},  # relation_types missing
-        # both type lists still valid, but the block is one the build rejects —
-        # the corners a hand-rolled entity/relation-only check would miss (#97 R1)
+        {"ontology": {"entity_types": ["Person"]}},  # the OPPOSITE list missing
+        # the ACCEPTED kind's own list missing/malformed (Codex #97 R2): the
+        # accept used to NORMALIZE these before validating — a missing list
+        # became [Exhibit], a string became character labels + Exhibit — and the
+        # repaired block passed, silently adopting a bad config. Accepting an
+        # ENTITY type here, so entity_types is the accepted kind's list:
+        {"ontology": {"relation_types": ["R"]}},  # entity_types MISSING
+        {"ontology": {"entity_types": "Person", "relation_types": ["R"]}},  # a STRING
+        # both type lists valid, but an unknown key / bad policy (Codex #97 R1)
         {"ontology": {"entity_types": ["P"], "relation_types": ["R"], "junk": 1}},
         {"ontology": {"entity_types": ["P"], "relation_types": ["R"], "proposal_policy": "bogus"}},
     ],
