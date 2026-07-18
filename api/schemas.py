@@ -296,6 +296,39 @@ class HybridQueryRequest(BaseModel):
         return self
 
 
+def build_step_dto(row: Any) -> dict[str, Any]:
+    """The contract BuildStep shape from a ``pipeline_steps`` row (RB1). Required
+    id/step_name/status are NOT NULL; the counts and timestamps are contract-
+    NULLABLE (a step that never ran reports nulls, never fabricated zeros), and
+    ``error`` is a nullable object — all emitted as-is."""
+    return {
+        "id": row.id,
+        "step_name": row.step_name,
+        "status": row.status,
+        "started_at": row.started_at,
+        "finished_at": row.finished_at,
+        "input_count": row.input_count,
+        "output_count": row.output_count,
+        "skipped_count": row.skipped_count,
+        "failed_count": row.failed_count,
+        "error": row.error,
+    }
+
+
+def build_step_item_dto(row: Any) -> dict[str, Any]:
+    """The contract BuildStepItem shape from a ``pipeline_step_items`` row (RB1).
+    Required id/item_kind/item_ref/status are NOT NULL; ``message``/``error`` are
+    contract-nullable, emitted as-is."""
+    return {
+        "id": row.id,
+        "item_kind": row.item_kind,
+        "item_ref": row.item_ref,
+        "status": row.status,
+        "message": row.message,
+        "error": row.error,
+    }
+
+
 def project_dto(p: Project) -> dict[str, Any]:
     """The contract Project shape."""
     return {
