@@ -125,8 +125,8 @@ describe("ReviewQueue", () => {
     renderAt("acme");
 
     fireEvent.click(await screen.findByRole("tab", { name: "關聯" }));
-    // the row is grounded by type; evidence loads lazily behind 查看原文證據
-    expect(await screen.findByText("PRACTICED_BY")).toBeInTheDocument();
+    // the row shows src→type→dst; evidence loads lazily behind 查看原文證據
+    expect(await screen.findByText(/PRACTICED_BY/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "查看原文證據" })).toBeInTheDocument();
   });
 

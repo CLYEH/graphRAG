@@ -198,6 +198,23 @@ function stubWorld() {
             created_by: "llm",
           },
         ]);
+      case "/projects/{project}/entities/{entity_id}":
+        // the relation review resolves src/dst endpoint names from here — the
+        // canonical name is chrome, the uuid/entity_key ride the audit fold
+        return ok({
+          id: E1,
+          project: "acme",
+          build_id: B1,
+          type: "EVENT",
+          canonical_name: "海祭",
+          entity_key: "fpv1:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+          attributes: {},
+          status: "active",
+          review_status: "unreviewed",
+          created_at: "2026-07-01T00:00:00Z",
+          updated_at: "2026-07-01T00:00:00Z",
+          created_by: "llm",
+        });
       case "/projects/{project}/relations":
         // the relation review queue: src/dst uuids + relation_signature (hex) must
         // ride the audit fold; type + confidence + evidenced quote are the chrome
@@ -418,7 +435,7 @@ describe("chrome invariant — no raw ids or store vocabulary outside folds", ()
     stubWorld();
     const { container } = renderPage(<ReviewQueue />, "review");
     fireEvent.click(await screen.findByRole("tab", { name: "關聯" }));
-    await screen.findByText("PRACTICED_BY");
+    await screen.findByText(/PRACTICED_BY/);
     assertChromeClean(container);
   });
 

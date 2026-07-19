@@ -3,53 +3,75 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { RelationReview } from "./RelationReview";
 import { api } from "../api/client";
-import { relation, renderWithProviders } from "../test-utils";
+import { entity, relation, renderWithProviders } from "../test-utils";
+
+import type { Relation } from "../api/queries";
 
 const META = { next_cursor: null, build_id: "b1", request_id: "r", elapsed_ms: 1 };
 
 const idemKeyOf = (call: unknown) =>
   (call as { params: { header: Record<string, string> } }).params.header["Idempotency-Key"];
 
+// Route-aware GET: the relation LIST (no evidence — the endpoint omits it), the
+// relation DETAIL (with evidence), and the src/dst ENTITY details (canonical names,
+// keyed by the id param). `list` has src_entity_id "e-src"/dst "e-dst" by default.
+function stubRelationWorld({
+  list,
+  quote = "頭目率領族人舉行",
+}: {
+  list: Relation[];
+  quote?: string | null;
+}) {
+  return vi.spyOn(api, "GET").mockImplementation(((path: string, opts: unknown) => {
+    if (path === "/projects/{project}/relations")
+      return Promise.resolve({ data: { data: list, meta: META }, error: undefined });
+    if (path === "/projects/{project}/relations/{relation_id}") {
+      const rid = (opts as { params: { path: { relation_id: string } } }).params.path.relation_id;
+      const base = list.find((r) => r.id === rid) ?? list[0];
+      return Promise.resolve({
+        data: {
+          data: {
+            ...base,
+            evidence: quote ? [{ id: "ev-1", evidence_type: "chunk", quote }] : [],
+          },
+          meta: META,
+        },
+        error: undefined,
+      });
+    }
+    if (path === "/projects/{project}/entities/{entity_id}") {
+      const eid = (opts as { params: { path: { entity_id: string } } }).params.path.entity_id;
+      const name = eid.startsWith("e-src") || eid.startsWith("e1") ? "海祭" : "阿美族";
+      return Promise.resolve({
+        data: { data: entity({ id: eid, canonical_name: name }), meta: META },
+        error: undefined,
+      });
+    }
+    return Promise.resolve({ data: { data: [], meta: META }, error: undefined });
+  }) as never);
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
 describe("RelationReview", () => {
-  it("lists needs_review relations on the needs_review facet and lazily loads evidence on demand (the list omits it)", async () => {
-    // the LIST row carries NO evidence (api/schemas.py relation_dto omits it —
-    // detail-only); the detail GET supplies the quote
-    const listRow = relation({ id: "r-a", type: "PRACTICED_BY", evidence: [] });
-    const get = vi.spyOn(api, "GET").mockImplementation(((path: string) =>
-      path === "/projects/{project}/relations/{relation_id}"
-        ? Promise.resolve({
-            data: {
-              data: {
-                ...listRow,
-                evidence: [{ id: "ev-1", evidence_type: "chunk", quote: "頭目率領族人舉行" }],
-              },
-              meta: META,
-            },
-            error: undefined,
-          })
-        : Promise.resolve({ data: { data: [listRow], meta: META }, error: undefined })) as never);
+  it("renders src→type→dst names (resolved from the endpoint entities) and the needs_review facet", async () => {
+    const r = relation({
+      id: "r-a",
+      type: "PRACTICED_BY",
+      src_entity_id: "e-src",
+      dst_entity_id: "e-dst",
+    });
+    const get = stubRelationWorld({ list: [r] });
 
     renderWithProviders(<RelationReview project="acme" />);
 
-    expect(await screen.findByText("PRACTICED_BY")).toBeInTheDocument();
-    // WHY: the list omits evidence, so NOTHING is fetched/shown until the reviewer
-    // expands it — the old inline read would have silently shown "no evidence"
-    expect(screen.queryByText(/頭目率領族人舉行/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "查看原文證據" }));
-    // now the DETAIL endpoint (with evidence) is hit and the quote appears
-    expect(await screen.findByText(/頭目率領族人舉行/)).toBeInTheDocument();
-    expect(get).toHaveBeenCalledWith(
-      "/projects/{project}/relations/{relation_id}",
-      expect.objectContaining({
-        params: expect.objectContaining({ path: { project: "acme", relation_id: "r-a" } }),
-      }),
-    );
-    // and the queue selected on the needs_review lifecycle facet (Health gauge
-    // parity — a review_status facet would drift)
+    // the operator sees WHICH pair — names, not raw uuids (Codex #106 P1b)
+    expect(await screen.findByText(/海祭/)).toBeInTheDocument();
+    expect(screen.getByText(/阿美族/)).toBeInTheDocument();
+    expect(screen.getByText(/PRACTICED_BY/)).toBeInTheDocument();
+    // queue selects on the needs_review lifecycle facet (Health gauge parity)
     expect(get).toHaveBeenCalledWith(
       "/projects/{project}/relations",
       expect.objectContaining({
@@ -60,20 +82,59 @@ describe("RelationReview", () => {
     );
   });
 
+  it("keeps the decision disabled until both endpoint names resolve (must see the pair first)", async () => {
+    const r = relation({ id: "r-a", src_entity_id: "e-src", dst_entity_id: "e-dst" });
+    // the entity-name fetches never resolve → names stay pending
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      path === "/projects/{project}/entities/{entity_id}"
+        ? new Promise(() => {})
+        : Promise.resolve({
+            data: {
+              data: path === "/projects/{project}/relations" ? [r] : r,
+              meta: META,
+            },
+            error: undefined,
+          })) as never);
+
+    renderWithProviders(<RelationReview project="acme" />);
+
+    // both actions locked while the pair is unknown
+    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeDisabled());
+    expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
+  });
+
+  it("lazily loads the evidence quote on demand (the list omits it)", async () => {
+    const r = relation({ id: "r-a", src_entity_id: "e-src", dst_entity_id: "e-dst", evidence: [] });
+    const get = stubRelationWorld({ list: [r], quote: "頭目率領族人舉行" });
+
+    renderWithProviders(<RelationReview project="acme" />);
+    await screen.findByText(/海祭/);
+
+    // nothing evidenced until the reviewer expands it
+    expect(screen.queryByText(/頭目率領族人舉行/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看原文證據" }));
+    expect(await screen.findByText(/頭目率領族人舉行/)).toBeInTheDocument();
+    expect(get).toHaveBeenCalledWith(
+      "/projects/{project}/relations/{relation_id}",
+      expect.objectContaining({
+        params: expect.objectContaining({ path: { project: "acme", relation_id: "r-a" } }),
+      }),
+    );
+  });
+
   it("keeps a relation inline (no confirm) via the approve path with a deterministic idem-key", async () => {
-    const r = relation({ id: "r-a" });
-    vi.spyOn(api, "GET").mockResolvedValue({
-      data: { data: [r], meta: META },
-      error: undefined,
-    } as never);
+    const r = relation({ id: "r-a", src_entity_id: "e-src", dst_entity_id: "e-dst" });
+    stubRelationWorld({ list: [r] });
     const post = vi.spyOn(api, "POST").mockResolvedValue({
       data: { data: { ...r, status: "active", review_status: "approved" }, meta: META },
       error: undefined,
     } as never);
 
     renderWithProviders(<RelationReview project="acme" />);
+    // wait until the pair resolves and the decision unlocks
+    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeEnabled());
 
-    fireEvent.click(await screen.findByRole("button", { name: "保留" }));
+    fireEvent.click(screen.getByRole("button", { name: "保留" }));
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     await waitFor(() =>
       expect(post).toHaveBeenCalledWith(
@@ -87,19 +148,17 @@ describe("RelationReview", () => {
   });
 
   it("guards 排除 (reject) behind a confirm and posts the reject path only on 確定", async () => {
-    const r = relation({ id: "r-a" });
-    vi.spyOn(api, "GET").mockResolvedValue({
-      data: { data: [r], meta: META },
-      error: undefined,
-    } as never);
+    const r = relation({ id: "r-a", src_entity_id: "e-src", dst_entity_id: "e-dst" });
+    stubRelationWorld({ list: [r] });
     const post = vi.spyOn(api, "POST").mockResolvedValue({
       data: { data: { ...r, status: "rejected", review_status: "rejected" }, meta: META },
       error: undefined,
     } as never);
 
     renderWithProviders(<RelationReview project="acme" />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "排除" })).toBeEnabled());
 
-    fireEvent.click(await screen.findByRole("button", { name: "排除" }));
+    fireEvent.click(screen.getByRole("button", { name: "排除" }));
     expect(await screen.findByRole("alertdialog", { name: "確認排除" })).toBeInTheDocument();
     expect(post).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
@@ -119,17 +178,26 @@ describe("RelationReview", () => {
   });
 
   it("locks the whole queue while a decision is in flight (Codex #104 P2)", async () => {
-    const a = relation({ id: "r-a", type: "PRACTICED_BY" });
-    const b = relation({ id: "r-b", type: "LOCATED_IN" });
-    vi.spyOn(api, "GET").mockResolvedValue({
-      data: { data: [a, b], meta: META },
-      error: undefined,
-    } as never);
+    const a = relation({
+      id: "r-a",
+      type: "PRACTICED_BY",
+      src_entity_id: "e-src",
+      dst_entity_id: "e-dst",
+    });
+    const b = relation({
+      id: "r-b",
+      type: "LOCATED_IN",
+      src_entity_id: "e-src",
+      dst_entity_id: "e-dst",
+    });
+    stubRelationWorld({ list: [a, b] });
     vi.spyOn(api, "POST").mockReturnValue(new Promise(() => {}) as never);
 
     renderWithProviders(<RelationReview project="acme" />);
     const keeps = () => screen.getAllByRole("button", { name: "保留" });
-    await waitFor(() => expect(keeps()).toHaveLength(2));
+    // names resolve → both rows unlock
+    await waitFor(() => expect(keeps()[0]).toBeEnabled());
+    await waitFor(() => expect(keeps()[1]).toBeEnabled());
 
     fireEvent.click(keeps()[0]);
     await waitFor(() => expect(keeps()[0]).toBeDisabled());
