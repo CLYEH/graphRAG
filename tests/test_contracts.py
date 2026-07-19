@@ -1003,6 +1003,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     additionalProperties explicitly — enumerated from the artifact itself, per
     the #17 universal-test rule, so a new endpoint cannot dodge the sweep."""
     silent: set[str] = set()
+    dynamic: set[str] = set()
     # EVERY schema-bearing JSON Schema 2020-12 keyword — enumerated as a table
     # so the sweep is grammar-driven, not example-driven (Codex #112 R3 named
     # prefixItems/dependentSchemas/if-then-else/patternProperties; listing only
@@ -1027,6 +1028,12 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     def walk(node: Any, label: str, seen: frozenset[str]) -> None:
         if not isinstance(node, dict):
             return
+        if "$dynamicRef" in node or "$dynamicAnchor" in node:
+            # real dynamic-scope resolution is out of this lint's league —
+            # fail LOUD instead of silently skipping, so $dynamicRef can never
+            # become a bypass: using it in a request body requires extending
+            # this walker first (Codex #112 R7)
+            dynamic.add(label)
         if "$ref" in node:
             ref = node["$ref"]
             if ref not in seen:
@@ -1083,31 +1090,68 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             if isinstance(sub, dict):
                 walk(sub, f"{label}[]" if kw == "items" else f"{label}.{kw}", seen)
 
+    def chase(node: Any) -> Any:
+        # guarded $ref chain following: a cycle yields {} instead of a hang
+        chain: set[str] = set()
+        while isinstance(node, dict) and "$ref" in node:
+            ref = node["$ref"]
+            if ref in chain:
+                return {}
+            chain.add(ref)
+            node = _pointer(spec, ref)
+        return node
+
     bodies = 0
-    for path, ops in spec["paths"].items():
+    visited_refs: set[str] = set()
+    # worklist of (path label, path-item map): top-level paths AND webhooks,
+    # plus every operation's callbacks (whose path items nest recursively) —
+    # a request body outside spec["paths"] must not dodge the sweep (#112 R7)
+    pending = [(path, ops) for path, ops in spec["paths"].items()]
+    pending += [(f"webhooks[{name}]", item) for name, item in spec.get("webhooks", {}).items()]
+    while pending:
+        path, ops = pending.pop()
         # a Path Item may itself be a $ref (3.1); overlap behavior between
-        # referenced and inline fields is spec-undefined, so scan both op
-        # sets IN FULL — even an HTTP method declared on both sides is
-        # scanned twice rather than letting either shadow the other
-        op_sets = [ops]
+        # referenced and inline fields is spec-undefined, so scan BOTH — the
+        # inline fields now, the referenced item re-entering the worklist
+        # (visited_refs bounds ref chains and cycles instead of hanging)
         if "$ref" in ops:
-            op_sets = [_pointer(spec, ops["$ref"]), {k: v for k, v in ops.items() if k != "$ref"}]
-        for op_map in op_sets:
-            for method, op in op_map.items():
-                if not isinstance(op, dict) or "requestBody" not in op:
-                    continue
-                # a reusable components/requestBodies entry may itself be a
-                # Reference Object, so follow the CHAIN of full pointers
-                # (Codex #112 R2/R5); a dangling ref raises fail-loud and
-                # test_openapi_document_is_valid rejects it independently
-                rb = _deref(spec, op["requestBody"])
-                for ctype, media in rb.get("content", {}).items():
-                    schema = media.get("schema")
-                    if schema is not None:
-                        bodies += 1
-                        walk(schema, f"{method.upper()} {path} [{ctype}]", frozenset())
+            ref = ops["$ref"]
+            ops = {k: v for k, v in ops.items() if k != "$ref"}
+            if ref not in visited_refs:
+                visited_refs.add(ref)
+                pending.append((path, _pointer(spec, ref)))
+        for method, op in ops.items():
+            if not isinstance(op, dict):
+                continue
+            for cb_name, cb in op.get("callbacks", {}).items():
+                if isinstance(cb, dict) and "$ref" in cb:
+                    # persistent guard: a $ref'd callback expands once — a
+                    # self-referential callback graph must drain, not hang
+                    if cb["$ref"] in visited_refs:
+                        continue
+                    visited_refs.add(cb["$ref"])
+                cb = chase(cb)  # Callback Object may be a (chained) $ref
+                pending += [
+                    (f"{path}.callbacks[{cb_name}][{expr}]", item) for expr, item in cb.items()
+                ]
+            if "requestBody" not in op:
+                continue
+            # a reusable components/requestBodies entry may itself be a
+            # Reference Object, so follow the CHAIN of full pointers
+            # (Codex #112 R2/R5); a dangling ref raises fail-loud and
+            # test_openapi_document_is_valid rejects it independently
+            rb = chase(op["requestBody"])
+            for ctype, media in rb.get("content", {}).items():
+                schema = media.get("schema")
+                if schema is not None:
+                    bodies += 1
+                    walk(schema, f"{method.upper()} {path} [{ctype}]", frozenset())
 
     assert bodies >= 23  # the walk must actually cover the surface, not vacuously pass
+    assert not dynamic, (
+        f"$dynamicRef/$dynamicAnchor in request-body schema(s): {sorted(dynamic)} — this "
+        "ratchet cannot resolve dynamic scopes; extend the walker before using them"
+    )
     new_silent = silent - _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS
     closed_legacy = _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS - silent
     assert not new_silent, (
