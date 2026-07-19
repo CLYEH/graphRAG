@@ -1194,7 +1194,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     )
     unknown: set[str] = set()
 
-    def effective(node: Any) -> Any:
+    def effective(node: Any, chain: frozenset[str] = frozenset()) -> Any:
         # a schema's EFFECTIVE constraint content: drop annotation-only
         # keywords, x-*, and constraints that cannot bind objects (they
         # validate nothing about object members — `{description: payload}` and
@@ -1202,7 +1202,6 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
         # follow a $ref left BARE by the drop. A $ref with OBJECT-relevant
         # siblings stops here — they may close what the target leaves open
         # (R10) and walk() judges them.
-        chain: set[str] = set()
         while isinstance(node, dict):
             node = {
                 k: v
@@ -1211,12 +1210,28 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 and k not in non_object_constraints
                 and not k.startswith("x-")
             }
+            if "allOf" in node:
+                # X ∧ true = X: drop unconstrained members; an allOf whose
+                # EVERY member is unconstrained (`allOf: [true]`/`[{}]`)
+                # constrains nothing and must not shield the node (#112 R15).
+                # The ref-cycle chain THREADS through the recursion, so a
+                # cyclic allOf resolves to {} instead of RecursionError.
+                members = [
+                    m
+                    for m in node["allOf"]
+                    if not (m is True or (isinstance(m, dict) and effective(m, chain) == {}))
+                ]
+                if members:
+                    node["allOf"] = members
+                else:
+                    node = {k: v for k, v in node.items() if k != "allOf"}
+                    continue  # re-normalize: the node may now be bare/empty
             if set(node) != {"$ref"}:
                 return node
             ref = node["$ref"]
             if ref in chain:
                 return {}
-            chain.add(ref)
+            chain |= {ref}
             node = _pointer(spec, ref)
         return node
 
