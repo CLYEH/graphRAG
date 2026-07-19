@@ -26,7 +26,6 @@ describe("EntityReview", () => {
     renderWithProviders(<EntityReview project="acme" />);
 
     expect(await screen.findByText("海祭")).toBeInTheDocument();
-    // reversible actions in operator words (UXA3), not raw approve/reject
     expect(screen.getByRole("button", { name: "保留" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "排除" })).toBeInTheDocument();
     // WHY: the queue MUST select on the LIFECYCLE status `needs_review` — the same
@@ -42,7 +41,7 @@ describe("EntityReview", () => {
     );
   });
 
-  it("keeps an entity via the approve path immediately, with no confirm step (decisions are reversible)", async () => {
+  it("keeps an entity inline (no confirm) via the approve path with a deterministic idem-key", async () => {
     const e = entity({ id: "e-a", canonical_name: "海祭" });
     vi.spyOn(api, "GET").mockResolvedValue({
       data: { data: [e], meta: META },
@@ -55,9 +54,7 @@ describe("EntityReview", () => {
 
     renderWithProviders(<EntityReview project="acme" />);
 
-    // 保留 posts the APPROVE verb path with NO alertdialog — a misclick is
-    // recoverable by re-deciding, so the terminal confirm (proposal/merge) is
-    // deliberately absent here
+    // 保留 (approve) is non-destructive → fires inline, no alertdialog
     fireEvent.click(await screen.findByRole("button", { name: "保留" }));
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     await waitFor(() =>
@@ -68,32 +65,45 @@ describe("EntityReview", () => {
         }),
       ),
     );
-    // a deterministic `${id}:approve` would replay THIS approve on a legitimate
-    // later re-decision — the key must be a fresh random one
-    expect(idemKeyOf(post.mock.calls[0][1])).not.toBe("e-a:approve");
+    // deterministic key: a lost-response retry replays the stored 200 instead of
+    // appending a SECOND ledger decision for one logical action (Codex #105)
+    expect(idemKeyOf(post.mock.calls[0][1])).toBe("e-a:approve");
   });
 
-  it("mints a FRESH random idem-key per decision so a reversible re-decision cannot replay the last", async () => {
-    const e = entity({ id: "e-a" });
+  it("guards 排除 (reject) behind a confirm and posts the reject path only on 確定", async () => {
+    const e = entity({ id: "e-a", canonical_name: "海祭" });
     vi.spyOn(api, "GET").mockResolvedValue({
       data: { data: [e], meta: META },
       error: undefined,
     } as never);
     const post = vi.spyOn(api, "POST").mockResolvedValue({
-      data: { data: { ...e, status: "active" }, meta: META },
+      data: { data: { ...e, status: "rejected", review_status: "rejected" }, meta: META },
       error: undefined,
     } as never);
 
     renderWithProviders(<EntityReview project="acme" />);
-    // the mocked queue always returns the row, so it stays after invalidation →
-    // a second decision is possible (the reversibility this key strategy exists for)
-    fireEvent.click(await screen.findByRole("button", { name: "保留" }));
-    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "保留" }));
-    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
 
-    expect(idemKeyOf(post.mock.calls[0][1])).not.toBe(idemKeyOf(post.mock.calls[1][1]));
+    // 排除 removes the entity from the active graph with no in-Console undo yet →
+    // the first click only ARMS a confirm; nothing posts
+    fireEvent.click(await screen.findByRole("button", { name: "排除" }));
+    expect(await screen.findByRole("alertdialog", { name: "確認排除" })).toBeInTheDocument();
+    expect(post).not.toHaveBeenCalled();
+    // 取消 backs out, still nothing posted
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(post).not.toHaveBeenCalled();
+
+    // re-arm and 確定排除 → the reject path with its deterministic key
+    fireEvent.click(await screen.findByRole("button", { name: "排除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "確定排除" }));
+    await waitFor(() =>
+      expect(post).toHaveBeenCalledWith(
+        "/projects/{project}/entities/{entity_id}/reject",
+        expect.objectContaining({
+          params: expect.objectContaining({ path: { project: "acme", entity_id: "e-a" } }),
+        }),
+      ),
+    );
+    expect(idemKeyOf(post.mock.calls[0][1])).toBe("e-a:reject");
   });
 
   it("locks the whole queue while a decision is in flight (single-observer concurrency, Codex #104 P2)", async () => {
@@ -110,8 +120,8 @@ describe("EntityReview", () => {
     const keeps = () => screen.getAllByRole("button", { name: "保留" });
     await waitFor(() => expect(keeps()).toHaveLength(2));
 
-    // deciding row A locks row B too — a second concurrent mutate() on the shared
-    // useMutation observer would strand the first's lifecycle
+    // 保留 fires inline; deciding row A locks row B too — a second concurrent
+    // mutate() on the shared useMutation observer would strand the first's lifecycle
     fireEvent.click(keeps()[0]);
     await waitFor(() => expect(keeps()[0]).toBeDisabled());
     expect(keeps()[1]).toBeDisabled();

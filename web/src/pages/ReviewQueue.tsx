@@ -104,7 +104,7 @@ export function ReviewQueue() {
           <>
             <p className="review__intro">
               系統不確定這些<strong>知識點</strong>是否正確,先擱著等你確認。
-              對的就保留,錯的就排除;決定之後仍可再改。
+              對的就保留;錯的就排除——排除會把它從上線的知識庫移除,目前無法從介面復原,請確認後再排除。
             </p>
             <EntityReview project={project} />
           </>

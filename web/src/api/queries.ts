@@ -516,16 +516,18 @@ export function useEntityReviewQueue(project: string | undefined) {
 export type ReviewTargetKind = "entity" | "relation";
 export type ReviewTargetVerb = "approve" | "reject";
 
-// Records a curator decision on an entity or relation (DESIGN §17). UNLIKE the
-// merge/proposal decisions, these are REVERSIBLE: review.py appends to the ledger
-// and latest-manual-wins resolves (§27.3), so a rejected row can be re-approved.
-// That reversibility is exactly why the Idempotency-Key is a per-attempt RANDOM
-// key (minted by the caller per click — the activate/trigger discipline), NOT a
-// deterministic `${id}:${verb}`: a deterministic key would replay an EARLIER
-// decision's stored response on a legitimate LATER re-decision. Verb+kind ride the
-// URL (four frozen paths), so switch to keep each a codegen literal. onSuccess
-// invalidates the matching queue, Health (the needs_review gauge moves), and the
-// target's detail cache (an open drawer reflects the new status).
+// Records a curator decision on an entity or relation (DESIGN §17). review.py
+// appends to the ledger and latest-manual-wins resolves (§27.3). The
+// Idempotency-Key is DETERMINISTIC per (target, verb) — the merge-decide
+// discipline — so a lost-response retry replays the stored 200 instead of
+// double-recording a second ledger entry for one logical decision (Codex #105).
+// The review queue only surfaces `needs_review` rows and a decision removes the
+// row, so each (target, verb) is decided at most once from the queue; a future
+// decided/audit view that offers a DELIBERATE re-decision must mint a fresh key.
+// Verb+kind ride the URL (four frozen paths), so switch to keep each a codegen
+// literal. onSuccess invalidates the matching queue, Health (the needs_review
+// gauge moves), and the target's detail cache (an open drawer reflects the new
+// status).
 export function useDecideReviewTarget(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
@@ -534,15 +536,13 @@ export function useDecideReviewTarget(project: string) {
       targetId,
       verb,
       reason,
-      idempotencyKey,
     }: {
       kind: ReviewTargetKind;
       targetId: string;
       verb: ReviewTargetVerb;
       reason: string | null;
-      idempotencyKey: string;
     }) => {
-      const header = { "Idempotency-Key": idempotencyKey };
+      const header = { "Idempotency-Key": `${targetId}:${verb}` };
       const body = { reason };
       const res =
         kind === "entity"
