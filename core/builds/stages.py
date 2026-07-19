@@ -39,7 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.builds.config import BuildConfig
 from core.builds.orchestrator import StageFn, StageResult, Stages
-from core.builds.retry import clone_graph_artifacts, relations_entangle_failed_docs
+from core.builds.retry import clone_graph_artifacts, graph_entangles_failed_docs
 from core.builds.sources import resolve_source
 from core.clean.chunking import clean_document
 from core.graph.documents import extract_documents
@@ -224,13 +224,14 @@ async def _plan_retry_skip(
     parent_config = await build_config_snapshot(conn, parent)
     if parent_config is None or parent_config != await build_config_snapshot(conn, build_id):
         return None, None
-    # A relation ROW is first-write-wins: if a FAILED doc first-wrote one (from a
-    # chunk that ran before its failure) and a successful doc also evidences it, the
-    # cloned row keeps the failed doc's PARTIAL scalars and preload blocks the
-    # re-extraction from fixing them — diverging from a full rebuild. We can't tell
-    # which doc first-wrote a relation, so any relation spanning a failed and a
-    # non-failed doc forces a full re-derive (Codex #103 R3).
-    if await relations_entangle_failed_docs(conn, parent, failed_docs):
+    # Entity AND relation ROWS are first-write-wins: if a FAILED doc first-wrote one
+    # (from a chunk that ran before its failure) and a successful doc also touches its
+    # key, the cloned row keeps the failed doc's PARTIAL scalars (e.g. a mis-cased
+    # canonical_name) and preload blocks the re-extraction from fixing them. We can't
+    # tell which doc first-wrote a row, so any ENTITY mentioned by both a failed and a
+    # non-failed doc forces a full re-derive — which subsumes the relation case, since
+    # a chunk-evidence relation's endpoints are always so mentioned (Codex #103 R3+R4).
+    if await graph_entangles_failed_docs(conn, parent, failed_docs):
         return None, None
     counts = await clone_graph_artifacts(conn, project, parent, build_id, failed_docs)
     return failed_docs, {

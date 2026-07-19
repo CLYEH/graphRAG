@@ -24,7 +24,7 @@ from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from core.builds.retry import clone_graph_artifacts, relations_entangle_failed_docs
+from core.builds.retry import clone_graph_artifacts, graph_entangles_failed_docs
 from core.config import get_settings
 from core.stores import tables
 from tests.conftest import ensure_project
@@ -313,42 +313,36 @@ async def test_empty_failed_set_clones_the_whole_text_graph(project: str) -> Non
         await engine.dispose()
 
 
-async def test_relations_entangle_failed_docs_flags_a_relation_from_both(project: str) -> None:
-    """RB1-retry-skip round-3 guard: a relation with chunk evidence from BOTH a
+async def test_graph_entangles_failed_docs_flags_an_entity_mentioned_by_both(project: str) -> None:
+    """RB1-retry-skip round-3/4 guard: an ENTITY with a text mention from BOTH a
     failed doc AND a non-failed doc may carry the FAILED doc's first-write scalars
-    (relation rows are first-write-wins), which the selective clone retains and
-    preload freezes — so the caller must full-re-derive. Discriminating: True only
-    when the relation genuinely spans the failed set; a relation evidenced solely by
-    non-failed docs is reusable (False), and entanglement is relative to WHICH docs
-    are failed (False when none of the relation's docs are in the failed set)."""
+    (entity/relation rows are first-write-wins), which the selective clone retains
+    and preload freezes — so the caller must full-re-derive. Checking entities
+    subsumes the relation case (a chunk-evidence relation's endpoints are always
+    mentioned by the same docs). Discriminating: True only when the entity genuinely
+    spans the failed set; an entity mentioned solely by non-failed docs is reusable
+    (False), and entanglement is relative to WHICH docs are failed."""
     engine = _engine()
     try:
         async with engine.connect() as conn:
             await ensure_project(conn, project)
             entangled = await _make_build(conn, project)
             clean = await _make_build(conn, project)
-            # entangled: one relation evidenced by hash-A (success) AND hash-B (failed)
-            x = await _entity(conn, project, entangled, "fpv2:x")
-            y = await _entity(conn, project, entangled, "fpv2:y")
-            r = await _relation(conn, project, entangled, x, y, "sig-shared")
-            await _evidence(conn, r, entangled, "hash-A", "eh-a")
-            await _evidence(conn, r, entangled, "hash-B", "eh-b")
-            # clean: a relation evidenced ONLY by the successful doc hash-A
-            p = await _entity(conn, project, clean, "fpv2:p")
-            q = await _entity(conn, project, clean, "fpv2:q")
-            rc = await _relation(conn, project, clean, p, q, "sig-clean")
-            await _evidence(conn, rc, clean, "hash-A", "eh-c")
+            # entangled: an entity mentioned by hash-A (success) AND hash-B (failed)
+            shared = await _entity(conn, project, entangled, "fpv2:shared")
+            await _mention(conn, shared, "hash-A")
+            await _mention(conn, shared, "hash-B")
+            # clean: an entity mentioned ONLY by the successful doc hash-A
+            solo = await _entity(conn, project, clean, "fpv2:solo")
+            await _mention(conn, solo, "hash-A")
             await conn.commit()
 
+            assert await graph_entangles_failed_docs(conn, entangled, frozenset({"hash-B"})) is True
+            # only success mention → reusable
+            assert await graph_entangles_failed_docs(conn, clean, frozenset({"hash-B"})) is False
+            # entanglement is relative to the failed set: neither of shared's docs is failed
             assert (
-                await relations_entangle_failed_docs(conn, entangled, frozenset({"hash-B"})) is True
-            )
-            # only success evidence → reusable
-            assert await relations_entangle_failed_docs(conn, clean, frozenset({"hash-B"})) is False
-            # entanglement is relative to the failed set: neither of r's docs is failed
-            assert (
-                await relations_entangle_failed_docs(conn, entangled, frozenset({"hash-Z"}))
-                is False
+                await graph_entangles_failed_docs(conn, entangled, frozenset({"hash-Z"})) is False
             )
             await conn.rollback()
     finally:
