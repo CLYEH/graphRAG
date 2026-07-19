@@ -1044,6 +1044,12 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             # become a bypass: using it in a request body requires extending
             # this walker first (Codex #112 R7)
             dynamic.add(label)
+        for k in node:
+            # closure over the round game (#112 R14): any keyword this walker
+            # does not understand fails LOUD — extend the walker, never let a
+            # novel construct pass unjudged
+            if k not in known_keywords and not k.startswith("x-") and not k.startswith("$dynamic"):
+                unknown.add(f"{label}::{k}")
         if "$ref" in node:
             ref = node["$ref"]
             if ref not in seen:
@@ -1094,6 +1100,16 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 walk(sub, sub_label, seen)
         for kw in list_keywords:
             for i, sub in enumerate(node.get(kw) or []):
+                # an UNCONSTRAINED oneOf/anyOf branch (true / {} / annotation-
+                # only) lets arbitrary objects through the whole combinator
+                # (true ∨ X = true — Codex #112 R14); allOf composes by ∧, so
+                # a true branch there is harmless and prefixItems positions
+                # are array slots, not request-body objects
+                if kw in ("oneOf", "anyOf") and (
+                    sub is True or (isinstance(sub, dict) and effective(sub) == {})
+                ):
+                    silent.add(f"{label}.{kw}[{i}]")
+                    continue
                 walk(sub, f"{label}.{kw}[{i}]", seen)
         for kw in single_keywords:
             sub = node.get(kw)
@@ -1126,17 +1142,74 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             "xml",
         }
     )
+    # constraints that CANNOT exclude or constrain an OBJECT value (they only
+    # bind strings/numbers/arrays), so a $ref sibling from this set does not
+    # resolve the open-object question (Codex #112 R14: `$ref → {} +
+    # minLength: 1` still admits arbitrary objects)
+    non_object_constraints = frozenset(
+        {
+            "minLength",
+            "maxLength",
+            "pattern",
+            "format",
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+            "minItems",
+            "maxItems",
+            "uniqueItems",
+            "minContains",
+            "maxContains",
+            "contentMediaType",
+            "contentEncoding",
+        }
+    )
+    # every keyword the walker understands; anything else fails LOUD (below)
+    # instead of silently passing — after #112's long round series the closure
+    # is structural: an unknown construct requires extending the walker first
+    known_keywords = (
+        annotations
+        | non_object_constraints
+        | frozenset(map_keywords)
+        | frozenset(list_keywords)
+        | frozenset(single_keywords)
+        | frozenset(
+            {
+                "$ref",
+                "$id",
+                "$schema",
+                "$anchor",
+                "type",
+                "enum",
+                "const",
+                "required",
+                "dependentRequired",
+                "minProperties",
+                "maxProperties",
+                "discriminator",
+            }
+        )
+    )
+    unknown: set[str] = set()
 
     def effective(node: Any) -> Any:
         # a schema's EFFECTIVE constraint content: drop annotation-only
-        # keywords and x-* (they validate nothing — `{description: payload}`
-        # accepts anything, Codex #112 R13), then follow a $ref left BARE by
-        # the drop. A $ref with VALIDATING siblings stops here — the siblings
-        # may close what the target leaves open (R10) and walk() judges them.
+        # keywords, x-*, and constraints that cannot bind objects (they
+        # validate nothing about object members — `{description: payload}` and
+        # `$ref + minLength` both admit arbitrary objects, R13/R14), then
+        # follow a $ref left BARE by the drop. A $ref with OBJECT-relevant
+        # siblings stops here — they may close what the target leaves open
+        # (R10) and walk() judges them.
         chain: set[str] = set()
         while isinstance(node, dict):
             node = {
-                k: v for k, v in node.items() if k not in annotations and not k.startswith("x-")
+                k: v
+                for k, v in node.items()
+                if k not in annotations
+                and k not in non_object_constraints
+                and not k.startswith("x-")
             }
             if set(node) != {"$ref"}:
                 return node
@@ -1258,6 +1331,10 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     assert not dynamic, (
         f"$dynamicRef/$dynamicAnchor in request-body schema(s): {sorted(dynamic)} — this "
         "ratchet cannot resolve dynamic scopes; extend the walker before using them"
+    )
+    assert not unknown, (
+        f"keyword(s) unknown to this ratchet in request-body schema(s): {sorted(unknown)} — "
+        "extend the walker's known_keywords (and its handling) before using them"
     )
     new_silent = silent - _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS
     closed_legacy = _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS - silent
