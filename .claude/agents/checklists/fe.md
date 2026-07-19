@@ -30,8 +30,9 @@ Catalog classes to read for FE diffs (each has 何時比對 + the full rule):
 
 FE-specific operational rules:
 - **UI-visible string renames sweep `web/e2e/*.spec.ts`** — Playwright e2e is
-  OUTSIDE check-all/CI (#104; until H18 lands), so a stale spec string is
-  invisible to every mechanical gate. Grep the old string across `web/`
+  outside the local check-all/push gates (#104); CI runs it only as the
+  non-required `e2e` job on web-touching PRs (H18), so a stale spec string
+  still passes every required gate. Grep the old string across `web/`
   INCLUDING e2e specs.
 - **UI-flow tasks require the Playwright e2e tier** (LOOP step 4) and tests
   that encode why; component tests mock at the API-client seam (`api.GET`),

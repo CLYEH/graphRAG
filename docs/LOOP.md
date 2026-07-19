@@ -229,7 +229,7 @@ full lane: task branch → PR → CI + Codex `+1`.
 | coverage | fail-under 85 | `poe test-cov` | ✅ / CI |
 | integration | real stores via docker | py: `@pytest.mark.integration` (auto-skips if down) | ❌ `check-full` / CI |
 | eval | retrieval-quality golden set | py: `@pytest.mark.eval` | ❌ on demand |
-| e2e | Console flows (Playwright) | `web/e2e/*.spec.ts` | ❌ `npm run test:e2e` |
+| e2e | Console flows (Playwright) | `web/e2e/*.spec.ts` | ❌ `npm run test:e2e` · CI `e2e` job (non-required, web-touching PRs — H18) |
 
 Every task lands with the tests for its tier. Keep the fast loop fast — don't put
 service-dependent or browser tests in `check-all`; use the markers.
