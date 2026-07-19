@@ -336,8 +336,13 @@ _RETRY_ONTOLOGY_CONFIG = {
     "chunking": {"max_chars": 1200, "overlap": 200},
 }
 
+# doc B SHARES the entity "Alice" with doc A (the successful one) — so when the
+# retry re-extracts B, its "Alice" must CONVERGE on the entity cloned from A (by
+# the frozen entity_key), gaining a second mention, exactly as a full rebuild
+# would. A cloned entity re-mentioned across the success/failure boundary is the
+# crux the oracle must exercise (Codex gate-2 nit).
 _DOC_A = "Alice knows Bob"
-_DOC_B = "Carol knows Dave"
+_DOC_B = "Alice knows Carol"
 
 
 def _extraction(a_name: str, b_name: str, text: str) -> str:
@@ -490,7 +495,7 @@ async def test_retry_skip_reextracts_only_the_failed_doc_and_equals_a_full_rebui
     project = _proj()
     answers = {
         _DOC_A: _extraction("Alice", "Bob", _DOC_A),
-        _DOC_B: _extraction("Carol", "Dave", _DOC_B),
+        _DOC_B: _extraction("Alice", "Carol", _DOC_B),  # shares "Alice" with doc A
     }
     try:
         async with engine.connect() as conn, conn.begin():
@@ -563,8 +568,18 @@ async def test_retry_skip_reextracts_only_the_failed_doc_and_equals_a_full_rebui
         child_fp = await _graph_fingerprint(engine, child)
         fresh_fp = await _graph_fingerprint(engine, fresh)
         assert child_fp == fresh_fp
-        # and it is non-trivial: both docs' entities/relations are present
-        assert child_fp[0] and len(child_fp[1]) == 2  # 2 KNOWS relations
+        # non-trivial: 3 entities (Alice/Bob/Carol), 2 KNOWS relations
+        assert len(child_fp[0]) == 3 and len(child_fp[1]) == 2
+        # the CRUX: the shared entity Alice was CLONED from doc A and then
+        # RE-MENTIONED when doc B re-extracted — converging on the cloned row by
+        # its frozen entity_key rather than minting a twin. So exactly one entity
+        # carries BOTH docs' mention refs, as a full rebuild would (gate-2 nit).
+        refs_by_key: dict[str, set[str]] = {}
+        for key, ref in child_fp[3]:
+            refs_by_key.setdefault(key, set()).add(ref)
+        assert [refs for refs in refs_by_key.values() if len(refs) == 2] == [
+            {"chunk:hash-a:0", "chunk:hash-b:0"}
+        ]
     finally:
         await _cleanup(engine, client, session, project)
         await engine.dispose()

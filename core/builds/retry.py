@@ -336,6 +336,10 @@ async def clone_graph_artifacts(
     # 4) relation_evidence (chunk only): remap parent relation → child relation by
     #    relation_signature. chunk_id is copied verbatim (dangling by design — not
     #    an FK; offsets are document-absolute so the citation survives re-chunking).
+    #    This is the ONE column that intentionally diverges from a full rebuild: a
+    #    cloned row keeps the PARENT's chunk_id (which won't resolve under the child,
+    #    whose re-chunk minted fresh ids), exactly like a pruned chunk's surviving
+    #    evidence (§27.4) — the merged==rebuild oracle deliberately omits chunk_id.
     pr = r.alias("pr")
     cr = r.alias("cr")
     child_ev = re_.alias("child_ev")
