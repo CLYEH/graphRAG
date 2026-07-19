@@ -20,10 +20,12 @@ describe("GovernanceBacklog", () => {
       pending_ontology_proposals: 1,
     });
 
-    // display-only + honest scope: the copy names the LIVE knowledge base (the
-    // counts are §19 active-build scoped — Codex #107 P2, they do NOT describe a
-    // candidate build) and says it does not affect activation (never a fake gate)
-    expect(screen.getByText(/上線中知識庫/)).toBeInTheDocument();
+    // display-only + honest scope: the build-scoped review counts sit under the
+    // 上線中知識庫 group (they describe the ACTIVE build — Codex #107 P2, not a
+    // candidate) while the project-wide proposal pool sits under 全專案 (Codex
+    // #107 R2); the title says it does not affect activation (never a fake gate)
+    expect(screen.getByText("上線中知識庫")).toBeInTheDocument();
+    expect(screen.getByText("全專案")).toBeInTheDocument();
     expect(screen.getByText(/不影響上線/)).toBeInTheDocument();
     // pair each label to ITS row's link so a label↔tab swap fails (a plain
     // some()-over-all-hrefs check would pass an entity↔relation swap)
@@ -34,6 +36,17 @@ describe("GovernanceBacklog", () => {
     expect(linkFor("待審知識點")).toContain("tab=entity");
     expect(linkFor("待審關聯")).toContain("tab=relation");
     expect(linkFor("待審本體提案")).toContain("tab=proposals");
+  });
+
+  it("shows proposals under 全專案 only — no live-KB claim when no active build exists (Codex #107 R2)", () => {
+    // the no-active-build corner: build-scoped counts are all zero (health.py
+    // returns zeros without an active build) but the project-wide proposal pool
+    // is non-empty — the panel must NOT claim a live knowledge base exists
+    renderBacklog({ pending_ontology_proposals: 4 });
+
+    expect(screen.getByText(/待審本體提案/)).toBeInTheDocument();
+    expect(screen.getByText("全專案")).toBeInTheDocument();
+    expect(screen.queryByText("上線中知識庫")).not.toBeInTheDocument();
   });
 
   it("shows the relation-quality counts as info WITHOUT a link (no facet endpoint yet)", () => {
