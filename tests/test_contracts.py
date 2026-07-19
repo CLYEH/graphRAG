@@ -1100,15 +1100,46 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             if isinstance(sub, dict):
                 walk(sub, f"{label}[]" if kw == "items" else f"{label}.{kw}", seen)
 
-    def chase(node: Any, only_bare: bool = False) -> Any:
-        # guarded $ref chain following: a cycle yields {} instead of a hang.
-        # only_bare stops at a $ref carrying SIBLING keywords — a 3.1 Schema
-        # Object's siblings may close what the target leaves open, so schema
-        # classification must not look through them (Codex #112 R10)
+    def chase(node: Any) -> Any:
+        # guarded $ref chain following: a cycle yields {} instead of a hang
         chain: set[str] = set()
-        while (
-            isinstance(node, dict) and "$ref" in node and (not only_bare or set(node) == {"$ref"})
-        ):
+        while isinstance(node, dict) and "$ref" in node:
+            ref = node["$ref"]
+            if ref in chain:
+                return {}
+            chain.add(ref)
+            node = _pointer(spec, ref)
+        return node
+
+    annotations = frozenset(
+        {
+            "title",
+            "description",
+            "default",
+            "deprecated",
+            "readOnly",
+            "writeOnly",
+            "examples",
+            "example",
+            "$comment",
+            "externalDocs",
+            "xml",
+        }
+    )
+
+    def effective(node: Any) -> Any:
+        # a schema's EFFECTIVE constraint content: drop annotation-only
+        # keywords and x-* (they validate nothing — `{description: payload}`
+        # accepts anything, Codex #112 R13), then follow a $ref left BARE by
+        # the drop. A $ref with VALIDATING siblings stops here — the siblings
+        # may close what the target leaves open (R10) and walk() judges them.
+        chain: set[str] = set()
+        while isinstance(node, dict):
+            node = {
+                k: v for k, v in node.items() if k not in annotations and not k.startswith("x-")
+            }
+            if set(node) != {"$ref"}:
+                return node
             ref = node["$ref"]
             if ref in chain:
                 return {}
@@ -1136,7 +1167,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             # through a BARE $ref chain to a true/{} component. A $ref WITH
             # siblings is left to walk(): the siblings may close it (R10).
             # `false` rejects every body — explicit and closed, so it passes.
-            resolved = chase(schema, only_bare=True) if isinstance(schema, dict) else schema
+            resolved = effective(schema) if isinstance(schema, dict) else schema
             if schema is None or resolved is True or resolved == {}:
                 bodies += 1
                 silent.add(body_label)
