@@ -39,6 +39,7 @@ from api.registry_errors import translate_registry_error
 from api.routers._query import reject_unsupported_query, single_filter_value
 from api.schemas import chunk_dto, document_dto, entity_dto, relation_dto, relation_evidence_dto
 from core.mcp.policy import PolicyError, query_policy_from_mapping
+from core.observability.health import LOW_CONFIDENCE_BELOW
 from core.query.graph import subgraph_context
 from core.registry import ProjectNotFoundError, get_project
 from core.stores import tables
@@ -72,6 +73,15 @@ def _not_found(resource: str, resource_id: uuid.UUID) -> HTTPException:
 #: per project) — only blankness is invalid there.
 LIFECYCLE_STATUS: tuple[str, ...] = ("active", "deprecated", "merged", "rejected", "needs_review")
 REVIEW_STATUS: tuple[str, ...] = ("unreviewed", "approved", "rejected")
+
+#: GOV2-facet quality facets on /relations (owner-ratified D4). CLOSED single-value
+#: vocabularies — not free-form numbers — so the predicate lives server-side in ONE
+#: place: `confidence=low` means `confidence < LOW_CONFIDENCE_BELOW` (the SAME §19
+#: constant health.py's low_confidence_relations gauge uses; NULL confidence is NOT
+#: low — SQL three-valued logic, mirroring the gauge) and `evidence=missing` means
+#: no relation_evidence row exists (the gauge's NOT EXISTS). Anything else 400s.
+CONFIDENCE_FACETS: tuple[str, ...] = ("low",)
+EVIDENCE_FACETS: tuple[str, ...] = ("missing",)
 
 
 def _escape_like(value: str) -> str:
@@ -258,11 +268,15 @@ async def list_relations_endpoint(
     cursor: str | None = None,
 ) -> dict[str, Any]:
     reject_unsupported_query(
-        request, "id", allowed_filters=frozenset({"type", "status", "review_status"})
+        request,
+        "id",
+        allowed_filters=frozenset({"type", "status", "review_status", "confidence", "evidence"}),
     )
     rtype = single_filter_value(request, "type")
     status = single_filter_value(request, "status", vocabulary=LIFECYCLE_STATUS)
     review_status = single_filter_value(request, "review_status", vocabulary=REVIEW_STATUS)
+    confidence = single_filter_value(request, "confidence", vocabulary=CONFIDENCE_FACETS)
+    evidence = single_filter_value(request, "evidence", vocabulary=EVIDENCE_FACETS)
     binding = await _bind(conn, project)
     repo = BuildScopedRepo.bound_to(conn, binding)
     rels = tables.relations
@@ -273,6 +287,16 @@ async def list_relations_endpoint(
         where.append(rels.c.status == status)
     if review_status is not None:
         where.append(rels.c.review_status == review_status)
+    if confidence is not None:
+        # `low` — the same strict-< predicate as the §19 gauge (NULL is not low)
+        where.append(rels.c.confidence < LOW_CONFIDENCE_BELOW)
+    if evidence is not None:
+        # `missing` — the gauge's NOT EXISTS over relation_evidence
+        where.append(
+            ~sa.exists(
+                sa.select(sa.literal(1)).where(tables.relation_evidence.c.relation_id == rels.c.id)
+            )
+        )
     if cursor:
         (after_id,) = decode_id_cursor(cursor)
         where.append(rels.c.id < after_id)

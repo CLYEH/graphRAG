@@ -549,3 +549,89 @@ async def test_ss1a_facets_filter_server_side(api: Api) -> None:
     # a facet naming nothing → empty list, never the unfiltered page
     r = await client.get(f"/projects/{project}/entities?filter[type]=Spaceship")
     assert r.status_code == 200 and r.json()["data"] == []
+
+
+async def test_relation_quality_facets_mirror_the_health_gauges(api: Api) -> None:
+    # WHY (GOV2-facet, owner D4): the low-confidence / missing-evidence lists a
+    # curator opens MUST count the same rows as §19's gauges — the facets reuse
+    # the gauges' own predicates (strict < LOW_CONFIDENCE_BELOW; NOT EXISTS over
+    # relation_evidence), and this test pins the parity through BOTH real
+    # endpoints on one seeded corpus. The adversarial rows pin the boundary
+    # semantics a naive re-implementation would get wrong: exactly-at-threshold
+    # confidence is NOT low (strict <, the class-8 boundary), NULL confidence is
+    # NOT low (SQL three-valued logic — not coalesced to 0), and a non-active
+    # row is invisible to the gauge (active scope) yet reachable by the facet
+    # without filter[status] — gauge parity is BY COMPOSITION with
+    # filter[status]=active (the facets stay orthogonal).
+    client, conn = api
+    project = await _make_project(client)
+    async with conn.begin_nested():
+        build = await _make_build(conn, project, "active")
+        a = await _make_entity(conn, project, build, "A")
+        b = await _make_entity(conn, project, build, "B")
+        r_low = await _make_relation(conn, project, build, a, b, confidence=0.49)
+        r_at = await _make_relation(conn, project, build, a, b, confidence=0.5)
+        r_null = await _make_relation(conn, project, build, a, b)  # confidence NULL
+        r_high = await _make_relation(conn, project, build, a, b, confidence=0.9)
+        r_hidden = await _make_relation(
+            conn, project, build, a, b, status="needs_review", confidence=0.1
+        )
+        # evidence present on r_low + r_high; absent on r_at / r_null / r_hidden
+        for rel in (r_low, r_high):
+            await conn.execute(
+                relation_evidence.insert().values(
+                    relation_id=rel,
+                    build_id=build,
+                    evidence_type="chunk",
+                    evidence_ref="doc-h:0",
+                    evidence_hash=f"eh-{uuid.uuid4().hex}",
+                    chunk_id=uuid.uuid4(),
+                    start_offset=0,
+                    end_offset=5,
+                    quote="proof",
+                    source_uri="file:///d.txt",
+                    confidence=0.9,
+                )
+            )
+
+    h = await client.get(f"/projects/{project}/health")
+    assert h.status_code == 200
+    counts = h.json()["data"]["counts"]
+
+    # low-confidence: ONLY the strictly-below-threshold active row
+    r = await client.get(
+        f"/projects/{project}/relations",
+        params={"filter[status]": "active", "filter[confidence]": "low"},
+    )
+    assert r.status_code == 200
+    low_ids = {row["id"] for row in r.json()["data"]}
+    assert low_ids == {str(r_low)}
+    assert len(low_ids) == counts["low_confidence_relations"]
+
+    # missing-evidence: the evidence-less active rows (NULL/at-threshold ones)
+    r = await client.get(
+        f"/projects/{project}/relations",
+        params={"filter[status]": "active", "filter[evidence]": "missing"},
+    )
+    assert r.status_code == 200
+    missing_ids = {row["id"] for row in r.json()["data"]}
+    assert missing_ids == {str(r_at), str(r_null)}
+    assert len(missing_ids) == counts["missing_evidence_relations"]
+
+    # the facets are orthogonal predicates: without filter[status] the
+    # needs_review row appears too (the gauge's active scope is composition,
+    # not baked into the facet)
+    r = await client.get(f"/projects/{project}/relations", params={"filter[confidence]": "low"})
+    assert {row["id"] for row in r.json()["data"]} == {str(r_low), str(r_hidden)}
+
+    # facets compose with each other (intersection): low AND missing = none of
+    # the active rows (the only low active row HAS evidence)
+    r = await client.get(
+        f"/projects/{project}/relations",
+        params={
+            "filter[status]": "active",
+            "filter[confidence]": "low",
+            "filter[evidence]": "missing",
+        },
+    )
+    assert r.json()["data"] == []

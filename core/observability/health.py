@@ -70,6 +70,12 @@ from core.stores import tables
 #: _STORE_ERRORS): unreachable = unmeasured, degraded to a warning.
 _PROBE_ERRORS = (Neo4jError, DriverError, ApiException)
 
+#: §19's low-confidence threshold (🔧). SINGLE source: the gauge below and the
+#: /relations `filter[confidence]=low` facet (api/routers/inspect.py) both read
+#: this constant, so the list a curator opens counts the SAME rows the Health
+#: gauge reported — a second literal would drift silently (GOV2-facet).
+LOW_CONFIDENCE_BELOW: float = 0.5
+
 STATUS_LIGHTS = (
     "Build failed",
     "Index drift",
@@ -142,7 +148,7 @@ async def health_report(
     *,
     vector_provider: Callable[[], Awaitable[AsyncQdrantClient]],
     graph_provider: Callable[[], Awaitable[AsyncDriver]],
-    low_confidence_below: float = 0.5,
+    low_confidence_below: float = LOW_CONFIDENCE_BELOW,
 ) -> HealthReport:
     """Compute §19's report for one project (read-only).
 
