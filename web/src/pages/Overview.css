@@ -62,6 +62,43 @@
   color: var(--text-h);
 }
 
+/* GOV2-fe-3 publish-readiness advisory (display-only) */
+.publishgate {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.publishgate__title {
+  margin: 0 0 8px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.publishgate__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.publishgate__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.publishgate__label {
+  color: var(--text-h);
+  font-size: 14px;
+}
+
+.publishgate__note {
+  color: var(--text);
+  font-size: 12px;
+}
+
 .overview__activate {
   display: flex;
   flex-direction: column;

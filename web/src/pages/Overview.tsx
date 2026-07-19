@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import { PublishGate } from "../components/PublishGate";
 import { useActivateBuild, useBuilds, useHealth, useSources } from "../api/queries";
 import { isPathAddressable, useActiveProject } from "../project/projectRoute";
 import "./Overview.css";
@@ -130,6 +131,10 @@ function OverviewBody({ project }: { project: string }) {
           前往審核
         </Link>
       )}
+
+      {/* GOV2-fe-3: display-only publish-readiness advisory — deep-links the other
+          §19 quality backlogs; never blocks activation (the §14 preflight decides) */}
+      <PublishGate counts={counts} />
 
       {updateCandidate && (
         <div className="overview__card">
