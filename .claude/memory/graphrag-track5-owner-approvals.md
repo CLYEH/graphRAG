@@ -36,9 +36,13 @@ GOV2-fe 因規模拆 fe-1/2/3/4;**GOV2-fe-1**(#105 entity 審核分頁 + 共用
 **Codex 2 輪**(R1 三 finding:隨機鍵重試雙記 ledger→決定性鍵、reversible 在 UI 不可達→排除加
 確認、佇列讀盡→reply-resolve;R2 TASKS.md 驗收準則漂移),教訓見 lesson catalog #105——
 **reversible→無確認+隨機鍵是過度聰明設計,被反推回 sibling §17 模式(決定性鍵+排除確認)**。
-SS1b/GOV3/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip(全數 merge)。
-尚餘 GOV2-fe-2(relation 審核,沿用 fe-1 修正後模式)、fe-3(發布閘顯示型)、fe-4(已決定/復原
-視圖 + 佇列分頁硬化)、low-confidence/missing-evidence 清單(另待 `/relations` facet api 任務);
+**GOV2-fe-2**(#106 relation 審核分頁)亦已 merge;**Codex 5 輪**全 P1/P2——relation 比 entity 豐富
+(需 src→type→dst 名稱解析 + evidence 懶載),「決定前須見所決之物」不變量逐面硬化:list 端點省略
+evidence→懶載 detail、名稱解析+決定 gate 至名載完(pending+error 皆鎖+重試)、每決定入口(含確認鈕)
+皆 gate、決定後 refetch 窗鎖定(queue.isFetching,回補 EntityReview+ProposalPool grep-all),教訓見
+lesson catalog #106。SS1b/GOV3/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip(全數 merge)。
+尚餘 GOV2-fe-3(發布閘顯示型)、fe-4(已決定/復原視圖 + 影響抽屜 + 佇列分頁硬化)、
+low-confidence/missing-evidence 清單(另待 `/relations` facet api 任務);
 Console MCP URL/健康顯示 = GOV2-fe 後續接 `GET /mcp` 端點。
 
 1. **CFG1 方向確認**:推翻 2026-07-10 雙源決策 — query-policy 統一單一 SoR
