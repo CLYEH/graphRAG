@@ -49,7 +49,7 @@ Schema/DDL 只驗結構不驗值=漏洞:每欄位要 type/range/length/non-empty
 規則改了但舊措辭活在其他入口——grep 全部 tracked *.md;凍結集合加成員→grep 既有成員名;雙詞彙→兩者都收斂;新領域錯誤→掃所有 consumer 的翻譯層。行為變更掃**行為 pin**(斷言常數),不只 prose(#89);退役假 affordance/警語→grep 它所有實例(標頭註解、inline、UI 文案,#101);絕不重抄凍結 schema 欄位清單——引用 schema(#53)。UI 可見字串改名必掃 `web/e2e/*.spec.ts`(Playwright 在本地 check-all/push gate 之外;CI 僅 web-touching PR 的非 required `e2e` job 跑它——H18,#104)。改清單排序一次連動五件事:order × keyset × cursor × sort-affordance × index(#99)。
 
 **Class 3 — 規則自洽 × 單一來源**(何時比對:寫 meta-rule、重用既有概念)[prose]
-Meta-rule 不得自相矛盾——驗證每個被允許的分支都能產出規則要求的證據;業務規則單一來源。寫服務既有概念的查詢前,先 grep 既定述詞(別重新發明佇列定義,#59)。
+Meta-rule 不得自相矛盾——驗證每個被允許的分支都能產出規則要求的證據;業務規則單一來源。寫服務既有概念的查詢前,先 grep 既定述詞(別重新發明佇列定義,#59)。新建 diff/path gate 前先讀在庫 sibling gate(push gate、governance-check)的旗標與模式——#111 兩輪 Codex(rename 摺疊要 `--no-renames`、capture-first 防 SIGPIPE)全是 sibling 已解教訓的重導輪。
 
 **Class 4 — 工具語意實測**(何時比對:依賴 CLI/API/庫的邊緣行為)[prose;宣稱須執行驗證]
 rename folding、分頁預設、text≠value、locale、statement_timeout 範圍、accessible-name 計算——先實測再依賴。時鐘**穩定度等級**(txn/statement/call)是正確性契約的一部分:PG `now()` 是 transaction-stable,逐決策序要 `clock_timestamp()`(#59);排序時戳單一時鐘源,絕不混 app clock(#38)。asyncio.timeout 只在 await 邊界搶佔——純 CPU 掃描要注入檢查點(#89);邊界規則按書寫系統分派(Latin 詞界/CJK 包含;isalnum 對 CJK 誤判,#89)。「anchor」的同秒 tie 語意分兩種:anchor 是對話方=回覆(未處理);anchor 是事件自身時戳=自己(已處理)(#29/#90)。截斷識別字只對 opaque 定寬域安全;複合/變長 id 顯示全長(#69)。FastAPI sync-def dep 走 threadpool→check-then-set 不原子,用 async def(#57)。
