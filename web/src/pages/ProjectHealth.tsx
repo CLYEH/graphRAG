@@ -40,6 +40,7 @@ const COUNT_LABELS: Record<string, string> = {
 // tabs. A count with no entry here shows the number without a link.
 const TAB_FOR_COUNT: Record<string, string> = {
   pending_ontology_proposals: "proposals",
+  needs_review_entities: "entity",
 };
 
 export function ProjectHealth() {

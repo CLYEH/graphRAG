@@ -477,6 +477,106 @@ export function useDecideOntologyProposal(project: string) {
   });
 }
 
+// GOV2-fe: the entity review queue (DESIGN §17 — extracted entities the pipeline
+// flagged `needs_review`). Active-build scoped like the merge queue: the endpoint
+// re-resolves the active build per request, so pin page 1's build_id and fail loud
+// on a mid-pagination swap (a spliced two-build queue would 404 on decide). The
+// queue selects on the LIFECYCLE status `needs_review` — the SAME facet health.py
+// counts as `needs_review_entities`, so the tab and the Health gauge count the
+// identical rows (a `review_status=unreviewed` facet would silently drift from the
+// gauge). Pages to exhaustion; fails loud so a store outage / no-active-build
+// surfaces rather than reading as "nothing to review".
+export function useEntityReviewQueue(project: string | undefined) {
+  return useQuery({
+    queryKey: ["entity-review", project],
+    enabled: project !== undefined && isPathAddressable(project),
+    queryFn: async () => {
+      const all: Entity[] = [];
+      let cursor: string | undefined;
+      let buildId: string | null | undefined;
+      do {
+        const { data, error } = await api.GET("/projects/{project}/entities", {
+          params: {
+            path: { project: project as string },
+            query: { limit: 200, cursor, filter: { status: "needs_review" } },
+          },
+        });
+        if (error) throw new Error(error.error.message);
+        if (buildId === undefined) buildId = data.meta.build_id;
+        else if (data.meta.build_id !== buildId)
+          throw new Error("The active build changed while loading the review queue — retry.");
+        all.push(...data.data);
+        cursor = data.meta.next_cursor ?? undefined;
+      } while (cursor);
+      return all;
+    },
+  });
+}
+
+export type ReviewTargetKind = "entity" | "relation";
+export type ReviewTargetVerb = "approve" | "reject";
+
+// Records a curator decision on an entity or relation (DESIGN §17). review.py
+// appends to the ledger and latest-manual-wins resolves (§27.3). The
+// Idempotency-Key is DETERMINISTIC per (target, verb) — the merge-decide
+// discipline — so a lost-response retry replays the stored 200 instead of
+// double-recording a second ledger entry for one logical decision (Codex #105).
+// The review queue only surfaces `needs_review` rows and a decision removes the
+// row, so each (target, verb) is decided at most once from the queue; a future
+// decided/audit view that offers a DELIBERATE re-decision must mint a fresh key.
+// Verb+kind ride the URL (four frozen paths), so switch to keep each a codegen
+// literal. onSuccess invalidates the matching queue, Health (the needs_review
+// gauge moves), and the target's detail cache (an open drawer reflects the new
+// status).
+export function useDecideReviewTarget(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      kind,
+      targetId,
+      verb,
+      reason,
+    }: {
+      kind: ReviewTargetKind;
+      targetId: string;
+      verb: ReviewTargetVerb;
+      reason: string | null;
+    }) => {
+      const header = { "Idempotency-Key": `${targetId}:${verb}` };
+      const body = { reason };
+      const res =
+        kind === "entity"
+          ? verb === "approve"
+            ? await api.POST("/projects/{project}/entities/{entity_id}/approve", {
+                params: { path: { project, entity_id: targetId }, header },
+                body,
+              })
+            : await api.POST("/projects/{project}/entities/{entity_id}/reject", {
+                params: { path: { project, entity_id: targetId }, header },
+                body,
+              })
+          : verb === "approve"
+            ? await api.POST("/projects/{project}/relations/{relation_id}/approve", {
+                params: { path: { project, relation_id: targetId }, header },
+                body,
+              })
+            : await api.POST("/projects/{project}/relations/{relation_id}/reject", {
+                params: { path: { project, relation_id: targetId }, header },
+                body,
+              });
+      if (res.error) throw new Error(res.error.error.message);
+      return res.data.data;
+    },
+    onSuccess: (_data, { kind, targetId }) => {
+      void queryClient.invalidateQueries({
+        queryKey: [kind === "entity" ? "entity-review" : "relation-review", project],
+      });
+      void queryClient.invalidateQueries({ queryKey: ["health", project] });
+      void queryClient.invalidateQueries({ queryKey: [kind, project, targetId] });
+    },
+  });
+}
+
 // The graph invocation carried in the contract's `options` channel (DESIGN §27.6).
 // The generated schema types `options` as an open object, so the shape the runtime
 // GraphOptions model enforces (api/schemas.py, extra="forbid") is declared here.
