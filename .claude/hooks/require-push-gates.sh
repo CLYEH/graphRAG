@@ -6,8 +6,13 @@
 #     - requires a code-reviewer PASS receipt whose tree hash matches the
 #       current content (see write-review-receipt.sh) — editing anything after
 #       the review makes the push mechanically impossible;
-#     - re-runs `uv run poe check` itself (and `poe web-check` when web/ files
-#       are outgoing) — "gates were green" is re-executed, not believed.
+#     - requires green-gates receipts for the same tree: a green `uv run poe
+#       check` stamps .claude/receipts/gates-check-<tree> as its final sequence
+#       step (scripts/stamp_gates_receipt.py; `poe web-check` likewise stamps
+#       gates-web-<tree>, required when web/ files are outgoing). Verifying the
+#       stamp replaces the old inline suite re-run: that took minutes, and a
+#       PreToolUse hook that outlives its timeout fails OPEN (only exit 2
+#       blocks), so the slowest gate was the least enforced (H15).
 #   Direct push to main (doc-only fast lane, LOOP.md):
 #     - every outgoing file must be *.md, else denied (use a PR);
 #     - requires a doc-reviewer (or code-reviewer) receipt matching the content.
@@ -55,11 +60,13 @@ snapshot_tree() {
   printf '%s' "$tree"
 }
 
+# one snapshot serves every receipt check below — the hook is a single moment
+now="$(snapshot_tree)"
+
 require_receipt() {
   # receipts are content-addressed (H5): .claude/receipts/<tree>, one per
   # reviewed state — parallel branches don't clobber each other's stamps
-  local tree reviewer rest now
-  now="$(snapshot_tree)"
+  local tree reviewer rest
   [ -f ".claude/receipts/$now" ] || deny "no review receipt for this content — a reviewer subagent must PASS this exact state (it stamps .claude/receipts/<tree>); anything edited after its PASS needs a re-review."
   read -r tree reviewer rest < ".claude/receipts/$now"
   [ "$tree" = "$now" ] || deny "receipt .claude/receipts/$now is corrupt (names tree '$tree') — re-run the reviewer."
@@ -69,15 +76,23 @@ require_receipt() {
   esac
 }
 
+require_gates_receipt() {
+  # stamped by scripts/stamp_gates_receipt.py as the FINAL step of a green
+  # `poe check` / `poe web-check` sequence, so its existence for THIS tree
+  # means the whole suite passed on exactly this content (H15)
+  local kind="$1" task="$2"
+  [ -f ".claude/receipts/gates-$kind-$now" ] || deny "no green '$task' receipt for this exact content — run 'uv run poe $task' (a green run stamps .claude/receipts/gates-$kind-<tree>); anything edited after the green run needs a re-run."
+}
+
 if [ "$lane" = doc ]; then
   nonmd="$(printf '%s\n' "$outgoing" | grep -v '\.md$' || true)"
   [ -n "$nonmd" ] && deny "the doc lane (docs/* branch or direct-to-main) is *.md-only; non-.md outgoing: $(printf '%s' "$nonmd" | tr '\n' ' ')— use a task branch + PR."
   require_receipt
 else
   require_receipt
-  uv run poe check >/dev/null 2>&1 || deny "backend gates are red — run 'uv run poe check', fix, re-review, then push."
+  require_gates_receipt check check
   if printf '%s\n' "$outgoing" | grep -q '^web/'; then
-    uv run poe web-check >/dev/null 2>&1 || deny "frontend gates are red — run 'uv run poe web-check', fix, re-review, then push."
+    require_gates_receipt web web-check
   fi
 fi
 exit 0

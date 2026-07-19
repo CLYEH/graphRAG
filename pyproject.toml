@@ -78,7 +78,7 @@ python_version = "3.12"
 strict = true
 warn_unused_ignores = true
 plugins = ["pydantic.mypy"]
-files = ["core", "api", "cli", "tests"]
+files = ["core", "api", "cli", "tests", "scripts"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
@@ -109,19 +109,33 @@ migrate = { cmd = "alembic upgrade head", help = "Apply Postgres migrations (nee
 worker = { cmd = "arq api.workers.build_worker.WorkerSettings", help = "Run the arq build worker (needs: docker compose up -d)" }
 
 [tool.poe.tasks.check]
-help = "Backend quality gates: fmt-check, lint, typecheck, test"
+help = "Backend quality gates: fmt-check, lint, typecheck, test (green run stamps the gates receipt)"
 sequence = [
     { ref = "fmt-check" },
     { ref = "lint" },
     { ref = "typecheck" },
     { ref = "test" },
+    { ref = "_stamp-gates-check" },
 ]
 
-[tool.poe.tasks.web-check]
+# gates receipts (H15): the stamp is the LAST sequence step, so it is only
+# reached when every gate before it passed; the push gate verifies the stamp
+# instead of re-running the suite inside a PreToolUse hook (which fails OPEN
+# on timeout). See scripts/stamp_gates_receipt.py for the full rationale.
+[tool.poe.tasks._stamp-gates-check]
+cmd = "python scripts/stamp_gates_receipt.py check"
+
+[tool.poe.tasks._stamp-gates-web]
+cmd = "python scripts/stamp_gates_receipt.py web"
+
+[tool.poe.tasks._web-check-run]
 shell = "npm run check"
 cwd = "web"
 interpreter = ["pwsh", "powershell", "bash", "sh"]
-help = "Frontend quality gates (runs in web/)"
+
+[tool.poe.tasks.web-check]
+help = "Frontend quality gates (runs in web/; green run stamps the gates receipt)"
+sequence = [{ ref = "_web-check-run" }, { ref = "_stamp-gates-web" }]
 
 [tool.poe.tasks.check-all]
 help = "Fast gate: backend + frontend (the loop's per-iteration definition of done)"

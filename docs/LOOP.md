@@ -19,6 +19,11 @@ loop back to step 3.
    uv run poe check-full       # + integration (first: docker compose up -d --wait)
    cd web && npm run test:e2e  # UI flows (first: npx playwright install)
    ```
+   A green `poe check` / `poe web-check` stamps a **gates receipt**
+   (`.claude/receipts/gates-<kind>-<tree>`, via `scripts/stamp_gates_receipt.py` as
+   the sequence's final step) that the push gate later verifies — no extra command
+   to remember, but note that editing ANYTHING afterwards invalidates the stamp,
+   so the last green run must be on the exact content you push.
    **FE tasks only (owner 2026-07-11):** after the gates above (incl. Playwright
    e2e) go green, run the **Claude in Chrome browser pass** — the agent drives a
    real Chrome (`mcp__claude-in-chrome__*`) through the task's UI flows on the
@@ -35,8 +40,14 @@ loop back to step 3.
    A PASS stamps a **receipt** binding the verdict to a content hash
    (`.claude/hooks/write-review-receipt.sh`); the push gate
    (`.claude/hooks/require-push-gates.sh`) recomputes the hash and blocks the push if
-   anything changed after the PASS — and re-runs `poe check` itself. Steps 4–5 are
-   therefore CPU-verified at push time, not taken on faith.
+   anything changed after the PASS — and requires the step-4 gates receipts for the
+   same hash. Steps 4–5 are therefore CPU-verified at push time, not taken on faith.
+   **Known boundary (H15): PreToolUse hooks fail OPEN** — only exit 2 blocks; a
+   hook that times out or crashes lets the command through silently. Mitigation:
+   both hooks now do only fast local/API work (receipt lookups, one paginated gh
+   query) under explicit 120s timeouts, so a timeout means something is
+   pathologically wrong, not that the suite was slow. CI + branch protection stay
+   the server-side backstop for anything a local hook misses.
    **The local review is the pre-push adversarial pass — spend the round HERE, not
    on Codex.** Run the `code-reviewer` §6/§7 matrix that matches the change to
    COMPLETION before the first push (input-position × level for parsers/validators;
