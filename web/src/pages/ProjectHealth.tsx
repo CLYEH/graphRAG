@@ -34,6 +34,14 @@ const COUNT_LABELS: Record<string, string> = {
   missing_evidence_relations: "缺證據關聯",
 };
 
+// A non-zero quality count deep-links into its governance tab (`../review?tab=`).
+// GOV3-fe wires the ontology-proposal pool; GOV2-fe adds the entity/relation
+// review and (once the backend facet lands) the low-confidence/missing-evidence
+// tabs. A count with no entry here shows the number without a link.
+const TAB_FOR_COUNT: Record<string, string> = {
+  pending_ontology_proposals: "proposals",
+};
+
 export function ProjectHealth() {
   const project = useActiveProject();
   const { data, isPending, isError, error } = useHealth(project);
@@ -112,12 +120,25 @@ function HealthView({ report }: { report: HealthReport }) {
       <h2>數量統計</h2>
       {counts.length > 0 ? (
         <dl className="health__grid">
-          {counts.map(([key, value]) => (
-            <div key={key}>
-              <dt>{COUNT_LABELS[key] ?? key}</dt>
-              <dd>{value}</dd>
-            </div>
-          ))}
+          {counts.map(([key, value]) => {
+            const tab = TAB_FOR_COUNT[key];
+            return (
+              <div key={key}>
+                <dt>{COUNT_LABELS[key] ?? key}</dt>
+                <dd>
+                  {value}
+                  {/* deep-link only a NON-ZERO count into its tab — a link to an
+                      empty list is the false affordance Codex #78 flagged */}
+                  {tab && Number(value) > 0 ? (
+                    <>
+                      {" "}
+                      <Link to={`../review?tab=${tab}`}>前往處理</Link>
+                    </>
+                  ) : null}
+                </dd>
+              </div>
+            );
+          })}
         </dl>
       ) : (
         <p className="health__muted">還沒有統計數字(建置並上線後出現)。</p>

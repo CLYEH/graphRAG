@@ -29,8 +29,9 @@ function renderHealthAt(route: string) {
 
 describe("ProjectHealth", () => {
   it("links 前往審核 only for a merge-candidate backlog (Codex #78)", async () => {
-    // the aggregate can be non-zero from ontology/entity/relation backlogs the
-    // /review page cannot show — no link for those, count still visible
+    // the AGGREGATE 前往審核 fact follows only the merge count — an ontology/entity/
+    // relation backlog gets its OWN per-count tab deep-link (前往處理, tested below),
+    // not the aggregate link
     stubHealth(
       healthReport({
         status: "needs_review",
@@ -40,7 +41,7 @@ describe("ProjectHealth", () => {
     );
     renderHealthAt(projectRoute("acme"));
     // both the aggregate fact and the count grid legitimately show the 4 —
-    // the pin is the ABSENT link
+    // the pin is the ABSENT aggregate link
     expect((await screen.findAllByText("4")).length).toBeGreaterThan(0);
     expect(screen.queryByRole("link", { name: "前往審核" })).not.toBeInTheDocument();
 
@@ -55,6 +56,35 @@ describe("ProjectHealth", () => {
     );
     renderHealthAt(projectRoute("acme"));
     expect(await screen.findByRole("link", { name: "前往審核" })).toBeInTheDocument();
+  });
+
+  it("deep-links a non-zero 待審本體提案 count into the proposals tab (GOV3-fe)", async () => {
+    // GOV3-fe shipped the ontology-proposal pool, so this backlog is now
+    // actionable — the count carries its OWN 前往處理 link to ?tab=proposals
+    stubHealth(
+      healthReport({
+        status: "needs_review",
+        counts: { pending_ontology_proposals: 2 },
+      }),
+    );
+    renderHealthAt(projectRoute("acme"));
+    const link = await screen.findByRole("link", { name: "前往處理" });
+    // the href must carry the tab that renders the pool — a bare ../review would
+    // land on the default 合併 tab and strand the operator
+    expect(link.getAttribute("href")).toContain("tab=proposals");
+
+    cleanup();
+    vi.restoreAllMocks();
+    // a ZERO count must NOT link — a link to an empty list is a false affordance
+    stubHealth(
+      healthReport({
+        status: "healthy",
+        counts: { pending_ontology_proposals: 0 },
+      }),
+    );
+    renderHealthAt(projectRoute("acme"));
+    await screen.findByText("專案健康(診斷)");
+    expect(screen.queryByRole("link", { name: "前往處理" })).not.toBeInTheDocument();
   });
 
   it("shows the status light, counts, and pending review for a healthy build", async () => {

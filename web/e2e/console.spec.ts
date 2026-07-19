@@ -99,7 +99,7 @@ test("console shell loads with the project switcher and section nav", async ({ p
     "檢視",
     "清洗",
     "圖譜",
-    "審核",
+    "治理",
     "品質",
     "檢索",
     "診斷",
@@ -354,9 +354,11 @@ test("the review section shows the queue and records a decision", async ({ page 
   );
 
   await page.goto("/");
-  await page.getByRole("link", { name: "審核" }).click();
+  await page.getByRole("link", { name: "治理" }).click();
 
-  await expect(page.getByRole("heading", { name: "實體審核" })).toBeVisible();
+  // the governance surface (治理) defaults to the 合併 (merge) tab — the flow below
+  // adjudicates a merge candidate, so no tab switch is needed
+  await expect(page.getByRole("heading", { name: "治理" })).toBeVisible();
   // the decision surface leads with the snapshot NAMES, never the id prefix (UXA1)
   await expect(page.getByText("國立海洋科技博物館")).toBeVisible();
   await expect(page.getByText("c1111111")).not.toBeVisible();
@@ -368,6 +370,96 @@ test("the review section shows the queue and records a decision", async ({ page 
   await page.getByRole("button", { name: "確定合併" }).click();
   // the approve verb must reach its own path (not reject/defer, not a body verb)
   await expect.poll(() => approvePath).toMatch(/\/merge-candidates\/[^/]+\/approve$/);
+});
+
+function ontologyProposalsResponse() {
+  return {
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: [
+        {
+          id: "d1111111-aaaa-4aaa-8aaa-000000000001",
+          project: "acme",
+          kind: "entity",
+          type_name: "Spaceship",
+          proposal_key: "fpv2:entity:spaceship",
+          fingerprint_version: 2,
+          example: "Rocinante",
+          chunk_ref: "chunk:abc123:0",
+          status: "proposed",
+          decided_by: null,
+          decided_at: null,
+          reason: null,
+          created_at: "2026-07-01T00:00:00Z",
+        },
+      ],
+      meta: META,
+    }),
+  };
+}
+
+test("the governance page adjudicates an ontology proposal on the 本體提案 tab", async ({
+  page,
+}) => {
+  await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  // the default 合併 tab mounts ReviewCases first, so its query needs a stub too
+  await page.route("**/projects/*/merge-candidates*", (route) =>
+    route.fulfill(mergeCandidatesResponse()),
+  );
+  await page.route("**/projects/*/ontology-proposals*", (route) =>
+    route.fulfill(ontologyProposalsResponse()),
+  );
+
+  let acceptPath = "";
+  let idemKey = "";
+  // more-specific accept route registered AFTER the list route so it wins for the
+  // POST (Playwright matches last-registered first)
+  await page.route("**/ontology-proposals/*/accept", (route) => {
+    acceptPath = new URL(route.request().url()).pathname;
+    idemKey = route.request().headers()["idempotency-key"] ?? "";
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          id: "d1111111-aaaa-4aaa-8aaa-000000000001",
+          project: "acme",
+          kind: "entity",
+          type_name: "Spaceship",
+          proposal_key: "fpv2:entity:spaceship",
+          fingerprint_version: 2,
+          example: "Rocinante",
+          chunk_ref: "chunk:abc123:0",
+          status: "accepted",
+          decided_by: "console",
+          decided_at: "2026-07-02T00:00:00Z",
+          reason: null,
+          created_at: "2026-07-01T00:00:00Z",
+        },
+        meta: META,
+      }),
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "治理" }).click();
+  // switch from the default 合併 tab to the ontology-proposal pool
+  await page.getByRole("tab", { name: "本體提案" }).click();
+
+  // the pool leads with the proposed TYPE name and its honest kind label — never
+  // the raw enum or a naked id (UXA3 translation layer)
+  await expect(page.getByText("Spaceship")).toBeVisible();
+  await expect(page.getByText("實體型別")).toBeVisible();
+
+  // 採納 arms the §17-terminal confirm; only 確定採納 posts. The accept verb rides
+  // its own path with the deterministic idem-key — a body-verb, the reject path,
+  // or a random key would fail these assertions
+  await page.getByRole("button", { name: "採納(加入本體)" }).click();
+  await page.getByRole("button", { name: "確定採納" }).click();
+  await expect.poll(() => acceptPath).toMatch(/\/ontology-proposals\/[^/]+\/accept$/);
+  expect(idemKey).toBe("d1111111-aaaa-4aaa-8aaa-000000000001:accept");
 });
 
 function queryResponse() {

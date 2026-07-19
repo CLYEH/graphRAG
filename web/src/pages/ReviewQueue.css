@@ -171,6 +171,121 @@
   font-size: 12px;
 }
 
+/* ---- governance tabs ---- */
+.review__tabs {
+  display: flex;
+  gap: 6px;
+  border-bottom: 1px solid var(--border);
+  width: 100%;
+}
+
+.review__tab {
+  padding: 6px 14px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 14px;
+  margin-bottom: -1px;
+}
+
+.review__tab--on {
+  color: var(--text-h);
+  border-bottom-color: var(--text-h);
+  font-weight: 500;
+}
+
+/* ---- ontology proposal pool (GOV3-fe) ---- */
+.proposals {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.proposals__row {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.proposals__head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.proposals__type {
+  font-family: var(--mono);
+  font-size: 15px;
+  color: var(--text-h);
+}
+
+.proposals__kind {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.proposals__example,
+.proposals__src {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.proposals__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.proposals__accept,
+.proposals__reject {
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  background: var(--social-bg);
+  color: var(--text-h);
+}
+
+.proposals__accept {
+  color: #1a7f45;
+  border-color: #1a7f45;
+}
+
+.proposals__accept:disabled,
+.proposals__reject:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* the §17-terminal-action confirm (mirrors .review__confirm on the merge flow) */
+.proposals__confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.proposals__confirm p {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.proposals__confirm button {
+  padding: 5px 12px;
+}
+
 @media (prefers-color-scheme: dark) {
   .review__line--error,
   .review__error {
@@ -179,5 +294,10 @@
 
   .review__note {
     color: #fbbf24;
+  }
+
+  .proposals__accept {
+    color: #4ade80;
+    border-color: #4ade80;
   }
 }

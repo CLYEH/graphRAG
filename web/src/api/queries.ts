@@ -15,6 +15,8 @@ export type JobAccepted = components["schemas"]["JobAccepted"];
 export type Job = components["schemas"]["Job"];
 export type MergeCandidate = components["schemas"]["MergeCandidate"];
 export type MergeCandidateStatus = components["schemas"]["MergeCandidateStatus"];
+export type OntologyProposal = components["schemas"]["OntologyProposal"];
+export type OntologyProposalStatus = components["schemas"]["OntologyProposalStatus"];
 export type Document = components["schemas"]["Document"];
 export type Chunk = components["schemas"]["Chunk"];
 export type QueryMode = components["schemas"]["QueryMode"];
@@ -392,6 +394,86 @@ export function useDecideMergeCandidate(project: string) {
       return res.data.data;
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["merge-candidates", project] }),
+  });
+}
+
+// GOV3-fe: the C3c ontology-proposal POOL (DESIGN §17 — LLM-observed types not in
+// the configured ontology, awaiting review). NOT build-scoped (project-wide, one
+// row per proposed type), so — unlike the merge queue — no build_id pin is needed.
+// The endpoint's default queue is `proposed`; pass a status for the audit view
+// (accepted/rejected). Paged to exhaustion: the pool is bounded (one per type),
+// not corpus-sized.
+export function useOntologyProposals(project: string | undefined, status?: OntologyProposalStatus) {
+  return useQuery({
+    queryKey: ["ontology-proposals", project, status ?? "proposed"],
+    enabled: project !== undefined && isPathAddressable(project),
+    queryFn: async () => {
+      const all: OntologyProposal[] = [];
+      let cursor: string | undefined;
+      do {
+        const { data, error } = await api.GET("/projects/{project}/ontology-proposals", {
+          params: {
+            path: { project: project as string },
+            // filter[status]=<status> (deepObject) only for the audit view; omit
+            // for the default `proposed` queue (the server's default).
+            query: status ? { limit: 200, cursor, filter: { status } } : { limit: 200, cursor },
+          },
+        });
+        if (error) throw new Error(error.error.message);
+        all.push(...data.data);
+        cursor = data.meta.next_cursor ?? undefined;
+      } while (cursor);
+      return all;
+    },
+  });
+}
+
+export type ProposalVerb = "accept" | "reject";
+
+// Records a curator decision on an ontology proposal (DESIGN §17: proposed →
+// accepted|rejected, terminal — a re-decide 409s). Accept adds the type to
+// projects.config.ontology (the config next build reads), so it invalidates the
+// project cache too; every decision invalidates the pool + Health (the
+// pending_ontology_proposals count). The verb rides the URL (keeps the typed path
+// a literal); the deterministic `${id}:${verb}` Idempotency-Key replays a lost
+// 200 rather than 409ing the now-decided proposal (the merge-decide discipline).
+export function useDecideOntologyProposal(project: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      proposalId,
+      verb,
+      reason,
+    }: {
+      proposalId: string;
+      verb: ProposalVerb;
+      reason: string | null;
+    }) => {
+      const params = {
+        path: { project, proposal_id: proposalId },
+        header: { "Idempotency-Key": `${proposalId}:${verb}` },
+      };
+      const body = { reason };
+      const res =
+        verb === "accept"
+          ? await api.POST("/projects/{project}/ontology-proposals/{proposal_id}/accept", {
+              params,
+              body,
+            })
+          : await api.POST("/projects/{project}/ontology-proposals/{proposal_id}/reject", {
+              params,
+              body,
+            });
+      if (res.error) throw new Error(res.error.error.message);
+      return res.data.data;
+    },
+    onSuccess: (_data, { verb }) => {
+      queryClient.invalidateQueries({ queryKey: ["ontology-proposals", project] });
+      queryClient.invalidateQueries({ queryKey: ["health", project] });
+      // accept mutated the project's configured ontology — the config any reader
+      // (Settings, the ontology editor) shows must refresh.
+      if (verb === "accept") queryClient.invalidateQueries({ queryKey: ["project", project] });
+    },
   });
 }
 
