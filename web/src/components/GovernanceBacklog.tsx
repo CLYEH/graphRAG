@@ -14,32 +14,37 @@ const SIGNALS: { key: string; label: string; tab?: string }[] = [
   { key: "missing_evidence_relations", label: "缺證據關聯" },
 ];
 
-// GOV2-fe-3: a DISPLAY-ONLY publish-readiness advisory beside the activate control.
-// It surfaces the non-zero §19 quality signals a curator may want to address before
-// publishing, and deep-links the actionable ones — but it NEVER blocks activation:
-// the §14 preflight decides that server-side (it blocks only on missing eval scores
-// / drift, not on these backlogs), so gating the activate button here would be a
-// fake gate. Health exposes no extraction-failure-rate count, so the panel shows
-// only the signals Health actually reports.
-export function PublishGate({ counts }: { counts: Record<string, number | undefined> }) {
+// GOV2-fe-3: a DISPLAY-ONLY governance-backlog summary on the Overview. It lists
+// the non-zero §19 quality signals and deep-links the actionable ones; it NEVER
+// blocks activation (the §14 preflight decides that server-side).
+//
+// Honest scope (Codex #107 P2): these counts follow §19 Health semantics — the
+// entity/relation review + confidence/evidence counts describe the CURRENTLY
+// ACTIVE build (zeros when none exists); only the proposal pool is project-wide.
+// So this is the LIVE knowledge base's governance backlog, NOT a publish-readiness
+// check of a candidate build — Health has no per-build facet, and a candidate-
+// scoped preflight would need a contract addition (deferred follow-up). Working
+// the backlog still pays forward: §17 decisions ride the DR-011 ledger into
+// future builds.
+export function GovernanceBacklog({ counts }: { counts: Record<string, number | undefined> }) {
   const active = SIGNALS.map((s) => ({ ...s, count: Number(counts[s.key] ?? 0) })).filter(
     (s) => s.count > 0,
   );
   if (active.length === 0) return null;
 
   return (
-    <section className="publishgate">
-      <p className="publishgate__title">發布前品質檢查(僅供參考,不影響上線)</p>
-      <ul className="publishgate__list">
+    <section className="govbacklog">
+      <p className="govbacklog__title">品質治理待辦(上線中知識庫;僅供參考,不影響上線)</p>
+      <ul className="govbacklog__list">
         {active.map((s) => (
-          <li key={s.key} className="publishgate__row">
-            <span className="publishgate__label">
+          <li key={s.key} className="govbacklog__row">
+            <span className="govbacklog__label">
               ⚠ {s.label}:{s.count}
             </span>
             {s.tab ? (
               <Link to={`../review?tab=${s.tab}`}>前往處理</Link>
             ) : (
-              <span className="publishgate__note">(清單待後端 facet)</span>
+              <span className="govbacklog__note">(清單待後端 facet)</span>
             )}
           </li>
         ))}

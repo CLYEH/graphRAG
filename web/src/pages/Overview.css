@@ -62,26 +62,26 @@
   color: var(--text-h);
 }
 
-/* GOV2-fe-3 publish-readiness advisory (display-only) */
-.publishgate {
+/* GOV2-fe-3 governance-backlog summary (display-only) */
+.govbacklog {
   padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: 10px;
 }
 
-.publishgate__title {
+.govbacklog__title {
   margin: 0 0 8px;
   font-weight: 600;
   color: var(--text-h);
 }
 
-.publishgate__list {
+.govbacklog__list {
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.publishgate__row {
+.govbacklog__row {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
@@ -89,12 +89,12 @@
   padding: 2px 0;
 }
 
-.publishgate__label {
+.govbacklog__label {
   color: var(--text-h);
   font-size: 14px;
 }
 
-.publishgate__note {
+.govbacklog__note {
   color: var(--text);
   font-size: 12px;
 }
