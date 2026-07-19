@@ -141,15 +141,19 @@ def spec() -> dict[str, Any]:
     return cast(dict[str, Any], yaml.safe_load(_OPENAPI.read_text(encoding="utf-8")))
 
 
+def _pointer(spec: dict[str, Any], ref: str) -> Any:
+    """Follow one local JSON Pointer (``#/a/b/c``, ~-escapes) to its target."""
+    assert isinstance(ref, str) and ref.startswith("#/"), f"non-local $ref: {ref!r}"
+    cur: Any = spec
+    for part in ref[2:].split("/"):
+        cur = cur[part.replace("~1", "/").replace("~0", "~")]
+    return cur
+
+
 def _deref(spec: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
     """Resolve local ``$ref`` pointers (``#/components/...``)."""
     while "$ref" in node:
-        ref = node["$ref"]
-        assert isinstance(ref, str) and ref.startswith("#/"), f"non-local $ref: {ref!r}"
-        cur: Any = spec
-        for part in ref[2:].split("/"):
-            cur = cur[part.replace("~1", "/").replace("~0", "~")]
-        node = cast(dict[str, Any], cur)
+        node = cast(dict[str, Any], _pointer(spec, node["$ref"]))
     return node
 
 
@@ -967,8 +971,11 @@ def test_v13_mcp_info_contract(spec: dict[str, Any]) -> None:
 # promised to accept. Every object node in every request body must therefore
 # DECLARE its openness: `false` (closed — the norm) or `true` (a documented
 # free-form bag). The runtime face already rejects extras on every pinned
-# model below (api/schemas.py: extra="forbid"), so the silent-open schemas
-# under-promise the strictness the server enforces — a schema-text-only gap.
+# JSON model below (api/schemas.py: extra="forbid") — EXCEPT the multipart
+# uploads body, which has no model at all: api/routers/uploads.py reads only
+# the `files`/`metadata` form parts and silently ignores unknown ones, so
+# that one is open on BOTH faces and its closure round must add runtime
+# validation, not just schema text (Codex #112 R3).
 # Closing them is a frozen-contract edit (DR-002: version bump + owner), so
 # this test is a RATCHET, not an allowlist: the pinned legacy set may only
 # SHRINK (delete the entry in the same change that closes its schema); any
@@ -995,42 +1002,64 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     and demands each object node with fixed `properties` declares
     additionalProperties explicitly — enumerated from the artifact itself, per
     the #17 universal-test rule, so a new endpoint cannot dodge the sweep."""
-    components = spec["components"]["schemas"]
-
     silent: set[str] = set()
+    # EVERY schema-bearing JSON Schema 2020-12 keyword — enumerated as a table
+    # so the sweep is grammar-driven, not example-driven (Codex #112 R3 named
+    # prefixItems/dependentSchemas/if-then-else/patternProperties; listing only
+    # the keywords a finding names is the class-9 anti-pattern)
+    map_keywords = ("properties", "patternProperties", "dependentSchemas", "$defs")
+    list_keywords = ("prefixItems", "oneOf", "anyOf", "allOf")
+    single_keywords = (
+        "items",
+        "additionalProperties",
+        "additionalItems",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "propertyNames",
+        "contains",
+        "if",
+        "then",
+        "else",
+        "not",
+    )
 
     def walk(node: Any, label: str, seen: frozenset[str]) -> None:
         if not isinstance(node, dict):
             return
         if "$ref" in node:
-            name = node["$ref"].rsplit("/", 1)[-1]
-            if name not in seen:
-                # the component gets its own RE-ROOTED walk so one pin entry
-                # covers every endpoint referencing it — while NESTED nodes
-                # extend the path, so a new silent node INSIDE a pinned
-                # component keeps its own identity (Codex #112 R1)
-                walk(components.get(name), name, seen | {name})
+            ref = node["$ref"]
+            if ref not in seen:
+                # the referenced schema gets its own RE-ROOTED walk so one pin
+                # entry covers every endpoint referencing it — while NESTED
+                # nodes extend the path, so a new silent node INSIDE a pinned
+                # component keeps its own identity (Codex #112 R1). Resolve
+                # the FULL pointer (a $defs-nested ref is legal — R3); a
+                # dangling ref raises here, and that is correct fail-loud:
+                # test_openapi_document_is_valid rejects it too.
+                short = ref.removeprefix("#/components/schemas/").replace("/", ".")
+                walk(_pointer(spec, ref), short, seen | {ref})
             # OpenAPI 3.1: a $ref may carry SIBLING schema keywords — judge
             # them under the ORIGINAL label instead of discarding them with
             # the ref (Codex #112 R2b); a bare {$ref} node ends here
             node = {k: v for k, v in node.items() if k != "$ref"}
             if not node:
                 return
-        # the walker judges only nodes carrying fixed `properties` — class 24's
-        # definition; a patternProperties-only map is out of its scope by design
-        if "properties" in node:
-            if "additionalProperties" not in node:
-                silent.add(label)
-            for pname, sub in node["properties"].items():
-                walk(sub, f"{label}.{pname}", seen)
-        ap = node.get("additionalProperties")
-        if isinstance(ap, dict):
-            walk(ap, f"{label}.additionalProperties", seen)
-        if "items" in node:
-            walk(node["items"], f"{label}[]", seen)
-        for comb in ("oneOf", "anyOf", "allOf"):
-            for i, sub in enumerate(node.get(comb) or []):
-                walk(sub, f"{label}.{comb}[{i}]", seen)
+        # judgment: only nodes carrying fixed `properties` are JUDGED (class
+        # 24's definition — a patternProperties-only map is not a fixed-
+        # semantics node), but every keyword's subschemas are WALKED below
+        if "properties" in node and "additionalProperties" not in node:
+            silent.add(label)
+        for kw in map_keywords:
+            for name, sub in (node.get(kw) or {}).items():
+                sub_label = f"{label}.{name}" if kw == "properties" else f"{label}.{kw}[{name}]"
+                walk(sub, sub_label, seen)
+        for kw in list_keywords:
+            for i, sub in enumerate(node.get(kw) or []):
+                walk(sub, f"{label}.{kw}[{i}]", seen)
+        for kw in single_keywords:
+            sub = node.get(kw)
+            if isinstance(sub, dict):
+                walk(sub, f"{label}[]" if kw == "items" else f"{label}.{kw}", seen)
 
     request_bodies = spec["components"].get("requestBodies", {})
     bodies = 0

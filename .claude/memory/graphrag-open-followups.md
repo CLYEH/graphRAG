@@ -55,9 +55,11 @@ GitHub 為準;立案或了結後從本檔劃掉):
 - **legacy request schema 的 additionalProperties:false 閉合**(H20a 掃出,DR-002 級):
   8 個 v1.0 時代 request schema(BuildRequest/IngestRequest/ProjectCreate/ProjectUpdate/
   QueryRequest/ReviewDecisionRequest/SourceCreate/uploads multipart inline)在 schema 文本
-  沉默開放,但 runtime 全數 `extra="forbid"`——契約低承諾了 server 實際強制的嚴格度
-  (純 schema-text 對齊,無行為變更)。閉合=凍結契約編輯:版本 bump + DESIGN §26 +
-  縮 test_contracts.py 的 ratchet pin,自成一 DR-002 任務,owner 決策。
+  沉默開放;其中 7 個 JSON model runtime 已 `extra="forbid"`(閉合=純 schema-text 對齊,
+  無行為變更),**multipart uploads 例外**:無 model,uploads.py 只讀 files/metadata、
+  忽略未知 form part=兩面皆開,閉合時須同步加 runtime 拒絕(行為變更)。閉合=凍結
+  契約編輯:版本 bump + DESIGN §26 + 縮 test_contracts.py 的 ratchet pin,自成一
+  DR-002 任務,owner 決策。
 - **候選-scoped 發布 preflight**(GOV2-fe-3 #107 Codex R1 浮現,DR-002 級):Health 的
   review/confidence/evidence 計數為 active-build scoped,無 per-build facet——故 Console
   無法對「即將上線的候選 build」做品質預檢(GovernanceBacklog 已誠實改述上線中知識庫)。
