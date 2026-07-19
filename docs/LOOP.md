@@ -68,10 +68,15 @@ loop back to step 3.
      | changes wanted | ≥1 **unresolved** Codex review thread (or a top-level change-request comment) | **triage each suggestion** (below): must-fix → step 3; else reply-and-resolve |
 
      ```bash
-     # reaction verdict: +1 = approved, eyes = still reviewing
+     # ILLUSTRATION ONLY — never re-implement verdict logic from this snippet.
+     # Authoritative implementations: .claude/hooks/require-codex-approval.sh
+     # (merge gate) fully PAGINATES reviewThreads (hasNextPage loop) and is the
+     # sole authority for the unresolved-thread verdict; scripts/watch-codex.sh
+     # owns waiting/triage — its thread count is a single first:100 page shown
+     # in the poll log for information only (not part of its exit-code logic).
+     # This sketch (first:50, unpaginated) is weaker than both.
      gh api repos/CLYEH/graphRAG/issues/<pr>/reactions \
        --jq '[.[]|select(.user.login=="chatgpt-codex-connector[bot]")|.content]'
-     # changes-wanted = UNRESOLVED Codex review threads (ignores resolved/historical ones)
      gh api graphql -f query='{repository(owner:"CLYEH",name:"graphRAG"){pullRequest(number:<pr>){
        reviewThreads(first:50){nodes{isResolved comments(first:1){nodes{author{login}}}}}}}}' \
        --jq '[.data.repository.pullRequest.reviewThreads.nodes[]

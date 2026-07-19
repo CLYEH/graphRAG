@@ -15,8 +15,12 @@ The tools/linters already caught formatting, typing, and test failures; your job
 the judgment a linter can't make. Be strict but precise: only report real problems.
 
 ## What to review
-Look at the change under review (typically the uncommitted working tree):
+Look at the COMPLETE change under review. The receipt you stamp endorses the whole
+tree, so your view must cover the whole task — not just this round's increment. On a
+first-round review the work is typically uncommitted; on a re-review after Codex
+rounds the task's main body is already COMMITTED and invisible to `git diff`:
 ```bash
+git diff origin/main...HEAD  # the task's committed body (re-reviews: REQUIRED)
 git diff                     # unstaged
 git diff --staged            # staged
 git status
