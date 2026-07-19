@@ -1151,19 +1151,30 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     # before or without a reference — #112 R11), plus every operation's
     # callbacks (whose path items nest recursively) — a request body outside
     # spec["paths"] must not dodge the sweep (#112 R7)
-    pending = [(path, ops) for path, ops in spec["paths"].items()]
-    pending += [(f"webhooks[{name}]", item) for name, item in spec.get("webhooks", {}).items()]
+    # x-* specification extensions are legal in ALL of these maps and may be
+    # dictionary-valued with method-shaped content — never seed them (R12)
+    pending = [(path, ops) for path, ops in spec["paths"].items() if not path.startswith("x-")]
+    pending += [
+        (f"webhooks[{name}]", item)
+        for name, item in spec.get("webhooks", {}).items()
+        if not name.startswith("x-")
+    ]
     pending += [
         (f"pathItems[{name}]", item)
         for name, item in spec["components"].get("pathItems", {}).items()
+        if not name.startswith("x-")
     ]
-    pending += [
-        (f"callbacks[{name}][{expr}]", item)
-        for name, cb in spec["components"].get("callbacks", {}).items()
-        if not name.startswith("x-") and isinstance(cb, dict) and "$ref" not in cb
-        for expr, item in cb.items()
-        if not expr.startswith("x-")
-    ]
+    for cb_name, cb in spec["components"].get("callbacks", {}).items():
+        if cb_name.startswith("x-") or not isinstance(cb, dict):
+            continue
+        cb = chase(cb)  # a reusable callback may itself be a (chained) $ref (R12)
+        if not isinstance(cb, dict):
+            continue
+        pending += [
+            (f"callbacks[{cb_name}][{expr}]", item)
+            for expr, item in cb.items()
+            if not expr.startswith("x-")
+        ]
     while pending:
         path, ops = pending.pop()
         if not isinstance(ops, dict):
