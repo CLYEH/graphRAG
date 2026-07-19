@@ -8,8 +8,8 @@ metadata:
 ---
 
 **Track 4(Console UX 翻新)九項已於 2026-07-15 全數 merge 完成**
-(UXA1-3/UXB1/UXC1a-b/UXC2a-c,PR #76-#84;逐 PR 教訓已入
-[[graphrag-loop-paused-pr5]] 的 classes 20-26 與各 per-PR 條目,此處不重複)。
+(UXA1-3/UXB1/UXC1a-b/UXC2a-c,PR #76-#84;教訓已入
+[[graphrag-lesson-classes]] 的 classes 20-26,此處不重複)。
 契約 v1.2(eval 觸發+上傳+通用文件 metadata envelope)= DR-010,見 DESIGN §26。
 原提案文件=`.discuss/ux-redesign/PROPOSAL.md`(gitignored)。
 

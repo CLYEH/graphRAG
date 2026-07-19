@@ -178,12 +178,17 @@ loop back to step 3.
    **Post-merge retro (owner rule, 2026-07-03):** before returning to step 1, sweep the
    merged PR's review findings — every Codex thread AND every local-reviewer blocker —
    and classify each against the **lesson classes** catalogued in
-   `.claude/memory/graphrag-loop-paused-pr5.md`:
+   `.claude/memory/graphrag-lesson-classes.md`:
    - **Repeated class** ⇒ the existing prevention isn't biting — strengthen it (sharpen
      the reviewer checklist / hook / CI check that should have caught it).
    - **New class** ⇒ add it to the catalog, and when it is mechanically preventable,
      file an `H<n>` harness task in TASKS.md.
    - Nothing new ⇒ note nothing and move on; the retro is a sweep, not a ceremony.
+   Record the retro as **class-entry updates only** (a sub-point with the PR anchor on
+   the matching class, or a new stable-numbered class); per-PR narrative blocks are
+   retired (owner, 2026-07-20) — round counts, task history, and roadmaps stay out of
+   the catalog. Mechanize-first: a preventable class becomes a hook/CI/lint/helper
+   (`H<n>`), prose is the fallback.
 
    **Retro routing (owner rule, 2026-07-03):** apply the retro's own follow-ups by lane —
    if they touch only `*.md` (catalog entries, reviewer-checklist sharpening, LOOP/CLAUDE

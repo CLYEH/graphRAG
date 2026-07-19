@@ -17,4 +17,4 @@ owner 2026-07-10 闡述初期目標:
 **Why**: 排序與取捨要對齊真實落地(博物館 agent 經 HTTP MCP 取知識);一般性是 owner 的明示邊界。
 **How to apply**: 涉及 MCP transport/auth/connector/ontology 的任務,先對照此場景;領域強化永遠 config 化。
 
-相關:[[graphrag-architecture]]、[[graphrag-loop-paused-pr5]](#57 條記錄 C8b 插隊定案)、[[graphrag-working-style]]
+相關:[[graphrag-architecture]]、[[graphrag-working-style]](C8b 插隊定案史料:PR #57,見 git history 的舊 lesson catalog)
