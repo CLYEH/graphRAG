@@ -39,7 +39,9 @@ SEMANTICS (spec-first — the judge-surface lesson):
 - **Metrics** are point-in-time counts, active-build-scoped where the metric
   is about content (docs/chunks/entities/relations), project-scoped where it
   is about workflow (builds, pending review). ``low_confidence_relations``
-  counts ACTIVE relations with ``confidence < 0.5`` (🔧 threshold param);
+  counts ACTIVE relations with ``confidence < LOW_CONFIDENCE_BELOW`` (🔧 the
+  module constant is the ONE tuning point — the /relations confidence facet
+  reads the same constant, so gauge and list can never disagree; GOV2-facet);
   ``missing_evidence_relations`` counts ACTIVE relations with zero evidence
   rows — both §19-named quality signals.
 - **Read-only**: Health never mutates; it binds the active build the same
@@ -148,7 +150,6 @@ async def health_report(
     *,
     vector_provider: Callable[[], Awaitable[AsyncQdrantClient]],
     graph_provider: Callable[[], Awaitable[AsyncDriver]],
-    low_confidence_below: float = LOW_CONFIDENCE_BELOW,
 ) -> HealthReport:
     """Compute §19's report for one project (read-only).
 
@@ -283,7 +284,11 @@ async def health_report(
             conn,
             sa.select(sa.func.count())
             .select_from(r)
-            .where(*scope_r, r.c.confidence < low_confidence_below),
+            # the SAME constant the /relations confidence facet applies — a
+            # per-call override here was a parity trap (Codex #109): a gauge at
+            # x≠0.5 would count rows the linked list can't show. ONE tuning
+            # point, both consumers move together.
+            .where(*scope_r, r.c.confidence < LOW_CONFIDENCE_BELOW),
         )
         metrics["missing_evidence_relations"] = await _count(
             conn,
