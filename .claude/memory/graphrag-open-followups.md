@@ -40,6 +40,12 @@ GitHub 為準;立案或了結後從本檔劃掉):
 - **MCP auth**:CFG1 gateway 不帶 auth(owner 2026-07-17 預設同意);對外
   曝露後 §23 placeholder 會變真需求,屆時是 DR-002 相關 owner 決策
   (凍結 enum 無 auth 錯誤碼)。
+- **RB1-retry-skip 的 entanglement 保守退全導**(#103 R3/R4 follow-up):目前若父有
+  「同時被失敗與非失敗 doc 觸及」的實體(或關係),整個重試退回全部重導(fork-C
+  紀律),放棄 compute-skip 省成本。真正精細解=只「額外重抽糾纏的成功 docs」(而非
+  全建置),既修 first-write-wins 部分 scalar 又保省成本;需算糾纏 doc 集合並讓 clone
+  排除之。已在 `core/builds/retry.py::graph_entangles_failed_docs` docstring 記為
+  future slice。
 - **run-level 失敗成因未曝露到 Console**(RB1-fe #102 P1+step-error 兩輪浮現,
   DR-002 級):`pipeline_runs.error`(整個 run 於「步驟之外」崩潰的權威成因)
   沒有任何讀端點曝露,且 `Build` schema 無 `job_id`、無 jobs 清單/build→job

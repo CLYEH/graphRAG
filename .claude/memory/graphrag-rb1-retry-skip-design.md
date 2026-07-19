@@ -1,6 +1,6 @@
 ---
 name: graphrag-rb1-retry-skip-design
-description: RB1-retry-skip(TASKS.md line 140,RB1 切片 B-2)owner 定案設計:pin 父設定 + v1 最小刀 + 選擇性 clone 關鍵正確性洞見;待實作
+description: RB1-retry-skip(TASKS.md line 140,RB1 切片 B-2)owner 定案設計:pin 父設定 + v1 最小刀 + 選擇性 clone 關鍵正確性洞見;**已實作並 merge(#103,Codex 4 輪)** — 設計如下,實際加了 fork-C/config-pin/chunk_id-remap/entanglement 四道守衛(見 lesson catalog #103)
 metadata:
   node_type: memory
   type: project

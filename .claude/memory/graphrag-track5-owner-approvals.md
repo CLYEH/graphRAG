@@ -23,10 +23,13 @@ RB1-fe(#102 RunsTable 失敗診斷:step/item 下鑽+安全 retry+lineage)亦已
 merge=RB1 FE 切片收官;**Codex 9 輪**(R4 note-suppression+CSS-cascade、
 filter[status]、P1 job-id 假承諾、step-error、next-page-error),每輪 fix+
 mutation-probe 判別測試+re-stamp,教訓見 lesson catalog #102。
-SS1b/GOV3/GOV2/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip。
-尚餘 RB1-retry-skip(逐項 compute-skip=真省成本+凍語料完備)、GOV3-fe、
-GOV2-fe(治理中心 UI + low-confidence/missing-evidence 清單 + publish gate);
-Console MCP URL/健康顯示 = GOV2-fe 落地時接 `GET /mcp` 端點。
+RB1-retry-skip(#103 選擇性 graph-layer clone+compute-skip:成功 doc 圖層重用、只
+重抽失敗 doc;owner 定案 pin 父設定+v1 最小刀)亦已 merge=**RB1 線完全收官**;
+**Codex 4 輪**(fork-C post-resolve 退全導、config-pin 強制+chunk_id remap、relation
+first-write-wins entanglement、entity entanglement subsumes),教訓見 lesson catalog #103。
+SS1b/GOV3/GOV2/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip(全數 merge)。
+尚餘 GOV3-fe、GOV2-fe(治理中心 UI + low-confidence/missing-evidence 清單 +
+publish gate,同落地);Console MCP URL/健康顯示 = GOV2-fe 落地時接 `GET /mcp` 端點。
 
 1. **CFG1 方向確認**:推翻 2026-07-10 雙源決策 — query-policy 統一單一 SoR
    (採建議:Postgres `projects.config`,MCP 啟動時讀 DB,`config.yaml` 退場)
