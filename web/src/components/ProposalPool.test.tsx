@@ -33,39 +33,47 @@ afterEach(() => {
 });
 
 describe("ProposalPool", () => {
-  // WHY: with a single `deciding` id, deciding row B overwrote A's value and
-  // re-enabled A's buttons while A's POST was still open — a second, opposite-verb
-  // decision on A could then race two terminal transitions (idem-keys A:accept vs
-  // A:reject differ, so the server 409s the loser and reports it as a failure).
-  // The pin: each in-flight row disables INDEPENDENTLY (Codex #104 P2).
-  it("keeps a row disabled while its own decision is in flight even after another row is decided", async () => {
+  // WHY: a single useMutation observer tracks ONE mutation; a second concurrent
+  // mutate() detaches it from the first, so the first's onSettled never fires and
+  // its row would stay stuck disabled — and two opposite-verb decisions on one row
+  // (idem-keys A:accept vs A:reject differ, so no dedupe) would race two terminal
+  // transitions, the loser 409ing into a spurious failure. The fix locks the whole
+  // pool while any decision is pending, so exactly one is ever in flight and
+  // react-query owns the pending lifecycle (Codex #104 P2, both rounds).
+  it("locks the whole pool while a decision is in flight and re-enables on settle", async () => {
     const a = proposal({ id: "a1", type_name: "Spaceship" });
     const b = proposal({ id: "b2", type_name: "Station" });
     vi.spyOn(api, "GET").mockResolvedValue({
       data: { data: [a, b], meta: META },
       error: undefined,
     } as never);
-    // decisions never settle, so both rows stay in flight for the whole test —
-    // onSettled never runs, so nothing is removed from the in-flight set
-    vi.spyOn(api, "POST").mockReturnValue(new Promise(() => {}) as never);
+    // a decision I settle on demand, so the in-flight window is observable
+    let reject!: (e: unknown) => void;
+    vi.spyOn(api, "POST").mockReturnValue(
+      new Promise((_res, rej) => {
+        reject = rej;
+      }) as never,
+    );
 
     renderWithProviders(<ProposalPool project="acme" />);
 
-    // re-query fresh each step so a re-render can't hand back a stale node;
-    // order follows the [a, b] response — [0] is row A, [1] is row B
+    // re-query fresh each step; order follows [a, b] — [0] is row A, [1] is row B
     const accepts = () => screen.getAllByRole("button", { name: /採納/ });
     await waitFor(() => expect(accepts()).toHaveLength(2));
-
-    // decide A → A's own buttons disable while its POST is open
-    fireEvent.click(accepts()[0]);
-    await waitFor(() => expect(accepts()[0]).toBeDisabled());
-    // B is untouched, still actionable
+    expect(accepts()[0]).toBeEnabled();
     expect(accepts()[1]).toBeEnabled();
 
-    // decide B while A is STILL posting → B disables AND A stays disabled.
-    // (the single-`deciding` bug re-enabled A here → this assertion would fail.)
-    fireEvent.click(accepts()[1]);
-    await waitFor(() => expect(accepts()[1]).toBeDisabled());
-    expect(accepts()[0]).toBeDisabled();
+    // decide row A → the ENTIRE pool locks, so no second concurrent decision can
+    // start (which is what would detach the observer and strand a row's cleanup)
+    fireEvent.click(accepts()[0]);
+    await waitFor(() => expect(accepts()[0]).toBeDisabled());
+    expect(accepts()[1]).toBeDisabled();
+
+    // the decision settles (here it fails) → the single observer flips isPending
+    // off, so every button re-enables — no row is left stuck — and the error shows
+    reject(new Error("boom"));
+    await waitFor(() => expect(accepts()[0]).toBeEnabled());
+    expect(accepts()[1]).toBeEnabled();
+    expect(screen.getByText(/決定失敗/)).toBeInTheDocument();
   });
 });

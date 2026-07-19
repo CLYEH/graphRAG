@@ -1,5 +1,3 @@
-import { useState } from "react";
-
 import { useDecideOntologyProposal, useOntologyProposals } from "../api/queries";
 
 import type { OntologyProposal, ProposalVerb } from "../api/queries";
@@ -23,27 +21,9 @@ function message(error: unknown): string {
 export function ProposalPool({ project }: { project: string }) {
   const proposals = useOntologyProposals(project);
   const decide = useDecideOntologyProposal(project);
-  // EVERY proposal whose decision is in flight — a Set, not a single id, so
-  // deciding row B doesn't re-enable row A while A's POST is still open. With a
-  // single value, A's buttons would light up again and a second (opposite-verb)
-  // decision on A could race two terminal transitions: the two carry different
-  // idem-keys (A:accept vs A:reject), so the server's §17 terminal guard 409s
-  // whichever loses the lock and reports it as a failure (Codex #104 P2).
-  const [inFlight, setInFlight] = useState<ReadonlySet<string>>(() => new Set());
 
   const onDecide = (proposalId: string, verb: ProposalVerb) => {
-    setInFlight((prev) => new Set(prev).add(proposalId));
-    decide.mutate(
-      { proposalId, verb, reason: null },
-      {
-        onSettled: () =>
-          setInFlight((prev) => {
-            const next = new Set(prev);
-            next.delete(proposalId);
-            return next;
-          }),
-      },
-    );
+    decide.mutate({ proposalId, verb, reason: null });
   };
 
   if (proposals.isPending) return <p className="review__line">載入提案…</p>;
@@ -68,12 +48,20 @@ export function ProposalPool({ project }: { project: string }) {
             </p>
           ) : null}
           <div className="proposals__actions">
+            {/* Whole-pool lock while ANY decision is in flight (decide.isPending),
+                not a per-row flag: a single useMutation observer tracks one
+                mutation, and a second concurrent mutate() would detach it from the
+                first — the first's onSettled would never fire and its row would
+                stay stuck disabled (Codex #104 P2). Locking the pool keeps exactly
+                one decision in flight, so react-query owns the pending lifecycle
+                and decide.isError reliably reports the one failure. A proposal
+                POST is sub-second; one-at-a-time matches the merge queue. */}
             {/* HONEST label: 採納 mutates the project's configured ontology, so a
                 future extraction stores this type — say so, don't just "accept" */}
             <button
               type="button"
               className="proposals__accept"
-              disabled={inFlight.has(p.id)}
+              disabled={decide.isPending}
               onClick={() => onDecide(p.id, "accept")}
             >
               採納(加入本體)
@@ -81,7 +69,7 @@ export function ProposalPool({ project }: { project: string }) {
             <button
               type="button"
               className="proposals__reject"
-              disabled={inFlight.has(p.id)}
+              disabled={decide.isPending}
               onClick={() => onDecide(p.id, "reject")}
             >
               拒絕
