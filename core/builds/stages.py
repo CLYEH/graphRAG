@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.builds.config import BuildConfig
 from core.builds.orchestrator import StageFn, StageResult, Stages
+from core.builds.retry import clone_graph_artifacts, graph_entangles_failed_docs
 from core.builds.sources import resolve_source
 from core.clean.chunking import clean_document
 from core.graph.documents import extract_documents
@@ -47,7 +48,9 @@ from core.graph.structured import extract_structured
 from core.index.indexing import index_build
 from core.ingest.connectors import DocumentPayload
 from core.ingest.documents import ingest_documents
-from core.observability.spec import ItemOutcome
+from core.observability.reads import latest_run_graph_items, latest_run_ran_resolve
+from core.observability.spec import ItemOutcome, retry_failed_only
+from core.registry.jobs import build_config_snapshot
 from core.registry.store import Source, list_sources
 from core.resolve.resolution import resolve_build
 from core.stores.graph import BuildScopedGraphProjector
@@ -106,16 +109,18 @@ def _all_payloads(sources: list[Source]) -> Iterator[DocumentPayload]:
         yield from resolve_source(source)
 
 
-async def _is_retry_build(conn: AsyncConnection, build_id: uuid.UUID) -> bool:
-    """Whether this build is an RB1-retry child (``builds.parent_build_id`` set).
+async def _retry_parent(conn: AsyncConnection, build_id: uuid.UUID) -> uuid.UUID | None:
+    """The parent this build retries (``builds.parent_build_id``), or None for an
+    ordinary build.
 
     A retry inherits the parent's documents (cloned in by the retry endpoint) as
-    its FROZEN corpus, so ingest must NOT re-read live sources — see ``_ingest_stage``.
+    its FROZEN corpus, so ingest must NOT re-read live sources — see
+    ``_ingest_stage`` — and its graph stage reuses the parent's successful graph
+    layer, re-extracting only the failed docs (RB1-retry-skip, ``_graph_stage``).
     """
-    parent = (
+    return (
         await conn.execute(sa.select(builds.c.parent_build_id).where(builds.c.id == build_id))
     ).scalar_one_or_none()
-    return parent is not None
 
 
 def _ingest_stage() -> StageFn:
@@ -129,7 +134,7 @@ def _ingest_stage() -> StageFn:
         # documents the parent never had. So a retry SKIPS source ingest; clean
         # re-chunks the cloned documents. (A full re-run against live sources is
         # POST /build, not retry.)
-        if await _is_retry_build(conn, build_id):
+        if await _retry_parent(conn, build_id) is not None:
             docs = await writer.fetch_all(documents)
             return StageResult(outcomes=(), detail={"retry_reused_documents": len(docs)})
         sources = await _load_sources(conn, project)
@@ -175,10 +180,77 @@ def _clean_stage(config: BuildConfig) -> StageFn:
     return clean
 
 
+async def _plan_retry_skip(
+    conn: AsyncConnection, project: str, build_id: uuid.UUID
+) -> tuple[frozenset[str] | None, dict[str, int] | None]:
+    """RB1-retry-skip: decide the graph stage's re-extraction set for a retry child.
+
+    Returns ``(extract_only, clone_detail)``. ``extract_only`` is the set of
+    document content_hashes to re-extract (the parent's graph-step failures);
+    ``None`` means "extract every text doc" (an ordinary build, OR a retry that
+    falls back to a full re-derive). ``clone_detail`` is the reuse report for
+    Health, or ``None`` when no clone happened.
+
+    The clone+skip is applied ONLY when the parent HAD graph-step failures to skip
+    around (``failed_docs`` non-empty). A later-stage failure, or a wholesale graph
+    crash that recorded no per-item failure, yields an empty set and falls back to
+    retry-core's full re-derive — correct, just not cost-saving (v1, fork C). When
+    it does apply, the clone runs HERE (before any extraction) so the fresh
+    re-extraction's ``preload`` sees the reused rows and converges on them instead
+    of minting drifted duplicates beside them.
+    """
+    parent = await _retry_parent(conn, build_id)
+    if parent is None:
+        return None, None
+    items = await latest_run_graph_items(conn, project, parent)
+    failed_docs = frozenset(ref for kind, ref in retry_failed_only(items) if kind == "document")
+    if not failed_docs:
+        return None, None  # full re-derive (retry-core): no clone, extract everything
+    # A parent that TOLERATED under-threshold graph failures can still have run
+    # resolve and failed later. Resolve merges entities (losers → 'merged' audit
+    # rows with repointed mentions, relations demoted to NULL signatures), so the
+    # pre-resolve-shaped selective clone would DROP those rows and diverge from a
+    # full re-derive. Clone+skip only when the parent stopped AT graph (resolve
+    # never ran); otherwise full re-derive (Codex #103 / fork C).
+    if await latest_run_ran_resolve(conn, project, parent):
+        return None, None
+    # CONFIRM the parent's config was pinned onto this child (凍語料完備). The retry
+    # endpoint pins it, but a LEGACY parent whose producing job recorded no config
+    # (schema-nullable) makes the pin fall back to the LIVE project config — so the
+    # cloned (parent-config) rows + the re-extracted docs would mix two configs, and
+    # the cloned chunk-evidence refs wouldn't line up with the child's re-chunk. Only
+    # clone+skip when the child is provably running the SAME config the parent ran;
+    # else full re-derive under the live config (Codex #103 R2).
+    parent_config = await build_config_snapshot(conn, parent)
+    if parent_config is None or parent_config != await build_config_snapshot(conn, build_id):
+        return None, None
+    # Entity AND relation ROWS are first-write-wins: if a FAILED doc first-wrote one
+    # (from a chunk that ran before its failure) and a successful doc also touches its
+    # key, the cloned row keeps the failed doc's PARTIAL scalars (e.g. a mis-cased
+    # canonical_name) and preload blocks the re-extraction from fixing them. We can't
+    # tell which doc first-wrote a row, so any ENTITY mentioned by both a failed and a
+    # non-failed doc forces a full re-derive — which subsumes the relation case, since
+    # a chunk-evidence relation's endpoints are always so mentioned (Codex #103 R3+R4).
+    if await graph_entangles_failed_docs(conn, parent, failed_docs):
+        return None, None
+    counts = await clone_graph_artifacts(conn, project, parent, build_id, failed_docs)
+    return failed_docs, {
+        "reextracted_docs": len(failed_docs),
+        "cloned_entities": counts.entities,
+        "cloned_mentions": counts.entity_mentions,
+        "cloned_relations": counts.relations,
+        "cloned_evidence": counts.relation_evidence,
+    }
+
+
 def _graph_stage(config: BuildConfig, chat_model: LLM) -> StageFn:
     async def graph(conn: AsyncConnection, project: str, build_id: uuid.UUID) -> StageResult:
         writer = await BuildScopedWriter.for_building_build(conn, project, build_id)
-        # C3a: deterministic structured rule-mapping extraction.
+        # RB1-retry-skip: reuse the parent's successful graph layer + re-extract
+        # only its failed docs (clones them in BEFORE the extractions below).
+        extract_only, retry_clone = await _plan_retry_skip(conn, project, build_id)
+        # C3a: deterministic structured rule-mapping extraction (always full — no
+        # LLM cost, and it reconverges on any cloned entity by its frozen key).
         structured = await extract_structured(writer, config.structured_mappings)
         outcomes = list(structured.outcomes)
         detail: dict[str, object] = {
@@ -189,9 +261,14 @@ def _graph_stage(config: BuildConfig, chat_model: LLM) -> StageFn:
                 "evidence": structured.evidence,
             }
         }
+        if retry_clone is not None:
+            detail["retry_skip"] = retry_clone
         if config.ontology is not None:
-            # C3b: LLM document extraction, then C3c: persist type proposals.
-            text = await extract_documents(writer, chat_model, config.ontology)
+            # C3b: LLM document extraction (only the failed docs on a retry-skip),
+            # then C3c: persist type proposals.
+            text = await extract_documents(
+                writer, chat_model, config.ontology, extract_only=extract_only
+            )
             outcomes.extend(text.outcomes)
             await persist_proposals(
                 conn, project, text.proposals, policy=config.ontology_proposal_policy

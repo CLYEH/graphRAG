@@ -547,6 +547,60 @@ async def test_long_quote_is_stored_truncated_with_full_span_offsets() -> None:
     assert ev["end_offset"] - ev["start_offset"] == len(long_quote)
 
 
+async def test_extract_only_reruns_failed_docs_and_never_calls_the_llm_for_reused() -> None:
+    """RB1-retry-skip: a retry hands ``extract_only`` = the parent's FAILED doc
+    content_hashes. ONLY those docs re-call the LLM (their artifacts are
+    re-extracted fresh); every successful doc was cloned into the child, so it is
+    skipped with NO LLM call and NO item outcome — re-extracting it would re-incur
+    cost AND let a nondeterministic model drift the cloned rows (the dedup index
+    blocks exact dups, not drift). The LLM call-count is the mutation probe: if
+    the skip regressed, the reused doc's chunk would be queried too."""
+    reused = SimpleNamespace(
+        id="doc-1", mime="text/plain", content_hash="hash-ok", source_uri="mem://ok.txt"
+    )
+    failed = SimpleNamespace(
+        id="doc-2", mime="text/plain", content_hash="hash-bad", source_uri="mem://bad.txt"
+    )
+    reused_chunk = SimpleNamespace(
+        id="c-1", ordinal=0, text="reused text", start_offset=0, end_offset=11, document_id="doc-1"
+    )
+    failed_chunk = SimpleNamespace(
+        id="c-2", ordinal=0, text=_TEXT, start_offset=0, end_offset=len(_TEXT), document_id="doc-2"
+    )
+
+    class _PerDocWriter(_FakeWriter):
+        async def fetch_all(self, table: Any, *where: Any) -> list[SimpleNamespace]:
+            if table is tables.chunks:
+                bound = where[0].right.value if where else None
+                return [c for c in self._chunks if c.document_id == bound]
+            return await super().fetch_all(table, *where)
+
+    writer = _PerDocWriter([reused, failed], [reused_chunk, failed_chunk])
+    llm = _FakeLLM({"reused text": _good_answer(), _TEXT: _good_answer()})
+    report = await extract_documents(
+        cast(BuildScopedWriter, writer),
+        cast(LLM, llm),
+        _ONTOLOGY,
+        extract_only=frozenset({"hash-bad"}),
+    )
+    # only the failed doc re-extracted; the reused doc got NO LLM call, NO outcome
+    assert [o.item_ref for o in report.outcomes] == ["hash-bad"]
+    assert llm.calls == 1  # exactly the failed doc's single chunk
+
+
+async def test_extract_only_empty_set_reextracts_nothing() -> None:
+    """An empty ``extract_only`` (a parent that failed AFTER graph — no graph-step
+    failures) re-extracts NO text document and calls the LLM zero times; the whole
+    graph layer is reused via the clone. Guards the boundary between ``None`` (a
+    normal build extracts all) and ``frozenset()`` (a retry extracts none)."""
+    writer = _FakeWriter([_doc()], [_chunk(_TEXT)])
+    llm = _FakeLLM({_TEXT: _good_answer()})
+    report = await extract_documents(
+        cast(BuildScopedWriter, writer), cast(LLM, llm), _ONTOLOGY, extract_only=frozenset()
+    )
+    assert report.outcomes == () and llm.calls == 0
+
+
 async def test_confidence_is_clamped_and_structured_docs_are_not_touched() -> None:
     structured = SimpleNamespace(
         id="doc-s", mime="application/json", content_hash="hash-s", source_uri="mem://s"

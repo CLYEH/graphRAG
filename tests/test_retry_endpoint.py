@@ -97,9 +97,18 @@ def _stub_produce(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         captured["clone"] = (parent, child)
         return CloneCounts(documents=2)
 
-    async def fake_create_job(conn: Any, project: str, kind: str, *, build_id: Any = None) -> Any:
+    async def fake_config_snapshot(conn: Any, build_id: Any) -> dict[str, Any]:
+        # RB1-retry-skip: the endpoint reads the PARENT's build config to pin it
+        # onto the child retry job; capture the arg to prove it looks up the PARENT
+        captured["config_lookup_build"] = build_id
+        return {"pinned": "parent-config"}
+
+    async def fake_create_job(
+        conn: Any, project: str, kind: str, *, build_id: Any = None, config_snapshot: Any = None
+    ) -> Any:
         captured["kind"] = kind
         captured["job_build_id"] = build_id
+        captured["job_config_snapshot"] = config_snapshot
         from types import SimpleNamespace
 
         return SimpleNamespace(id=job_id, status="queued")
@@ -110,6 +119,7 @@ def _stub_produce(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     monkeypatch.setattr("api.routers.builds.create_build", fake_create_build)
     monkeypatch.setattr("api.routers.builds.clone_raw_artifacts", fake_clone)
+    monkeypatch.setattr("api.routers.builds.build_config_snapshot", fake_config_snapshot)
     monkeypatch.setattr("api.routers.builds.create_job_exclusive", fake_create_job)
     monkeypatch.setattr("api.routers.builds.enqueue_build", fake_enqueue)
     return captured
@@ -142,6 +152,12 @@ def test_retry_records_child_lineage_and_retry_kind(
     assert captured["kind"] == "retry"
     assert captured["job_build_id"] == captured["child_id"]
     assert captured["enqueued_job_id"] == captured["job_id"]
+    # ...pinning the PARENT build's config onto the retry job (RB1-retry-skip,
+    # 凍語料完備): the endpoint looks up the PARENT's config and passes it as the
+    # child job's config_snapshot — so the reused parent-config graph layer and
+    # the re-extracted docs share one config even if the project config drifted.
+    assert captured["config_lookup_build"] == _PARENT
+    assert captured["job_config_snapshot"] == {"pinned": "parent-config"}
 
 
 @pytest.mark.parametrize("status", ["building", "ready", "active", "archived"])
@@ -208,7 +224,9 @@ def test_retry_overlapping_job_is_409_conflict(
     _stub_parent(monkeypatch)
     captured = _stub_produce(monkeypatch)
 
-    async def conflict(conn: Any, project: str, kind: str, *, build_id: Any = None) -> Any:
+    async def conflict(
+        conn: Any, project: str, kind: str, *, build_id: Any = None, config_snapshot: Any = None
+    ) -> Any:
         raise JobConflictError(project, uuid.uuid4())
 
     monkeypatch.setattr("api.routers.builds.create_job_exclusive", conflict)
@@ -228,7 +246,9 @@ def test_retry_project_vanished_at_job_creation_is_404(
     _stub_parent(monkeypatch)
     _stub_produce(monkeypatch)
 
-    async def missing(conn: Any, project: str, kind: str, *, build_id: Any = None) -> Any:
+    async def missing(
+        conn: Any, project: str, kind: str, *, build_id: Any = None, config_snapshot: Any = None
+    ) -> Any:
         raise ProjectNotFoundError(project)
 
     monkeypatch.setattr("api.routers.builds.create_job_exclusive", missing)

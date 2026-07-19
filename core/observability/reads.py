@@ -24,7 +24,20 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from core.observability.spec import ItemOutcome
 from core.stores import tables
+
+#: The §5 pipeline step whose per-document failures drive RB1-retry-skip's
+#: re-extraction. Verbatim from ``orchestrator._STAGE_ORDER`` (a test pins the
+#: lockstep) — the LLM-cost stage, the only one whose failed docs must be
+#: re-extracted rather than reused.
+GRAPH_STEP_NAME = "graph"
+
+#: The §5 stage right AFTER ``graph`` — the one that MERGES entities. Its presence
+#: in the parent's latest run means the graph layer is POST-resolve (see
+#: :func:`latest_run_ran_resolve`), which RB1-retry-skip's selective clone can't
+#: faithfully reuse. Verbatim from ``orchestrator._STAGE_ORDER`` (lockstep-tested).
+RESOLVE_STEP_NAME = "resolve"
 
 #: sentinel for a run with no ``started_at`` (would be NULL) — sorts as the
 #: OLDEST run so NULLs land last in the newest-run-first order without NULLS-
@@ -109,6 +122,82 @@ async def list_build_steps(
     page = rows[:limit]
     next_after = (page[-1].run_started_at, page[-1].id) if len(rows) > limit and page else None
     return page, next_after
+
+
+async def latest_run_graph_items(
+    conn: AsyncConnection, project: str, build_id: uuid.UUID
+) -> list[ItemOutcome]:
+    """The ``graph`` step's recorded item outcomes for the build's LATEST run.
+
+    RB1-retry-skip's failed-set source. The caller runs these through
+    :func:`core.observability.spec.retry_failed_only` (this is its production
+    caller) to get the failed ``(item_kind, item_ref)`` set the child re-extracts;
+    everything else (``extracted``/``skipped``) is reused via the graph-layer clone.
+
+    Scoped to the GRAPH step specifically, not all steps: a document can be
+    ``failed`` at ``index`` (a chunk-embed failure) while ``extracted`` at
+    ``graph`` — its graph artifacts are good and must NOT be re-extracted, so only
+    graph-step failures drive re-extraction. Scoped to the LATEST run (§27.7 "前次
+    run 的 failed 集合"): a parent that was itself resumed/retried holds several
+    runs, and an older run's failures are stale.
+
+    Returns ``[]`` when the parent has no graph step in its latest run (it failed
+    at/before ``clean``) — the caller then re-extracts nothing and clones the whole
+    (pre-graph, empty) graph layer, i.e. a full fresh graph build.
+    """
+    runs = tables.pipeline_runs
+    steps = tables.pipeline_steps
+    items = tables.pipeline_step_items
+    latest_run = (
+        sa.select(runs.c.id)
+        .where(runs.c.project == project, runs.c.build_id == build_id)
+        .order_by(sa.func.coalesce(runs.c.started_at, _EPOCH).desc(), runs.c.id.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    rows = (
+        await conn.execute(
+            sa.select(items.c.item_kind, items.c.item_ref, items.c.status)
+            .select_from(items.join(steps, items.c.step_id == steps.c.id))
+            .where(steps.c.run_id == latest_run, steps.c.step_name == GRAPH_STEP_NAME)
+        )
+    ).all()
+    return [ItemOutcome(item_kind=r.item_kind, item_ref=r.item_ref, status=r.status) for r in rows]
+
+
+async def latest_run_ran_resolve(conn: AsyncConnection, project: str, build_id: uuid.UUID) -> bool:
+    """Whether the build's LATEST run progressed into ``resolve`` (the stage right
+    after ``graph``).
+
+    RB1-retry-skip's selective clone assumes a PRE-resolve graph layer. But §22
+    TOLERATES under-threshold graph-item failures, so a parent can fail a document
+    at ``graph`` (a non-empty failed set), run ``resolve`` anyway, and only then
+    fail at ``index``/``summarize``. Resolve MERGES entities — the loser is left as
+    a ``status='merged'`` audit row with its mentions REPOINTED to the survivor,
+    and merged relations are demoted to NULL signatures (§17/§27.3,
+    ``core/resolve/resolution.py``). The clone's success-mention predicate then
+    omits those loser rows, and ``extract_only`` skips the (successful) document
+    that produced them, so the child would silently LOSE merged audit rows and
+    diverge from a full re-derive. When resolve ran, the caller must fall back to a
+    full extraction (retry-core's behavior), never the clone+skip (Codex #103 /
+    v1 fork C — the clone+skip applies only when the parent stopped AT graph).
+    """
+    runs = tables.pipeline_runs
+    steps = tables.pipeline_steps
+    latest_run = (
+        sa.select(runs.c.id)
+        .where(runs.c.project == project, runs.c.build_id == build_id)
+        .order_by(sa.func.coalesce(runs.c.started_at, _EPOCH).desc(), runs.c.id.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    return (
+        await conn.execute(
+            sa.select(steps.c.id)
+            .where(steps.c.run_id == latest_run, steps.c.step_name == RESOLVE_STEP_NAME)
+            .limit(1)
+        )
+    ).first() is not None
 
 
 async def step_belongs_to_build(
