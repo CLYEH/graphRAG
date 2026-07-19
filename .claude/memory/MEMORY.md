@@ -1,10 +1,11 @@
 # Memory Index
 
 - [PR 標題一律英文](graphrag-pr-titles-english.md) — owner 2026-07-17 指示;`<TASK-ID>: <english summary>`,body/commit 維持慣例
+- [GOV2-fe/GOV3-fe 治理中心設計](graphrag-gov-fe-design.md) — owner 2026-07-19 定案:分頁式治理頁(審核→治理)+ 兩 gap 清單(低信心/缺證據)延後另立 api facet 任務 + 發布閘顯示型;純 runtime FE,Plan 已驗碼,4 切片待實作
 - [RB1-retry-skip 設計定案](graphrag-rb1-retry-skip-design.md) — owner 2026-07-19 定案:pin 父設定(凍語料完備)+ v1 最小刀(只跳成功文件 graph LLM)+ 選擇性 clone(整圖 clone 會生鬼影)關鍵洞見;**已實作並 merge(#103,Codex 4 輪;實際加 fork-C/config-pin/chunk_id-remap/entanglement 四守衛,見 lesson catalog #103)**
 - [Track 5 owner 全數核准](graphrag-track5-owner-approvals.md) — 2026-07-17「全部同意」;CFG1(#93)、SS1a(#92)、CTR1(#94,DR-013,v1.3)、SRC2(#95)、SS1b-api(#96)、GOV3-api(#97)、GOV2-api(#98)、RB1-api(#99 drill-down)、RB1-retry-core(#100 lineage+端點+documents clone,Codex 5 輪)、SS1b-fe(#101 Graph 伺服器 q 搜尋)、RB1-fe(#102 失敗診斷 UI,Codex 9 輪)、RB1-retry-skip(#103 選擇性 clone+compute-skip+config-pin+entanglement 守衛,Codex 4 輪)runtime 皆已 merge=**RB1 線收官**;尚餘 GOV3-fe/GOV2-fe(治理中心 UI,同落地)
 - [Memory 去蕪存菁指示](graphrag-memory-pruning-directive.md) — owner 2026-07-17:retro 附帶 memory 盤點(過時拿掉/重要保存);首輪全掃 2026-07-18 執行完畢,之後 stale 即修
-- [懸置 follow-ups 集中帳](graphrag-open-followups.md) — useCancelJob 冪等鍵/ontology 首次設定 UI/UXC2 codegen binary/教學位置/MCP auth 將成真需求/policy.py text= 孤兒參數/server.py dispose 不對稱/untracked data/config 樂觀併發/run-level 失敗成因未曝露到 Console(RB1-api)/RB1-retry-skip entanglement 保守退全導(只重抽糾纏成功 docs 為精細解)
+- [懸置 follow-ups 集中帳](graphrag-open-followups.md) — useCancelJob 冪等鍵/ontology 首次設定 UI/UXC2 codegen binary/教學位置/MCP auth 將成真需求/policy.py text= 孤兒參數/server.py dispose 不對稱/untracked data/config 樂觀併發/run-level 失敗成因未曝露到 Console(RB1-api)/RB1-retry-skip entanglement 保守退全導(只重抽糾纏成功 docs 為精細解)/relations 低信心+缺證據 facet(GOV2-fe D4 延後)
 - [graphRAG 架構定案](graphrag-architecture.md) — 多專案 hybrid RAG 平台:Python + LlamaIndex + Postgres/Qdrant/Neo4j,一專案一邏輯 MCP server 經單一 gateway `/mcp/<project>` 供應(CFG1/DR-012),DESIGN.md v0.5(實作凍結版)
 - [graphRAG 工作方式](graphrag-working-style.md) — agent 全開發追求最完整、使用者握定案權、可與 ChatGPT 交叉討論
 - [Codex +1 才能 merge](codex-plus-one-merge-gate.md) — 合併硬門檻=Codex 👍(+1),無例外;已用 PreToolUse hook 機械性強制
