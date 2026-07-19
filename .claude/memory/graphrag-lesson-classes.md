@@ -66,7 +66,7 @@ Checker 探測的≠consumer 實際做的——checker 參數從 consumer 原始
 **Class 8 — 邊界語意 × 表示誤差**(何時比對:threshold、浮點、JSONB null)[pattern:對抗值 fixture 套件 + property-based(H4)]
 精確門檻被浮點表示破壞;Python None→JSONB 是 `'null'` 字面量不是 SQL NULL(`none_as_null=True`/`sa.null()`,#43);結構性 CHECK 能抓 ORM 表示 bug 而行為測試抓不到;fake-conn 測試繞過 SQL ORDER BY=假綠(#40)。對抗性不可表示值+顯式容差。
 
-**Class 9 — 防護面完整性 × 過度阻擋**(何時比對:寫任何 deny/guard)[部分:H17 checklist §7]
+**Class 9 — 防護面完整性 × 過度阻擋**(何時比對:寫任何 deny/guard)[部分機械化:reviewer routing→checklists/guards.md]
 Deny-guard 的面有 sibling 建構子 × 巢狀深度——全枚舉;每條 deny 配正向 accept pin;以值/字串判別不以型別。讀側:每個投影→輸出值「驗證於 SoR 否則 DROP」(不 raise),drop 計入 PARTIAL_RESULTS(#31);不可信選擇輸出 partial-valid=whole-fail(整答案 breadth-first fallback,#36)。allowlist 參數 guard 讓未來 facet 免 bump 即可加(#87);公共 core seam 自我強制簽名的 scope 參數(「unused param」warning=洩漏訊號,#99);對抗性威脅模型決定值域大小,並在 review 中點名該威脅模型(#21)。
 
 **Class 10 — 綁定時檢查 ≠ 不變量(TOCTOU)**(何時比對:多 commit 編排、鎖、並發 admin 面)[pattern:in-window 探針]

@@ -49,7 +49,8 @@ loop back to step 3.
    pathologically wrong, not that the suite was slow. CI + branch protection stay
    the server-side backstop for anything a local hook misses.
    **The local review is the pre-push adversarial pass — spend the round HERE, not
-   on Codex.** Run the `code-reviewer` §6/§7 matrix that matches the change to
+   on Codex.** Run the `code-reviewer` routed checklist matrix that matches the
+   change (`.claude/agents/checklists/*.md`, routed by diff content) to
    COMPLETION before the first push (input-position × level for parsers/validators;
    commit-boundary × crash/race for multi-commit; operation × state × interleaving
    for state machines), sweeping each class's siblings in the same pass. A class
