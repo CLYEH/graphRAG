@@ -292,6 +292,63 @@ describe("RelationReview", () => {
     expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
   });
 
+  it("restores a rejected relation from the 已排除 view with a FRESH key — names still gate (GOV2-fe-4a)", async () => {
+    const rej = relation({
+      id: "r-a",
+      src_entity_id: "e-src",
+      dst_entity_id: "e-dst",
+      status: "rejected",
+      review_status: "rejected",
+    });
+    const get = vi.spyOn(api, "GET").mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/relations") {
+        const filter = (opts as { params: { query: { filter?: { status?: string } } } }).params
+          .query.filter;
+        return Promise.resolve({
+          data: { data: filter?.status === "rejected" ? [rej] : [], meta: META },
+          error: undefined,
+        });
+      }
+      if (path === "/projects/{project}/entities/{entity_id}") {
+        const eid = (opts as { params: { path: { entity_id: string } } }).params.path.entity_id;
+        return Promise.resolve({
+          data: { data: entity({ id: eid, canonical_name: "海祭" }), meta: META },
+          error: undefined,
+        });
+      }
+      return Promise.resolve({ data: { data: rej, meta: META }, error: undefined });
+    }) as never);
+    const post = vi.spyOn(api, "POST").mockResolvedValue({
+      data: { data: { ...rej, status: "active", review_status: "approved" }, meta: META },
+      error: undefined,
+    } as never);
+
+    renderWithProviders(<RelationReview project="acme" />);
+    fireEvent.click(await screen.findByRole("button", { name: "已排除" }));
+    // the decided view selects the rejected facet, and the restore unlocks only
+    // after both endpoint names resolve (a restore re-adds the pair to the live
+    // graph — the see-the-pair safeguard applies to it too)
+    await waitFor(() => expect(screen.getByRole("button", { name: /復原/ })).toBeEnabled());
+    expect(get).toHaveBeenCalledWith(
+      "/projects/{project}/relations",
+      expect.objectContaining({
+        params: expect.objectContaining({
+          query: expect.objectContaining({ filter: { status: "rejected" } }),
+        }),
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /復原/ }));
+    await waitFor(() =>
+      expect(post).toHaveBeenCalledWith(
+        "/projects/{project}/relations/{relation_id}/approve",
+        expect.anything(),
+      ),
+    );
+    // deliberate re-decision — must NOT reuse the deterministic key
+    expect(idemKeyOf(post.mock.calls[0][1])).not.toBe("r-a:approve");
+  });
+
   it("locks the whole queue while a decision is in flight (Codex #104 P2)", async () => {
     const a = relation({
       id: "r-a",

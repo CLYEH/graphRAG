@@ -1,8 +1,8 @@
 import { useState } from "react";
 
-import { useDecideReviewTarget, useEntityReviewQueue } from "../api/queries";
+import { useDecideReviewTarget, useEntityReviewList } from "../api/queries";
 
-import type { ReviewTargetVerb } from "../api/queries";
+import type { Entity, ReviewTargetVerb } from "../api/queries";
 
 // approve/reject → operator words, keyed on the contract verb enum so a new verb
 // is a type error, not a silently-english label (the UXA3 translation layer).
@@ -15,29 +15,63 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
 }
 
-// GOV2-fe: the entity review queue (DESIGN §17). Entities the pipeline flagged
-// `needs_review`, one row each with the canonical name + type. A decision removes
-// the row and (like the sibling merge/proposal flows) is not re-decidable from the
-// queue — a decided/audit view for correcting a committed decision is a follow-up
-// (GOV2-fe-4). So 排除 (reject) — which removes the entity from the active graph
-// with no in-Console undo yet — is guarded by an explicit confirm (Codex #105 P1);
-// 保留 (approve, non-destructive: keeps the entity) stays inline for lightweight
-// bulk review. The whole queue locks while any decision posts (decide.isPending) —
-// a single useMutation observer, one mutation at a time (Codex #104 P2). Raw
-// ids/keys live only inside the per-row 原始資料 <details> fold (the
-// chrome-invariant escape hatch).
+// The per-row audit fold — raw ids / entity_key / store-vocabulary live ONLY here
+// (the chrome-invariant escape hatch; the per-decision audit trail, GOV2 §17).
+function EntityAudit({ e }: { e: Entity }) {
+  return (
+    <details className="targets__audit">
+      <summary>原始資料</summary>
+      <dl>
+        <div>
+          <dt>id</dt>
+          <dd>{e.id}</dd>
+        </div>
+        <div>
+          <dt>entity_key</dt>
+          <dd>{e.entity_key}</dd>
+        </div>
+        <div>
+          <dt>status</dt>
+          <dd>{e.status}</dd>
+        </div>
+        <div>
+          <dt>review_status</dt>
+          <dd>{e.review_status ?? "—"}</dd>
+        </div>
+        <div>
+          <dt>created_by</dt>
+          <dd>{e.created_by ?? "—"}</dd>
+        </div>
+        <div>
+          <dt>attributes</dt>
+          <dd>{JSON.stringify(e.attributes ?? {})}</dd>
+        </div>
+      </dl>
+    </details>
+  );
+}
+
+// GOV2-fe: the entity review surface (DESIGN §17), two views:
+// - 待審 (needs_review): the queue — 保留 (approve, non-destructive) inline; 排除
+//   (reject, removes from the active graph) behind a confirm. Deterministic
+//   idem-key in the hook (queue rows are decided at most once).
+// - 已排除 (rejected, GOV2-fe-4a): the decided view — rows a curator excluded,
+//   with a 復原(保留) restore (approve re-activates; review.py appends +
+//   latest-manual-wins). Restores mint a FRESH random idem-key per attempt: a
+//   reject→restore→reject cycle would otherwise replay an earlier cycle's stored
+//   response. Non-destructive → inline, no confirm.
+// Both views page INCREMENTALLY (Codex #105 P2) with a load-more; a next-page
+// failure keeps the loaded rows and offers an inline retry (the #102 discipline).
+// Every decision control locks while a decision posts OR the list refreshes
+// (decide.isPending || list.isFetching — Codex #104 P2 / #106 P1d).
 export function EntityReview({ project }: { project: string }) {
-  const queue = useEntityReviewQueue(project);
+  const [view, setView] = useState<"queue" | "rejected">("queue");
+  const list = useEntityReviewList(project, view === "queue" ? "needs_review" : "rejected");
   const decide = useDecideReviewTarget(project);
-  // the entity id awaiting a reject confirm (one at a time)
+  // the entity id awaiting a reject confirm (one at a time; queue view only)
   const [confirmingReject, setConfirmingReject] = useState<string | null>(null);
 
-  // lock every decision control while a decision posts AND while the queue refreshes
-  // after one: a resolved POST clears decide.isPending before the invalidated GET
-  // drops the decided row, so a second decision in that window would re-decide it
-  // and latest-manual-wins would silently reverse the one just confirmed (Codex #106
-  // P1d — the ReviewCases queueRefreshing guard). 取消 stays usable to back out.
-  const locked = decide.isPending || queue.isFetching;
+  const locked = decide.isPending || list.isFetching;
 
   const onApprove = (id: string) =>
     decide.mutate({ kind: "entity", targetId: id, verb: "approve", reason: null });
@@ -45,95 +79,140 @@ export function EntityReview({ project }: { project: string }) {
     decide.mutate({ kind: "entity", targetId: id, verb: "reject", reason: null });
     setConfirmingReject(null);
   };
+  const onRestore = (id: string) =>
+    decide.mutate({
+      kind: "entity",
+      targetId: id,
+      verb: "approve",
+      reason: null,
+      // deliberate re-decision — fresh key per attempt (see useDecideReviewTarget)
+      idempotencyKey: crypto.randomUUID(),
+    });
 
-  if (queue.isPending) return <p className="review__line">載入審核佇列…</p>;
-  if (queue.isError)
-    return <p className="review__line review__line--error">無法載入佇列:{message(queue.error)}</p>;
-  if (queue.data.length === 0) return <p className="review__line">目前沒有待審的知識點。</p>;
+  const rows = list.data?.pages.flatMap((p) => p.rows) ?? [];
 
   return (
-    <ul className="targets">
-      {queue.data.map((e) => (
-        <li key={e.id} className="targets__row">
-          <div className="targets__head">
-            <span className="targets__name">{e.canonical_name}</span>
-            <span className="targets__type">{e.type}</span>
-          </div>
-          {confirmingReject === e.id ? (
-            <div className="targets__confirm" role="alertdialog" aria-label="確認排除">
-              <p>排除後這個知識點會從上線的知識庫移除,目前無法從介面復原。確定嗎?</p>
-              <button
-                type="button"
-                className="targets__reject"
-                disabled={locked}
-                onClick={() => onConfirmReject(e.id)}
-              >
-                確定{VERB_LABEL.reject}
-              </button>
-              <button
-                type="button"
-                disabled={decide.isPending}
-                onClick={() => setConfirmingReject(null)}
-              >
-                取消
-              </button>
-            </div>
-          ) : (
-            <div className="targets__actions">
-              <button
-                type="button"
-                className="targets__approve"
-                disabled={locked}
-                onClick={() => onApprove(e.id)}
-              >
-                {VERB_LABEL.approve}
-              </button>
-              <button
-                type="button"
-                className="targets__reject"
-                disabled={locked}
-                onClick={() => setConfirmingReject(e.id)}
-              >
-                {VERB_LABEL.reject}
-              </button>
-            </div>
-          )}
-          {/* raw ids / entity_key / store-vocabulary = the chrome-invariant
-              <details> escape hatch (the per-decision audit trail, GOV2 §17) */}
-          <details className="targets__audit">
-            <summary>原始資料</summary>
-            <dl>
-              <div>
-                <dt>id</dt>
-                <dd>{e.id}</dd>
+    <div>
+      <div className="targets__views">
+        <button
+          type="button"
+          className={`targets__view${view === "queue" ? " targets__view--on" : ""}`}
+          aria-pressed={view === "queue"}
+          onClick={() => setView("queue")}
+        >
+          待審
+        </button>
+        <button
+          type="button"
+          className={`targets__view${view === "rejected" ? " targets__view--on" : ""}`}
+          aria-pressed={view === "rejected"}
+          onClick={() => setView("rejected")}
+        >
+          已排除
+        </button>
+      </div>
+
+      {list.isPending ? (
+        <p className="review__line">載入中…</p>
+      ) : list.isError && !list.data ? (
+        // initial load failed — nothing to show, fail loud
+        <p className="review__line review__line--error">無法載入清單:{message(list.error)}</p>
+      ) : rows.length === 0 ? (
+        <p className="review__line">
+          {view === "queue" ? "目前沒有待審的知識點。" : "沒有已排除的知識點。"}
+        </p>
+      ) : (
+        <ul className="targets">
+          {rows.map((e) => (
+            <li key={e.id} className="targets__row">
+              <div className="targets__head">
+                <span className="targets__name">{e.canonical_name}</span>
+                <span className="targets__type">{e.type}</span>
               </div>
-              <div>
-                <dt>entity_key</dt>
-                <dd>{e.entity_key}</dd>
-              </div>
-              <div>
-                <dt>status</dt>
-                <dd>{e.status}</dd>
-              </div>
-              <div>
-                <dt>review_status</dt>
-                <dd>{e.review_status ?? "—"}</dd>
-              </div>
-              <div>
-                <dt>created_by</dt>
-                <dd>{e.created_by ?? "—"}</dd>
-              </div>
-              <div>
-                <dt>attributes</dt>
-                <dd>{JSON.stringify(e.attributes ?? {})}</dd>
-              </div>
-            </dl>
-          </details>
-        </li>
-      ))}
-      {decide.isError ? (
-        <li className="review__line review__line--error">決定失敗:{message(decide.error)}</li>
+              {view === "rejected" ? (
+                <div className="targets__actions">
+                  {/* restore re-activates the entity — non-destructive, inline */}
+                  <button
+                    type="button"
+                    className="targets__approve"
+                    disabled={locked}
+                    onClick={() => onRestore(e.id)}
+                  >
+                    復原({VERB_LABEL.approve})
+                  </button>
+                </div>
+              ) : confirmingReject === e.id ? (
+                <div className="targets__confirm" role="alertdialog" aria-label="確認排除">
+                  <p>排除後這個知識點會從上線的知識庫移除(可在「已排除」視圖復原)。確定嗎?</p>
+                  <button
+                    type="button"
+                    className="targets__reject"
+                    disabled={locked}
+                    onClick={() => onConfirmReject(e.id)}
+                  >
+                    確定{VERB_LABEL.reject}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={decide.isPending}
+                    onClick={() => setConfirmingReject(null)}
+                  >
+                    取消
+                  </button>
+                </div>
+              ) : (
+                <div className="targets__actions">
+                  <button
+                    type="button"
+                    className="targets__approve"
+                    disabled={locked}
+                    onClick={() => onApprove(e.id)}
+                  >
+                    {VERB_LABEL.approve}
+                  </button>
+                  <button
+                    type="button"
+                    className="targets__reject"
+                    disabled={locked}
+                    onClick={() => setConfirmingReject(e.id)}
+                  >
+                    {VERB_LABEL.reject}
+                  </button>
+                </div>
+              )}
+              <EntityAudit e={e} />
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {/* next-page failure: the loaded rows stay, the error is inline, retry
+          re-attempts the SAME next page (RB1-fe #102 next-page discipline) */}
+      {list.isError && list.data ? (
+        <p className="review__line review__line--error">
+          載入更多失敗:{message(list.error)}
+          <button
+            type="button"
+            className="targets__evidence-toggle"
+            onClick={() => void list.fetchNextPage()}
+          >
+            重試
+          </button>
+        </p>
       ) : null}
-    </ul>
+      {list.hasNextPage && !list.isError ? (
+        <button
+          type="button"
+          className="targets__more"
+          disabled={list.isFetchingNextPage}
+          onClick={() => void list.fetchNextPage()}
+        >
+          {list.isFetchingNextPage ? "載入中…" : "載入更多"}
+        </button>
+      ) : null}
+      {decide.isError ? (
+        <p className="review__line review__line--error">決定失敗:{message(decide.error)}</p>
+      ) : null}
+    </div>
   );
 }

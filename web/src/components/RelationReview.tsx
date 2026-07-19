@@ -4,7 +4,7 @@ import {
   useDecideReviewTarget,
   useEntity,
   useRelation,
-  useRelationReviewQueue,
+  useRelationReviewList,
 } from "../api/queries";
 
 import type { Relation, ReviewTargetVerb } from "../api/queries";
@@ -49,36 +49,33 @@ function endpointName(q: ReturnType<typeof useEntity>): string {
   return q.data?.canonical_name ?? "(未知)";
 }
 
-// One relation row: resolves src→type→dst names, gates the decision on them,
-// keeps the CORRECTED GOV2-fe-1 decision UX (deterministic idem-key in the hook,
-// 保留 inline, 排除 behind a confirm, whole-queue isPending lock).
+// One relation row. mode="queue": 保留 inline + 排除 behind a confirm (the
+// corrected GOV2-fe-1 pattern). mode="restore" (the 已排除 decided view,
+// GOV2-fe-4a): a single 復原(保留) — approve re-activates; deliberate
+// re-decision, so the caller mints a fresh idem-key. EVERY decision entry point
+// gates on `locked` (decide posting, list refreshing, names unresolved) — the
+// operator must see the pair before any decision, including a restore that
+// re-adds the relation to the live graph (Codex #106 P1b/P1c/P2/P1d).
 function RelationRow({
   project,
   r,
   decide,
-  queueRefreshing,
+  listRefreshing,
+  mode,
 }: {
   project: string;
   r: Relation;
   decide: ReturnType<typeof useDecideReviewTarget>;
-  queueRefreshing: boolean;
+  listRefreshing: boolean;
+  mode: "queue" | "restore";
 }) {
   const src = useEntity(project, r.src_entity_id);
   const dst = useEntity(project, r.dst_entity_id);
   const [confirmingReject, setConfirmingReject] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
 
-  // no decision until the operator can actually SEE the pair. A still-loading OR a
-  // FAILED name lookup both keep it locked — an error only shows "(名稱載入失敗)",
-  // never the pair, so enabling on error would defeat the safeguard and permit an
-  // irreversible reject on unknown endpoints (Codex #106 P1c). A retry recovers.
-  // ALSO lock while the queue is refreshing after a decision (queueRefreshing): a
-  // resolved POST clears decide.isPending before the invalidated GET removes the
-  // row, so a second decision in that window would re-decide it and latest-manual-
-  // wins would silently reverse the one just confirmed (Codex #106 P1d — the
-  // ReviewCases queueRefreshing guard).
   const namesUnresolved = src.isPending || dst.isPending || src.isError || dst.isError;
-  const locked = decide.isPending || namesUnresolved || queueRefreshing;
+  const locked = decide.isPending || namesUnresolved || listRefreshing;
   const namesFailed = src.isError || dst.isError;
 
   const onApprove = () =>
@@ -87,6 +84,15 @@ function RelationRow({
     decide.mutate({ kind: "relation", targetId: r.id, verb: "reject", reason: null });
     setConfirmingReject(false);
   };
+  const onRestore = () =>
+    decide.mutate({
+      kind: "relation",
+      targetId: r.id,
+      verb: "approve",
+      reason: null,
+      // deliberate re-decision — fresh key per attempt (see useDecideReviewTarget)
+      idempotencyKey: crypto.randomUUID(),
+    });
   const retryNames = () => {
     void src.refetch();
     void dst.refetch();
@@ -123,13 +129,15 @@ function RelationRow({
         </button>
         {showEvidence ? <RelationEvidence project={project} relationId={r.id} /> : null}
       </div>
-      {confirmingReject ? (
+      {mode === "restore" ? (
+        <div className="targets__actions">
+          <button type="button" className="targets__approve" disabled={locked} onClick={onRestore}>
+            復原({VERB_LABEL.approve})
+          </button>
+        </div>
+      ) : confirmingReject ? (
         <div className="targets__confirm" role="alertdialog" aria-label="確認排除">
-          <p>排除後這個關聯會從上線的知識庫移除,目前無法從介面復原。確定嗎?</p>
-          {/* gate on `locked`, not just decide.isPending: if a name lookup goes
-              unresolved WHILE the confirm is open (e.g. a focus-refetch errors
-              after a build swap), the pair is no longer visible → the irreversible
-              reject must re-lock too (Codex #106 P2). 取消 stays usable to back out. */}
+          <p>排除後這個關聯會從上線的知識庫移除(可在「已排除」視圖復原)。確定嗎?</p>
           <button
             type="button"
             className="targets__reject"
@@ -200,34 +208,87 @@ function RelationRow({
   );
 }
 
-// GOV2-fe-2: the relation review queue (DESIGN §17). Relations the pipeline flagged
-// `needs_review`, each shown as src→type→dst with confidence and (on demand) the
-// evidenced quote. Reuses the CORRECTED GOV2-fe-1 pattern (Codex #105): the shared
-// useDecideReviewTarget (deterministic idem-key), 保留 inline / 排除-confirm, and
-// the whole-queue isPending lock (Codex #104 P2).
+// GOV2-fe: the relation review surface (DESIGN §17), two views: 待審 (the queue)
+// and 已排除 (the decided view with restore, GOV2-fe-4a). Both page INCREMENTALLY
+// (Codex #105 P2) with a load-more; a next-page failure keeps the loaded rows and
+// offers an inline retry (the #102 discipline).
 export function RelationReview({ project }: { project: string }) {
-  const queue = useRelationReviewQueue(project);
+  const [view, setView] = useState<"queue" | "rejected">("queue");
+  const list = useRelationReviewList(project, view === "queue" ? "needs_review" : "rejected");
   const decide = useDecideReviewTarget(project);
 
-  if (queue.isPending) return <p className="review__line">載入審核佇列…</p>;
-  if (queue.isError)
-    return <p className="review__line review__line--error">無法載入佇列:{message(queue.error)}</p>;
-  if (queue.data.length === 0) return <p className="review__line">目前沒有待審的關聯。</p>;
+  const rows = list.data?.pages.flatMap((p) => p.rows) ?? [];
 
   return (
-    <ul className="targets">
-      {queue.data.map((r) => (
-        <RelationRow
-          key={r.id}
-          project={project}
-          r={r}
-          decide={decide}
-          queueRefreshing={queue.isFetching}
-        />
-      ))}
-      {decide.isError ? (
-        <li className="review__line review__line--error">決定失敗:{message(decide.error)}</li>
+    <div>
+      <div className="targets__views">
+        <button
+          type="button"
+          className={`targets__view${view === "queue" ? " targets__view--on" : ""}`}
+          aria-pressed={view === "queue"}
+          onClick={() => setView("queue")}
+        >
+          待審
+        </button>
+        <button
+          type="button"
+          className={`targets__view${view === "rejected" ? " targets__view--on" : ""}`}
+          aria-pressed={view === "rejected"}
+          onClick={() => setView("rejected")}
+        >
+          已排除
+        </button>
+      </div>
+
+      {list.isPending ? (
+        <p className="review__line">載入中…</p>
+      ) : list.isError && !list.data ? (
+        <p className="review__line review__line--error">無法載入清單:{message(list.error)}</p>
+      ) : rows.length === 0 ? (
+        <p className="review__line">
+          {view === "queue" ? "目前沒有待審的關聯。" : "沒有已排除的關聯。"}
+        </p>
+      ) : (
+        <ul className="targets">
+          {rows.map((r) => (
+            <RelationRow
+              key={r.id}
+              project={project}
+              r={r}
+              decide={decide}
+              listRefreshing={list.isFetching}
+              mode={view === "rejected" ? "restore" : "queue"}
+            />
+          ))}
+        </ul>
+      )}
+
+      {/* next-page failure: loaded rows stay, inline error + retry (#102) */}
+      {list.isError && list.data ? (
+        <p className="review__line review__line--error">
+          載入更多失敗:{message(list.error)}
+          <button
+            type="button"
+            className="targets__evidence-toggle"
+            onClick={() => void list.fetchNextPage()}
+          >
+            重試
+          </button>
+        </p>
       ) : null}
-    </ul>
+      {list.hasNextPage && !list.isError ? (
+        <button
+          type="button"
+          className="targets__more"
+          disabled={list.isFetchingNextPage}
+          onClick={() => void list.fetchNextPage()}
+        >
+          {list.isFetchingNextPage ? "載入中…" : "載入更多"}
+        </button>
+      ) : null}
+      {decide.isError ? (
+        <p className="review__line review__line--error">決定失敗:{message(decide.error)}</p>
+      ) : null}
+    </div>
   );
 }

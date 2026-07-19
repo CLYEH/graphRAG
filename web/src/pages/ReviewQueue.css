@@ -287,6 +287,39 @@
 }
 
 /* GOV2-fe entity/relation review rows (mirrors .proposals__*) */
+/* GOV2-fe-4: the 待審/已排除 view toggle + incremental load-more */
+.targets__views {
+  display: flex;
+  gap: 6px;
+  margin: 0 0 8px;
+}
+
+.targets__view {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.targets__view--on {
+  color: var(--text-h);
+  border-color: var(--text);
+}
+
+.targets__more {
+  margin-top: 8px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--social-bg);
+  color: var(--text-h);
+  font-size: 13px;
+  cursor: pointer;
+}
+
 .targets__row {
   padding: 12px 0;
   border-bottom: 1px solid var(--border);
