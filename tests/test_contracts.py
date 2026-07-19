@@ -1017,6 +1017,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
         "unevaluatedProperties",
         "propertyNames",
         "contains",
+        "contentSchema",
         "if",
         "then",
         "else",
@@ -1064,21 +1065,29 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     request_bodies = spec["components"].get("requestBodies", {})
     bodies = 0
     for path, ops in spec["paths"].items():
-        for method, op in ops.items():
-            if not isinstance(op, dict) or "requestBody" not in op:
-                continue
-            rb = op["requestBody"]
-            if "$ref" in rb:
-                # a reusable components/requestBodies ref must be dereferenced,
-                # or its schema is never scanned (Codex #112 R2) — a dangling
-                # ref resolves to {} here and test_openapi_document_is_valid
-                # is the gate that rejects it
-                rb = request_bodies.get(rb["$ref"].rsplit("/", 1)[-1], {})
-            for ctype, media in rb.get("content", {}).items():
-                schema = media.get("schema")
-                if schema is not None:
-                    bodies += 1
-                    walk(schema, f"{method.upper()} {path} [{ctype}]", frozenset())
+        # a Path Item may itself be a $ref (3.1); overlap behavior between
+        # referenced and inline fields is spec-undefined, so scan both op
+        # sets IN FULL — even an HTTP method declared on both sides is
+        # scanned twice rather than letting either shadow the other
+        op_sets = [ops]
+        if "$ref" in ops:
+            op_sets = [_pointer(spec, ops["$ref"]), {k: v for k, v in ops.items() if k != "$ref"}]
+        for op_map in op_sets:
+            for method, op in op_map.items():
+                if not isinstance(op, dict) or "requestBody" not in op:
+                    continue
+                rb = op["requestBody"]
+                if "$ref" in rb:
+                    # a reusable components/requestBodies ref must be
+                    # dereferenced, or its schema is never scanned (Codex #112
+                    # R2) — a dangling ref resolves to {} here and
+                    # test_openapi_document_is_valid is the gate rejecting it
+                    rb = request_bodies.get(rb["$ref"].rsplit("/", 1)[-1], {})
+                for ctype, media in rb.get("content", {}).items():
+                    schema = media.get("schema")
+                    if schema is not None:
+                        bodies += 1
+                        walk(schema, f"{method.upper()} {path} [{ctype}]", frozenset())
 
     assert bodies >= 23  # the walk must actually cover the surface, not vacuously pass
     new_silent = silent - _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS
