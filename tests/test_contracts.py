@@ -145,14 +145,18 @@ def spec() -> dict[str, Any]:
 def _pointer(spec: dict[str, Any], ref: str) -> Any:
     """Follow one local JSON Pointer (``#/a/b/c``) to its target.
 
-    The fragment is a URI: percent-decode each token FIRST (``display%20name``
-    → ``display name``), then apply the JSON Pointer ``~1``/``~0`` transforms —
-    that order is the RFC 6901 evaluation order.
+    RFC 6901 evaluation order: percent-decode the WHOLE URI fragment into the
+    pointer string, split it on ``/``, then apply the ``~1``/``~0`` transforms
+    per token (``display%20name`` → ``display name``; ``%2F`` → a separator).
     """
-    assert isinstance(ref, str) and ref.startswith("#/"), f"non-local $ref: {ref!r}"
+    assert isinstance(ref, str) and ref.startswith("#"), f"non-local $ref: {ref!r}"
+    pointer = unquote(ref[1:])  # the WHOLE fragment decodes to the pointer,
+    # THEN it splits — %2F is a separator once decoded (a literal slash inside
+    # a token is ~1); splitting first mis-tokenizes encoded separators
+    assert pointer.startswith("/"), f"not a JSON Pointer fragment: {ref!r}"
     cur: Any = spec
-    for part in ref[2:].split("/"):
-        cur = cur[unquote(part).replace("~1", "/").replace("~0", "~")]
+    for part in pointer[1:].split("/"):
+        cur = cur[part.replace("~1", "/").replace("~0", "~")]
     return cur
 
 
@@ -1113,12 +1117,53 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
         return node
 
     bodies = 0
+
+    def scan_request_body(rb_node: Any, label_prefix: str) -> None:
+        nonlocal bodies
+        # a reusable components/requestBodies entry may itself be a Reference
+        # Object, so follow the CHAIN of full pointers (Codex #112 R2/R5); a
+        # dangling ref raises fail-loud and test_openapi_document_is_valid
+        # rejects it independently
+        rb = chase(rb_node)
+        if not isinstance(rb, dict):
+            return
+        for ctype, media in rb.get("content", {}).items():
+            body_label = f"{label_prefix} [{ctype}]"
+            schema = media.get("schema") if isinstance(media, dict) else None
+            # an ABSENT, boolean-true, or empty schema accepts arbitrary keys
+            # without declaring anything — that is a silently-open body, not a
+            # skippable one (Codex #112 R8) — and the same judgment applies
+            # through a BARE $ref chain to a true/{} component. A $ref WITH
+            # siblings is left to walk(): the siblings may close it (R10).
+            # `false` rejects every body — explicit and closed, so it passes.
+            resolved = chase(schema, only_bare=True) if isinstance(schema, dict) else schema
+            if schema is None or resolved is True or resolved == {}:
+                bodies += 1
+                silent.add(body_label)
+                continue
+            if isinstance(schema, dict):
+                bodies += 1
+                walk(schema, body_label, frozenset())
+
     visited_refs: set[str] = set()
     # worklist of (path label, path-item map): top-level paths AND webhooks,
-    # plus every operation's callbacks (whose path items nest recursively) —
-    # a request body outside spec["paths"] must not dodge the sweep (#112 R7)
+    # plus reusable components.pathItems/components.callbacks (declarable
+    # before or without a reference — #112 R11), plus every operation's
+    # callbacks (whose path items nest recursively) — a request body outside
+    # spec["paths"] must not dodge the sweep (#112 R7)
     pending = [(path, ops) for path, ops in spec["paths"].items()]
     pending += [(f"webhooks[{name}]", item) for name, item in spec.get("webhooks", {}).items()]
+    pending += [
+        (f"pathItems[{name}]", item)
+        for name, item in spec["components"].get("pathItems", {}).items()
+    ]
+    pending += [
+        (f"callbacks[{name}][{expr}]", item)
+        for name, cb in spec["components"].get("callbacks", {}).items()
+        if not name.startswith("x-") and isinstance(cb, dict) and "$ref" not in cb
+        for expr, item in cb.items()
+        if not expr.startswith("x-")
+    ]
     while pending:
         path, ops = pending.pop()
         if not isinstance(ops, dict):
@@ -1158,29 +1203,14 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 ]
             if "requestBody" not in op:
                 continue
-            # a reusable components/requestBodies entry may itself be a
-            # Reference Object, so follow the CHAIN of full pointers
-            # (Codex #112 R2/R5); a dangling ref raises fail-loud and
-            # test_openapi_document_is_valid rejects it independently
-            rb = chase(op["requestBody"])
-            for ctype, media in rb.get("content", {}).items():
-                body_label = f"{method.upper()} {path} [{ctype}]"
-                schema = media.get("schema")
-                # an ABSENT, boolean-true, or empty schema accepts arbitrary
-                # keys without declaring anything — that is a silently-open
-                # body, not a skippable one (Codex #112 R8) — and the same
-                # judgment applies through a BARE $ref chain to a true/{}
-                # component. A $ref WITH siblings is left to walk(): the
-                # siblings may close it (R10). `false` rejects every body —
-                # explicit and closed, so it passes.
-                resolved = chase(schema, only_bare=True) if isinstance(schema, dict) else schema
-                if schema is None or resolved is True or resolved == {}:
-                    bodies += 1
-                    silent.add(body_label)
-                    continue
-                if isinstance(schema, dict):
-                    bodies += 1
-                    walk(schema, body_label, frozenset())
+            scan_request_body(op["requestBody"], f"{method.upper()} {path}")
+
+    # a reusable request body may be DECLARED before (or without) a reference —
+    # scan components.requestBodies directly so it cannot sit silently open
+    # while unreferenced (Codex #112 R11)
+    for rb_name, rb_node in spec["components"].get("requestBodies", {}).items():
+        if not rb_name.startswith("x-"):
+            scan_request_body(rb_node, f"requestBodies[{rb_name}]")
 
     assert bodies >= 23  # the walk must actually cover the surface, not vacuously pass
     assert not dynamic, (
