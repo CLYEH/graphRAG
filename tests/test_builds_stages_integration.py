@@ -35,8 +35,10 @@ from sqlalchemy.pool import NullPool
 
 from core.builds.config import load_build_config
 from core.builds.orchestrator import run_build
+from core.builds.retry import clone_raw_artifacts
 from core.builds.stages import default_stages
 from core.config import get_settings
+from core.observability.recorder import StepReport, record_run
 from core.registry import add_source, create_job, create_project, get_job
 from core.stores import tables
 from core.stores.graph import graph_driver
@@ -320,6 +322,249 @@ async def test_retry_build_ingest_skips_live_sources(
             )
         # exactly the clone — the CSV's rows were never ingested into the child
         assert list(hashes) == ["cloned-hash"]
+    finally:
+        await _cleanup(engine, client, session, project)
+        await engine.dispose()
+
+
+_RETRY_ONTOLOGY_CONFIG = {
+    "ontology": {
+        "entity_types": ["Person"],
+        "relation_types": ["KNOWS"],
+        "proposal_policy": "review",
+    },
+    "chunking": {"max_chars": 1200, "overlap": 200},
+}
+
+_DOC_A = "Alice knows Bob"
+_DOC_B = "Carol knows Dave"
+
+
+def _extraction(a_name: str, b_name: str, text: str) -> str:
+    return json.dumps(
+        {
+            "entities": [
+                {"type": "Person", "name": a_name, "confidence": 0.9},
+                {"type": "Person", "name": b_name, "confidence": 0.9},
+            ],
+            "relations": [
+                {
+                    "src_type": "Person",
+                    "src_name": a_name,
+                    "type": "KNOWS",
+                    "dst_type": "Person",
+                    "dst_name": b_name,
+                    "quote": text,  # verbatim in the chunk (§27.4)
+                    "confidence": 0.8,
+                }
+            ],
+        }
+    )
+
+
+class _ExtractLLM:
+    """Deterministic per-chunk text extraction; RAISES on a configured chunk to
+    simulate a transient graph failure for one document. Records its calls so a
+    test can prove the retry re-extracted ONLY the failed doc."""
+
+    def __init__(self, answers: dict[str, str], fail: set[str] | None = None) -> None:
+        self._answers = answers
+        self._fail = fail or set()
+        self.calls: list[str] = []
+
+    async def achat(self, messages: Any, **kwargs: Any) -> Any:
+        user = str(messages[-1].content)
+        self.calls.append(user)
+        if user in self._fail:
+            raise RuntimeError("transient LLM failure")
+        return SimpleNamespace(message=SimpleNamespace(content=self._answers[user]))
+
+
+async def _make_building(
+    engine: AsyncEngine, project: str, *, parent: uuid.UUID | None = None
+) -> uuid.UUID:
+    async with engine.connect() as conn, conn.begin():
+        return cast(
+            "uuid.UUID",
+            (
+                await conn.execute(
+                    tables.builds.insert()
+                    .values(project=project, status="building", parent_build_id=parent)
+                    .returning(tables.builds.c.id)
+                )
+            ).scalar_one(),
+        )
+
+
+async def _seed_text_doc(
+    engine: AsyncEngine, project: str, build_id: uuid.UUID, h: str, raw: str
+) -> None:
+    async with engine.connect() as conn, conn.begin():
+        await conn.execute(
+            tables.documents.insert().values(
+                project=project,
+                build_id=build_id,
+                source_uri=f"file:///{h}.txt",
+                raw=raw,
+                content_hash=h,
+                mime="text/plain",
+                status="ingested",
+            )
+        )
+
+
+async def _run_clean_then_graph(
+    engine: AsyncEngine, stages: Any, project: str, build_id: uuid.UUID
+) -> Any:
+    async with engine.connect() as conn, conn.begin():
+        await stages.clean(conn, project, build_id)
+    async with engine.connect() as conn, conn.begin():
+        return await stages.graph(conn, project, build_id)
+
+
+async def _graph_fingerprint(
+    engine: AsyncEngine, build_id: uuid.UUID
+) -> tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[tuple[str, str]]]:
+    """A build's post-graph identity: entity_keys, relation_signatures, evidence
+    hashes, and (entity_key, mention source_ref) pairs — everything the merge of
+    (cloned successes + re-extracted failures) must equal in a full rebuild."""
+    async with engine.connect() as conn:
+        ents = (
+            await conn.execute(
+                sa.select(tables.entities.c.id, tables.entities.c.entity_key).where(
+                    tables.entities.c.build_id == build_id
+                )
+            )
+        ).all()
+        key_by_id = {e.id: e.entity_key for e in ents}
+        mentions = (
+            await conn.execute(
+                sa.select(
+                    tables.entity_mentions.c.entity_id, tables.entity_mentions.c.source_ref
+                ).where(tables.entity_mentions.c.entity_id.in_(list(key_by_id) or [uuid.uuid4()]))
+            )
+        ).all()
+        sigs = (
+            (
+                await conn.execute(
+                    sa.select(tables.relations.c.relation_signature).where(
+                        tables.relations.c.build_id == build_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        ev = (
+            (
+                await conn.execute(
+                    sa.select(tables.relation_evidence.c.evidence_hash).where(
+                        tables.relation_evidence.c.build_id == build_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return (
+        frozenset(key_by_id.values()),
+        frozenset(s for s in sigs if s is not None),
+        frozenset(ev),
+        frozenset((key_by_id[m.entity_id], m.source_ref) for m in mentions),
+    )
+
+
+async def test_retry_skip_reextracts_only_the_failed_doc_and_equals_a_full_rebuild(
+    stores: tuple[AsyncQdrantClient, AsyncSession], tmp_path: Path
+) -> None:
+    """RB1-retry-skip end-to-end oracle. A parent build extracts doc A but FAILS
+    doc B at graph (transient LLM error). The retry child reuses A's graph layer
+    (cloned) and re-extracts ONLY B — and because the failure was transient, B now
+    succeeds. The merged child graph must be IDENTICAL to a full clean rebuild's
+    (where both docs succeed): same entity_keys, relation_signatures, evidence
+    hashes, and mention refs. This is the whole point — reuse must not lose or
+    drift anything the full run would have produced, under a deterministic LLM.
+    The call log proves the child re-called the LLM for B ONLY (A was reused)."""
+    client, session = stores
+    engine = _engine()
+    project = _proj()
+    answers = {
+        _DOC_A: _extraction("Alice", "Bob", _DOC_A),
+        _DOC_B: _extraction("Carol", "Dave", _DOC_B),
+    }
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+
+        # ---- PARENT: A extracted, B fails at graph ----
+        parent = await _make_building(engine, project)
+        await _seed_text_doc(engine, project, parent, "hash-a", _DOC_A)
+        await _seed_text_doc(engine, project, parent, "hash-b", _DOC_B)
+        parent_stages = default_stages(
+            load_build_config(_RETRY_ONTOLOGY_CONFIG),
+            chat_model=cast(LLM, _ExtractLLM(answers, fail={_DOC_B})),
+            embedder=cast(BaseEmbedding, _FakeEmbedder()),
+            vector_client=client,
+            graph_session=session,
+        )
+        parent_graph = await _run_clean_then_graph(engine, parent_stages, project, parent)
+        # record the graph step's items so the retry can read the failed set
+        # (record_run owns its OWN transaction — hand it a no-txn connection),
+        # then terminalize the parent 'failed' (as run_build would on a failed item)
+        async with engine.connect() as conn:
+            await record_run(
+                conn,
+                project,
+                parent,
+                "build",
+                [StepReport("graph", parent_graph.outcomes)],
+                verbosity="failures",
+            )
+        async with engine.connect() as conn, conn.begin():
+            await conn.execute(
+                tables.builds.update().where(tables.builds.c.id == parent).values(status="failed")
+            )
+        assert {(o.item_ref, o.status) for o in parent_graph.outcomes} == {
+            ("hash-a", "extracted"),
+            ("hash-b", "failed"),
+        }
+
+        # ---- RETRY CHILD: clone docs, re-run; B recovers ----
+        child = await _make_building(engine, project, parent=parent)
+        async with engine.connect() as conn, conn.begin():
+            await clone_raw_artifacts(conn, project, parent, child)
+        child_llm = _ExtractLLM(answers, fail=set())  # transient failure gone
+        child_stages = default_stages(
+            load_build_config(_RETRY_ONTOLOGY_CONFIG),
+            chat_model=cast(LLM, child_llm),
+            embedder=cast(BaseEmbedding, _FakeEmbedder()),
+            vector_client=client,
+            graph_session=session,
+        )
+        await _run_clean_then_graph(engine, child_stages, project, child)
+        # the compute-skip: the child re-called the LLM for B's chunk ONLY — A's
+        # graph layer was reused via the clone, never re-extracted
+        assert child_llm.calls == [_DOC_B]
+
+        # ---- FULL REBUILD: fresh build, both docs succeed ----
+        fresh = await _make_building(engine, project)
+        await _seed_text_doc(engine, project, fresh, "hash-a", _DOC_A)
+        await _seed_text_doc(engine, project, fresh, "hash-b", _DOC_B)
+        fresh_stages = default_stages(
+            load_build_config(_RETRY_ONTOLOGY_CONFIG),
+            chat_model=cast(LLM, _ExtractLLM(answers, fail=set())),
+            embedder=cast(BaseEmbedding, _FakeEmbedder()),
+            vector_client=client,
+            graph_session=session,
+        )
+        await _run_clean_then_graph(engine, fresh_stages, project, fresh)
+
+        # ---- ORACLE: the reused+re-extracted child graph == the full rebuild ----
+        child_fp = await _graph_fingerprint(engine, child)
+        fresh_fp = await _graph_fingerprint(engine, fresh)
+        assert child_fp == fresh_fp
+        # and it is non-trivial: both docs' entities/relations are present
+        assert child_fp[0] and len(child_fp[1]) == 2  # 2 KNOWS relations
     finally:
         await _cleanup(engine, client, session, project)
         await engine.dispose()
