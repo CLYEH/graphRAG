@@ -71,9 +71,11 @@ describe("ReviewQueue", () => {
     expect(await screen.findByText("Spaceship")).toBeInTheDocument();
     expect(screen.getByText(/Rocinante/)).toBeInTheDocument();
 
-    // 採納 → POST the ACCEPT path (verb rides the URL) with the deterministic
-    // Idempotency-Key; a body-verb or the reject path would fail this
-    fireEvent.click(screen.getByRole("button", { name: /採納/ }));
+    // 採納 arms the §17-terminal confirm; only 確定採納 posts the ACCEPT path (verb
+    // rides the URL) with the deterministic Idempotency-Key — a body-verb or the
+    // reject path would fail this
+    fireEvent.click(screen.getByRole("button", { name: /加入本體/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "確定採納" }));
     await waitFor(() =>
       expect(post).toHaveBeenCalledWith(
         "/projects/{project}/ontology-proposals/{proposal_id}/accept",

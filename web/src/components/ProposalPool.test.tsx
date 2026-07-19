@@ -28,19 +28,46 @@ function proposal(over: Partial<OntologyProposal>): OntologyProposal {
   };
 }
 
+// the action button carries "加入本體"; the confirm button is "確定採納" — matching
+// on the former isolates the arming buttons from the confirm one
+const acceptButtons = () => screen.getAllByRole("button", { name: /加入本體/ });
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
 describe("ProposalPool", () => {
+  // WHY: accept/reject are §17-TERMINAL (a re-decide 409s) and irreversible from
+  // here — reject drops the type, accept mutates the configured ontology — so a
+  // lone inline misclick must not commit them. Mirrors the merge flow's confirm.
+  it("arms a confirm before a terminal decision and cancels back out with no POST", async () => {
+    const a = proposal({ id: "a1", type_name: "Spaceship" });
+    vi.spyOn(api, "GET").mockResolvedValue({
+      data: { data: [a], meta: META },
+      error: undefined,
+    } as never);
+    const post = vi.spyOn(api, "POST");
+
+    renderWithProviders(<ProposalPool project="acme" />);
+
+    // first click ARMS the confirm — nothing posts yet
+    fireEvent.click(await screen.findByRole("button", { name: /加入本體/ }));
+    expect(await screen.findByRole("alertdialog", { name: "確認決定" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "確定採納" })).toBeInTheDocument();
+    expect(post).not.toHaveBeenCalled();
+
+    // 取消 backs out to the action buttons, still nothing posted
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(await screen.findByRole("button", { name: /加入本體/ })).toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(post).not.toHaveBeenCalled();
+  });
+
   // WHY: a single useMutation observer tracks ONE mutation; a second concurrent
-  // mutate() detaches it from the first, so the first's onSettled never fires and
-  // its row would stay stuck disabled — and two opposite-verb decisions on one row
-  // (idem-keys A:accept vs A:reject differ, so no dedupe) would race two terminal
-  // transitions, the loser 409ing into a spurious failure. The fix locks the whole
-  // pool while any decision is pending, so exactly one is ever in flight and
-  // react-query owns the pending lifecycle (Codex #104 P2, both rounds).
-  it("locks the whole pool while a decision is in flight and re-enables on settle", async () => {
+  // mutate() detaches it from the first, stranding the first's cleanup and racing
+  // two opposite-verb terminal transitions. Locking the whole pool while any
+  // decision is pending keeps exactly one in flight (Codex #104 P2).
+  it("posts only after confirm, locks the whole pool in flight, and re-enables on settle", async () => {
     const a = proposal({ id: "a1", type_name: "Spaceship" });
     const b = proposal({ id: "b2", type_name: "Station" });
     vi.spyOn(api, "GET").mockResolvedValue({
@@ -49,31 +76,31 @@ describe("ProposalPool", () => {
     } as never);
     // a decision I settle on demand, so the in-flight window is observable
     let reject!: (e: unknown) => void;
-    vi.spyOn(api, "POST").mockReturnValue(
+    const post = vi.spyOn(api, "POST").mockReturnValue(
       new Promise((_res, rej) => {
         reject = rej;
       }) as never,
     );
 
     renderWithProviders(<ProposalPool project="acme" />);
+    await waitFor(() => expect(acceptButtons()).toHaveLength(2));
 
-    // re-query fresh each step; order follows [a, b] — [0] is row A, [1] is row B
-    const accepts = () => screen.getAllByRole("button", { name: /採納/ });
-    await waitFor(() => expect(accepts()).toHaveLength(2));
-    expect(accepts()[0]).toBeEnabled();
-    expect(accepts()[1]).toBeEnabled();
+    // arm row A's confirm, then commit it
+    fireEvent.click(acceptButtons()[0]);
+    fireEvent.click(await screen.findByRole("button", { name: "確定採納" }));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
 
-    // decide row A → the ENTIRE pool locks, so no second concurrent decision can
-    // start (which is what would detach the observer and strand a row's cleanup)
-    fireEvent.click(accepts()[0]);
-    await waitFor(() => expect(accepts()[0]).toBeDisabled());
-    expect(accepts()[1]).toBeDisabled();
+    // decision in flight → the ENTIRE pool locks (both rows' accept disabled), so
+    // no second concurrent mutation can detach the observer
+    await waitFor(() => {
+      for (const btn of acceptButtons()) expect(btn).toBeDisabled();
+    });
 
-    // the decision settles (here it fails) → the single observer flips isPending
-    // off, so every button re-enables — no row is left stuck — and the error shows
+    // settle (here it fails) → every button re-enables — no stuck row — and the
+    // error surfaces
     reject(new Error("boom"));
-    await waitFor(() => expect(accepts()[0]).toBeEnabled());
-    expect(accepts()[1]).toBeEnabled();
+    await waitFor(() => expect(acceptButtons()[0]).toBeEnabled());
+    expect(acceptButtons()[1]).toBeEnabled();
     expect(screen.getByText(/決定失敗/)).toBeInTheDocument();
   });
 });

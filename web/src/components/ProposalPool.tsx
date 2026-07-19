@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import { useDecideOntologyProposal, useOntologyProposals } from "../api/queries";
 
 import type { OntologyProposal, ProposalVerb } from "../api/queries";
@@ -15,15 +17,23 @@ function message(error: unknown): string {
 
 // GOV3-fe: the ontology-proposal pool — LLM-observed types not in the configured
 // ontology, awaiting review. Accept adds the type to the project's ontology (next
-// build reads it); reject excludes it. A list with inline actions (not the merge
-// queue's one-at-a-time flow) because a proposal decision is a single terminal
-// choice, not a per-pair adjudication.
+// build reads it); reject excludes it. A list (not the merge queue's one-at-a-time
+// walk) because a proposal is a single terminal choice, not a per-pair adjudication.
 export function ProposalPool({ project }: { project: string }) {
   const proposals = useOntologyProposals(project);
   const decide = useDecideOntologyProposal(project);
+  // Which row is awaiting an explicit confirm, and for which verb. accept/reject
+  // are §17-TERMINAL (a re-decide 409s) and irreversible from here — reject drops
+  // the type, accept mutates the configured ontology — so a single inline misclick
+  // must NOT commit them; the first click only arms a confirm. The sibling
+  // merge-review flow gates its terminal verbs behind the same confirm for the
+  // same reason (ReviewCases). One row confirms at a time.
+  const [confirming, setConfirming] = useState<{ id: string; verb: ProposalVerb } | null>(null);
 
-  const onDecide = (proposalId: string, verb: ProposalVerb) => {
-    decide.mutate({ proposalId, verb, reason: null });
+  const onConfirm = () => {
+    if (!confirming) return;
+    decide.mutate({ proposalId: confirming.id, verb: confirming.verb, reason: null });
+    setConfirming(null);
   };
 
   if (proposals.isPending) return <p className="review__line">載入提案…</p>;
@@ -47,34 +57,53 @@ export function ProposalPool({ project }: { project: string }) {
               首見來源:{p.chunk_ref}
             </p>
           ) : null}
-          <div className="proposals__actions">
-            {/* Whole-pool lock while ANY decision is in flight (decide.isPending),
-                not a per-row flag: a single useMutation observer tracks one
-                mutation, and a second concurrent mutate() would detach it from the
-                first — the first's onSettled would never fire and its row would
-                stay stuck disabled (Codex #104 P2). Locking the pool keeps exactly
-                one decision in flight, so react-query owns the pending lifecycle
-                and decide.isError reliably reports the one failure. A proposal
-                POST is sub-second; one-at-a-time matches the merge queue. */}
-            {/* HONEST label: 採納 mutates the project's configured ontology, so a
-                future extraction stores this type — say so, don't just "accept" */}
-            <button
-              type="button"
-              className="proposals__accept"
-              disabled={decide.isPending}
-              onClick={() => onDecide(p.id, "accept")}
-            >
-              採納(加入本體)
-            </button>
-            <button
-              type="button"
-              className="proposals__reject"
-              disabled={decide.isPending}
-              onClick={() => onDecide(p.id, "reject")}
-            >
-              拒絕
-            </button>
-          </div>
+          {confirming?.id === p.id ? (
+            <div className="proposals__confirm" role="alertdialog" aria-label="確認決定">
+              <p>
+                {confirming.verb === "accept"
+                  ? "採納後會把這個型別加入本體,下次建置生效。"
+                  : "拒絕後這個型別會被排除。"}
+                此決定<strong>無法復原</strong>,確定嗎?
+              </p>
+              <button
+                type="button"
+                className={confirming.verb === "accept" ? "proposals__accept" : "proposals__reject"}
+                disabled={decide.isPending}
+                onClick={onConfirm}
+              >
+                {confirming.verb === "accept" ? "確定採納" : "確定拒絕"}
+              </button>
+              <button type="button" disabled={decide.isPending} onClick={() => setConfirming(null)}>
+                取消
+              </button>
+            </div>
+          ) : (
+            <div className="proposals__actions">
+              {/* First click ARMS the confirm above (terminal-action guard); the
+                  buttons also lock while ANY decision posts (decide.isPending), so
+                  exactly one mutation is ever in flight — react-query owns the
+                  pending lifecycle (no observer-detach stranding a row) and the
+                  opposite-verb race can't form (Codex #104 P2). */}
+              {/* HONEST label: 採納 mutates the project's configured ontology, so a
+                  future extraction stores this type — say so, don't just "accept" */}
+              <button
+                type="button"
+                className="proposals__accept"
+                disabled={decide.isPending}
+                onClick={() => setConfirming({ id: p.id, verb: "accept" })}
+              >
+                採納(加入本體)
+              </button>
+              <button
+                type="button"
+                className="proposals__reject"
+                disabled={decide.isPending}
+                onClick={() => setConfirming({ id: p.id, verb: "reject" })}
+              >
+                拒絕
+              </button>
+            </div>
+          )}
         </li>
       ))}
       {decide.isError ? (

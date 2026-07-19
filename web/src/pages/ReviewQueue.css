@@ -266,6 +266,26 @@
   cursor: default;
 }
 
+/* the §17-terminal-action confirm (mirrors .review__confirm on the merge flow) */
+.proposals__confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.proposals__confirm p {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.proposals__confirm button {
+  padding: 5px 12px;
+}
+
 @media (prefers-color-scheme: dark) {
   .review__line--error,
   .review__error {

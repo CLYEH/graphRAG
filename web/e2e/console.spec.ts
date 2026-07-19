@@ -453,9 +453,11 @@ test("the governance page adjudicates an ontology proposal on the 本體提案 t
   await expect(page.getByText("Spaceship")).toBeVisible();
   await expect(page.getByText("實體型別")).toBeVisible();
 
-  // 採納 posts the ACCEPT verb on its own path with the deterministic idem-key; a
-  // body-verb, the reject path, or a random key would fail these assertions
-  await page.getByRole("button", { name: /採納/ }).click();
+  // 採納 arms the §17-terminal confirm; only 確定採納 posts. The accept verb rides
+  // its own path with the deterministic idem-key — a body-verb, the reject path,
+  // or a random key would fail these assertions
+  await page.getByRole("button", { name: "採納(加入本體)" }).click();
+  await page.getByRole("button", { name: "確定採納" }).click();
   await expect.poll(() => acceptPath).toMatch(/\/ontology-proposals\/[^/]+\/accept$/);
   expect(idemKey).toBe("d1111111-aaaa-4aaa-8aaa-000000000001:accept");
 });
