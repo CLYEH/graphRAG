@@ -1142,10 +1142,23 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             # test_openapi_document_is_valid rejects it independently
             rb = chase(op["requestBody"])
             for ctype, media in rb.get("content", {}).items():
+                body_label = f"{method.upper()} {path} [{ctype}]"
                 schema = media.get("schema")
-                if schema is not None:
+                # an ABSENT, boolean-true, or empty schema accepts arbitrary
+                # keys without declaring anything — that is a silently-open
+                # body, not a skippable one (Codex #112 R8) — and the same
+                # judgment applies through a $ref CHAIN to a true/{} component
+                # (classify on the chased value, walk the original node so
+                # component labels — and the pin — are preserved). `false`
+                # rejects every body — explicit and closed, so it passes.
+                resolved = chase(schema) if isinstance(schema, dict) else schema
+                if schema is None or resolved is True or resolved == {}:
                     bodies += 1
-                    walk(schema, f"{method.upper()} {path} [{ctype}]", frozenset())
+                    silent.add(body_label)
+                    continue
+                if isinstance(schema, dict):
+                    bodies += 1
+                    walk(schema, body_label, frozenset())
 
     assert bodies >= 23  # the walk must actually cover the surface, not vacuously pass
     assert not dynamic, (
