@@ -54,6 +54,59 @@ class CloneCounts:
     relation_evidence: int = 0
 
 
+async def relations_entangle_failed_docs(
+    conn: AsyncConnection,
+    parent_build_id: uuid.UUID,
+    failed_content_hashes: frozenset[str],
+) -> bool:
+    """Whether any parent relation has chunk evidence from BOTH a failed doc AND a
+    non-failed doc — a state RB1-retry-skip's selective clone can't faithfully reuse.
+
+    A relation ROW's scalar fields (confidence/attributes/created_by) are
+    first-write-wins: ``extract_documents`` creates the row on the first chunk to
+    hit a signature and NEVER updates it (``core/graph/documents.py`` — an existing
+    signature only gains evidence). So if a FAILED document first-wrote such a
+    relation from a chunk that ran BEFORE its failure, the row carries that PARTIAL
+    output; cloning it copies those scalars, and the child's ``preload`` blocks the
+    re-extraction from correcting them — so the row can differ from a full rebuild
+    (whose first-writer might be the now-succeeding failed chunk, changing the
+    confidence a Health check reads). The relation row records no creating-doc, so
+    this conservative check treats ANY relation spanning a failed and a non-failed
+    document as unsafe to selectively clone; the caller falls back to a full
+    re-derive (Codex #103 R3). A relation touched ONLY by failed docs is already
+    excluded from the clone (no success evidence); one touched only by non-failed
+    docs is genuinely reusable. Follow-up (a future slice): re-extract just the
+    entangled successful docs instead of the whole build.
+
+    Considered residual: relation ``confidence`` is inherently nondeterministic
+    across runs anyway — ``extract_documents`` iterates documents with no ``ORDER
+    BY``, so the first-writer (and its confidence) can vary run-to-run, and the
+    ``merged==rebuild`` oracle deliberately omits confidence for that reason. This
+    guard removes the SYSTEMATIC bias where a failed doc's partial write is retained;
+    a confidence-only "post-failure first-writer" sub-case can remain, but it carries
+    no identity/evidence loss and sits inside that same pre-existing tolerated
+    envelope (a follow-up that re-extracts the entangled docs would close it too).
+    """
+    re_ = tables.relation_evidence
+    failed = sorted(failed_content_hashes)
+    fe = re_.alias("fe")  # a chunk evidence from a FAILED doc …
+    se = re_.alias("se")  # … and one from a non-failed doc, on the SAME relation
+    entangled = (
+        sa.select(sa.literal(1))
+        .select_from(fe.join(se, fe.c.relation_id == se.c.relation_id))
+        .where(
+            fe.c.build_id == parent_build_id,
+            fe.c.evidence_type == "chunk",
+            sa.func.split_part(fe.c.evidence_ref, ":", 2).in_(failed),
+            se.c.build_id == parent_build_id,
+            se.c.evidence_type == "chunk",
+            sa.func.split_part(se.c.evidence_ref, ":", 2).notin_(failed),
+        )
+        .limit(1)
+    )
+    return (await conn.execute(entangled)).first() is not None
+
+
 async def clone_raw_artifacts(
     conn: AsyncConnection,
     project: str,

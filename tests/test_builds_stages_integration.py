@@ -39,6 +39,7 @@ from core.builds.retry import clone_raw_artifacts
 from core.builds.stages import default_stages
 from core.config import get_settings
 from core.observability.recorder import StepReport, record_run
+from core.observability.spec import ItemOutcome
 from core.registry import add_source, create_job, create_project, get_job
 from core.stores import tables
 from core.stores.graph import graph_driver
@@ -782,6 +783,126 @@ async def test_retry_falls_back_to_full_rederive_when_the_parent_config_is_unava
             child,
         )
         # the parent config is unavailable → full re-derive, both docs re-extracted
+        assert set(child_llm.calls) == {_DOC_A, _DOC_B}
+    finally:
+        await _cleanup(engine, client, session, project)
+        await engine.dispose()
+
+
+async def test_retry_full_rederives_when_a_relation_entangles_failed_and_success_docs(
+    stores: tuple[AsyncQdrantClient, AsyncSession], tmp_path: Path
+) -> None:
+    """Codex #103 R3: a relation with chunk evidence from BOTH a failed doc and a
+    successful doc may carry the FAILED doc's first-write scalars (relation rows are
+    first-write-wins), which the selective clone retains and preload freezes. The
+    retry must detect that entanglement and fall back to a FULL re-derive — re-
+    extracting EVERY doc — rather than a selective reuse. Discriminating: the LLM is
+    called for BOTH docs; the clone+skip path would call it for the failed one only."""
+    client, session = stores
+    engine = _engine()
+    project = _proj()
+    answers = {
+        _DOC_A: _extraction("Alice", "Bob", _DOC_A),
+        _DOC_B: _extraction("Alice", "Carol", _DOC_B),
+    }
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+        parent = await _make_building(engine, project)
+        await _seed_build_job(engine, project, parent, _RETRY_ONTOLOGY_CONFIG)
+        await _seed_text_doc(engine, project, parent, "hash-a", _DOC_A)
+        await _seed_text_doc(engine, project, parent, "hash-b", _DOC_B)
+        # seed a parent relation ENTANGLED across hash-a (success) + hash-b (failed):
+        # one signature with chunk evidence from both docs
+        async with engine.connect() as conn, conn.begin():
+            e_ids = [
+                (
+                    await conn.execute(
+                        tables.entities.insert()
+                        .values(
+                            project=project,
+                            build_id=parent,
+                            type="Person",
+                            canonical_name=name,
+                            entity_key=f"fpv2:{name}",
+                            status="active",
+                            created_by="llm",
+                        )
+                        .returning(tables.entities.c.id)
+                    )
+                ).scalar_one()
+                for name in ("alice", "bob")
+            ]
+            rel = (
+                await conn.execute(
+                    tables.relations.insert()
+                    .values(
+                        project=project,
+                        build_id=parent,
+                        src_entity_id=e_ids[0],
+                        dst_entity_id=e_ids[1],
+                        type="KNOWS",
+                        relation_signature="sig-shared",
+                        status="active",
+                        created_by="llm",
+                    )
+                    .returning(tables.relations.c.id)
+                )
+            ).scalar_one()
+            for h, eh in (("hash-a", "eh-a"), ("hash-b", "eh-b")):
+                await conn.execute(
+                    tables.relation_evidence.insert().values(
+                        relation_id=rel,
+                        build_id=parent,
+                        evidence_type="chunk",
+                        evidence_ref=f"chunk:{h}:0",
+                        start_offset=0,
+                        end_offset=5,
+                        quote="q",
+                        source_uri="file:///x.txt",
+                        evidence_hash=eh,
+                    )
+                )
+        async with engine.connect() as conn:
+            await record_run(
+                conn,
+                project,
+                parent,
+                "build",
+                [
+                    StepReport(
+                        "graph",
+                        (
+                            ItemOutcome("document", "hash-a", "extracted"),
+                            ItemOutcome("document", "hash-b", "failed"),
+                        ),
+                    )
+                ],
+                verbosity="failures",
+            )
+        async with engine.connect() as conn, conn.begin():
+            await conn.execute(
+                tables.builds.update().where(tables.builds.c.id == parent).values(status="failed")
+            )
+
+        child = await _make_building(engine, project, parent=parent)
+        await _seed_build_job(engine, project, child, _RETRY_ONTOLOGY_CONFIG, kind="retry")
+        async with engine.connect() as conn, conn.begin():
+            await clone_raw_artifacts(conn, project, parent, child)
+        child_llm = _ExtractLLM(answers, fail=set())
+        await _run_clean_then_graph(
+            engine,
+            default_stages(
+                load_build_config(_RETRY_ONTOLOGY_CONFIG),
+                chat_model=cast(LLM, child_llm),
+                embedder=cast(BaseEmbedding, _FakeEmbedder()),
+                vector_client=client,
+                graph_session=session,
+            ),
+            project,
+            child,
+        )
+        # entanglement → full re-derive: BOTH docs re-extracted, not just failed B
         assert set(child_llm.calls) == {_DOC_A, _DOC_B}
     finally:
         await _cleanup(engine, client, session, project)
