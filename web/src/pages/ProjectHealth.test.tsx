@@ -101,6 +101,18 @@ describe("ProjectHealth", () => {
     expect(link.getAttribute("href")).toContain("tab=entity");
   });
 
+  it("deep-links a non-zero 待審關聯 count into the relation tab (GOV2-fe-2)", async () => {
+    stubHealth(
+      healthReport({
+        status: "needs_review",
+        counts: { needs_review_relations: 4 },
+      }),
+    );
+    renderHealthAt(projectRoute("acme"));
+    const link = await screen.findByRole("link", { name: "前往處理" });
+    expect(link.getAttribute("href")).toContain("tab=relation");
+  });
+
   it("shows the status light, counts, and pending review for a healthy build", async () => {
     stubHealth(
       healthReport({

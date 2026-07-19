@@ -2,6 +2,7 @@ import { useSearchParams } from "react-router-dom";
 
 import { EntityReview } from "../components/EntityReview";
 import { ProposalPool } from "../components/ProposalPool";
+import { RelationReview } from "../components/RelationReview";
 import { ReviewCases } from "../components/ReviewCases";
 import { isPathAddressable, useActiveProject } from "../project/projectRoute";
 import "./ReviewQueue.css";
@@ -9,13 +10,13 @@ import "./ReviewQueue.css";
 import type { KeyboardEvent } from "react";
 
 // The governance surface (DESIGN §17 names four review kinds). Tabs: merge
-// candidates (UXA1), entity review (GOV2-fe), ontology proposals (GOV3-fe);
-// relation review lands with GOV2-fe-2. The route stays `review` (deep-links +
-// e2e depend on it); the active tab lives in `?tab=` so Health signals can
-// deep-link a specific tab.
+// candidates (UXA1), entity review (GOV2-fe-1), relation review (GOV2-fe-2),
+// ontology proposals (GOV3-fe). The route stays `review` (deep-links + e2e depend
+// on it); the active tab lives in `?tab=` so Health signals can deep-link a tab.
 const TABS = [
   { key: "merge", label: "合併" },
   { key: "entity", label: "知識點" },
+  { key: "relation", label: "關聯" },
   { key: "proposals", label: "本體提案" },
 ] as const;
 type TabKey = (typeof TABS)[number]["key"];
@@ -107,6 +108,15 @@ export function ReviewQueue() {
               對的就保留;錯的就排除——排除會把它從上線的知識庫移除,目前無法從介面復原,請確認後再排除。
             </p>
             <EntityReview project={project} />
+          </>
+        )}
+        {tab === "relation" && (
+          <>
+            <p className="review__intro">
+              系統不確定這些<strong>關聯</strong>是否正確,附上原文引文供你判斷。
+              對的就保留;錯的就排除——排除會把它從上線的知識庫移除,目前無法從介面復原,請確認後再排除。
+            </p>
+            <RelationReview project={project} />
           </>
         )}
         {tab === "proposals" && (

@@ -311,6 +311,17 @@
   padding: 1px 8px;
 }
 
+.targets__confidence {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.targets__evidence {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
 .targets__actions {
   display: flex;
   gap: 8px;

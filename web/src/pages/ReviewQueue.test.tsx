@@ -8,6 +8,7 @@ import {
   entity,
   mergeCandidate,
   projectRoute,
+  relation,
   renderWithProviders,
   stubMergeCandidates,
   stubReviewWorld,
@@ -111,6 +112,29 @@ describe("ReviewQueue", () => {
     const panel = document.getElementById(controlled as string);
     expect(panel).toHaveAttribute("role", "tabpanel");
     expect(panel).toHaveAttribute("aria-labelledby", tab.id);
+  });
+
+  it("lists needs_review relations on the 關聯 tab from /relations (GOV2-fe-2)", async () => {
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      path === "/projects/{project}/relations"
+        ? Promise.resolve({
+            data: {
+              data: [
+                relation({
+                  type: "PRACTICED_BY",
+                  evidence: [{ id: "ev-1", evidence_type: "chunk", quote: "頭目率領族人舉行" }],
+                }),
+              ],
+              meta: META,
+            },
+            error: undefined,
+          })
+        : Promise.resolve({ data: { data: [], meta: META }, error: undefined })) as never);
+    renderAt("acme");
+
+    fireEvent.click(await screen.findByRole("tab", { name: "關聯" }));
+    expect(await screen.findByText("PRACTICED_BY")).toBeInTheDocument();
+    expect(screen.getByText(/頭目率領族人舉行/)).toBeInTheDocument();
   });
 
   it("reports an un-addressable key instead of firing a doomed request", () => {
