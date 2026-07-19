@@ -959,3 +959,98 @@ def test_v13_mcp_info_contract(spec: dict[str, Any]) -> None:
         info["properties"]["url"]["type"] == "string"
     )  # non-null: always reachable ⇒ always a url
     assert "path_addressable" not in info["properties"]  # the unreachable branch is gone
+
+
+# H20a — class-24 mechanized (#94/#80): a fixed-semantics request body that
+# does not declare additionalProperties is SILENTLY open (the JSON-Schema
+# default), so a conformant client may send junk keys the contract never
+# promised to accept. Every object node in every request body must therefore
+# DECLARE its openness: `false` (closed — the norm) or `true` (a documented
+# free-form bag). The runtime face already rejects extras on every pinned
+# model below (api/schemas.py: extra="forbid"), so the silent-open schemas
+# under-promise the strictness the server enforces — a schema-text-only gap.
+# Closing them is a frozen-contract edit (DR-002: version bump + owner), so
+# this test is a RATCHET, not an allowlist: the pinned legacy set may only
+# SHRINK (delete the entry in the same change that closes its schema); any
+# NEW silently-open node fails the exact-equality assertion immediately.
+_LEGACY_SILENT_OPEN_REQUEST_SCHEMAS = frozenset(
+    {
+        "BuildRequest",
+        "IngestRequest",
+        "ProjectCreate",
+        "ProjectUpdate",
+        "QueryRequest",
+        "ReviewDecisionRequest",
+        "SourceCreate",
+        "POST /projects/{project}/uploads [multipart/form-data]",  # inline body
+    }
+)
+
+
+def test_request_body_object_nodes_declare_additional_properties(spec: dict[str, Any]) -> None:
+    """Why: PR #94 added additionalProperties:false to new bodies one review
+    round at a time; the rule ("fixed semantics ⇒ closed") only holds forever
+    if silence is mechanically impossible. This walks EVERY requestBody schema
+    (all content types, refs resolved, nested properties/items/combinators)
+    and demands each object node with fixed `properties` declares
+    additionalProperties explicitly — enumerated from the artifact itself, per
+    the #17 universal-test rule, so a new endpoint cannot dodge the sweep."""
+    components = spec["components"]["schemas"]
+
+    def resolve(node: dict[str, Any]) -> tuple[Any, str | None]:
+        if "$ref" in node:
+            name = node["$ref"].rsplit("/", 1)[-1]
+            return components.get(name), name
+        return node, None
+
+    silent: set[str] = set()
+
+    def walk(node: Any, label: str, seen: frozenset[str]) -> None:
+        if not isinstance(node, dict):
+            return
+        node, refname = resolve(node)
+        if not isinstance(node, dict):
+            return
+        if refname:
+            if refname in seen:
+                return
+            seen |= {refname}
+            label = refname  # pin by component name so one entry covers all its endpoints
+        # the walker judges only nodes carrying fixed `properties` — class 24's
+        # definition; a patternProperties-only map is out of its scope by design
+        if "properties" in node:
+            if "additionalProperties" not in node:
+                silent.add(label)
+            for sub in node["properties"].values():
+                walk(sub, label, seen)
+        ap = node.get("additionalProperties")
+        if isinstance(ap, dict):
+            walk(ap, label, seen)
+        if "items" in node:
+            walk(node["items"], label, seen)
+        for comb in ("oneOf", "anyOf", "allOf"):
+            for sub in node.get(comb) or []:
+                walk(sub, label, seen)
+
+    bodies = 0
+    for path, ops in spec["paths"].items():
+        for method, op in ops.items():
+            if not isinstance(op, dict) or "requestBody" not in op:
+                continue
+            for ctype, media in op["requestBody"].get("content", {}).items():
+                schema = media.get("schema")
+                if schema is not None:
+                    bodies += 1
+                    walk(schema, f"{method.upper()} {path} [{ctype}]", frozenset())
+
+    assert bodies >= 23  # the walk must actually cover the surface, not vacuously pass
+    new_silent = silent - _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS
+    closed_legacy = _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS - silent
+    assert not new_silent, (
+        f"new silently-open request-body object node(s): {sorted(new_silent)} — declare "
+        "additionalProperties explicitly (false unless the node is a documented free-form bag)"
+    )
+    assert not closed_legacy, (
+        f"legacy schemas now closed: {sorted(closed_legacy)} — shrink "
+        "_LEGACY_SILENT_OPEN_REQUEST_SCHEMAS in the same change (the ratchet only tightens)"
+    )
