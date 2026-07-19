@@ -9,6 +9,7 @@ import { encodeProjectSegment } from "./project/projectRoute";
 import type { ReactElement } from "react";
 import type {
   Build,
+  Entity,
   HealthReport,
   Job,
   MergeCandidate,
@@ -208,6 +209,25 @@ export function stubMergeCandidates(candidates: MergeCandidate[]) {
   return vi
     .spyOn(api, "GET")
     .mockResolvedValue({ data: { data: candidates, meta: META }, error: undefined } as never);
+}
+
+// GOV2-fe: a needs_review entity for the review-queue tests.
+export function entity(overrides: Partial<Entity> = {}): Entity {
+  return {
+    id: "e1000000-0000-0000-0000-000000000000",
+    project: "acme",
+    build_id: "b0000000-0000-0000-0000-000000000000",
+    type: "EVENT",
+    canonical_name: "海祭",
+    entity_key: "fpv1:deadbeef",
+    attributes: {},
+    status: "needs_review",
+    review_status: "unreviewed",
+    created_by: "llm",
+    created_at: "2026-07-01T00:00:00Z",
+    updated_at: "2026-07-01T00:00:00Z",
+    ...overrides,
+  };
 }
 
 export type SubgraphStub = {

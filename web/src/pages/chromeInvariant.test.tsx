@@ -374,6 +374,16 @@ describe("chrome invariant — no raw ids or store vocabulary outside folds", ()
     assertChromeClean(container);
   });
 
+  it("治理 → 知識點 (entity review) — raw ids/keys confined to the audit fold", async () => {
+    // the entity tab is the densest new raw-field surface (id, entity_key,
+    // status, review_status, created_by) — all must stay inside its <details>
+    stubWorld();
+    const { container } = renderPage(<ReviewQueue />, "review");
+    fireEvent.click(await screen.findByRole("tab", { name: "知識點" }));
+    await screen.findByText("海祭");
+    assertChromeClean(container);
+  });
+
   it("檢視 (Inspect documents)", async () => {
     stubWorld();
     const { container } = renderPage(<Inspect />, "inspect");

@@ -87,6 +87,20 @@ describe("ProjectHealth", () => {
     expect(screen.queryByRole("link", { name: "前往處理" })).not.toBeInTheDocument();
   });
 
+  it("deep-links a non-zero 待審知識點 count into the entity tab (GOV2-fe)", async () => {
+    // GOV2-fe shipped the entity review tab, so this backlog is now actionable
+    stubHealth(
+      healthReport({
+        status: "needs_review",
+        counts: { needs_review_entities: 3 },
+      }),
+    );
+    renderHealthAt(projectRoute("acme"));
+    const link = await screen.findByRole("link", { name: "前往處理" });
+    // must target the entity tab specifically — a bare ../review lands on 合併
+    expect(link.getAttribute("href")).toContain("tab=entity");
+  });
+
   it("shows the status light, counts, and pending review for a healthy build", async () => {
     stubHealth(
       healthReport({

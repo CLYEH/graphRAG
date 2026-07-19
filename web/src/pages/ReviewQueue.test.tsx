@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ReviewQueue } from "./ReviewQueue";
 import { api } from "../api/client";
 import {
+  entity,
   mergeCandidate,
   projectRoute,
   renderWithProviders,
@@ -86,6 +87,30 @@ describe("ReviewQueue", () => {
         }),
       ),
     );
+  });
+
+  it("lists needs_review entities on the 知識點 tab and associates tab↔panel for a11y (GOV2-fe)", async () => {
+    // route-aware GET: entities for the review queue, empty elsewhere — a blanket
+    // mock would feed merge-shaped data to the entity tab (false green)
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      path === "/projects/{project}/entities"
+        ? Promise.resolve({
+            data: { data: [entity({ canonical_name: "海祭" })], meta: META },
+            error: undefined,
+          })
+        : Promise.resolve({ data: { data: [], meta: META }, error: undefined })) as never);
+    renderAt("acme");
+
+    const tab = await screen.findByRole("tab", { name: "知識點" });
+    fireEvent.click(tab);
+    expect(await screen.findByText("海祭")).toBeInTheDocument();
+
+    // a11y: the tab points at a real tabpanel that is labelled back by the tab
+    const controlled = tab.getAttribute("aria-controls");
+    expect(controlled).toBeTruthy();
+    const panel = document.getElementById(controlled as string);
+    expect(panel).toHaveAttribute("role", "tabpanel");
+    expect(panel).toHaveAttribute("aria-labelledby", tab.id);
   });
 
   it("reports an un-addressable key instead of firing a doomed request", () => {
