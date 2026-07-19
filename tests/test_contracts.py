@@ -997,29 +997,25 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     the #17 universal-test rule, so a new endpoint cannot dodge the sweep."""
     components = spec["components"]["schemas"]
 
-    def resolve(node: dict[str, Any]) -> tuple[Any, str | None]:
-        if "$ref" in node:
-            name = node["$ref"].rsplit("/", 1)[-1]
-            return components.get(name), name
-        return node, None
-
     silent: set[str] = set()
 
     def walk(node: Any, label: str, seen: frozenset[str]) -> None:
         if not isinstance(node, dict):
             return
-        node, refname = resolve(node)
-        if not isinstance(node, dict):
-            return
-        if refname:
-            if refname in seen:
+        if "$ref" in node:
+            name = node["$ref"].rsplit("/", 1)[-1]
+            if name not in seen:
+                # the component gets its own RE-ROOTED walk so one pin entry
+                # covers every endpoint referencing it — while NESTED nodes
+                # extend the path, so a new silent node INSIDE a pinned
+                # component keeps its own identity (Codex #112 R1)
+                walk(components.get(name), name, seen | {name})
+            # OpenAPI 3.1: a $ref may carry SIBLING schema keywords — judge
+            # them under the ORIGINAL label instead of discarding them with
+            # the ref (Codex #112 R2b); a bare {$ref} node ends here
+            node = {k: v for k, v in node.items() if k != "$ref"}
+            if not node:
                 return
-            seen |= {refname}
-            # re-root the label at the component so one pin entry covers every
-            # endpoint referencing it — but NESTED nodes below keep extending
-            # the path, so a new silent node INSIDE a pinned component gets its
-            # own identity (Codex #112 R1: a component-only label would mask it)
-            label = refname
         # the walker judges only nodes carrying fixed `properties` — class 24's
         # definition; a patternProperties-only map is out of its scope by design
         if "properties" in node:
