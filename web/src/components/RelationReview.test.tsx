@@ -103,6 +103,32 @@ describe("RelationReview", () => {
     expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
   });
 
+  it("keeps the decision locked when an endpoint name FAILS to load (Codex #106 P1c) and offers a retry", async () => {
+    const r = relation({ id: "r-a", src_entity_id: "e-src", dst_entity_id: "e-dst" });
+    // the entity-name fetches error out (a 503, retried then failed)
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      path === "/projects/{project}/entities/{entity_id}"
+        ? Promise.resolve({
+            data: undefined,
+            error: {
+              error: { code: "STORE_UNAVAILABLE", message: "down", details: null, request_id: "r" },
+            },
+            response: { status: 503 },
+          })
+        : Promise.resolve({
+            data: { data: path === "/projects/{project}/relations" ? [r] : r, meta: META },
+            error: undefined,
+          })) as never);
+
+    renderWithProviders(<RelationReview project="acme" />);
+
+    // a FAILED lookup shows the retry affordance and keeps BOTH actions locked —
+    // enabling on error would defeat the "see the pair first" safeguard
+    expect(await screen.findByRole("button", { name: "重試" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保留" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
+  });
+
   it("lazily loads the evidence quote on demand (the list omits it)", async () => {
     const r = relation({ id: "r-a", src_entity_id: "e-src", dst_entity_id: "e-dst", evidence: [] });
     const get = stubRelationWorld({ list: [r], quote: "頭目率領族人舉行" });

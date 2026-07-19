@@ -40,8 +40,9 @@ function RelationEvidence({ project, relationId }: { project: string; relationId
 // Resolves an endpoint entity id to its canonical name. The list row carries only
 // uuids, so a decision would be blind to WHICH pair it acts on — the names are
 // fetched from GET /entities/{id} (useEntity, cached/deduped across shared
-// endpoints) and the decision buttons stay disabled until both resolve (Codex #106
-// P1b). A name-load error degrades to an honest label rather than blocking review.
+// endpoints) and the decision stays LOCKED until both resolve (Codex #106 P1b), and
+// a failed lookup keeps it locked (only "(名稱載入失敗)" shows, never the pair) with
+// a retry rather than silently enabling the decision (Codex #106 P1c).
 function endpointName(q: ReturnType<typeof useEntity>): string {
   if (q.isPending) return "…";
   if (q.isError) return "(名稱載入失敗)";
@@ -65,15 +66,23 @@ function RelationRow({
   const [confirmingReject, setConfirmingReject] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
 
-  // no decision until the operator can see the pair (both endpoints settled)
-  const namesPending = src.isPending || dst.isPending;
-  const locked = decide.isPending || namesPending;
+  // no decision until the operator can actually SEE the pair. A still-loading OR a
+  // FAILED name lookup both keep it locked — an error only shows "(名稱載入失敗)",
+  // never the pair, so enabling on error would defeat the safeguard and permit an
+  // irreversible reject on unknown endpoints (Codex #106 P1c). A retry recovers.
+  const namesUnresolved = src.isPending || dst.isPending || src.isError || dst.isError;
+  const locked = decide.isPending || namesUnresolved;
+  const namesFailed = src.isError || dst.isError;
 
   const onApprove = () =>
     decide.mutate({ kind: "relation", targetId: r.id, verb: "approve", reason: null });
   const onConfirmReject = () => {
     decide.mutate({ kind: "relation", targetId: r.id, verb: "reject", reason: null });
     setConfirmingReject(false);
+  };
+  const retryNames = () => {
+    void src.refetch();
+    void dst.refetch();
   };
 
   return (
@@ -85,6 +94,14 @@ function RelationRow({
         {"→ "}
         <span className="targets__name">{endpointName(dst)}</span>
       </p>
+      {namesFailed ? (
+        <p className="review__line review__line--error">
+          端點名稱載入失敗,無法確認是哪一對,已暫停決定。
+          <button type="button" className="targets__evidence-toggle" onClick={retryNames}>
+            重試
+          </button>
+        </p>
+      ) : null}
       {r.confidence !== null && r.confidence !== undefined ? (
         <p className="targets__confidence">信心 {r.confidence.toFixed(2)}</p>
       ) : null}
