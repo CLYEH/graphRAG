@@ -1096,10 +1096,15 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             if isinstance(sub, dict):
                 walk(sub, f"{label}[]" if kw == "items" else f"{label}.{kw}", seen)
 
-    def chase(node: Any) -> Any:
-        # guarded $ref chain following: a cycle yields {} instead of a hang
+    def chase(node: Any, only_bare: bool = False) -> Any:
+        # guarded $ref chain following: a cycle yields {} instead of a hang.
+        # only_bare stops at a $ref carrying SIBLING keywords — a 3.1 Schema
+        # Object's siblings may close what the target leaves open, so schema
+        # classification must not look through them (Codex #112 R10)
         chain: set[str] = set()
-        while isinstance(node, dict) and "$ref" in node:
+        while (
+            isinstance(node, dict) and "$ref" in node and (not only_bare or set(node) == {"$ref"})
+        ):
             ref = node["$ref"]
             if ref in chain:
                 return {}
@@ -1129,6 +1134,10 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 visited_refs.add(ref)
                 pending.append((path, _pointer(spec, ref)))
         for method, op in ops.items():
+            # only Operation positions — a dict-valued x-* Path Item extension
+            # must be neither crashed on nor misread as an operation (#112 R10)
+            if method not in _HTTP_METHODS:
+                continue
             if not isinstance(op, dict):
                 continue
             for cb_name, cb in op.get("callbacks", {}).items():
@@ -1160,11 +1169,11 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 # an ABSENT, boolean-true, or empty schema accepts arbitrary
                 # keys without declaring anything — that is a silently-open
                 # body, not a skippable one (Codex #112 R8) — and the same
-                # judgment applies through a $ref CHAIN to a true/{} component
-                # (classify on the chased value, walk the original node so
-                # component labels — and the pin — are preserved). `false`
-                # rejects every body — explicit and closed, so it passes.
-                resolved = chase(schema) if isinstance(schema, dict) else schema
+                # judgment applies through a BARE $ref chain to a true/{}
+                # component. A $ref WITH siblings is left to walk(): the
+                # siblings may close it (R10). `false` rejects every body —
+                # explicit and closed, so it passes.
+                resolved = chase(schema, only_bare=True) if isinstance(schema, dict) else schema
                 if schema is None or resolved is True or resolved == {}:
                     bodies += 1
                     silent.add(body_label)
