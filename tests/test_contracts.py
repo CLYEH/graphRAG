@@ -1045,17 +1045,31 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             node = {k: v for k, v in node.items() if k != "$ref"}
             if not node:
                 return
-        # judgment: any OBJECT-SHAPING node (declared `type: object`, or
-        # carrying `properties`/`patternProperties`) must declare its
-        # openness — a bare `type: object` with neither properties nor an
-        # additionalProperties declaration is a silently-open free-form bag
-        # (Codex #112 R5); every keyword's subschemas are WALKED below
+        # judgment: any OBJECT-SHAPING node must declare its openness. Shaping
+        # markers cover the whole 2020-12 object vocabulary — `type: object`
+        # (incl. the 3.1 nullable list form) plus every object-only applicator
+        # (`{required: [name]}` alone is a valid, silently-open object
+        # constraint — Codex #112 R5/R6). The declaration side accepts
+        # `additionalProperties` OR `unevaluatedProperties`: the latter is an
+        # explicit (composition-aware) closure statement, so flagging it
+        # would be the class-9 over-block dual.
         node_type = node.get("type")
         object_typed = node_type == "object" or (
             isinstance(node_type, list) and "object" in node_type  # 3.1 nullable form
         )
-        object_shaped = object_typed or "properties" in node or "patternProperties" in node
-        if object_shaped and "additionalProperties" not in node:
+        object_markers = (
+            "properties",
+            "patternProperties",
+            "required",
+            "dependentRequired",
+            "dependentSchemas",
+            "propertyNames",
+            "minProperties",
+            "maxProperties",
+        )
+        object_shaped = object_typed or any(k in node for k in object_markers)
+        declared = "additionalProperties" in node or "unevaluatedProperties" in node
+        if object_shaped and not declared:
             silent.add(label)
         for kw in map_keywords:
             for name, sub in (node.get(kw) or {}).items():
