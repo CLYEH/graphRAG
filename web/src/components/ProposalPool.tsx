@@ -36,6 +36,14 @@ export function ProposalPool({ project }: { project: string }) {
     setConfirming(null);
   };
 
+  // lock the decision controls while a decision posts AND while the pool refreshes
+  // after one: a resolved POST clears decide.isPending before the invalidated GET
+  // drops the decided proposal, so a second decision in that window re-hits the
+  // now-terminal proposal and 409s into a spurious "決定失敗" (Codex #106 P1d — the
+  // same stale-while-revalidate guard as the entity/relation review tabs). 取消
+  // stays usable to back out of a confirm.
+  const locked = decide.isPending || proposals.isFetching;
+
   if (proposals.isPending) return <p className="review__line">載入提案…</p>;
   if (proposals.isError)
     return (
@@ -68,7 +76,7 @@ export function ProposalPool({ project }: { project: string }) {
               <button
                 type="button"
                 className={confirming.verb === "accept" ? "proposals__accept" : "proposals__reject"}
-                disabled={decide.isPending}
+                disabled={locked}
                 onClick={onConfirm}
               >
                 {confirming.verb === "accept" ? "確定採納" : "確定拒絕"}
@@ -89,7 +97,7 @@ export function ProposalPool({ project }: { project: string }) {
               <button
                 type="button"
                 className="proposals__accept"
-                disabled={decide.isPending}
+                disabled={locked}
                 onClick={() => setConfirming({ id: p.id, verb: "accept" })}
               >
                 採納(加入本體)
@@ -97,7 +105,7 @@ export function ProposalPool({ project }: { project: string }) {
               <button
                 type="button"
                 className="proposals__reject"
-                disabled={decide.isPending}
+                disabled={locked}
                 onClick={() => setConfirming({ id: p.id, verb: "reject" })}
               >
                 拒絕

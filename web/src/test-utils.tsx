@@ -15,6 +15,7 @@ import type {
   MergeCandidate,
   Project,
   QueryResult,
+  Relation,
   Source,
 } from "./api/queries";
 
@@ -224,6 +225,28 @@ export function entity(overrides: Partial<Entity> = {}): Entity {
     status: "needs_review",
     review_status: "unreviewed",
     created_by: "llm",
+    created_at: "2026-07-01T00:00:00Z",
+    updated_at: "2026-07-01T00:00:00Z",
+    ...overrides,
+  };
+}
+
+// GOV2-fe-2: a needs_review relation for the relation-review tests.
+export function relation(overrides: Partial<Relation> = {}): Relation {
+  return {
+    id: "r1000000-0000-0000-0000-000000000000",
+    project: "acme",
+    build_id: "b0000000-0000-0000-0000-000000000000",
+    src_entity_id: "e1000000-0000-0000-0000-000000000000",
+    dst_entity_id: "e2000000-0000-0000-0000-000000000000",
+    type: "PRACTICED_BY",
+    attributes: {},
+    relation_signature: "fpv1:rel-deadbeef",
+    status: "needs_review",
+    review_status: "unreviewed",
+    created_by: "llm",
+    confidence: 0.9,
+    evidence: [],
     created_at: "2026-07-01T00:00:00Z",
     updated_at: "2026-07-01T00:00:00Z",
     ...overrides,

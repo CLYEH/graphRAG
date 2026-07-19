@@ -198,6 +198,52 @@ function stubWorld() {
             created_by: "llm",
           },
         ]);
+      case "/projects/{project}/entities/{entity_id}":
+        // the relation review resolves src/dst endpoint names from here — the
+        // canonical name is chrome, the uuid/entity_key ride the audit fold
+        return ok({
+          id: E1,
+          project: "acme",
+          build_id: B1,
+          type: "EVENT",
+          canonical_name: "海祭",
+          entity_key: "fpv1:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+          attributes: {},
+          status: "active",
+          review_status: "unreviewed",
+          created_at: "2026-07-01T00:00:00Z",
+          updated_at: "2026-07-01T00:00:00Z",
+          created_by: "llm",
+        });
+      case "/projects/{project}/relations":
+        // the relation review queue: src/dst uuids + relation_signature (hex) must
+        // ride the audit fold; type + confidence + evidenced quote are the chrome
+        return ok([
+          {
+            id: "r1111111-aaaa-4aaa-8aaa-000000000001",
+            project: "acme",
+            build_id: B1,
+            src_entity_id: E1,
+            dst_entity_id: "e2222222-aaaa-4aaa-8aaa-000000000002",
+            type: "PRACTICED_BY",
+            attributes: {},
+            relation_signature:
+              "fpv1:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            status: "needs_review",
+            review_status: "unreviewed",
+            confidence: 0.9,
+            evidence: [
+              {
+                id: "ev111111-aaaa-4aaa-8aaa-000000000001",
+                evidence_type: "chunk",
+                quote: "每年5月初由頭目率領族人舉行",
+              },
+            ],
+            created_at: "2026-07-01T00:00:00Z",
+            updated_at: "2026-07-01T00:00:00Z",
+            created_by: "llm",
+          },
+        ]);
       case "/projects/{project}/relations/{relation_id}":
         return ok({
           id: "r1111111-aaaa-4aaa-8aaa-000000000001",
@@ -381,6 +427,15 @@ describe("chrome invariant — no raw ids or store vocabulary outside folds", ()
     const { container } = renderPage(<ReviewQueue />, "review");
     fireEvent.click(await screen.findByRole("tab", { name: "知識點" }));
     await screen.findByText("海祭");
+    assertChromeClean(container);
+  });
+
+  it("治理 → 關聯 (relation review) — raw ids/signatures confined to the audit fold", async () => {
+    // the relation row's src/dst uuids + relation_signature must stay in <details>
+    stubWorld();
+    const { container } = renderPage(<ReviewQueue />, "review");
+    fireEvent.click(await screen.findByRole("tab", { name: "關聯" }));
+    await screen.findByText(/PRACTICED_BY/);
     assertChromeClean(container);
   });
 

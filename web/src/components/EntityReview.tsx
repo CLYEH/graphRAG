@@ -32,6 +32,13 @@ export function EntityReview({ project }: { project: string }) {
   // the entity id awaiting a reject confirm (one at a time)
   const [confirmingReject, setConfirmingReject] = useState<string | null>(null);
 
+  // lock every decision control while a decision posts AND while the queue refreshes
+  // after one: a resolved POST clears decide.isPending before the invalidated GET
+  // drops the decided row, so a second decision in that window would re-decide it
+  // and latest-manual-wins would silently reverse the one just confirmed (Codex #106
+  // P1d — the ReviewCases queueRefreshing guard). 取消 stays usable to back out.
+  const locked = decide.isPending || queue.isFetching;
+
   const onApprove = (id: string) =>
     decide.mutate({ kind: "entity", targetId: id, verb: "approve", reason: null });
   const onConfirmReject = (id: string) => {
@@ -58,7 +65,7 @@ export function EntityReview({ project }: { project: string }) {
               <button
                 type="button"
                 className="targets__reject"
-                disabled={decide.isPending}
+                disabled={locked}
                 onClick={() => onConfirmReject(e.id)}
               >
                 確定{VERB_LABEL.reject}
@@ -76,7 +83,7 @@ export function EntityReview({ project }: { project: string }) {
               <button
                 type="button"
                 className="targets__approve"
-                disabled={decide.isPending}
+                disabled={locked}
                 onClick={() => onApprove(e.id)}
               >
                 {VERB_LABEL.approve}
@@ -84,7 +91,7 @@ export function EntityReview({ project }: { project: string }) {
               <button
                 type="button"
                 className="targets__reject"
-                disabled={decide.isPending}
+                disabled={locked}
                 onClick={() => setConfirmingReject(e.id)}
               >
                 {VERB_LABEL.reject}

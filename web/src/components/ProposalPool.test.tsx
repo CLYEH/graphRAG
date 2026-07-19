@@ -103,4 +103,30 @@ describe("ProposalPool", () => {
     expect(acceptButtons()[1]).toBeEnabled();
     expect(screen.getByText(/決定失敗/)).toBeInTheDocument();
   });
+
+  it("stays locked while the pool refreshes after a decision (stale-while-revalidate, Codex #106 P1d)", async () => {
+    const p = proposal({ id: "p-a", type_name: "Spaceship" });
+    let getCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation((() => {
+      getCalls += 1;
+      // initial load resolves; the post-decision refetch HANGS → isFetching true
+      return getCalls === 1
+        ? Promise.resolve({ data: { data: [p], meta: META }, error: undefined })
+        : new Promise(() => {});
+    }) as never);
+    const post = vi.spyOn(api, "POST").mockResolvedValue({
+      data: { data: { ...p, status: "accepted" }, meta: META },
+      error: undefined,
+    } as never);
+
+    renderWithProviders(<ProposalPool project="acme" />);
+    // arm + commit the accept
+    fireEvent.click(await screen.findByRole("button", { name: /加入本體/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "確定採納" }));
+    await waitFor(() => expect(post).toHaveBeenCalled());
+
+    // POST resolved but the invalidated pool GET is still in flight → the stale
+    // decided proposal must stay locked (a re-decision would 409 into 決定失敗)
+    await waitFor(() => expect(acceptButtons()[0]).toBeDisabled());
+  });
 });

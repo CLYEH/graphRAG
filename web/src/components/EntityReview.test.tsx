@@ -106,6 +106,33 @@ describe("EntityReview", () => {
     expect(idemKeyOf(post.mock.calls[0][1])).toBe("e-a:reject");
   });
 
+  it("stays locked while the queue refreshes after a decision, so a decided row can't be re-decided (Codex #106 P1d)", async () => {
+    const e = entity({ id: "e-a", canonical_name: "海祭" });
+    let queueCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation((() => {
+      queueCalls += 1;
+      // the initial load resolves; the post-decision refetch HANGS → isFetching
+      // stays true while the (stale) decided row is still on screen
+      return queueCalls === 1
+        ? Promise.resolve({ data: { data: [e], meta: META }, error: undefined })
+        : new Promise(() => {});
+    }) as never);
+    const post = vi.spyOn(api, "POST").mockResolvedValue({
+      data: { data: { ...e, status: "active", review_status: "approved" }, meta: META },
+      error: undefined,
+    } as never);
+
+    renderWithProviders(<EntityReview project="acme" />);
+    fireEvent.click(await screen.findByRole("button", { name: "保留" }));
+    await waitFor(() => expect(post).toHaveBeenCalled());
+
+    // the POST resolved (decide.isPending clears) but the invalidated GET is still
+    // in flight → the row must NOT re-enable, or a second approve/reject would
+    // re-decide it and latest-manual-wins would reverse the one just made
+    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeDisabled());
+    expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
+  });
+
   it("locks the whole queue while a decision is in flight (single-observer concurrency, Codex #104 P2)", async () => {
     const a = entity({ id: "e-a", canonical_name: "海祭" });
     const b = entity({ id: "e-b", canonical_name: "豐年祭" });

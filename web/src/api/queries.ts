@@ -513,6 +513,40 @@ export function useEntityReviewQueue(project: string | undefined) {
   });
 }
 
+// GOV2-fe: the relation review queue (DESIGN §17). Mirrors useEntityReviewQueue
+// (active-build scoped, build_id pin, `filter[status]=needs_review` for Health
+// gauge parity, page-to-exhaustion, fail-loud). `/relations` has no `q`/`total`
+// (unlike /entities) — neither is needed here. The decide flow reuses
+// useDecideReviewTarget (kind="relation"); the `["relation-review", project]` key
+// it invalidates is exactly this hook's queryKey (pinned by
+// useDecideReviewTarget.test.tsx).
+export function useRelationReviewQueue(project: string | undefined) {
+  return useQuery({
+    queryKey: ["relation-review", project],
+    enabled: project !== undefined && isPathAddressable(project),
+    queryFn: async () => {
+      const all: Relation[] = [];
+      let cursor: string | undefined;
+      let buildId: string | null | undefined;
+      do {
+        const { data, error } = await api.GET("/projects/{project}/relations", {
+          params: {
+            path: { project: project as string },
+            query: { limit: 200, cursor, filter: { status: "needs_review" } },
+          },
+        });
+        if (error) throw new Error(error.error.message);
+        if (buildId === undefined) buildId = data.meta.build_id;
+        else if (data.meta.build_id !== buildId)
+          throw new Error("The active build changed while loading the review queue — retry.");
+        all.push(...data.data);
+        cursor = data.meta.next_cursor ?? undefined;
+      } while (cursor);
+      return all;
+    },
+  });
+}
+
 export type ReviewTargetKind = "entity" | "relation";
 export type ReviewTargetVerb = "approve" | "reject";
 

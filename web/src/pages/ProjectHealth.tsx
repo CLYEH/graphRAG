@@ -41,6 +41,7 @@ const COUNT_LABELS: Record<string, string> = {
 const TAB_FOR_COUNT: Record<string, string> = {
   pending_ontology_proposals: "proposals",
   needs_review_entities: "entity",
+  needs_review_relations: "relation",
 };
 
 export function ProjectHealth() {
