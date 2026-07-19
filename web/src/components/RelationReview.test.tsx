@@ -1,4 +1,6 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { RelationReview } from "./RelationReview";
@@ -127,6 +129,57 @@ describe("RelationReview", () => {
     expect(await screen.findByRole("button", { name: "重試" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "保留" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
+  });
+
+  it("re-locks the reject confirmation if an endpoint name goes unresolved after the dialog opens (Codex #106 P2)", async () => {
+    const r = relation({ id: "r-a", src_entity_id: "e-src", dst_entity_id: "e-dst" });
+    let entityErrors = false;
+    vi.spyOn(api, "GET").mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/entities/{entity_id}") {
+        if (entityErrors)
+          return Promise.resolve({
+            data: undefined,
+            error: {
+              error: { code: "STORE_UNAVAILABLE", message: "down", details: null, request_id: "r" },
+            },
+            response: { status: 503 },
+          });
+        const eid = (opts as { params: { path: { entity_id: string } } }).params.path.entity_id;
+        return Promise.resolve({
+          data: { data: entity({ id: eid, canonical_name: "海祭" }), meta: META },
+          error: undefined,
+        });
+      }
+      return Promise.resolve({
+        data: { data: path === "/projects/{project}/relations" ? [r] : r, meta: META },
+        error: undefined,
+      });
+    }) as never);
+
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <RelationReview project="acme" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // names OK → arm the reject confirm; 確定排除 starts enabled
+    await waitFor(() => expect(screen.getByRole("button", { name: "排除" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "排除" }));
+    expect(await screen.findByRole("button", { name: "確定排除" })).toBeEnabled();
+
+    // the endpoint names now go unresolved (a refetch errors) WHILE the dialog is open
+    entityErrors = true;
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["entity", "acme"] });
+    });
+
+    // the irreversible reject must re-lock — the pair is no longer visible
+    await waitFor(() => expect(screen.getByRole("button", { name: "確定排除" })).toBeDisabled());
   });
 
   it("lazily loads the evidence quote on demand (the list omits it)", async () => {

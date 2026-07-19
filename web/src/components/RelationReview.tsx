@@ -119,10 +119,14 @@ function RelationRow({
       {confirmingReject ? (
         <div className="targets__confirm" role="alertdialog" aria-label="確認排除">
           <p>排除後這個關聯會從上線的知識庫移除,目前無法從介面復原。確定嗎?</p>
+          {/* gate on `locked`, not just decide.isPending: if a name lookup goes
+              unresolved WHILE the confirm is open (e.g. a focus-refetch errors
+              after a build swap), the pair is no longer visible → the irreversible
+              reject must re-lock too (Codex #106 P2). 取消 stays usable to back out. */}
           <button
             type="button"
             className="targets__reject"
-            disabled={decide.isPending}
+            disabled={locked}
             onClick={onConfirmReject}
           >
             確定{VERB_LABEL.reject}
