@@ -1045,10 +1045,17 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             node = {k: v for k, v in node.items() if k != "$ref"}
             if not node:
                 return
-        # judgment: only nodes carrying fixed `properties` are JUDGED (class
-        # 24's definition — a patternProperties-only map is not a fixed-
-        # semantics node), but every keyword's subschemas are WALKED below
-        if "properties" in node and "additionalProperties" not in node:
+        # judgment: any OBJECT-SHAPING node (declared `type: object`, or
+        # carrying `properties`/`patternProperties`) must declare its
+        # openness — a bare `type: object` with neither properties nor an
+        # additionalProperties declaration is a silently-open free-form bag
+        # (Codex #112 R5); every keyword's subschemas are WALKED below
+        node_type = node.get("type")
+        object_typed = node_type == "object" or (
+            isinstance(node_type, list) and "object" in node_type  # 3.1 nullable form
+        )
+        object_shaped = object_typed or "properties" in node or "patternProperties" in node
+        if object_shaped and "additionalProperties" not in node:
             silent.add(label)
         for kw in map_keywords:
             for name, sub in (node.get(kw) or {}).items():
@@ -1062,7 +1069,6 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             if isinstance(sub, dict):
                 walk(sub, f"{label}[]" if kw == "items" else f"{label}.{kw}", seen)
 
-    request_bodies = spec["components"].get("requestBodies", {})
     bodies = 0
     for path, ops in spec["paths"].items():
         # a Path Item may itself be a $ref (3.1); overlap behavior between
@@ -1076,13 +1082,11 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             for method, op in op_map.items():
                 if not isinstance(op, dict) or "requestBody" not in op:
                     continue
-                rb = op["requestBody"]
-                if "$ref" in rb:
-                    # a reusable components/requestBodies ref must be
-                    # dereferenced, or its schema is never scanned (Codex #112
-                    # R2) — a dangling ref resolves to {} here and
-                    # test_openapi_document_is_valid is the gate rejecting it
-                    rb = request_bodies.get(rb["$ref"].rsplit("/", 1)[-1], {})
+                # a reusable components/requestBodies entry may itself be a
+                # Reference Object, so follow the CHAIN of full pointers
+                # (Codex #112 R2/R5); a dangling ref raises fail-loud and
+                # test_openapi_document_is_valid rejects it independently
+                rb = _deref(spec, op["requestBody"])
                 for ctype, media in rb.get("content", {}).items():
                     schema = media.get("schema")
                     if schema is not None:
