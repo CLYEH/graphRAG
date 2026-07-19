@@ -477,73 +477,76 @@ export function useDecideOntologyProposal(project: string) {
   });
 }
 
-// GOV2-fe: the entity review queue (DESIGN §17 — extracted entities the pipeline
-// flagged `needs_review`). Active-build scoped like the merge queue: the endpoint
-// re-resolves the active build per request, so pin page 1's build_id and fail loud
-// on a mid-pagination swap (a spliced two-build queue would 404 on decide). The
-// queue selects on the LIFECYCLE status `needs_review` — the SAME facet health.py
-// counts as `needs_review_entities`, so the tab and the Health gauge count the
-// identical rows (a `review_status=unreviewed` facet would silently drift from the
-// gauge). Pages to exhaustion; fails loud so a store outage / no-active-build
-// surfaces rather than reading as "nothing to review".
-export function useEntityReviewQueue(project: string | undefined) {
-  return useQuery({
-    queryKey: ["entity-review", project],
+// GOV2-fe-4: the entity/relation review LISTS (DESIGN §17), status-parameterized —
+// `needs_review` is the review queue (the SAME lifecycle facet health.py counts as
+// needs_review_*, keeping tab and gauge on identical rows), `rejected` is the
+// decided view (GOV2-fe-4a: excluded rows awaiting a possible restore). Both are
+// active-build scoped like the merge queue. INCREMENTAL pagination (Codex #105 P2:
+// needs_review can be corpus-sized, so page-to-exhaustion would serialize hundreds
+// of requests before first paint) — useInfiniteQuery with a load-more, the
+// useStepItems discipline. The build_id pin rides the pageParam: page 1 records
+// meta.build_id, every later page compares and fails loud on a swap (a spliced
+// two-build list would 404 on decide). A live 載入更多 across a swap trips the
+// pin; a FULL refetch (focus/invalidate/remount) recomputes params from the fresh
+// page 1 (react-query v5 getNextPageParam re-threading) and pulls a clean
+// snapshot directly.
+const REVIEW_PAGE = 50;
+
+export type ReviewListStatus = "needs_review" | "rejected";
+type ReviewPageParam = { cursor: string; buildId: string | null } | undefined;
+
+export function useEntityReviewList(project: string | undefined, status: ReviewListStatus) {
+  return useInfiniteQuery({
+    queryKey: ["entity-review", project, status],
     enabled: project !== undefined && isPathAddressable(project),
-    queryFn: async () => {
-      const all: Entity[] = [];
-      let cursor: string | undefined;
-      let buildId: string | null | undefined;
-      do {
-        const { data, error } = await api.GET("/projects/{project}/entities", {
-          params: {
-            path: { project: project as string },
-            query: { limit: 200, cursor, filter: { status: "needs_review" } },
-          },
-        });
-        if (error) throw new Error(error.error.message);
-        if (buildId === undefined) buildId = data.meta.build_id;
-        else if (data.meta.build_id !== buildId)
-          throw new Error("The active build changed while loading the review queue — retry.");
-        all.push(...data.data);
-        cursor = data.meta.next_cursor ?? undefined;
-      } while (cursor);
-      return all;
+    initialPageParam: undefined as ReviewPageParam,
+    queryFn: async ({ pageParam }) => {
+      const { data, error } = await api.GET("/projects/{project}/entities", {
+        params: {
+          path: { project: project as string },
+          query: { limit: REVIEW_PAGE, cursor: pageParam?.cursor, filter: { status } },
+        },
+      });
+      if (error) throw new Error(error.error.message);
+      if (pageParam !== undefined && data.meta.build_id !== pageParam.buildId)
+        throw new Error("The active build changed while loading the review queue — retry.");
+      const buildId = pageParam?.buildId ?? data.meta.build_id;
+      return {
+        rows: data.data,
+        next: data.meta.next_cursor ? { cursor: data.meta.next_cursor, buildId } : undefined,
+      };
     },
+    getNextPageParam: (last: { rows: Entity[]; next: ReviewPageParam }) => last.next,
   });
 }
 
-// GOV2-fe: the relation review queue (DESIGN §17). Mirrors useEntityReviewQueue
-// (active-build scoped, build_id pin, `filter[status]=needs_review` for Health
-// gauge parity, page-to-exhaustion, fail-loud). `/relations` has no `q`/`total`
-// (unlike /entities) — neither is needed here. The decide flow reuses
-// useDecideReviewTarget (kind="relation"); the `["relation-review", project]` key
-// it invalidates is exactly this hook's queryKey (pinned by
+// Mirror of useEntityReviewList over /relations (which has no `q`/`total` —
+// neither is needed here). The decide flow reuses useDecideReviewTarget
+// (kind="relation"); the `["relation-review", project]` key it invalidates
+// prefix-matches BOTH status views of this hook (pinned by
 // useDecideReviewTarget.test.tsx).
-export function useRelationReviewQueue(project: string | undefined) {
-  return useQuery({
-    queryKey: ["relation-review", project],
+export function useRelationReviewList(project: string | undefined, status: ReviewListStatus) {
+  return useInfiniteQuery({
+    queryKey: ["relation-review", project, status],
     enabled: project !== undefined && isPathAddressable(project),
-    queryFn: async () => {
-      const all: Relation[] = [];
-      let cursor: string | undefined;
-      let buildId: string | null | undefined;
-      do {
-        const { data, error } = await api.GET("/projects/{project}/relations", {
-          params: {
-            path: { project: project as string },
-            query: { limit: 200, cursor, filter: { status: "needs_review" } },
-          },
-        });
-        if (error) throw new Error(error.error.message);
-        if (buildId === undefined) buildId = data.meta.build_id;
-        else if (data.meta.build_id !== buildId)
-          throw new Error("The active build changed while loading the review queue — retry.");
-        all.push(...data.data);
-        cursor = data.meta.next_cursor ?? undefined;
-      } while (cursor);
-      return all;
+    initialPageParam: undefined as ReviewPageParam,
+    queryFn: async ({ pageParam }) => {
+      const { data, error } = await api.GET("/projects/{project}/relations", {
+        params: {
+          path: { project: project as string },
+          query: { limit: REVIEW_PAGE, cursor: pageParam?.cursor, filter: { status } },
+        },
+      });
+      if (error) throw new Error(error.error.message);
+      if (pageParam !== undefined && data.meta.build_id !== pageParam.buildId)
+        throw new Error("The active build changed while loading the review queue — retry.");
+      const buildId = pageParam?.buildId ?? data.meta.build_id;
+      return {
+        rows: data.data,
+        next: data.meta.next_cursor ? { cursor: data.meta.next_cursor, buildId } : undefined,
+      };
     },
+    getNextPageParam: (last: { rows: Relation[]; next: ReviewPageParam }) => last.next,
   });
 }
 
@@ -556,12 +559,15 @@ export type ReviewTargetVerb = "approve" | "reject";
 // discipline — so a lost-response retry replays the stored 200 instead of
 // double-recording a second ledger entry for one logical decision (Codex #105).
 // The review queue only surfaces `needs_review` rows and a decision removes the
-// row, so each (target, verb) is decided at most once from the queue; a future
-// decided/audit view that offers a DELIBERATE re-decision must mint a fresh key.
-// Verb+kind ride the URL (four frozen paths), so switch to keep each a codegen
-// literal. onSuccess invalidates the matching queue, Health (the needs_review
-// gauge moves), and the target's detail cache (an open drawer reflects the new
-// status).
+// row, so each (target, verb) is decided at most once from the queue. The decided
+// view (GOV2-fe-4a) is the exception: a restore there is a DELIBERATE re-decision
+// in a possible reject→restore→reject cycle, where the deterministic key would
+// replay an EARLIER cycle's stored response — so its caller passes a fresh random
+// `idempotencyKey` per attempt (the activate/trigger discipline); queue callers
+// omit it and get the deterministic default. Verb+kind ride the URL (four frozen
+// paths), so switch to keep each a codegen literal. onSuccess invalidates the
+// matching list family (both status views), Health (the needs_review gauge
+// moves), and the target's detail cache (an open drawer reflects the new status).
 export function useDecideReviewTarget(project: string) {
   const queryClient = useQueryClient();
   return useMutation({
@@ -570,13 +576,15 @@ export function useDecideReviewTarget(project: string) {
       targetId,
       verb,
       reason,
+      idempotencyKey,
     }: {
       kind: ReviewTargetKind;
       targetId: string;
       verb: ReviewTargetVerb;
       reason: string | null;
+      idempotencyKey?: string;
     }) => {
-      const header = { "Idempotency-Key": `${targetId}:${verb}` };
+      const header = { "Idempotency-Key": idempotencyKey ?? `${targetId}:${verb}` };
       const body = { reason };
       const res =
         kind === "entity"

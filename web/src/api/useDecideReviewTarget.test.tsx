@@ -47,7 +47,8 @@ describe("useDecideReviewTarget (relation branch)", () => {
     // deterministic key per (target, verb) — a lost-response retry replays the 200
     // instead of double-recording in the append-only ledger (Codex #105)
     expect(idemKeyOf(post.mock.calls[0][1])).toBe("r-1:approve");
-    // the cross-slice contract GOV2-fe-2's useRelationReviewQueue must key on
+    // the cross-slice contract useRelationReviewList keys on (prefix-matches
+    // both of its status views)
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["relation-review", "acme"] }),
     );
