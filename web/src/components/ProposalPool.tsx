@@ -23,12 +23,27 @@ function message(error: unknown): string {
 export function ProposalPool({ project }: { project: string }) {
   const proposals = useOntologyProposals(project);
   const decide = useDecideOntologyProposal(project);
-  // the row whose decision is in flight — disables just its two buttons
-  const [deciding, setDeciding] = useState<string | null>(null);
+  // EVERY proposal whose decision is in flight — a Set, not a single id, so
+  // deciding row B doesn't re-enable row A while A's POST is still open. With a
+  // single value, A's buttons would light up again and a second (opposite-verb)
+  // decision on A could race two terminal transitions: the two carry different
+  // idem-keys (A:accept vs A:reject), so the server's §17 terminal guard 409s
+  // whichever loses the lock and reports it as a failure (Codex #104 P2).
+  const [inFlight, setInFlight] = useState<ReadonlySet<string>>(() => new Set());
 
   const onDecide = (proposalId: string, verb: ProposalVerb) => {
-    setDeciding(proposalId);
-    decide.mutate({ proposalId, verb, reason: null }, { onSettled: () => setDeciding(null) });
+    setInFlight((prev) => new Set(prev).add(proposalId));
+    decide.mutate(
+      { proposalId, verb, reason: null },
+      {
+        onSettled: () =>
+          setInFlight((prev) => {
+            const next = new Set(prev);
+            next.delete(proposalId);
+            return next;
+          }),
+      },
+    );
   };
 
   if (proposals.isPending) return <p className="review__line">載入提案…</p>;
@@ -58,7 +73,7 @@ export function ProposalPool({ project }: { project: string }) {
             <button
               type="button"
               className="proposals__accept"
-              disabled={deciding === p.id}
+              disabled={inFlight.has(p.id)}
               onClick={() => onDecide(p.id, "accept")}
             >
               採納(加入本體)
@@ -66,7 +81,7 @@ export function ProposalPool({ project }: { project: string }) {
             <button
               type="button"
               className="proposals__reject"
-              disabled={deciding === p.id}
+              disabled={inFlight.has(p.id)}
               onClick={() => onDecide(p.id, "reject")}
             >
               拒絕
