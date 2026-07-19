@@ -15,26 +15,41 @@ afterEach(() => {
 });
 
 describe("RelationReview", () => {
-  it("lists needs_review relations from /relations on the needs_review facet, grounded by type + evidence quote", async () => {
-    const r = relation({
-      id: "r-a",
-      type: "PRACTICED_BY",
-      evidence: [{ id: "ev-1", evidence_type: "chunk", quote: "每年5月初由頭目率領族人舉行" }],
-    });
-    const get = vi.spyOn(api, "GET").mockResolvedValue({
-      data: { data: [r], meta: META },
-      error: undefined,
-    } as never);
+  it("lists needs_review relations on the needs_review facet and lazily loads evidence on demand (the list omits it)", async () => {
+    // the LIST row carries NO evidence (api/schemas.py relation_dto omits it —
+    // detail-only); the detail GET supplies the quote
+    const listRow = relation({ id: "r-a", type: "PRACTICED_BY", evidence: [] });
+    const get = vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      path === "/projects/{project}/relations/{relation_id}"
+        ? Promise.resolve({
+            data: {
+              data: {
+                ...listRow,
+                evidence: [{ id: "ev-1", evidence_type: "chunk", quote: "頭目率領族人舉行" }],
+              },
+              meta: META,
+            },
+            error: undefined,
+          })
+        : Promise.resolve({ data: { data: [listRow], meta: META }, error: undefined })) as never);
 
     renderWithProviders(<RelationReview project="acme" />);
 
-    // the row is grounded by its type and the evidenced quote (the src/dst uuids
-    // ride the audit fold, not the chrome)
     expect(await screen.findByText("PRACTICED_BY")).toBeInTheDocument();
-    expect(screen.getByText(/每年5月初由頭目率領族人舉行/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "保留" })).toBeInTheDocument();
-    // WHY: same needs_review lifecycle facet as the Health needs_review_relations
-    // gauge — a review_status facet would drift from it
+    // WHY: the list omits evidence, so NOTHING is fetched/shown until the reviewer
+    // expands it — the old inline read would have silently shown "no evidence"
+    expect(screen.queryByText(/頭目率領族人舉行/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看原文證據" }));
+    // now the DETAIL endpoint (with evidence) is hit and the quote appears
+    expect(await screen.findByText(/頭目率領族人舉行/)).toBeInTheDocument();
+    expect(get).toHaveBeenCalledWith(
+      "/projects/{project}/relations/{relation_id}",
+      expect.objectContaining({
+        params: expect.objectContaining({ path: { project: "acme", relation_id: "r-a" } }),
+      }),
+    );
+    // and the queue selected on the needs_review lifecycle facet (Health gauge
+    // parity — a review_status facet would drift)
     expect(get).toHaveBeenCalledWith(
       "/projects/{project}/relations",
       expect.objectContaining({

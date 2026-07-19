@@ -322,6 +322,25 @@
   color: var(--text-h);
 }
 
+.targets__evidence-toggle {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--link, #2563eb);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.targets__quote {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.targets__quote--muted {
+  color: var(--text);
+}
+
 .targets__actions {
   display: flex;
   gap: 8px;

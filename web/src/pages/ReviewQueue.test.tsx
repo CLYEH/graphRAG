@@ -118,23 +118,16 @@ describe("ReviewQueue", () => {
     vi.spyOn(api, "GET").mockImplementation(((path: string) =>
       path === "/projects/{project}/relations"
         ? Promise.resolve({
-            data: {
-              data: [
-                relation({
-                  type: "PRACTICED_BY",
-                  evidence: [{ id: "ev-1", evidence_type: "chunk", quote: "頭目率領族人舉行" }],
-                }),
-              ],
-              meta: META,
-            },
+            data: { data: [relation({ type: "PRACTICED_BY" })], meta: META },
             error: undefined,
           })
         : Promise.resolve({ data: { data: [], meta: META }, error: undefined })) as never);
     renderAt("acme");
 
     fireEvent.click(await screen.findByRole("tab", { name: "關聯" }));
+    // the row is grounded by type; evidence loads lazily behind 查看原文證據
     expect(await screen.findByText("PRACTICED_BY")).toBeInTheDocument();
-    expect(screen.getByText(/頭目率領族人舉行/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "查看原文證據" })).toBeInTheDocument();
   });
 
   it("reports an un-addressable key instead of firing a doomed request", () => {
