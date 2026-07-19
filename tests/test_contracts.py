@@ -12,6 +12,7 @@ import json
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import unquote
 
 import jsonschema
 import pytest
@@ -142,11 +143,16 @@ def spec() -> dict[str, Any]:
 
 
 def _pointer(spec: dict[str, Any], ref: str) -> Any:
-    """Follow one local JSON Pointer (``#/a/b/c``, ~-escapes) to its target."""
+    """Follow one local JSON Pointer (``#/a/b/c``) to its target.
+
+    The fragment is a URI: percent-decode each token FIRST (``display%20name``
+    → ``display name``), then apply the JSON Pointer ``~1``/``~0`` transforms —
+    that order is the RFC 6901 evaluation order.
+    """
     assert isinstance(ref, str) and ref.startswith("#/"), f"non-local $ref: {ref!r}"
     cur: Any = spec
     for part in ref[2:].split("/"):
-        cur = cur[part.replace("~1", "/").replace("~0", "~")]
+        cur = cur[unquote(part).replace("~1", "/").replace("~0", "~")]
     return cur
 
 
@@ -1110,6 +1116,8 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     pending += [(f"webhooks[{name}]", item) for name, item in spec.get("webhooks", {}).items()]
     while pending:
         path, ops = pending.pop()
+        if not isinstance(ops, dict):
+            continue  # x-* Specification Extensions in Paths/webhooks maps
         # a Path Item may itself be a $ref (3.1); overlap behavior between
         # referenced and inline fields is spec-undefined, so scan BOTH — the
         # inline fields now, the referenced item re-entering the worklist
@@ -1124,7 +1132,9 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             if not isinstance(op, dict):
                 continue
             for cb_name, cb in op.get("callbacks", {}).items():
-                if isinstance(cb, dict) and "$ref" in cb:
+                if cb_name.startswith("x-") or not isinstance(cb, dict):
+                    continue  # specification extensions are not Callback Objects
+                if "$ref" in cb:
                     # persistent guard: a $ref'd callback expands once — a
                     # self-referential callback graph must drain, not hang
                     if cb["$ref"] in visited_refs:
@@ -1132,7 +1142,10 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                     visited_refs.add(cb["$ref"])
                 cb = chase(cb)  # Callback Object may be a (chained) $ref
                 pending += [
-                    (f"{path}.callbacks[{cb_name}][{expr}]", item) for expr, item in cb.items()
+                    (f"{path}.callbacks[{cb_name}][{expr}]", item)
+                    for expr, item in cb.items()
+                    # x-* extensions and scalar values are not Path Items
+                    if not expr.startswith("x-") and isinstance(item, dict)
                 ]
             if "requestBody" not in op:
                 continue
