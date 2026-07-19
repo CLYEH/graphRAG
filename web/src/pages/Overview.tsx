@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import { GovernanceBacklog } from "../components/GovernanceBacklog";
 import { useActivateBuild, useBuilds, useHealth, useSources } from "../api/queries";
 import { isPathAddressable, useActiveProject } from "../project/projectRoute";
 import "./Overview.css";
@@ -130,6 +131,12 @@ function OverviewBody({ project }: { project: string }) {
           前往審核
         </Link>
       )}
+
+      {/* GOV2-fe-3: display-only governance-backlog summary — deep-links the other
+          §19 quality backlogs; never blocks activation (the §14 preflight decides).
+          The counts are ACTIVE-build scoped (Codex #107 P2), so this describes the
+          live knowledge base, not a candidate build's publish readiness. */}
+      <GovernanceBacklog counts={counts} />
 
       {updateCandidate && (
         <div className="overview__card">
