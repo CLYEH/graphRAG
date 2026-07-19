@@ -97,7 +97,12 @@ _COLS = (
 
 
 async def create_job(
-    conn: AsyncConnection, project: str, kind: str, *, build_id: uuid.UUID | None = None
+    conn: AsyncConnection,
+    project: str,
+    kind: str,
+    *,
+    build_id: uuid.UUID | None = None,
+    config_snapshot: dict[str, Any] | None = None,
 ) -> Job:
     """Insert a fresh ``queued`` job for a project. The caller (a trigger
     endpoint) has already verified the project exists; the FK backstops a
@@ -107,7 +112,13 @@ async def create_job(
     subquery), so the build runs the config the user submitted even if a later
     ``PATCH /projects`` edits it during the queue delay before the first dispatch.
     The worker reuses this snapshot on every (re-)dispatch (capture_config_snapshot)
-    rather than re-reading live config, which would drift a resuming build."""
+    rather than re-reading live config, which would drift a resuming build.
+
+    An explicit ``config_snapshot`` OVERRIDES that live pin: an RB1-retry-skip
+    child pins the PARENT build's config (not the current project config), so the
+    reused (cloned, parent-config) graph layer and the re-extracted failed docs
+    share ONE config — a drifted chunk/ontology would otherwise mix two configs
+    in one build (owner 2026-07-19: 凍語料完備). ``None`` keeps the live-config pin."""
     row = (
         await conn.execute(
             tables.jobs.insert()
@@ -119,6 +130,8 @@ async def create_job(
                     sa.select(tables.projects.c.config)
                     .where(tables.projects.c.name == project)
                     .scalar_subquery()
+                    if config_snapshot is None
+                    else config_snapshot
                 ),
             )
             .returning(*_COLS)
@@ -128,7 +141,12 @@ async def create_job(
 
 
 async def create_job_exclusive(
-    conn: AsyncConnection, project: str, kind: str, *, build_id: uuid.UUID | None = None
+    conn: AsyncConnection,
+    project: str,
+    kind: str,
+    *,
+    build_id: uuid.UUID | None = None,
+    config_snapshot: dict[str, Any] | None = None,
 ) -> Job:
     """``create_job`` guarded by the single-active-job-per-project rule the
     trigger endpoints enforce (the contract's 409 ``JOB_CONFLICT`` "overlapping
@@ -171,7 +189,37 @@ async def create_job_exclusive(
     ).scalar_one_or_none()
     if active is not None:
         raise JobConflictError(project, active)
-    return await create_job(conn, project, kind, build_id=build_id)
+    return await create_job(conn, project, kind, build_id=build_id, config_snapshot=config_snapshot)
+
+
+async def build_config_snapshot(
+    conn: AsyncConnection, build_id: uuid.UUID, *, ignore_kind: str
+) -> dict[str, Any] | None:
+    """The config a build was BUILT with — its own job's ``config_snapshot``.
+
+    A build is created by exactly ONE build-producing job (a build/retry trigger,
+    which the orchestrator stamps with this ``build_id``), and that job's snapshot
+    is the config the build actually ran. Other jobs can carry the ``build_id``
+    without having produced the build — an eval names an already-existing build and
+    its snapshot is the project config AS OF THE EVAL, unrelated to how the build
+    was produced. ``ignore_kind`` is that non-producing kind (the caller owns the
+    §15 kind vocabulary; ``core`` must not name it), so excluding it leaves the
+    single build-producing job. Ordered only for determinism — one row qualifies.
+
+    RB1-retry-skip pins this onto the retry child (owner 2026-07-19: 凍語料完備), so
+    the reused (cloned, parent-config) graph layer and the re-extracted failed docs
+    share ONE config. Returns None when no such job exists or it recorded no config
+    (an old build predating the config pin) — the caller then falls back to the
+    live-config pin, i.e. retry-core's behavior.
+    """
+    return (
+        await conn.execute(
+            sa.select(tables.jobs.c.config_snapshot)
+            .where(tables.jobs.c.build_id == build_id, tables.jobs.c.kind != ignore_kind)
+            .order_by(tables.jobs.c.created_at.asc(), tables.jobs.c.id.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
 
 
 async def get_job(conn: AsyncConnection, job_id: uuid.UUID) -> Job | None:

@@ -26,6 +26,7 @@ from core.registry import (
     JobConflictError,
     ProjectHasActiveJobsError,
     ProjectNotFoundError,
+    build_config_snapshot,
     count_active_jobs,
     create_job,
     create_job_exclusive,
@@ -57,6 +58,45 @@ def _engine() -> AsyncEngine:
 
 def _proj() -> str:
     return f"itest-{uuid.uuid4().hex[:10]}"
+
+
+async def test_build_config_snapshot_returns_the_build_job_not_an_eval(migrated: None) -> None:
+    """RB1-retry-skip pins the PARENT's config onto the retry child. The lookup
+    must return the config the build was BUILT with (its build/retry job's
+    snapshot) and EXCLUDE a later eval of the same build, whose snapshot is the
+    project config as of the eval — which may have drifted. Discriminating: the
+    project config drifts BETWEEN the build job and an eval of the same build, so a
+    lookup that didn't exclude eval could return the drifted 9999, not the 1000 the
+    build ran."""
+    engine = _engine()
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            project = _proj()
+            await create_project(conn, name=project)
+            build_id = uuid.uuid4()
+            # the build's config, then its build job (bound to build_id) snapshots it
+            await conn.execute(
+                projects.update()
+                .where(projects.c.name == project)
+                .values(config={"chunking": {"max_chars": 1000}})
+            )
+            await create_job(conn, project, "build", build_id=build_id)
+            # the project config DRIFTS, then an eval of the SAME build snapshots it
+            await conn.execute(
+                projects.update()
+                .where(projects.c.name == project)
+                .values(config={"chunking": {"max_chars": 9999}})
+            )
+            await create_job(conn, project, "eval", build_id=build_id)
+
+            snap = await build_config_snapshot(conn, build_id, ignore_kind="eval")
+            assert snap == {"chunking": {"max_chars": 1000}}  # the build's, not eval's 9999
+            # a build_id with no producing job → None (the endpoint's live-config fallback)
+            assert await build_config_snapshot(conn, uuid.uuid4(), ignore_kind="eval") is None
+            await trans.rollback()
+    finally:
+        await engine.dispose()
 
 
 async def test_create_get_and_progress_roundtrip(migrated: None) -> None:

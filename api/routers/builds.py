@@ -72,6 +72,7 @@ from core.observability.reads import (
 from core.registry import (
     JobConflictError,
     ProjectNotFoundError,
+    build_config_snapshot,
     create_job_exclusive,
     get_project,
     set_eval_inputs_fingerprint,
@@ -499,6 +500,16 @@ async def retry_build_endpoint(
         # here, then finds the winner's active job and gets JOB_CONFLICT — the
         # lock order _trigger already uses (projects-row FOR UPDATE first).
         await get_project(conn, project, for_update=True)
+        # RB1-retry-skip (owner 2026-07-19: 凍語料完備): the child must re-process
+        # under the PARENT's config, not the current project config. Its graph
+        # stage reuses the parent's (cloned, parent-config) graph layer and
+        # re-extracts only the failed docs; if a later PATCH /projects drifted the
+        # chunking/ontology, running the re-extraction under the CURRENT config
+        # would mix two configs in one build (and the cloned text refs would no
+        # longer line up with the child's re-chunk). Pin the parent's snapshot onto
+        # the retry job (None → the parent predates the pin → live-config fallback,
+        # i.e. retry-core's behavior).
+        parent_config = await build_config_snapshot(conn, build_id, ignore_kind=EVAL_JOB_KIND)
         try:
             child_build_id = await create_build(conn, project, parent_build_id=build_id)
             # Take the single-active-job guard BEFORE the (potentially large)
@@ -507,7 +518,13 @@ async def retry_build_endpoint(
             # (Codex #100 P2 R1). Both create_build (project vanished under us)
             # and create_job_exclusive map their registry errors through the same
             # translator (symmetric 404/409); the whole txn is atomic (no orphan).
-            job = await create_job_exclusive(conn, project, RETRY_JOB_KIND, build_id=child_build_id)
+            job = await create_job_exclusive(
+                conn,
+                project,
+                RETRY_JOB_KIND,
+                build_id=child_build_id,
+                config_snapshot=parent_config,
+            )
             clone = await clone_raw_artifacts(conn, project, build_id, child_build_id)
             # A parent that failed AT/BEFORE ingest committed no documents (the
             # ingest stage is one all-or-nothing txn), so there is nothing to
