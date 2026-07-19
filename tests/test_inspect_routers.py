@@ -276,7 +276,12 @@ def test_chunks_cursor_and_compound_order(
         ("/projects/p/entities", {"filter[review_status]": "bogus"}),
         ("/projects/p/entities", {"filter[type]": "   "}),
         ("/projects/p/relations", {"filter[status]": "bogus"}),
+        # GOV2-facet: confidence/evidence are CLOSED single-member vocabularies
+        # ("low" / "missing") — a numeric threshold or "present" is refused, so
+        # the predicate can only ever be the §19 gauge's own (no client-side
+        # threshold drift)
         ("/projects/p/relations", {"filter[confidence]": "1"}),
+        ("/projects/p/relations", {"filter[evidence]": "present"}),
     ],
 )
 def test_unsupported_sort_filter_rejected(
@@ -739,6 +744,9 @@ def test_ss1a_facets_are_accepted_on_their_endpoints(
         ("/projects/p/entities", {"filter[review_status]": "unreviewed"}),
         ("/projects/p/relations", {"filter[type]": "works_with"}),
         ("/projects/p/relations", {"filter[status]": "needs_review"}),
+        # GOV2-facet quality facets (accept pin for the closed vocabularies)
+        ("/projects/p/relations", {"filter[confidence]": "low"}),
+        ("/projects/p/relations", {"filter[evidence]": "missing"}),
     ):
         r = client.get(path, params=params)
         assert r.status_code == 200, (path, params, r.text)
