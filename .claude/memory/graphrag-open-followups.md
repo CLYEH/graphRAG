@@ -53,6 +53,11 @@ GitHub 為準;立案或了結後從本檔劃掉):
   全建置),既修 first-write-wins 部分 scalar 又保省成本;需算糾纏 doc 集合並讓 clone
   排除之。已在 `core/builds/retry.py::graph_entangles_failed_docs` docstring 記為
   future slice。
+- **候選-scoped 發布 preflight**(GOV2-fe-3 #107 Codex R1 浮現,DR-002 級):Health 的
+  review/confidence/evidence 計數為 active-build scoped,無 per-build facet——故 Console
+  無法對「即將上線的候選 build」做品質預檢(GovernanceBacklog 已誠實改述上線中知識庫)。
+  若 owner 想要真正的發布前品質檢查,需契約新增 per-build health/counts facet
+  (如 `GET /builds/{id}/health` 或 health 帶 build 參數),自成 DR-002 任務。
 - **run-level 失敗成因未曝露到 Console**(RB1-fe #102 P1+step-error 兩輪浮現,
   DR-002 級):`pipeline_runs.error`(整個 run 於「步驟之外」崩潰的權威成因)
   沒有任何讀端點曝露,且 `Build` schema 無 `job_id`、無 jobs 清單/build→job

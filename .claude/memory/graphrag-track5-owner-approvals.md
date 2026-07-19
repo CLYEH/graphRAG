@@ -40,9 +40,13 @@ GOV2-fe 因規模拆 fe-1/2/3/4;**GOV2-fe-1**(#105 entity 審核分頁 + 共用
 (需 src→type→dst 名稱解析 + evidence 懶載),「決定前須見所決之物」不變量逐面硬化:list 端點省略
 evidence→懶載 detail、名稱解析+決定 gate 至名載完(pending+error 皆鎖+重試)、每決定入口(含確認鈕)
 皆 gate、決定後 refetch 窗鎖定(queue.isFetching,回補 EntityReview+ProposalPool grep-all),教訓見
-lesson catalog #106。SS1b/GOV3/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip(全數 merge)。
-尚餘 GOV2-fe-3(發布閘顯示型)、fe-4(已決定/復原視圖 + 影響抽屜 + 佇列分頁硬化)、
-low-confidence/missing-evidence 清單(另待 `/relations` facet api 任務);
+lesson catalog #106。**GOV2-fe-3**(#107 GovernanceBacklog 治理待辦顯示型面板)亦已 merge;
+**Codex 2 輪**皆 scope-honesty(「發布閘」框架→counts 為 active-build scoped 故改框治理待辦、
+混 scope 訊號依真實 scope 分組〔上線中知識庫/全專案〕),教訓見 lesson catalog #107。
+SS1b/GOV3/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip(全數 merge)。
+尚餘 GOV2-fe-4(已決定/復原視圖 + 影響抽屜 + 佇列分頁硬化)、
+low-confidence/missing-evidence 清單(另待 `/relations` facet api 任務)、
+候選-scoped 發布 preflight(需 per-build health facet=契約變更,owner 決);
 Console MCP URL/健康顯示 = GOV2-fe 後續接 `GET /mcp` 端點。
 
 1. **CFG1 方向確認**:推翻 2026-07-10 雙源決策 — query-policy 統一單一 SoR
