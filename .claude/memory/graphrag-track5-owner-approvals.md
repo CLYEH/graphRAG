@@ -31,9 +31,15 @@ GOV3-fe(#104 本體提案採納/拒絕 UI + 分頁式治理頁〔審核→治理
 `pending_ontology_proposals` 深連結)亦已 merge=**GOV3 線收官**(api #97 + fe #104);
 **Codex 3 輪**(R1 單值 deciding 讓相反動詞競態、R2 Set 因 react-query 單-observer
 併發卸離 strand、R3 §17 終態動作加確認步驟對齊 ReviewCases),教訓見 lesson catalog #104。
-SS1b/GOV3/GOV2/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip(全數 merge)。
-尚餘 GOV2-fe(治理中心 UI 的實體/關聯審核 + low-confidence/missing-evidence 清單 +
-publish gate);Console MCP URL/健康顯示 = GOV2-fe 落地時接 `GET /mcp` 端點。
+GOV2-fe 因規模拆 fe-1/2/3/4;**GOV2-fe-1**(#105 entity 審核分頁 + 共用
+`useDecideReviewTarget` + 分頁 WAI-ARIA + Health `needs_review_entities` 深連結)亦已 merge;
+**Codex 2 輪**(R1 三 finding:隨機鍵重試雙記 ledger→決定性鍵、reversible 在 UI 不可達→排除加
+確認、佇列讀盡→reply-resolve;R2 TASKS.md 驗收準則漂移),教訓見 lesson catalog #105——
+**reversible→無確認+隨機鍵是過度聰明設計,被反推回 sibling §17 模式(決定性鍵+排除確認)**。
+SS1b/GOV3/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip(全數 merge)。
+尚餘 GOV2-fe-2(relation 審核,沿用 fe-1 修正後模式)、fe-3(發布閘顯示型)、fe-4(已決定/復原
+視圖 + 佇列分頁硬化)、low-confidence/missing-evidence 清單(另待 `/relations` facet api 任務);
+Console MCP URL/健康顯示 = GOV2-fe 後續接 `GET /mcp` 端點。
 
 1. **CFG1 方向確認**:推翻 2026-07-10 雙源決策 — query-policy 統一單一 SoR
    (採建議:Postgres `projects.config`,MCP 啟動時讀 DB,`config.yaml` 退場)

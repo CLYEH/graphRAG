@@ -53,10 +53,6 @@ GitHub 為準;立案或了結後從本檔劃掉):
   全建置),既修 first-write-wins 部分 scalar 又保省成本;需算糾纏 doc 集合並讓 clone
   排除之。已在 `core/builds/retry.py::graph_entangles_failed_docs` docstring 記為
   future slice。
-- **治理分頁 a11y 補強**(GOV3-fe #104 gate-2 nit,v1 可接受):`ReviewQueue.tsx`
-  的 `role="tablist"/tab` 分頁有 `aria-selected` 但缺 `aria-controls`/對應 panel 的
-  `role="tabpanel"`+`id` 關聯,亦無方向鍵(←/→)roving focus。v1 語意夠用;做 GOV2-fe
-  分頁(同一 host 會加更多 tab)時順手補齊 tab↔panel 關聯與 roving。
 - **run-level 失敗成因未曝露到 Console**(RB1-fe #102 P1+step-error 兩輪浮現,
   DR-002 級):`pipeline_runs.error`(整個 run 於「步驟之外」崩潰的權威成因)
   沒有任何讀端點曝露,且 `Build` schema 無 `job_id`、無 jobs 清單/build→job
