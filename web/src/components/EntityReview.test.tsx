@@ -289,6 +289,55 @@ describe("EntityReview", () => {
     expect(idemKeyOf(post.mock.calls[1][1])).not.toBe(k1);
   });
 
+  it("reuses the SAME restore key across a failed retry — one key per logical restore (Codex #108 R2)", async () => {
+    const rej = entity({
+      id: "e-a",
+      canonical_name: "海祭",
+      status: "rejected",
+      review_status: "rejected",
+    });
+    vi.spyOn(api, "GET").mockImplementation(((_path: string, opts: unknown) => {
+      const filter = (opts as { params: { query: { filter?: { status?: string } } } }).params.query
+        .filter;
+      return Promise.resolve({
+        data: { data: filter?.status === "rejected" ? [rej] : [], meta: META },
+        error: undefined,
+      });
+    }) as never);
+    let postCalls = 0;
+    const post = vi.spyOn(api, "POST").mockImplementation((() => {
+      postCalls += 1;
+      // the FIRST restore attempt fails (e.g. the response is lost / 503); the
+      // retry must replay the SAME key or the append-only ledger records a second
+      // approval whose newer timestamp could override an intervening decision
+      return postCalls === 1
+        ? Promise.resolve({
+            data: undefined,
+            error: {
+              error: { code: "STORE_UNAVAILABLE", message: "down", details: null, request_id: "r" },
+            },
+            response: { status: 503 },
+          })
+        : Promise.resolve({
+            data: { data: { ...rej, status: "active", review_status: "approved" }, meta: META },
+            error: undefined,
+          });
+    }) as never);
+
+    renderWithProviders(<EntityReview project="acme" />);
+    fireEvent.click(await screen.findByRole("button", { name: "已排除" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: /復原/ }));
+    await waitFor(() => expect(screen.getByText(/決定失敗/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /復原/ }));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+
+    const k1 = idemKeyOf(post.mock.calls[0][1]);
+    const k2 = idemKeyOf(post.mock.calls[1][1]);
+    expect(k1).toBe(k2);
+    expect(k1).not.toBe("e-a:approve");
+  });
+
   it("stays locked while the queue refreshes after a decision, so a decided row can't be re-decided (Codex #106 P1d)", async () => {
     const e = entity({ id: "e-a", canonical_name: "海祭" });
     let queueCalls = 0;

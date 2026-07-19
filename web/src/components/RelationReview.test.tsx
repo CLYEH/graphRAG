@@ -396,6 +396,65 @@ describe("RelationReview", () => {
     expect(idemKeyOf(post.mock.calls[0][1])).not.toBe("r-a:approve");
   });
 
+  it("reuses the SAME restore key across a failed retry — row-scoped key lifecycle (Codex #108 R2)", async () => {
+    const rej = relation({
+      id: "r-a",
+      src_entity_id: "e-src",
+      dst_entity_id: "e-dst",
+      status: "rejected",
+      review_status: "rejected",
+    });
+    vi.spyOn(api, "GET").mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/relations") {
+        const filter = (opts as { params: { query: { filter?: { status?: string } } } }).params
+          .query.filter;
+        return Promise.resolve({
+          data: { data: filter?.status === "rejected" ? [rej] : [], meta: META },
+          error: undefined,
+        });
+      }
+      if (path === "/projects/{project}/entities/{entity_id}") {
+        const eid = (opts as { params: { path: { entity_id: string } } }).params.path.entity_id;
+        return Promise.resolve({
+          data: { data: entity({ id: eid, canonical_name: "海祭" }), meta: META },
+          error: undefined,
+        });
+      }
+      return Promise.resolve({ data: { data: rej, meta: META }, error: undefined });
+    }) as never);
+    let postCalls = 0;
+    const post = vi.spyOn(api, "POST").mockImplementation((() => {
+      postCalls += 1;
+      // first attempt fails (lost response) — the retry must replay the SAME key
+      return postCalls === 1
+        ? Promise.resolve({
+            data: undefined,
+            error: {
+              error: { code: "STORE_UNAVAILABLE", message: "down", details: null, request_id: "r" },
+            },
+            response: { status: 503 },
+          })
+        : Promise.resolve({
+            data: { data: { ...rej, status: "active", review_status: "approved" }, meta: META },
+            error: undefined,
+          });
+    }) as never);
+
+    renderWithProviders(<RelationReview project="acme" />);
+    fireEvent.click(await screen.findByRole("button", { name: "已排除" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /復原/ })).toBeEnabled());
+
+    fireEvent.click(screen.getByRole("button", { name: /復原/ }));
+    await waitFor(() => expect(screen.getByText(/決定失敗/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /復原/ }));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+
+    const k1 = idemKeyOf(post.mock.calls[0][1]);
+    const k2 = idemKeyOf(post.mock.calls[1][1]);
+    expect(k1).toBe(k2);
+    expect(k1).not.toBe("r-a:approve");
+  });
+
   it("locks the whole queue while a decision is in flight (Codex #104 P2)", async () => {
     const a = relation({
       id: "r-a",

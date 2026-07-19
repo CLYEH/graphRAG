@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import {
   useDecideReviewTarget,
@@ -84,15 +84,22 @@ function RelationRow({
     decide.mutate({ kind: "relation", targetId: r.id, verb: "reject", reason: null });
     setConfirmingReject(false);
   };
-  const onRestore = () =>
-    decide.mutate({
-      kind: "relation",
-      targetId: r.id,
-      verb: "approve",
-      reason: null,
-      // deliberate re-decision — fresh key per attempt (see useDecideReviewTarget)
-      idempotencyKey: crypto.randomUUID(),
-    });
+  // ONE key per LOGICAL restore, retained across failed retries and cleared on
+  // success (Codex #108 R2 — a per-click key would double-record on a lost-
+  // response retry; the deterministic key would replay across rejection cycles).
+  const restoreKey = useRef<string | null>(null);
+  const onRestore = () => {
+    const key = restoreKey.current ?? crypto.randomUUID();
+    restoreKey.current = key;
+    decide.mutate(
+      { kind: "relation", targetId: r.id, verb: "approve", reason: null, idempotencyKey: key },
+      {
+        onSuccess: () => {
+          restoreKey.current = null;
+        },
+      },
+    );
+  };
   const retryNames = () => {
     void src.refetch();
     void dst.refetch();
