@@ -56,10 +56,12 @@ function RelationRow({
   project,
   r,
   decide,
+  queueRefreshing,
 }: {
   project: string;
   r: Relation;
   decide: ReturnType<typeof useDecideReviewTarget>;
+  queueRefreshing: boolean;
 }) {
   const src = useEntity(project, r.src_entity_id);
   const dst = useEntity(project, r.dst_entity_id);
@@ -70,8 +72,13 @@ function RelationRow({
   // FAILED name lookup both keep it locked — an error only shows "(名稱載入失敗)",
   // never the pair, so enabling on error would defeat the safeguard and permit an
   // irreversible reject on unknown endpoints (Codex #106 P1c). A retry recovers.
+  // ALSO lock while the queue is refreshing after a decision (queueRefreshing): a
+  // resolved POST clears decide.isPending before the invalidated GET removes the
+  // row, so a second decision in that window would re-decide it and latest-manual-
+  // wins would silently reverse the one just confirmed (Codex #106 P1d — the
+  // ReviewCases queueRefreshing guard).
   const namesUnresolved = src.isPending || dst.isPending || src.isError || dst.isError;
-  const locked = decide.isPending || namesUnresolved;
+  const locked = decide.isPending || namesUnresolved || queueRefreshing;
   const namesFailed = src.isError || dst.isError;
 
   const onApprove = () =>
@@ -210,7 +217,13 @@ export function RelationReview({ project }: { project: string }) {
   return (
     <ul className="targets">
       {queue.data.map((r) => (
-        <RelationRow key={r.id} project={project} r={r} decide={decide} />
+        <RelationRow
+          key={r.id}
+          project={project}
+          r={r}
+          decide={decide}
+          queueRefreshing={queue.isFetching}
+        />
       ))}
       {decide.isError ? (
         <li className="review__line review__line--error">決定失敗:{message(decide.error)}</li>

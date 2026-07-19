@@ -256,6 +256,42 @@ describe("RelationReview", () => {
     expect(idemKeyOf(post.mock.calls[0][1])).toBe("r-a:reject");
   });
 
+  it("stays locked while the queue refreshes after a decision (stale-while-revalidate, Codex #106 P1d)", async () => {
+    const r = relation({ id: "r-a", src_entity_id: "e-src", dst_entity_id: "e-dst" });
+    let queueCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/relations") {
+        queueCalls += 1;
+        // initial load resolves; the post-decision refetch HANGS → isFetching true
+        return queueCalls === 1
+          ? Promise.resolve({ data: { data: [r], meta: META }, error: undefined })
+          : new Promise(() => {});
+      }
+      if (path === "/projects/{project}/entities/{entity_id}") {
+        const eid = (opts as { params: { path: { entity_id: string } } }).params.path.entity_id;
+        return Promise.resolve({
+          data: { data: entity({ id: eid, canonical_name: "海祭" }), meta: META },
+          error: undefined,
+        });
+      }
+      return Promise.resolve({ data: { data: r, meta: META }, error: undefined });
+    }) as never);
+    const post = vi.spyOn(api, "POST").mockResolvedValue({
+      data: { data: { ...r, status: "active", review_status: "approved" }, meta: META },
+      error: undefined,
+    } as never);
+
+    renderWithProviders(<RelationReview project="acme" />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "保留" }));
+    await waitFor(() => expect(post).toHaveBeenCalled());
+
+    // POST resolved but the invalidated queue GET is still in flight → the stale
+    // decided row must stay locked (a re-decision would be reversed by latest-wins)
+    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeDisabled());
+    expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
+  });
+
   it("locks the whole queue while a decision is in flight (Codex #104 P2)", async () => {
     const a = relation({
       id: "r-a",
