@@ -53,7 +53,7 @@ from api.schemas import (
     build_step_item_dto,
     job_accepted_dto,
 )
-from api.workers.build_worker import EVAL_JOB_KIND, RETRY_JOB_KIND, enqueue_build, enqueue_eval
+from api.workers.build_worker import RETRY_JOB_KIND, enqueue_build, enqueue_eval
 from core.builds.creation import create_build
 from core.builds.lifecycle import (
     BuildInfo,
@@ -70,6 +70,7 @@ from core.observability.reads import (
     step_belongs_to_build,
 )
 from core.registry import (
+    EVAL_JOB_KIND,
     JobConflictError,
     ProjectNotFoundError,
     build_config_snapshot,
@@ -509,7 +510,7 @@ async def retry_build_endpoint(
         # longer line up with the child's re-chunk). Pin the parent's snapshot onto
         # the retry job (None → the parent predates the pin → live-config fallback,
         # i.e. retry-core's behavior).
-        parent_config = await build_config_snapshot(conn, build_id, ignore_kind=EVAL_JOB_KIND)
+        parent_config = await build_config_snapshot(conn, build_id)
         try:
             child_build_id = await create_build(conn, project, parent_build_id=build_id)
             # Take the single-active-job guard BEFORE the (potentially large)

@@ -90,10 +90,10 @@ async def test_build_config_snapshot_returns_the_build_job_not_an_eval(migrated:
             )
             await create_job(conn, project, "eval", build_id=build_id)
 
-            snap = await build_config_snapshot(conn, build_id, ignore_kind="eval")
+            snap = await build_config_snapshot(conn, build_id)
             assert snap == {"chunking": {"max_chars": 1000}}  # the build's, not eval's 9999
             # a build_id with no producing job → None (the endpoint's live-config fallback)
-            assert await build_config_snapshot(conn, uuid.uuid4(), ignore_kind="eval") is None
+            assert await build_config_snapshot(conn, uuid.uuid4()) is None
             await trans.rollback()
     finally:
         await engine.dispose()

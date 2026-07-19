@@ -401,6 +401,30 @@ async def _make_building(
         )
 
 
+async def _seed_build_job(
+    engine: AsyncEngine,
+    project: str,
+    build_id: uuid.UUID,
+    config: dict[str, Any],
+    *,
+    kind: str = "build",
+) -> None:
+    """Seed the job that BUILT a build, carrying its config_snapshot — so
+    `build_config_snapshot(build_id)` returns `config`. RB1-retry-skip's config
+    guard reads the parent's and child's snapshots to confirm the child runs the
+    parent's config before reusing its graph layer."""
+    async with engine.connect() as conn, conn.begin():
+        await conn.execute(
+            tables.jobs.insert().values(
+                project=project,
+                kind=kind,
+                build_id=build_id,
+                status="done",
+                config_snapshot=config,
+            )
+        )
+
+
 async def _seed_text_doc(
     engine: AsyncEngine, project: str, build_id: uuid.UUID, h: str, raw: str
 ) -> None:
@@ -503,6 +527,7 @@ async def test_retry_skip_reextracts_only_the_failed_doc_and_equals_a_full_rebui
 
         # ---- PARENT: A extracted, B fails at graph ----
         parent = await _make_building(engine, project)
+        await _seed_build_job(engine, project, parent, _RETRY_ONTOLOGY_CONFIG)
         await _seed_text_doc(engine, project, parent, "hash-a", _DOC_A)
         await _seed_text_doc(engine, project, parent, "hash-b", _DOC_B)
         parent_stages = default_stages(
@@ -536,6 +561,7 @@ async def test_retry_skip_reextracts_only_the_failed_doc_and_equals_a_full_rebui
 
         # ---- RETRY CHILD: clone docs, re-run; B recovers ----
         child = await _make_building(engine, project, parent=parent)
+        await _seed_build_job(engine, project, child, _RETRY_ONTOLOGY_CONFIG, kind="retry")
         async with engine.connect() as conn, conn.begin():
             await clone_raw_artifacts(conn, project, parent, child)
         child_llm = _ExtractLLM(answers, fail=set())  # transient failure gone
@@ -580,6 +606,31 @@ async def test_retry_skip_reextracts_only_the_failed_doc_and_equals_a_full_rebui
         assert [refs for refs in refs_by_key.values() if len(refs) == 2] == [
             {"chunk:hash-a:0", "chunk:hash-b:0"}
         ]
+        # P2 (Codex #103 R2): cloned chunk-evidence's chunk_id was REMAPPED to the
+        # child's re-chunked chunk (same content_hash+ordinal), so every citation
+        # resolves under the active child — never a dangling parent chunk id.
+        async with engine.connect() as conn:
+            ev_chunk_ids = (
+                (
+                    await conn.execute(
+                        sa.select(tables.relation_evidence.c.chunk_id).where(
+                            tables.relation_evidence.c.build_id == child
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            child_chunk_ids = set(
+                (
+                    await conn.execute(
+                        sa.select(tables.chunks.c.id).where(tables.chunks.c.build_id == child)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert ev_chunk_ids and all(cid in child_chunk_ids for cid in ev_chunk_ids)
     finally:
         await _cleanup(engine, client, session, project)
         await engine.dispose()
@@ -606,6 +657,7 @@ async def test_retry_falls_back_to_full_rederive_when_the_parent_ran_resolve(
         async with engine.connect() as conn, conn.begin():
             await create_project(conn, name=project)
         parent = await _make_building(engine, project)
+        await _seed_build_job(engine, project, parent, _RETRY_ONTOLOGY_CONFIG)
         await _seed_text_doc(engine, project, parent, "hash-a", _DOC_A)
         await _seed_text_doc(engine, project, parent, "hash-b", _DOC_B)
         parent_graph = await _run_clean_then_graph(
@@ -637,6 +689,7 @@ async def test_retry_falls_back_to_full_rederive_when_the_parent_ran_resolve(
             )
 
         child = await _make_building(engine, project, parent=parent)
+        await _seed_build_job(engine, project, child, _RETRY_ONTOLOGY_CONFIG, kind="retry")
         async with engine.connect() as conn, conn.begin():
             await clone_raw_artifacts(conn, project, parent, child)
         child_llm = _ExtractLLM(answers, fail=set())
@@ -654,6 +707,81 @@ async def test_retry_falls_back_to_full_rederive_when_the_parent_ran_resolve(
         )
         # FULL re-derive: the resolve-ran guard suppressed the clone+skip, so the
         # LLM re-extracted BOTH docs — not just the failed B the skip path would do
+        assert set(child_llm.calls) == {_DOC_A, _DOC_B}
+    finally:
+        await _cleanup(engine, client, session, project)
+        await engine.dispose()
+
+
+async def test_retry_falls_back_to_full_rederive_when_the_parent_config_is_unavailable(
+    stores: tuple[AsyncQdrantClient, AsyncSession], tmp_path: Path
+) -> None:
+    """Codex #103 R2 P1: a LEGACY parent whose producing job recorded no config
+    (config_snapshot is schema-nullable) makes the retry endpoint's pin fall back to
+    the LIVE project config — so the child's clone (parent-config rows) plus its
+    re-extraction (live config) would MIX two configs. The graph stage must confirm
+    the pin held (parent config present AND equal to the child's) before clone+skip;
+    when the parent config is unavailable it falls back to a FULL re-derive.
+    Discriminating: NO build job is seeded for the parent, so its config is None →
+    the LLM re-extracts BOTH docs, not just the failed one."""
+    client, session = stores
+    engine = _engine()
+    project = _proj()
+    answers = {
+        _DOC_A: _extraction("Alice", "Bob", _DOC_A),
+        _DOC_B: _extraction("Alice", "Carol", _DOC_B),
+    }
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+        parent = await _make_building(engine, project)
+        # NB: NO _seed_build_job for the parent → build_config_snapshot(parent) is None
+        await _seed_text_doc(engine, project, parent, "hash-a", _DOC_A)
+        await _seed_text_doc(engine, project, parent, "hash-b", _DOC_B)
+        parent_graph = await _run_clean_then_graph(
+            engine,
+            default_stages(
+                load_build_config(_RETRY_ONTOLOGY_CONFIG),
+                chat_model=cast(LLM, _ExtractLLM(answers, fail={_DOC_B})),
+                embedder=cast(BaseEmbedding, _FakeEmbedder()),
+                vector_client=client,
+                graph_session=session,
+            ),
+            project,
+            parent,
+        )
+        async with engine.connect() as conn:
+            await record_run(
+                conn,
+                project,
+                parent,
+                "build",
+                [StepReport("graph", parent_graph.outcomes)],
+                verbosity="failures",
+            )
+        async with engine.connect() as conn, conn.begin():
+            await conn.execute(
+                tables.builds.update().where(tables.builds.c.id == parent).values(status="failed")
+            )
+
+        child = await _make_building(engine, project, parent=parent)
+        await _seed_build_job(engine, project, child, _RETRY_ONTOLOGY_CONFIG, kind="retry")
+        async with engine.connect() as conn, conn.begin():
+            await clone_raw_artifacts(conn, project, parent, child)
+        child_llm = _ExtractLLM(answers, fail=set())
+        await _run_clean_then_graph(
+            engine,
+            default_stages(
+                load_build_config(_RETRY_ONTOLOGY_CONFIG),
+                chat_model=cast(LLM, child_llm),
+                embedder=cast(BaseEmbedding, _FakeEmbedder()),
+                vector_client=client,
+                graph_session=session,
+            ),
+            project,
+            child,
+        )
+        # the parent config is unavailable → full re-derive, both docs re-extracted
         assert set(child_llm.calls) == {_DOC_A, _DOC_B}
     finally:
         await _cleanup(engine, client, session, project)

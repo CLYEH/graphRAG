@@ -50,6 +50,7 @@ from core.ingest.connectors import DocumentPayload
 from core.ingest.documents import ingest_documents
 from core.observability.reads import latest_run_graph_items, latest_run_ran_resolve
 from core.observability.spec import ItemOutcome, retry_failed_only
+from core.registry.jobs import build_config_snapshot
 from core.registry.store import Source, list_sources
 from core.resolve.resolution import resolve_build
 from core.stores.graph import BuildScopedGraphProjector
@@ -212,6 +213,16 @@ async def _plan_retry_skip(
     # full re-derive. Clone+skip only when the parent stopped AT graph (resolve
     # never ran); otherwise full re-derive (Codex #103 / fork C).
     if await latest_run_ran_resolve(conn, project, parent):
+        return None, None
+    # CONFIRM the parent's config was pinned onto this child (凍語料完備). The retry
+    # endpoint pins it, but a LEGACY parent whose producing job recorded no config
+    # (schema-nullable) makes the pin fall back to the LIVE project config — so the
+    # cloned (parent-config) rows + the re-extracted docs would mix two configs, and
+    # the cloned chunk-evidence refs wouldn't line up with the child's re-chunk. Only
+    # clone+skip when the child is provably running the SAME config the parent ran;
+    # else full re-derive under the live config (Codex #103 R2).
+    parent_config = await build_config_snapshot(conn, parent)
+    if parent_config is None or parent_config != await build_config_snapshot(conn, build_id):
         return None, None
     counts = await clone_graph_artifacts(conn, project, parent, build_id, failed_docs)
     return failed_docs, {

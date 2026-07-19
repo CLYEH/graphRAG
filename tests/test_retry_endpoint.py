@@ -97,12 +97,10 @@ def _stub_produce(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         captured["clone"] = (parent, child)
         return CloneCounts(documents=2)
 
-    async def fake_config_snapshot(conn: Any, build_id: Any, *, ignore_kind: str) -> dict[str, Any]:
+    async def fake_config_snapshot(conn: Any, build_id: Any) -> dict[str, Any]:
         # RB1-retry-skip: the endpoint reads the PARENT's build config to pin it
-        # onto the child retry job; capture the args to prove it looks up the PARENT
-        # and excludes eval jobs (whose snapshot is unrelated to the build's config)
+        # onto the child retry job; capture the arg to prove it looks up the PARENT
         captured["config_lookup_build"] = build_id
-        captured["config_ignore_kind"] = ignore_kind
         return {"pinned": "parent-config"}
 
     async def fake_create_job(

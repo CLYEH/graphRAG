@@ -334,12 +334,26 @@ async def clone_graph_artifacts(
     relations_n = (await conn.execute(r.insert().from_select(rel_cols, rel_sel))).rowcount
 
     # 4) relation_evidence (chunk only): remap parent relation → child relation by
-    #    relation_signature. chunk_id is copied verbatim (dangling by design — not
-    #    an FK; offsets are document-absolute so the citation survives re-chunking).
-    #    This is the ONE column that intentionally diverges from a full rebuild: a
-    #    cloned row keeps the PARENT's chunk_id (which won't resolve under the child,
-    #    whose re-chunk minted fresh ids), exactly like a pruned chunk's surviving
-    #    evidence (§27.4) — the merged==rebuild oracle deliberately omits chunk_id.
+    #    relation_signature, AND remap chunk_id to the CHILD's re-chunked chunk of
+    #    the same document+ordinal. The parent's chunk_id won't resolve under the
+    #    active child (clean re-chunked with fresh ids), so copying it verbatim would
+    #    make the citation 404 even though the equivalent child chunk exists (Codex
+    #    #103 R2). The remap is sound because the config is PINNED (guarded above),
+    #    so the child's deterministic re-chunk reproduces the parent's ordinals; the
+    #    ``chunk:{content_hash}:{ordinal}`` evidence_ref carries both. (A miss leaves
+    #    NULL — a tolerated dangling pointer, like a pruned chunk's evidence §27.4.)
+    chunks = tables.chunks
+    docs = tables.documents
+    child_chunk_id = (
+        sa.select(chunks.c.id)
+        .select_from(chunks.join(docs, docs.c.id == chunks.c.document_id))
+        .where(
+            chunks.c.build_id == child_build_id,
+            docs.c.content_hash == sa.func.split_part(re_.c.evidence_ref, ":", 2),
+            chunks.c.ordinal == sa.cast(sa.func.split_part(re_.c.evidence_ref, ":", 3), sa.Integer),
+        )
+        .scalar_subquery()
+    )
     pr = r.alias("pr")
     cr = r.alias("cr")
     child_ev = re_.alias("child_ev")
@@ -359,7 +373,7 @@ async def clone_graph_artifacts(
             sa.literal(child_build_id, type_=re_.c.build_id.type),
             re_.c.evidence_type,
             re_.c.evidence_ref,
-            re_.c.chunk_id,
+            child_chunk_id,  # remapped to the child's re-chunked chunk (Codex #103 R2)
             re_.c.start_offset,
             re_.c.end_offset,
             re_.c.quote,

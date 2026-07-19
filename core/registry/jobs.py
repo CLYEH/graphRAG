@@ -26,6 +26,14 @@ from core.stores import tables
 #: deleted under it, and cancel is still meaningful).
 _ACTIVE_STATUSES = ("queued", "running")
 
+#: The one ``jobs.kind`` that does NOT produce a build — an eval names an
+#: already-existing build and its ``config_snapshot`` is the project config as of
+#: the eval, unrelated to how the build was produced. Lives here (not the api
+#: worker) because :func:`build_config_snapshot` must exclude it to find a build's
+#: OWN config; the worker/endpoint import it from here so creator and excluder
+#: can't drift (Job.kind is a free §15 string; this is internal control flow).
+EVAL_JOB_KIND = "eval"
+
 
 def is_active_status(status: str) -> bool:
     """True while a job is still live (``queued``/``running``) — i.e. NOT terminal
@@ -193,7 +201,7 @@ async def create_job_exclusive(
 
 
 async def build_config_snapshot(
-    conn: AsyncConnection, build_id: uuid.UUID, *, ignore_kind: str
+    conn: AsyncConnection, build_id: uuid.UUID
 ) -> dict[str, Any] | None:
     """The config a build was BUILT with — its own job's ``config_snapshot``.
 
@@ -202,20 +210,20 @@ async def build_config_snapshot(
     is the config the build actually ran. Other jobs can carry the ``build_id``
     without having produced the build — an eval names an already-existing build and
     its snapshot is the project config AS OF THE EVAL, unrelated to how the build
-    was produced. ``ignore_kind`` is that non-producing kind (the caller owns the
-    §15 kind vocabulary; ``core`` must not name it), so excluding it leaves the
-    single build-producing job. Ordered only for determinism — one row qualifies.
+    was produced — so :data:`EVAL_JOB_KIND` is excluded, leaving the single
+    build-producing job. Ordered only for determinism — one row qualifies.
 
-    RB1-retry-skip pins this onto the retry child (owner 2026-07-19: 凍語料完備), so
-    the reused (cloned, parent-config) graph layer and the re-extracted failed docs
-    share ONE config. Returns None when no such job exists or it recorded no config
-    (an old build predating the config pin) — the caller then falls back to the
-    live-config pin, i.e. retry-core's behavior.
+    RB1-retry-skip pins this onto the retry child (owner 2026-07-19: 凍語料完備) and
+    the child's graph stage re-reads it to CONFIRM the pin held before reusing the
+    parent-config graph layer. Returns None when no such job exists or it recorded
+    no config (an old build predating the config pin); the retry then falls back to
+    a full re-derive (retry-core's behavior) rather than a mixed-config selective
+    reuse (Codex #103).
     """
     return (
         await conn.execute(
             sa.select(tables.jobs.c.config_snapshot)
-            .where(tables.jobs.c.build_id == build_id, tables.jobs.c.kind != ignore_kind)
+            .where(tables.jobs.c.build_id == build_id, tables.jobs.c.kind != EVAL_JOB_KIND)
             .order_by(tables.jobs.c.created_at.asc(), tables.jobs.c.id.asc())
             .limit(1)
         )

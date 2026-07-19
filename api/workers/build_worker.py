@@ -53,6 +53,7 @@ from core.config import get_settings
 from core.llm.factory import chat_model, embedding_model
 from core.paths import safe_project_subdir
 from core.registry import (
+    EVAL_JOB_KIND,
     capture_config_snapshot,
     find_reapable_jobs,
     find_unenqueued_jobs,
@@ -77,9 +78,10 @@ EVAL_TASK = "run_eval_task"
 #: The ``jobs.kind`` the reaper re-dispatches onto ``EVAL_TASK`` (with the job's
 #: ``build_id``) instead of ``BUILD_TASK``. build/ingest jobs both run the §5
 #: pipeline via ``BUILD_TASK``; an eval job is the one kind that maps elsewhere, so
-#: crash/lost-dispatch recovery must branch on it. The eval trigger stamps this
-#: same string (api.routers.builds), so creator and reaper can't drift.
-EVAL_JOB_KIND = "eval"
+#: crash/lost-dispatch recovery must branch on it. ``EVAL_JOB_KIND`` is defined in
+#: ``core.registry.jobs`` (build_config_snapshot must exclude it) and imported
+#: above; the eval trigger (api.routers.builds) stamps the same constant, so
+#: creator, reaper, and the config-snapshot excluder can't drift.
 
 #: The ``jobs.kind`` a retry (RB1-retry, DR-013) stamps. It flows through the
 #: SAME ``BUILD_TASK`` path as build/ingest — the retry endpoint creates the

@@ -8,6 +8,7 @@ land in BA1b/BA2.
 """
 
 from core.registry.jobs import (
+    EVAL_JOB_KIND,
     Job,
     JobConflictError,
     JobNotFoundError,
@@ -61,6 +62,7 @@ __all__ = [
     "ProjectNotFoundError",
     "Source",
     "SourceNotFoundError",
+    "EVAL_JOB_KIND",
     "add_source",
     "build_config_snapshot",
     "capture_config_snapshot",
