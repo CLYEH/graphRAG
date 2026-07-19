@@ -585,6 +585,81 @@ async def test_retry_skip_reextracts_only_the_failed_doc_and_equals_a_full_rebui
         await engine.dispose()
 
 
+async def test_retry_falls_back_to_full_rederive_when_the_parent_ran_resolve(
+    stores: tuple[AsyncQdrantClient, AsyncSession], tmp_path: Path
+) -> None:
+    """fork C (Codex #103): §22 TOLERATES an under-threshold graph failure, so a
+    parent can fail doc B at graph, RUN resolve (merging entities into 'merged'
+    audit rows + null-signature relations), then fail later. That post-resolve
+    graph layer can't be faithfully reused by the pre-resolve-shaped selective
+    clone, so the retry must DETECT resolve ran and fall back to a FULL re-derive —
+    re-extracting EVERY doc, never the clone+skip. Discriminating: the LLM is
+    called for BOTH docs (the skip path would call it for the failed B only)."""
+    client, session = stores
+    engine = _engine()
+    project = _proj()
+    answers = {
+        _DOC_A: _extraction("Alice", "Bob", _DOC_A),
+        _DOC_B: _extraction("Alice", "Carol", _DOC_B),
+    }
+    try:
+        async with engine.connect() as conn, conn.begin():
+            await create_project(conn, name=project)
+        parent = await _make_building(engine, project)
+        await _seed_text_doc(engine, project, parent, "hash-a", _DOC_A)
+        await _seed_text_doc(engine, project, parent, "hash-b", _DOC_B)
+        parent_graph = await _run_clean_then_graph(
+            engine,
+            default_stages(
+                load_build_config(_RETRY_ONTOLOGY_CONFIG),
+                chat_model=cast(LLM, _ExtractLLM(answers, fail={_DOC_B})),
+                embedder=cast(BaseEmbedding, _FakeEmbedder()),
+                vector_client=client,
+                graph_session=session,
+            ),
+            project,
+            parent,
+        )
+        # the parent TOLERATED the graph failure and RAN resolve, then failed later:
+        # record BOTH a graph step (B failed) AND a resolve step
+        async with engine.connect() as conn:
+            await record_run(
+                conn,
+                project,
+                parent,
+                "build",
+                [StepReport("graph", parent_graph.outcomes), StepReport("resolve", ())],
+                verbosity="failures",
+            )
+        async with engine.connect() as conn, conn.begin():
+            await conn.execute(
+                tables.builds.update().where(tables.builds.c.id == parent).values(status="failed")
+            )
+
+        child = await _make_building(engine, project, parent=parent)
+        async with engine.connect() as conn, conn.begin():
+            await clone_raw_artifacts(conn, project, parent, child)
+        child_llm = _ExtractLLM(answers, fail=set())
+        await _run_clean_then_graph(
+            engine,
+            default_stages(
+                load_build_config(_RETRY_ONTOLOGY_CONFIG),
+                chat_model=cast(LLM, child_llm),
+                embedder=cast(BaseEmbedding, _FakeEmbedder()),
+                vector_client=client,
+                graph_session=session,
+            ),
+            project,
+            child,
+        )
+        # FULL re-derive: the resolve-ran guard suppressed the clone+skip, so the
+        # LLM re-extracted BOTH docs — not just the failed B the skip path would do
+        assert set(child_llm.calls) == {_DOC_A, _DOC_B}
+    finally:
+        await _cleanup(engine, client, session, project)
+        await engine.dispose()
+
+
 async def test_xlsx_source_ingests_per_row_text_documents(
     stores: tuple[AsyncQdrantClient, AsyncSession], tmp_path: Path
 ) -> None:

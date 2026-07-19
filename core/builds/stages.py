@@ -48,7 +48,7 @@ from core.graph.structured import extract_structured
 from core.index.indexing import index_build
 from core.ingest.connectors import DocumentPayload
 from core.ingest.documents import ingest_documents
-from core.observability.reads import latest_run_graph_items
+from core.observability.reads import latest_run_graph_items, latest_run_ran_resolve
 from core.observability.spec import ItemOutcome, retry_failed_only
 from core.registry.store import Source, list_sources
 from core.resolve.resolution import resolve_build
@@ -205,6 +205,14 @@ async def _plan_retry_skip(
     failed_docs = frozenset(ref for kind, ref in retry_failed_only(items) if kind == "document")
     if not failed_docs:
         return None, None  # full re-derive (retry-core): no clone, extract everything
+    # A parent that TOLERATED under-threshold graph failures can still have run
+    # resolve and failed later. Resolve merges entities (losers → 'merged' audit
+    # rows with repointed mentions, relations demoted to NULL signatures), so the
+    # pre-resolve-shaped selective clone would DROP those rows and diverge from a
+    # full re-derive. Clone+skip only when the parent stopped AT graph (resolve
+    # never ran); otherwise full re-derive (Codex #103 / fork C).
+    if await latest_run_ran_resolve(conn, project, parent):
+        return None, None
     counts = await clone_graph_artifacts(conn, project, parent, build_id, failed_docs)
     return failed_docs, {
         "reextracted_docs": len(failed_docs),

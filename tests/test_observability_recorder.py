@@ -83,17 +83,20 @@ def test_duplicate_item_refs_dedupe_first_kept() -> None:
     assert len(_persistable(outcomes, "all")) == 2  # dedup applies in every mode
 
 
-def test_graph_step_name_matches_the_orchestrator_stage() -> None:
-    """RB1-retry-skip's failed-set reader (``reads.latest_run_graph_items``)
-    filters ``pipeline_steps`` on ``reads.GRAPH_STEP_NAME``. It MUST equal the
-    orchestrator's §5 'graph' stage name: a rename of that stage
-    (``orchestrator._STAGE_ORDER``) that didn't update the constant would silently
-    read ZERO failed docs, re-extract nothing, and produce a graph-less retry that
-    looks successful — the exact class of silent break the lockstep exists to catch."""
+def test_retry_skip_step_names_match_the_orchestrator_stages() -> None:
+    """RB1-retry-skip filters ``pipeline_steps`` on ``reads.GRAPH_STEP_NAME`` (the
+    failed-set reader) and ``reads.RESOLVE_STEP_NAME`` (the resolve-ran guard). Both
+    MUST equal the orchestrator's §5 stage names, and RESOLVE must come AFTER GRAPH
+    — the guard's whole premise is "resolve runs after graph, so its presence means
+    a post-resolve graph layer". A rename of either stage that didn't update the
+    constant would silently break the guard (read zero failures → graph-less retry;
+    or miss a post-resolve parent → drop merged audit rows) — the class of silent
+    break this lockstep exists to catch."""
     from core.builds.orchestrator import _STAGE_ORDER
-    from core.observability.reads import GRAPH_STEP_NAME
+    from core.observability.reads import GRAPH_STEP_NAME, RESOLVE_STEP_NAME
 
-    assert GRAPH_STEP_NAME in _STAGE_ORDER
+    assert GRAPH_STEP_NAME in _STAGE_ORDER and RESOLVE_STEP_NAME in _STAGE_ORDER
+    assert _STAGE_ORDER.index(RESOLVE_STEP_NAME) == _STAGE_ORDER.index(GRAPH_STEP_NAME) + 1
 
 
 def test_dedupe_keeps_first_when_no_failure() -> None:
