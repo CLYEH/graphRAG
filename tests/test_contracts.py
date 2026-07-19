@@ -1015,29 +1015,41 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             if refname in seen:
                 return
             seen |= {refname}
-            label = refname  # pin by component name so one entry covers all its endpoints
+            # re-root the label at the component so one pin entry covers every
+            # endpoint referencing it — but NESTED nodes below keep extending
+            # the path, so a new silent node INSIDE a pinned component gets its
+            # own identity (Codex #112 R1: a component-only label would mask it)
+            label = refname
         # the walker judges only nodes carrying fixed `properties` — class 24's
         # definition; a patternProperties-only map is out of its scope by design
         if "properties" in node:
             if "additionalProperties" not in node:
                 silent.add(label)
-            for sub in node["properties"].values():
-                walk(sub, label, seen)
+            for pname, sub in node["properties"].items():
+                walk(sub, f"{label}.{pname}", seen)
         ap = node.get("additionalProperties")
         if isinstance(ap, dict):
-            walk(ap, label, seen)
+            walk(ap, f"{label}.additionalProperties", seen)
         if "items" in node:
-            walk(node["items"], label, seen)
+            walk(node["items"], f"{label}[]", seen)
         for comb in ("oneOf", "anyOf", "allOf"):
-            for sub in node.get(comb) or []:
-                walk(sub, label, seen)
+            for i, sub in enumerate(node.get(comb) or []):
+                walk(sub, f"{label}.{comb}[{i}]", seen)
 
+    request_bodies = spec["components"].get("requestBodies", {})
     bodies = 0
     for path, ops in spec["paths"].items():
         for method, op in ops.items():
             if not isinstance(op, dict) or "requestBody" not in op:
                 continue
-            for ctype, media in op["requestBody"].get("content", {}).items():
+            rb = op["requestBody"]
+            if "$ref" in rb:
+                # a reusable components/requestBodies ref must be dereferenced,
+                # or its schema is never scanned (Codex #112 R2) — a dangling
+                # ref resolves to {} here and test_openapi_document_is_valid
+                # is the gate that rejects it
+                rb = request_bodies.get(rb["$ref"].rsplit("/", 1)[-1], {})
+            for ctype, media in rb.get("content", {}).items():
                 schema = media.get("schema")
                 if schema is not None:
                     bodies += 1
