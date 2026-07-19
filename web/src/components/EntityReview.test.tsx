@@ -162,6 +162,82 @@ describe("EntityReview", () => {
     expect(screen.queryByText("豐年祭")).not.toBeInTheDocument();
   });
 
+  it("keeps stale rows LOCKED when the post-decision refetch fails (Codex #108 P1)", async () => {
+    const e = entity({ id: "e-a", canonical_name: "海祭" });
+    let getCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation((() => {
+      getCalls += 1;
+      // initial load OK; the post-decision refetch ERRORS → react-query keeps the
+      // stale pages, clears isFetching, and sets isError
+      return getCalls === 1
+        ? Promise.resolve({ data: { data: [e], meta: META }, error: undefined })
+        : Promise.resolve({
+            data: undefined,
+            error: {
+              error: { code: "STORE_UNAVAILABLE", message: "down", details: null, request_id: "r" },
+            },
+            response: { status: 503 },
+          });
+    }) as never);
+    const post = vi.spyOn(api, "POST").mockResolvedValue({
+      data: { data: { ...e, status: "active", review_status: "approved" }, meta: META },
+      error: undefined,
+    } as never);
+
+    renderWithProviders(<EntityReview project="acme" />);
+    fireEvent.click(await screen.findByRole("button", { name: "保留" }));
+    await waitFor(() => expect(post).toHaveBeenCalled());
+
+    // the stale decided row is still on screen — its controls MUST stay locked,
+    // or an opposite verb would silently reverse the decision just made
+    await waitFor(() => expect(screen.getByText(/載入失敗/)).toBeInTheDocument());
+    expect(screen.getByText("海祭")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保留" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
+  });
+
+  it("重新載入 after a build-swap pin trip restarts from page 1 and recovers (Codex #108 P2)", async () => {
+    const a = entity({ id: "e-a", canonical_name: "海祭" });
+    const b = entity({ id: "e-b", canonical_name: "豐年祭" });
+    let swapped = false;
+    vi.spyOn(api, "GET").mockImplementation(((_path: string, opts: unknown) => {
+      const cursor = (opts as { params: { query: { cursor?: string } } }).params.query.cursor;
+      if (!swapped) {
+        if (cursor === "c2") {
+          // page 2 arrives from the NEW build — the pin trips; from here on the
+          // world has swapped to build b2
+          swapped = true;
+          return Promise.resolve({
+            data: { data: [b], meta: { ...META, build_id: "b2", next_cursor: null } },
+            error: undefined,
+          });
+        }
+        return Promise.resolve({
+          data: { data: [a], meta: { ...META, next_cursor: "c2" } },
+          error: undefined,
+        });
+      }
+      // post-swap world: a single clean page from build b2
+      return Promise.resolve({
+        data: { data: [b], meta: { ...META, build_id: "b2", next_cursor: null } },
+        error: undefined,
+      });
+    }) as never);
+
+    renderWithProviders(<EntityReview project="acme" />);
+    await screen.findByText("海祭");
+    fireEvent.click(screen.getByRole("button", { name: "載入更多" }));
+    await screen.findByText(/active build changed/i);
+
+    // a fetchNextPage retry would replay the stale cursor + old pin forever; the
+    // full-refetch retry restarts from page 1 and lands on the new build cleanly
+    fireEvent.click(screen.getByRole("button", { name: "重新載入" }));
+    expect(await screen.findByText("豐年祭")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText(/active build changed/i)).not.toBeInTheDocument(),
+    );
+  });
+
   it("lists rejected entities in the 已排除 view and restores with a FRESH key per attempt (GOV2-fe-4a)", async () => {
     const rej = entity({
       id: "e-a",

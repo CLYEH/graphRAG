@@ -292,6 +292,53 @@ describe("RelationReview", () => {
     expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
   });
 
+  it("keeps stale rows LOCKED when the post-decision refetch fails (Codex #108 P1)", async () => {
+    const r = relation({ id: "r-a", src_entity_id: "e-src", dst_entity_id: "e-dst" });
+    let listCalls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/relations") {
+        listCalls += 1;
+        return listCalls === 1
+          ? Promise.resolve({ data: { data: [r], meta: META }, error: undefined })
+          : Promise.resolve({
+              data: undefined,
+              error: {
+                error: {
+                  code: "STORE_UNAVAILABLE",
+                  message: "down",
+                  details: null,
+                  request_id: "r",
+                },
+              },
+              response: { status: 503 },
+            });
+      }
+      if (path === "/projects/{project}/entities/{entity_id}") {
+        const eid = (opts as { params: { path: { entity_id: string } } }).params.path.entity_id;
+        return Promise.resolve({
+          data: { data: entity({ id: eid, canonical_name: "海祭" }), meta: META },
+          error: undefined,
+        });
+      }
+      return Promise.resolve({ data: { data: r, meta: META }, error: undefined });
+    }) as never);
+    const post = vi.spyOn(api, "POST").mockResolvedValue({
+      data: { data: { ...r, status: "active", review_status: "approved" }, meta: META },
+      error: undefined,
+    } as never);
+
+    renderWithProviders(<RelationReview project="acme" />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "保留" }));
+    await waitFor(() => expect(post).toHaveBeenCalled());
+
+    // the failed refetch leaves stale pages with isFetching false — the decided
+    // row must stay locked or an opposite verb would silently reverse it
+    await waitFor(() => expect(screen.getByText(/載入失敗/)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "保留" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
+  });
+
   it("restores a rejected relation from the 已排除 view with a FRESH key — names still gate (GOV2-fe-4a)", async () => {
     const rej = relation({
       id: "r-a",

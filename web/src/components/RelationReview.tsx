@@ -256,23 +256,27 @@ export function RelationReview({ project }: { project: string }) {
               project={project}
               r={r}
               decide={decide}
-              listRefreshing={list.isFetching}
+              // isError too: a failed post-decision refetch keeps stale pages with
+              // isFetching false — the decided row must stay locked (Codex #108 P1)
+              listRefreshing={list.isFetching || list.isError}
               mode={view === "rejected" ? "restore" : "queue"}
             />
           ))}
         </ul>
       )}
 
-      {/* next-page failure: loaded rows stay, inline error + retry (#102) */}
+      {/* any list failure with rows on screen: rows stay (#102), retry via FULL
+          refetch — recomputes params from fresh page 1, recovering transient
+          failures AND the build-swap pin trip (Codex #108 P2) */}
       {list.isError && list.data ? (
         <p className="review__line review__line--error">
-          載入更多失敗:{message(list.error)}
+          載入失敗:{message(list.error)}
           <button
             type="button"
             className="targets__evidence-toggle"
-            onClick={() => void list.fetchNextPage()}
+            onClick={() => void list.refetch()}
           >
-            重試
+            重新載入
           </button>
         </p>
       ) : null}

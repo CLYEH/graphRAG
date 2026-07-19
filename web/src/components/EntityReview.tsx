@@ -71,7 +71,11 @@ export function EntityReview({ project }: { project: string }) {
   // the entity id awaiting a reject confirm (one at a time; queue view only)
   const [confirmingReject, setConfirmingReject] = useState<string | null>(null);
 
-  const locked = decide.isPending || list.isFetching;
+  // lock on isError too: if the post-decision refetch FAILS, react-query keeps
+  // the old pages and clears isFetching while setting isError — the decided row
+  // would otherwise re-enable and an opposite verb would silently reverse the
+  // decision just made (Codex #108 P1). Decisions stay locked until a clean load.
+  const locked = decide.isPending || list.isFetching || list.isError;
 
   const onApprove = (id: string) =>
     decide.mutate({ kind: "entity", targetId: id, verb: "approve", reason: null });
@@ -186,17 +190,20 @@ export function EntityReview({ project }: { project: string }) {
         </ul>
       )}
 
-      {/* next-page failure: the loaded rows stay, the error is inline, retry
-          re-attempts the SAME next page (RB1-fe #102 next-page discipline) */}
+      {/* any list failure with rows on screen: keep the rows visible (#102) but
+          retry via a FULL refetch — it recomputes pageParams from the fresh page 1
+          (v5 re-threading), which recovers BOTH a transient failure AND the
+          build-swap pin trip; a fetchNextPage retry would replay the stale cursor
+          + old pin forever (Codex #108 P2) */}
       {list.isError && list.data ? (
         <p className="review__line review__line--error">
-          載入更多失敗:{message(list.error)}
+          載入失敗:{message(list.error)}
           <button
             type="button"
             className="targets__evidence-toggle"
-            onClick={() => void list.fetchNextPage()}
+            onClick={() => void list.refetch()}
           >
-            重試
+            重新載入
           </button>
         </p>
       ) : null}
