@@ -40,13 +40,12 @@ GitHub 為準;立案或了結後從本檔劃掉):
 - **MCP auth**:CFG1 gateway 不帶 auth(owner 2026-07-17 預設同意);對外
   曝露後 §23 placeholder 會變真需求,屆時是 DR-002 相關 owner 決策
   (凍結 enum 無 auth 錯誤碼)。
-- **/relations 低信心 + 缺證據 facet**(GOV2-fe 定案 D4 延後,owner 2026-07-19 核准另立):
-  GOV2-fe 規格的「低信心關聯清單 + 缺證據關聯清單」後端目前無法服務——`/relations` 的
-  filter allowlist 僅 `{type,status,review_status}`(`api/routers/inspect.py`),無
-  confidence/evidence facet;Health 有算數但無列端點;缺證據無法 client-side(evidence
-  只在明細)。需 SS1a-式小任務:加 `filter[confidence]`(如 `lt:0.5`)/`filter[evidence]=
-  missing` 到 `/relations`(改 inspect.py + `_query.py` allowlist,**免契約 bump**,deepObject
-  Filter 已凍)。做完 GOV2-fe 再切一片補上兩清單 + 其 Health 深連結。
+- **GOV2 gap-list FE 片**(facet api 已於 #109 落地〔GOV2-facet:`filter[confidence]=low`/
+  `filter[evidence]=missing`,述詞與 §19 gauge 同 `LOW_CONFIDENCE_BELOW` 常數〕;剩 FE):
+  治理頁加「低信心」「缺證據」兩分頁(重用 RelationReview 模式)+ Health `TAB_FOR_COUNT`
+  的 `low_confidence_relations`/`missing_evidence_relations` 深連結。**測試必斷言同送
+  `filter[status]=active`+facet 兩參數**(facet 正交,gauge parity 靠組合——#109 gate-2 nit
+  明記)。落地後 GOV2 umbrella 的完成準則(每個非零品質訊號皆深連結至可行動清單)即閉合。
 - **RB1-retry-skip 的 entanglement 保守退全導**(#103 R3/R4 follow-up):目前若父有
   「同時被失敗與非失敗 doc 觸及」的實體(或關係),整個重試退回全部重導(fork-C
   紀律),放棄 compute-skip 省成本。真正精細解=只「額外重抽糾纏的成功 docs」(而非
