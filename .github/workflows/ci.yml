@@ -64,7 +64,9 @@ jobs:
           BASE: ${{ github.base_ref }}
         run: |
           git fetch -q origin "$BASE"
-          if git diff --name-only "origin/$BASE"...HEAD | grep -qE '^(web/|\.github/workflows/ci\.yml)'; then
+          # --no-renames: a rename OUT of web/ must surface its old web/ path,
+          # or the fold hides removed frontend code (same rule as the push gate)
+          if git diff --name-only --no-renames "origin/$BASE"...HEAD | grep -qE '^(web/|\.github/workflows/ci\.yml)'; then
             echo "web=true" >> "$GITHUB_OUTPUT"
           else
             echo "web=false" >> "$GITHUB_OUTPUT"
