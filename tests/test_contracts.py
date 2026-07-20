@@ -1040,12 +1040,20 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
         # annotation-only/no-op content (via effective)
         return sub is True or (isinstance(sub, dict) and effective(sub) == {})
 
-    def walk(node: Any, label: str, seen: frozenset[str], judge: bool = True) -> None:
-        # judge=False in PREDICATE positions (if / not / propertyNames): those
-        # subschemas TEST instances rather than admit them — flagging them (or
-        # closing them with additionalProperties) would change or invert the
-        # predicate's semantics (Codex #112 R16). Coverage checks (unknown /
-        # dynamic keywords) still run there.
+    def walk(
+        node: Any, label: str, seen: frozenset[str], judge: bool = True, composed: bool = False
+    ) -> None:
+        # Two suppression flags (Codex #112 R16/R17 + reviewer):
+        # - judge=False is STICKY: predicate positions (if / not /
+        #   propertyNames) TEST instances rather than admit them — flagging
+        #   them (or closing them with additionalProperties) would change or
+        #   invert the predicate's semantics. Threads through the subtree.
+        # - composed=True is ONE-SCOPE: an outer unevaluatedProperties covers
+        #   this node's OWN instance-properties (through in-place applicators)
+        #   but NOT nested child instances, so it propagates only through
+        #   in-place descents and RESETS at child-instance descents (a
+        #   `payload: {}` inside a composed branch is still genuinely open).
+        # Coverage checks (unknown / dynamic keywords) always run.
         if not isinstance(node, dict):
             return
         if "$dynamicRef" in node or "$dynamicAnchor" in node:
@@ -1071,7 +1079,15 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 # dangling ref raises here, and that is correct fail-loud:
                 # test_openapi_document_is_valid rejects it too.
                 short = ref.removeprefix("#/components/schemas/").replace("/", ".")
-                walk(_pointer(spec, ref), short, seen | {ref}, judge)
+                # $ref is an in-place applicator: an outer unevaluatedProperties
+                # sibling covers the referenced schema's properties too (R17)
+                walk(
+                    _pointer(spec, ref),
+                    short,
+                    seen | {ref},
+                    judge,
+                    composed or "unevaluatedProperties" in node,
+                )
             # OpenAPI 3.1: a $ref may carry SIBLING schema keywords — judge
             # them under the ORIGINAL label instead of discarding them with
             # the ref (Codex #112 R2b); a bare {$ref} node ends here
@@ -1102,45 +1118,60 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
         )
         object_shaped = object_typed or any(k in node for k in object_markers)
         declared = "additionalProperties" in node or "unevaluatedProperties" in node
-        if judge and object_shaped and not declared:
+        if judge and not composed and object_shaped and not declared:
             silent.add(label)
+        # an outer `unevaluatedProperties` declaration is COMPOSITION-AWARE:
+        # per 2020-12 it sees through in-place applicators (allOf/oneOf/anyOf/
+        # then-else/dependentSchemas/$ref), so branches carrying bare
+        # `properties` are already covered — judging them would push authors
+        # toward per-branch additionalProperties:false, which makes sibling
+        # branches reject each other (Codex #112 R17). It does NOT cover
+        # nested child instances, so `composed` resets on those descents.
+        next_composed = composed or "unevaluatedProperties" in node
         for kw in map_keywords:
+            in_place = kw == "dependentSchemas"
             for name, sub in (node.get(kw) or {}).items():
                 sub_label = f"{label}.{name}" if kw == "properties" else f"{label}.{kw}[{name}]"
                 # an ADMITTING child position (a property/pattern/dependent
                 # value) that is unconstrained accepts arbitrary object values
                 # without declaring anything (`payload: {}` — Codex #112 R16);
                 # $defs entries are uninstantiated, so they are walked only
-                if judge and kw != "$defs" and unconstrained(sub):
+                child_judged = judge and kw != "$defs" and not (in_place and next_composed)
+                if child_judged and unconstrained(sub):
                     silent.add(sub_label)
                     continue
-                walk(sub, sub_label, seen, judge)
+                walk(sub, sub_label, seen, judge, next_composed if in_place else False)
         for kw in list_keywords:
+            in_place = kw != "prefixItems"
             for i, sub in enumerate(node.get(kw) or []):
                 # an UNCONSTRAINED oneOf/anyOf branch lets arbitrary objects
                 # through the whole combinator (true ∨ X = true — #112 R14),
                 # and an unconstrained prefixItems slot admits arbitrary
                 # objects at that array position (R16); allOf composes by ∧,
                 # so its true/{} members are handled in effective() instead
-                if judge and kw != "allOf" and unconstrained(sub):
+                branch_judged = judge and kw != "allOf" and not (in_place and next_composed)
+                if branch_judged and unconstrained(sub):
                     silent.add(f"{label}.{kw}[{i}]")
                     continue
-                walk(sub, f"{label}.{kw}[{i}]", seen, judge)
+                walk(sub, f"{label}.{kw}[{i}]", seen, judge, next_composed if in_place else False)
         for kw in single_keywords:
             sub = node.get(kw)
-            if not isinstance(sub, dict):
-                continue
             sub_label = f"{label}[]" if kw == "items" else f"{label}.{kw}"
-            if kw in ("if", "not", "propertyNames"):
-                walk(sub, sub_label, seen, False)  # predicate position (R16)
-                continue
-            # items/contentSchema admit instance values; the declaration
-            # keywords (additionalProperties/unevaluated*) ARE declarations,
-            # and then/else compose conjunctively — a true/{} there is a no-op
+            # boolean schemas are legal here: `items: true` admits arbitrary
+            # object items and must be judged BEFORE the dict guard (#112 R17)
             if judge and kw in ("items", "contentSchema") and unconstrained(sub):
                 silent.add(sub_label)
                 continue
-            walk(sub, sub_label, seen, judge)
+            if not isinstance(sub, dict):
+                continue
+            if kw in ("if", "not", "propertyNames"):
+                walk(sub, sub_label, seen, False)  # predicate position (R16)
+                continue
+            # then/else are in-place applicators (composed propagates); the
+            # declaration keywords (additionalProperties/unevaluated*) ARE
+            # declarations, and a true/{} then/else is a conjunctive no-op
+            in_place = kw in ("then", "else")
+            walk(sub, sub_label, seen, judge, next_composed if in_place else False)
 
     def chase(node: Any) -> Any:
         # guarded $ref chain following: a cycle yields {} instead of a hang
