@@ -312,3 +312,25 @@ def test_mcp_info_fails_loud_on_an_unusable_public_host(
     err = r.json()["error"]
     assert err["code"] == "INTERNAL"
     assert "mcp_public_host" in err["message"]  # actionable naming, not a bare 500
+
+
+@pytest.mark.parametrize("bad_port", [0, 70000])
+def test_mcp_info_fails_loud_on_an_unadvertisable_port(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, bad_port: int
+) -> None:
+    """Why: port 0 binds an OS-chosen ephemeral port, so advertising `:0`
+    hands out a URL that cannot reach the running gateway; out-of-range ports
+    violate format: uri outright. Same fail-loud-and-name-the-setting contract
+    as the host rows above."""
+    _project_exists(monkeypatch)
+    monkeypatch.setattr(
+        "api.routers.health.get_settings",
+        lambda: SimpleNamespace(
+            mcp_http_host="127.0.0.1", mcp_http_port=bad_port, mcp_public_host=None
+        ),
+    )
+    r = client.get("/projects/p/mcp")
+    assert r.status_code == 500
+    err = r.json()["error"]
+    assert err["code"] == "INTERNAL"
+    assert "mcp_http_port" in err["message"]

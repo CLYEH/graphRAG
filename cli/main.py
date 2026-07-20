@@ -231,7 +231,7 @@ def _serve_mcp(args: argparse.Namespace) -> int:
     command, so it branches before ``_run``'s store plumbing)."""
     import uvicorn
 
-    from core.mcp.addressing import resolved_advertised_host
+    from core.mcp.addressing import resolved_advertised_host, validated_advertised_port
     from core.mcp.gateway import build_gateway
 
     settings = get_settings()
@@ -253,12 +253,13 @@ def _serve_mcp(args: argparse.Namespace) -> int:
         adv = None
         try:
             adv = resolved_advertised_host(settings)
+            validated_advertised_port(settings.mcp_http_port)
         except ValueError as exc:
             # distinct from the wildcard case below: this None means the value
             # is UNUSABLE, and the panel will 500 — don't relabel it a wildcard
             invalid = True
             print(
-                f"warning: mcp_public_host/mcp_http_host cannot form a valid URL "
+                f"warning: mcp_public_host/mcp_http_host/mcp_http_port cannot form a valid URL "
                 f"authority ({exc}) — the Console's MCP panel will fail loudly "
                 "until the setting is fixed.",
                 file=sys.stderr,

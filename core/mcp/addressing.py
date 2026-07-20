@@ -88,3 +88,18 @@ def _validate(host: str) -> str | None:
     if ip.is_unspecified:
         return None
     return f"[{bare}]" if isinstance(ip, ipaddress.IPv6Address) else bare
+
+
+def validated_advertised_port(port: int) -> int:
+    """``port`` when it can appear in an advertised URL, else ``ValueError``.
+
+    1..65535 only. ``0`` deserves the explicit call-out (Codex #113 R3): it is
+    a legal BIND ("OS picks an ephemeral port at listen time"), but the
+    advertised URL cannot know which port the OS picked — advertising ``:0``
+    is the port-shaped twin of advertising a wildcard host. Out-of-range
+    values simply violate ``format: uri``. Same fail-loud contract as
+    ``resolved_advertised_host``.
+    """
+    if not 1 <= port <= 65535:
+        raise ValueError(f"not an advertisable TCP port (1..65535): {port!r}")
+    return port

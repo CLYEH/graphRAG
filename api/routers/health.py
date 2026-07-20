@@ -32,7 +32,7 @@ from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.registry_errors import translate_registry_error
 from core.config import Settings, get_settings
-from core.mcp.addressing import resolved_advertised_host
+from core.mcp.addressing import resolved_advertised_host, validated_advertised_port
 from core.observability.health import HealthReport, health_report, latest_eval_payload
 from core.registry import ProjectNotFoundError, get_project
 
@@ -84,7 +84,7 @@ async def get_eval_endpoint(request: Request, project: str, conn: Conn) -> dict[
     )
 
 
-def _advertised_host(settings: Settings, request: Request) -> str:
+def _advertised_authority(settings: Settings, request: Request) -> tuple[str, int]:
     """The host an EXTERNAL agent should dial, via the SHARED resolver in
     ``core.mcp.addressing`` (the serve-mcp CLI warning uses the same one, so
     the two can never disagree about what the Console advertises).
@@ -102,13 +102,14 @@ def _advertised_host(settings: Settings, request: Request) -> str:
     """
     try:
         host = resolved_advertised_host(settings, reached_host=request.url.hostname or "localhost")
+        port = validated_advertised_port(settings.mcp_http_port)
     except ValueError as exc:
         raise ApiError(
             ErrorCode.INTERNAL,
-            f"mcp_public_host/mcp_http_host cannot form a valid URL authority: {exc}",
+            f"mcp_public_host/mcp_http_host/mcp_http_port cannot form a valid URL authority: {exc}",
         ) from exc
     assert host is not None  # reached_host was supplied, so None is impossible
-    return host
+    return host, port
 
 
 @router.get("/projects/{project}/mcp")
@@ -145,8 +146,8 @@ async def get_mcp_info_endpoint(request: Request, project: str, conn: Conn) -> d
     """
     await _require_project(conn, project)
     settings = get_settings()
-    host = _advertised_host(settings, request)
-    url = f"http://{host}:{settings.mcp_http_port}/mcp/{quote(project, safe='')}"
+    host, port = _advertised_authority(settings, request)
+    url = f"http://{host}:{port}/mcp/{quote(project, safe='')}"
     return success(
         {"transport": "streamable-http", "auth": "none", "url": url},
         **response_meta(request),

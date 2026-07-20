@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.mcp.addressing import resolved_advertised_host
+from core.mcp.addressing import resolved_advertised_host, validated_advertised_port
 
 
 class _Settings:
@@ -77,3 +77,17 @@ def test_cli_path_reports_request_dependence_as_none(
     # reached_host=None is the CLI's call shape: it has no request, so a
     # wildcard resolves to None ("describe the fallback") rather than a guess
     assert resolved_advertised_host(_settings(bind, public)) == expected
+
+
+@pytest.mark.parametrize("bad_port", [0, -1, 65536, 70000])
+def test_unadvertisable_ports_raise(bad_port: int) -> None:
+    # 0 is a legal BIND (ephemeral) but the advertised URL cannot know which
+    # port the OS picked — the port-shaped twin of a wildcard host; the rest
+    # simply violate format: uri
+    with pytest.raises(ValueError):
+        validated_advertised_port(bad_port)
+
+
+@pytest.mark.parametrize("ok_port", [1, 8300, 65535])
+def test_advertisable_ports_pass_through(ok_port: int) -> None:
+    assert validated_advertised_port(ok_port) == ok_port
