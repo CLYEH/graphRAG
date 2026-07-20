@@ -209,7 +209,7 @@ def test_mcp_info_derives_the_url_from_the_gateway_settings(
     _project_exists(monkeypatch)
     monkeypatch.setattr(
         "api.routers.health.get_settings",
-        lambda: SimpleNamespace(mcp_http_host="10.0.0.7", mcp_http_port=9300),
+        lambda: SimpleNamespace(mcp_http_host="10.0.0.7", mcp_http_port=9300, mcp_public_host=None),
     )
     r = client.get("/projects/p/mcp")
     assert r.status_code == 200
@@ -236,7 +236,9 @@ def test_mcp_info_percent_encodes_the_project_segment(
     _project_exists(monkeypatch)
     monkeypatch.setattr(
         "api.routers.health.get_settings",
-        lambda: SimpleNamespace(mcp_http_host="127.0.0.1", mcp_http_port=8300),
+        lambda: SimpleNamespace(
+            mcp_http_host="127.0.0.1", mcp_http_port=8300, mcp_public_host=None
+        ),
     )
     r = client.get("/projects/my%20proj%23a/mcp")
     assert r.status_code == 200
@@ -252,3 +254,40 @@ def test_mcp_info_route_is_unreachable_for_non_path_addressable_names(
     # routing fact rather than trusting the prose.
     _project_exists(monkeypatch)
     assert client.get("/projects/a%2Fb/mcp").status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("bind", "public", "expected_host"),
+    [
+        ("10.0.0.7", None, "10.0.0.7"),  # a dialable bind is advertised as-is
+        ("0.0.0.0", None, "testserver"),  # wildcard → the host the Console reached
+        ("::", None, "testserver"),  # the IPv6 wildcard is the same trap
+        ("0.0.0.0", "mcp.example.lan", "mcp.example.lan"),  # operator's own answer wins
+        ("::1", None, "[::1]"),  # IPv6 literal needs authority brackets
+        ("0.0.0.0", "[::1]", "[::1]"),  # already-bracketed: bracketing is idempotent
+        ("0:0:0:0:0:0:0:0", None, "testserver"),  # an unlisted SPELLING of the same wildcard
+        ("::0.0.0.0", None, "testserver"),  # and the v4-mapped spelling
+    ],
+)
+def test_mcp_info_advertises_a_dialable_host(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    bind: str,
+    public: str | None,
+    expected_host: str,
+) -> None:
+    """Why: a BIND is an interface, not an address (Codex #113 P1). Advertising
+    `0.0.0.0` hands the operator a URL their agent resolves LOCALLY — it never
+    reaches this gateway — and an unbracketed IPv6 literal makes `host:port`
+    ambiguous, i.e. a malformed URL. The wildcard case is the likely one: the
+    CLI warning tells operators to put a LAN bind into the SETTING, and
+    `0.0.0.0` is how that is spelled.
+    """
+    _project_exists(monkeypatch)
+    monkeypatch.setattr(
+        "api.routers.health.get_settings",
+        lambda: SimpleNamespace(mcp_http_host=bind, mcp_http_port=8300, mcp_public_host=public),
+    )
+    r = client.get("/projects/p/mcp")
+    assert r.status_code == 200
+    assert r.json()["data"]["url"] == f"http://{expected_host}:8300/mcp/p"

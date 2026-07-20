@@ -91,6 +91,18 @@ class Settings(BaseSettings):
     mcp_http_host: str = "127.0.0.1"
     mcp_http_port: int = 8300
 
+    # The host an EXTERNAL agent should dial, when that differs from the bind
+    # interface above. A bind is an interface, not an address: `0.0.0.0` / `::`
+    # mean "every interface" and are meaningless to a client — advertising them
+    # hands the operator a URL their agent resolves LOCALLY and never reaches
+    # this gateway (Codex #113 P1). Set this to the machine's LAN name/IP when
+    # binding a wildcard, AND whenever a reverse proxy rewrites ``Host``:
+    # left unset, the MCP info endpoint derives the host from the bind, and for
+    # an unspecified bind falls back to the CLIENT-SUPPLIED ``Host`` header the
+    # Console was reached on (the same machine in the DR-012 single-host
+    # deploy) — behind a rewriting proxy that header is no longer this host.
+    mcp_public_host: str | None = None
+
     # UXC1b uploads (tunable 🔧, DR-010): the server-managed corpus root — each
     # project's uploaded files live under ``<upload_corpus_dir>/<project>/`` and a
     # single canonical file:// source points at that directory. Assumes the API

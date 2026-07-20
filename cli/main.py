@@ -248,7 +248,9 @@ def _serve_mcp(args: argparse.Namespace) -> int:
             f"warning: serving on {host}:{port}, but the Console advertises "
             f"{settings.mcp_http_host}:{settings.mcp_http_port} (from settings). "
             "Set GRAPHRAG_MCP_HTTP_HOST/GRAPHRAG_MCP_HTTP_PORT instead so the "
-            "Console's MCP panel shows a URL that reaches this gateway.",
+            "Console's MCP panel shows a URL that reaches this gateway (when "
+            "binding a wildcard like 0.0.0.0, also set GRAPHRAG_MCP_PUBLIC_HOST "
+            "to the address agents should dial).",
             file=sys.stderr,
         )
     uvicorn.run(build_gateway(), host=host, port=port)

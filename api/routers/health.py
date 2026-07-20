@@ -20,6 +20,7 @@ report is served) and stays null when there is none.
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from typing import Any
 from urllib.parse import quote
@@ -30,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from api.deps import Conn, neo4j_driver, qdrant_client, response_meta
 from api.envelope import success
 from api.registry_errors import translate_registry_error
-from core.config import get_settings
+from core.config import Settings, get_settings
 from core.observability.health import HealthReport, health_report, latest_eval_payload
 from core.registry import ProjectNotFoundError, get_project
 
@@ -82,19 +83,68 @@ async def get_eval_endpoint(request: Request, project: str, conn: Conn) -> dict[
     )
 
 
+def _advertised_host(settings: Settings, request: Request) -> str:
+    """The host an EXTERNAL agent should dial, as a URL authority.
+
+    Both decisions here are made on the ADDRESS's own properties, never on how
+    it is spelled: ``ipaddress`` answers "is this the unspecified address?"
+    for every spelling of it (``0.0.0.0``, ``::``, ``0:0:0:0:0:0:0:0``,
+    ``::0.0.0.0``, …) and "is this IPv6?" for the bracketing, where an
+    enumerated wildcard list and a ``":" in host`` proxy each admit the very
+    defect they exist to prevent (class 9 completeness / class 5 proxy —
+    gate-2 reproduced both: an unlisted wildcard spelling advertised verbatim,
+    and an operator-written ``[::1]`` double-bracketed into an invalid URI).
+
+    Preference order: the explicit ``mcp_public_host`` (the operator's own
+    answer), else the bind host when it names something dialable, else — for
+    an unspecified ("every interface") bind — the host the Console itself was
+    reached on, since the DR-012 deploy runs the gateway on that same machine.
+    That fallback comes from the client-supplied ``Host`` header: a reverse
+    proxy that rewrites ``Host`` is exactly when ``mcp_public_host`` becomes
+    mandatory. A caller can only influence its OWN uncached response, so the
+    accident model applies here, not the adversarial one.
+
+    A value that is not an IP literal (a hostname, or an already-bracketed
+    literal an operator wrote for a URL) is returned untouched — bracketing is
+    idempotent by construction rather than by a second guard.
+    """
+    host = settings.mcp_public_host or settings.mcp_http_host
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host  # a hostname, or an already-bracketed literal
+    if ip.is_unspecified:
+        host = request.url.hostname or "localhost"
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return host
+    return f"[{host}]" if isinstance(ip, ipaddress.IPv6Address) else host
+
+
 @router.get("/projects/{project}/mcp")
 async def get_mcp_info_endpoint(request: Request, project: str, conn: Conn) -> dict[str, Any]:
     """The project's DR-012 gateway connection info (contract v1.3).
 
-    The URL is DERIVED from the settings the gateway binds to by default
+    The URL is DERIVED from the settings the gateway binds to
     (``mcp_http_host``/``mcp_http_port``) and the path shape it routes
-    (``/mcp/<project>``), so a settings change moves both together. NOTE the
-    one fork the contract leaves open: ``graphrag serve-mcp --host/--port``
-    overrides the bind for that process WITHOUT changing the settings, and
-    this payload follows the settings (the frozen contract says "derived from
-    the server's GRAPHRAG_MCP_HTTP_HOST/PORT settings"). The CLI warns loudly
-    when an override diverges and names both addresses; operators who want the
-    Console to advertise an address must set the SETTING, not the flag.
+    (``/mcp/<project>``), so a settings change moves both together. Two
+    corrections the naive f-string gets wrong (Codex #113 P1):
+
+    * a BIND is an interface, not an address — ``0.0.0.0``/``::`` mean "every
+      interface" and are meaningless to a client, which would resolve them
+      locally and never reach this gateway. ``_advertised_host`` substitutes
+      an address an external agent can actually dial: the explicit
+      ``mcp_public_host`` setting if the operator set one, else the host the
+      Console itself was reached on (same machine in the single-host deploy).
+    * an IPv6 literal needs authority BRACKETS (``[::1]:8300``), or the port
+      colon is ambiguous and the URL is malformed.
+
+    NOTE the one fork the contract leaves open: ``graphrag serve-mcp
+    --host/--port`` overrides the bind for that process WITHOUT changing the
+    settings, and this payload follows the settings (the frozen contract says
+    "derived from the server's GRAPHRAG_MCP_HTTP_HOST/PORT settings"). The CLI
+    warns loudly when an override diverges and names both addresses.
 
     The project segment is percent-encoded with an empty ``safe`` set: the
     gateway matches the RAW path and keeps an encoded slash inside its segment
@@ -106,7 +156,8 @@ async def get_mcp_info_endpoint(request: Request, project: str, conn: Conn) -> d
     """
     await _require_project(conn, project)
     settings = get_settings()
-    url = f"http://{settings.mcp_http_host}:{settings.mcp_http_port}/mcp/{quote(project, safe='')}"
+    host = _advertised_host(settings, request)
+    url = f"http://{host}:{settings.mcp_http_port}/mcp/{quote(project, safe='')}"
     return success(
         {"transport": "streamable-http", "auth": "none", "url": url},
         **response_meta(request),
