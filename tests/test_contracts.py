@@ -153,7 +153,10 @@ def _pointer(spec: dict[str, Any], ref: str) -> Any:
     pointer = unquote(ref[1:])  # the WHOLE fragment decodes to the pointer,
     # THEN it splits — %2F is a separator once decoded (a literal slash inside
     # a token is ~1); splitting first mis-tokenizes encoded separators
-    assert pointer.startswith("/"), f"not a JSON Pointer fragment: {ref!r}"
+    # plain-name $anchor fragments (#name) and $id-scoped resolution are
+    # deliberately unsupported — this asserts LOUD instead of resolving wrong;
+    # extend the resolver before using anchors in contracts/ (rescue P2)
+    assert pointer.startswith("/"), f"non-pointer fragment (e.g. $anchor) unsupported: {ref!r}"
     cur: Any = spec
     for part in pointer[1:].split("/"):
         cur = cur[part.replace("~1", "/").replace("~0", "~")]
@@ -1077,7 +1080,13 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             # closure over the round game (#112 R14): any keyword this walker
             # does not understand fails LOUD — extend the walker, never let a
             # novel construct pass unjudged
-            if k not in known_keywords and not k.startswith("x-") and not k.startswith("$dynamic"):
+            if (
+                k not in known_keywords
+                and not k.startswith("x-")
+                # exact names only — a typo like $dynamicRefTypo must land in
+                # `unknown`, not slip through a prefix exemption (rescue P1)
+                and k not in ("$dynamicRef", "$dynamicAnchor")
+            ):
                 unknown.add(f"{label}::{k}")
         if "$ref" in node:
             ref = node["$ref"]
@@ -1089,7 +1098,15 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             # a recursive component first reached under composed suppression
             # must be re-walked when reached again with weaker coverage (a
             # nested child instance resets composed — Codex #112 R19)
-            key = f"{ref}|{judge}|{t_composed}|{t_composed_items}"
+            # a sibling `type` that excludes objects composes in-place with
+            # the referenced schema — object judgment is moot there (rescue P2)
+            sib_type = node.get("type")
+            t_judge = judge and (
+                sib_type is None
+                or sib_type == "object"
+                or (isinstance(sib_type, list) and "object" in sib_type)
+            )
+            key = f"{ref}|{t_judge}|{t_composed}|{t_composed_items}"
             if key not in seen:
                 # the referenced schema gets its own RE-ROOTED walk so one pin
                 # entry covers every endpoint referencing it — while NESTED
@@ -1103,7 +1120,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                     _pointer(spec, ref),
                     short,
                     seen | {key},
-                    judge,
+                    t_judge,
                     t_composed,
                     t_composed_items,
                 )
@@ -1135,22 +1152,36 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             "minProperties",
             "maxProperties",
         )
+        # a `type` that EXCLUDES "object" makes object instances impossible —
+        # sibling object markers are dead weight, not openness, and in-place
+        # branches compose with that exclusion (rescue P2: `{type: string,
+        # properties: …}` must not be flagged). Child INSTANCE positions
+        # (items etc.) are separate instances and keep their own judgment.
+        objects_possible = "type" not in node or object_typed
+        obj_judge = judge and objects_possible
         object_shaped = object_typed or any(k in node for k in object_markers)
         declared = "additionalProperties" in node or "unevaluatedProperties" in node
-        if judge and not composed and object_shaped and not declared:
+        if obj_judge and not composed and object_shaped and not declared:
             silent.add(label)
         # an ARRAY node with no item constraint is `items: true` in disguise
         # (JSON Schema default) — `{type: array}` bare, or prefixItems with the
         # remaining positions unconstrained, admits arbitrary object elements
         # (Codex #112 R18). unevaluatedProperties does not cover items, so
-        # `composed` does not suppress this.
+        # `composed` does not suppress this. A `maxItems` bound that leaves no
+        # position beyond prefixItems means no unconstrained slot is reachable
+        # (rescue P2: `{type: array, maxItems: 0}` admits no elements).
         array_typed = node_type == "array" or (isinstance(node_type, list) and "array" in node_type)
         items_declared = "items" in node or "unevaluatedItems" in node
+        max_items = node.get("maxItems")
+        items_bounded = isinstance(max_items, int) and max_items <= len(
+            node.get("prefixItems") or []
+        )
         if (
             judge
             and not composed_items
             and (array_typed or "prefixItems" in node)
             and not items_declared
+            and not items_bounded
         ):
             silent.add(f"{label}[]")
         # an outer `unevaluatedProperties` declaration is COMPOSITION-AWARE:
@@ -1175,7 +1206,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 # an admitted child value (Codex #112 R21); nontrivial
                 # branches are still walked and node-judged below
                 child_judged = (
-                    judge
+                    obj_judge
                     and kw not in ("$defs", "dependentSchemas")
                     and not (in_place and next_composed)
                 )
@@ -1185,7 +1216,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 # $defs entries admit no request value — coverage-walk them
                 # with judge=False; a REFERENCED definition is judged when its
                 # $ref is traversed (Codex #112 R18)
-                sub_judge = False if kw == "$defs" else judge
+                sub_judge = False if kw == "$defs" else obj_judge
                 walk(
                     sub,
                     sub_label,
@@ -1196,13 +1227,26 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 )
         for kw in list_keywords:
             in_place = kw != "prefixItems"
-            for i, sub in enumerate(node.get(kw) or []):
+            subs = node.get(kw) or []
+            # allOf with a boolean-false member is unsatisfiable — nothing is
+            # admitted, so its members are coverage-walked only (rescue P2)
+            kw_base = obj_judge if in_place else judge
+            if kw == "allOf" and any(m is False for m in subs):
+                kw_base = False
+            # oneOf demands EXACTLY ONE match: with two or more unconstrained
+            # branches every instance matches several and is REJECTED, so an
+            # unconstrained branch only admits when it is the single one
+            # (rescue P2: `oneOf: [true, true]` admits nothing)
+            open_branches = sum(1 for m in subs if unconstrained(m)) if kw == "oneOf" else None
+            for i, sub in enumerate(subs):
                 # an UNCONSTRAINED oneOf/anyOf branch lets arbitrary objects
                 # through the whole combinator (true ∨ X = true — #112 R14),
                 # and an unconstrained prefixItems slot admits arbitrary
                 # objects at that array position (R16); allOf composes by ∧,
                 # so its true/{} members are handled in effective() instead
-                branch_judged = judge and kw != "allOf" and not (in_place and next_composed)
+                branch_judged = kw_base and kw != "allOf" and not (in_place and next_composed)
+                if branch_judged and open_branches is not None and open_branches != 1:
+                    branch_judged = False if unconstrained(sub) else branch_judged
                 if branch_judged and unconstrained(sub):
                     silent.add(f"{label}.{kw}[{i}]")
                     continue
@@ -1210,7 +1254,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                     sub,
                     f"{label}.{kw}[{i}]",
                     seen,
-                    judge,
+                    kw_base,
                     next_composed if in_place else False,
                     next_composed_items if in_place else False,
                 )
@@ -1230,15 +1274,17 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 # the match semantics, so it is coverage-walked like if/not
                 walk(sub, sub_label, seen, False)
                 continue
-            # then/else are in-place applicators (composed propagates); the
-            # declaration keywords (additionalProperties/unevaluated*) ARE
-            # declarations, and a true/{} then/else is a conjunctive no-op
+            # then/else are in-place applicators (composed propagates, and an
+            # object-excluding sibling `type` suppresses their judgment —
+            # rescue P2); the declaration keywords (additionalProperties/
+            # unevaluated*) ARE declarations, and a true/{} then/else is a
+            # conjunctive no-op
             in_place = kw in ("then", "else")
             walk(
                 sub,
                 sub_label,
                 seen,
-                judge,
+                obj_judge if in_place else judge,
                 next_composed if in_place else False,
                 next_composed_items if in_place else False,
             )
@@ -1302,6 +1348,10 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             "contentSchema",
         }
     )
+    # keywords with NO direct validation effect at all — a schema consisting
+    # solely of these admits everything, so effective() strips them like
+    # annotations (rescue P1: `{$defs: {...}}` alone is an open bag)
+    no_op_keywords = frozenset({"$defs", "$id", "$schema", "$anchor", "discriminator"})
     # every keyword the walker understands; anything else fails LOUD (below)
     # instead of silently passing — after #112's long round series the closure
     # is structural: an unknown construct requires extending the walker first
@@ -1344,9 +1394,22 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 for k, v in node.items()
                 if k not in annotations
                 and k not in non_object_constraints
+                and k not in no_op_keywords
                 and not k.startswith("x-")
             }
+            # an `if` with neither `then` nor `else` has no effect, and an
+            # orphaned `then`/`else` without `if` never applies (rescue P1) —
+            # drop the dead halves of the conditional group
+            if "if" in node and "then" not in node and "else" not in node:
+                node = {k: v for k, v in node.items() if k != "if"}
+            if "if" not in node:
+                node = {k: v for k, v in node.items() if k not in ("then", "else")}
             if "allOf" in node:
+                # a boolean-false member makes the WHOLE allOf unsatisfiable —
+                # nothing is admitted, so the schema is closed (rescue P2):
+                # represent that as the match-nothing `{"enum": []}`
+                if any(m is False for m in node["allOf"]):
+                    return {"enum": []}
                 # X ∧ true = X: drop unconstrained members; an allOf whose
                 # EVERY member is unconstrained (`allOf: [true]`/`[{}]`)
                 # constrains nothing and must not shield the node (#112 R15).
