@@ -181,7 +181,7 @@ def test_broken_store_config_cannot_poison_the_404(
     assert r.json()["error"]["code"] == "PROJECT_NOT_FOUND"
 
 
-@pytest.mark.parametrize("path", ["health", "metrics", "eval"])
+@pytest.mark.parametrize("path", ["health", "metrics", "eval", "mcp"])
 def test_unknown_project_is_404_on_every_surface(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, path: str
 ) -> None:
@@ -197,3 +197,58 @@ def test_unknown_project_is_404_on_every_surface(
     r = client.get(f"/projects/ghost/{path}")
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "PROJECT_NOT_FOUND"
+
+
+def test_mcp_info_derives_the_url_from_the_gateway_settings(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY: the advertised URL must be the one the DR-012 gateway actually
+    # serves — same settings (mcp_http_host/port), same path shape
+    # (/mcp/<project>). Deriving it anywhere else would let the Console hand
+    # an operator a URL that resolves nowhere the moment the gateway moves.
+    _project_exists(monkeypatch)
+    monkeypatch.setattr(
+        "api.routers.health.get_settings",
+        lambda: SimpleNamespace(mcp_http_host="10.0.0.7", mcp_http_port=9300),
+    )
+    r = client.get("/projects/p/mcp")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["data"] == {
+        "transport": "streamable-http",
+        "auth": "none",
+        "url": "http://10.0.0.7:9300/mcp/p",
+    }
+    # the payload is about the CONNECTION surface, not any build's content
+    assert body["meta"]["build_id"] is None
+
+
+def test_mcp_info_percent_encodes_the_project_segment(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY: the emitted URL is a URL, not a display string — a name carrying
+    # URL-significant characters (space, #, ?) must be percent-encoded or the
+    # operator copies a link that truncates at the fragment/query or is
+    # outright invalid. The gateway matches the RAW path and decodes per
+    # segment (Codex #93 R3), so the encoded form is what it resolves.
+    # (A name containing `/` cannot reach this route at all — the contract's
+    # own "path-addressable only" claim, pinned by the sibling test below.)
+    _project_exists(monkeypatch)
+    monkeypatch.setattr(
+        "api.routers.health.get_settings",
+        lambda: SimpleNamespace(mcp_http_host="127.0.0.1", mcp_http_port=8300),
+    )
+    r = client.get("/projects/my%20proj%23a/mcp")
+    assert r.status_code == 200
+    assert r.json()["data"]["url"] == "http://127.0.0.1:8300/mcp/my%20proj%23a"
+
+
+def test_mcp_info_route_is_unreachable_for_non_path_addressable_names(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY: the contract states `url` is ALWAYS non-null because the route is
+    # path-keyed exactly like the gateway — a name with `/` reaches neither.
+    # That guarantee is what lets McpInfo require a non-null url, so pin the
+    # routing fact rather than trusting the prose.
+    _project_exists(monkeypatch)
+    assert client.get("/projects/a%2Fb/mcp").status_code == 404

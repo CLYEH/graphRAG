@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import uuid
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Request
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -29,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from api.deps import Conn, neo4j_driver, qdrant_client, response_meta
 from api.envelope import success
 from api.registry_errors import translate_registry_error
+from core.config import get_settings
 from core.observability.health import HealthReport, health_report, latest_eval_payload
 from core.registry import ProjectNotFoundError, get_project
 
@@ -77,4 +79,36 @@ async def get_eval_endpoint(request: Request, project: str, conn: Conn) -> dict[
         payload,
         **response_meta(request),
         build_id=uuid.UUID(served) if isinstance(served, str) else None,
+    )
+
+
+@router.get("/projects/{project}/mcp")
+async def get_mcp_info_endpoint(request: Request, project: str, conn: Conn) -> dict[str, Any]:
+    """The project's DR-012 gateway connection info (contract v1.3).
+
+    The URL is DERIVED from the settings the gateway binds to by default
+    (``mcp_http_host``/``mcp_http_port``) and the path shape it routes
+    (``/mcp/<project>``), so a settings change moves both together. NOTE the
+    one fork the contract leaves open: ``graphrag serve-mcp --host/--port``
+    overrides the bind for that process WITHOUT changing the settings, and
+    this payload follows the settings (the frozen contract says "derived from
+    the server's GRAPHRAG_MCP_HTTP_HOST/PORT settings"). The CLI warns loudly
+    when an override diverges and names both addresses; operators who want the
+    Console to advertise an address must set the SETTING, not the flag.
+
+    The project segment is percent-encoded with an empty ``safe`` set: the
+    gateway matches the RAW path and keeps an encoded slash inside its segment
+    (Codex #93 R3), so emitting the raw name would advertise a URL that
+    resolves to a DIFFERENT project.
+
+    ``meta.build_id`` is null: this payload is about the connection surface,
+    not about any build's content (the observation-precedence note above).
+    """
+    await _require_project(conn, project)
+    settings = get_settings()
+    url = f"http://{settings.mcp_http_host}:{settings.mcp_http_port}/mcp/{quote(project, safe='')}"
+    return success(
+        {"transport": "streamable-http", "auth": "none", "url": url},
+        **response_meta(request),
+        build_id=None,
     )

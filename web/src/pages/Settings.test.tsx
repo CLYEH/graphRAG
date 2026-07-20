@@ -24,6 +24,13 @@ function projectBody(config: Record<string, unknown> = {}) {
   };
 }
 
+function mcpBody(url = "http://127.0.0.1:8300/mcp/acme") {
+  return {
+    data: { data: { transport: "streamable-http", auth: "none", url }, meta: META },
+    error: undefined,
+  };
+}
+
 // A config with EVERY block family: the load-bearing assertion in most tests
 // below is that blocks a section did NOT touch survive its PATCH verbatim —
 // PATCH replaces the whole config column server-side (no deep merge), so one
@@ -612,7 +619,12 @@ describe("Settings — drafts survive sibling saves", () => {
     let serverConfig: Record<string, unknown> = FULL_CONFIG;
     let release: ((v: unknown) => void) | null = null;
     let gets = 0;
-    vi.spyOn(api, "GET").mockImplementation(((): Promise<unknown> => {
+    // path-aware: the page also reads the MCP panel's connection info, and a
+    // call-COUNT-keyed stub would hand that query the hanging slot meant for
+    // the post-save refetch (class 5 — the stub must key on what the consumer
+    // actually asks for, not on how many times it asks).
+    vi.spyOn(api, "GET").mockImplementation(((path: string): Promise<unknown> => {
+      if (path === "/projects/{project}/mcp") return Promise.resolve(mcpBody());
       if (++gets >= 3) return new Promise((r) => (release = r));
       return Promise.resolve(projectBody(serverConfig));
     }) as never);
@@ -787,5 +799,82 @@ describe("Settings — fail closed", () => {
 
     await screen.findByText(/無法載入專案設定:boom/);
     expect(screen.queryByRole("button", { name: /儲存/ })).toBeNull();
+  });
+});
+
+describe("Settings — MCP 連線資訊", () => {
+  // WHY the panel shows a SERVER-derived url and never composes one: the
+  // gateway's host/port live in server settings, so a client-composed URL
+  // would keep advertising the old address after an operator moves the
+  // gateway — the operator would copy a link that reaches nothing.
+  function mockGets(mcp: unknown) {
+    vi.spyOn(api, "GET").mockImplementation(((path: string) =>
+      path === "/projects/{project}/mcp"
+        ? Promise.resolve(mcp)
+        : Promise.resolve(projectBody(FULL_CONFIG))) as never);
+  }
+
+  it("shows the url the server derived, verbatim", async () => {
+    mockGets(mcpBody("http://10.0.0.7:9300/mcp/acme"));
+    renderSettings();
+
+    expect(await screen.findByText("http://10.0.0.7:9300/mcp/acme")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "複製" })).toBeInTheDocument();
+  });
+
+  it("fails LOUD with a retry when the read errors — a blank panel would look like 'no MCP'", async () => {
+    // An operator seeing nothing concludes the feature is unavailable and
+    // debugs the gateway; the error must name the failure and offer a retry.
+    let calls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path !== "/projects/{project}/mcp") return Promise.resolve(projectBody(FULL_CONFIG));
+      calls += 1;
+      return calls === 1
+        ? Promise.resolve({
+            data: undefined,
+            error: { error: { code: "INTERNAL", message: "gateway settings unreadable" } },
+          })
+        : Promise.resolve(mcpBody());
+    }) as never);
+    renderSettings();
+
+    await screen.findByText(/讀取連線資訊失敗:gateway settings unreadable/);
+    expect(screen.queryByRole("button", { name: "複製" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "重試" }));
+    expect(await screen.findByText("http://127.0.0.1:8300/mcp/acme")).toBeInTheDocument();
+  });
+
+  it("says copying FAILED when the clipboard is unavailable — a silent no-op button is the bug this panel prevents", async () => {
+    // The Console is served over plain http to a LAN browser (DR-012), where
+    // navigator.clipboard is undefined: the button must not silently do
+    // nothing and leave the operator pasting whatever was there before.
+    mockGets(mcpBody());
+    const original = navigator.clipboard;
+    Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
+    try {
+      renderSettings();
+      fireEvent.click(await screen.findByRole("button", { name: "複製" }));
+      expect(await screen.findByText(/複製失敗,請手動選取網址/)).toBeInTheDocument();
+      expect(screen.queryByText("已複製")).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, "clipboard", { value: original, configurable: true });
+    }
+  });
+
+  it("says copying FAILED when writeText rejects (permission denied)", async () => {
+    mockGets(mcpBody());
+    const original = navigator.clipboard;
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: () => Promise.reject(new Error("denied")) },
+      configurable: true,
+    });
+    try {
+      renderSettings();
+      fireEvent.click(await screen.findByRole("button", { name: "複製" }));
+      expect(await screen.findByText(/複製失敗,請手動選取網址/)).toBeInTheDocument();
+    } finally {
+      Object.defineProperty(navigator, "clipboard", { value: original, configurable: true });
+    }
   });
 });

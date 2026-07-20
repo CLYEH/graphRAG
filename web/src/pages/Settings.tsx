@@ -8,6 +8,7 @@ import {
   ontologyFromConfig,
   policyFromConfig,
   settingsSaveMutationKey,
+  useMcpInfo,
   useProject,
   useSaveChunking,
   useSaveOntology,
@@ -108,6 +109,7 @@ function SettingsBody({ project }: { project: string }) {
       <OntologySection project={project} config={config} locked={locked} />
       <ChunkingSection project={project} config={config} locked={locked} />
       <PolicySection project={project} config={config} locked={locked} />
+      <McpSection project={project} />
     </div>
   );
 }
@@ -583,6 +585,77 @@ function PolicySection({ project, config, locked }: SectionProps) {
         <summary>進階:圖譜查詢防護(text_to_cypher,唯讀)</summary>
         <pre>{JSON.stringify(pol.cypherBlock ?? DEFAULT_QUERY_POLICY.text_to_cypher, null, 2)}</pre>
       </details>
+    </section>
+  );
+}
+
+// ---- MCP 連線資訊 (MCP1-fe) -------------------------------------------------
+
+// Why this is a READ-ONLY panel and not a computed string: the url comes from
+// the server, which derives it from the DR-012 gateway's own host/port settings
+// and path shape. Composing it in the browser would fork the source — the
+// Console would keep advertising localhost after an operator moved the gateway.
+// Read-only means there is no lock/draft discipline to inherit here; the panel
+// only has to fail loud (an operator copying a stale or blank URL debugs the
+// wrong system) and offer a retry.
+function McpSection({ project }: { project: string }) {
+  const info = useMcpInfo(project);
+  // tri-state, not a boolean: the Clipboard API is unavailable in any
+  // NON-SECURE context — which is exactly this panel's deployment (the Console
+  // served over plain http to a LAN browser, DR-012). A silent no-op button
+  // there is the same failure the panel exists to prevent (the operator thinks
+  // the URL was copied and pastes something else), so an unavailable or
+  // rejecting clipboard must SAY SO and point at manual selection.
+  const [copyState, setCopyState] = useState<"idle" | "ok" | "failed">("idle");
+
+  return (
+    <section className="settings__section" aria-label="MCP 連線資訊">
+      <h2>MCP 連線資訊</h2>
+      <p className="settings__muted">
+        外部 AI 代理平台(如導覽助理)用這個網址連到本專案的 MCP 伺服器;需要閘道(
+        <code>graphrag serve-mcp</code>)正在執行。
+      </p>
+      {info.isPending && <p className="settings__line">讀取連線資訊中…</p>}
+      {info.isError && (
+        <p className="settings__line settings__line--error">
+          讀取連線資訊失敗:{message(info.error)}{" "}
+          <button type="button" onClick={() => void info.refetch()}>
+            重試
+          </button>
+        </p>
+      )}
+      {info.data && (
+        <dl className="settings__mcp">
+          <dt>網址</dt>
+          <dd>
+            <code className="settings__mcp-url">{info.data.url}</code>{" "}
+            <button
+              type="button"
+              onClick={() => {
+                const written = navigator.clipboard?.writeText(info.data.url);
+                if (written === undefined) {
+                  setCopyState("failed"); // no Clipboard API (non-secure context)
+                  return;
+                }
+                void written.then(
+                  () => setCopyState("ok"),
+                  () => setCopyState("failed"),
+                );
+              }}
+            >
+              複製
+            </button>
+            {copyState === "ok" && <span className="settings__muted"> 已複製</span>}
+            {copyState === "failed" && (
+              <span className="settings__line--error"> 複製失敗,請手動選取網址</span>
+            )}
+          </dd>
+          <dt>傳輸方式</dt>
+          <dd>{info.data.transport}</dd>
+          <dt>驗證</dt>
+          <dd>{info.data.auth === "none" ? "無(尚未啟用)" : info.data.auth}</dd>
+        </dl>
+      )}
     </section>
   );
 }

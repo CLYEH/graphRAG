@@ -112,3 +112,24 @@
   padding: 0.5rem;
   border-radius: 4px;
 }
+
+/* MCP 連線資訊 (MCP1-fe): a definition list of read-only facts; the url wraps
+   rather than overflowing so a long host stays fully copyable by eye. */
+.settings__mcp {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.35rem 1rem;
+  margin: 0;
+}
+
+.settings__mcp dt {
+  color: var(--muted, #666);
+}
+
+.settings__mcp dd {
+  margin: 0;
+}
+
+.settings__mcp-url {
+  overflow-wrap: anywhere;
+}
