@@ -1086,14 +1086,17 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     silent: set[str] = set()
     unsupported: set[str] = set()
 
-    def chase(node: Any) -> Any:
+    def chase(node: Any, label: str) -> Any:
         # guarded $ref chain following for Reference Objects (request bodies,
-        # callbacks): a cycle yields {} instead of a hang
+        # callbacks): a CYCLE is recorded as unsupported and yields None —
+        # silently returning {} would let the endpoint evade the ratchet
+        # while the bodies floor still passes (Codex #112 R25)
         chain: set[str] = set()
         while isinstance(node, dict) and "$ref" in node:
             ref = node["$ref"]
             if ref in chain:
-                return {}
+                unsupported.add(f"{label}::$ref-cycle")
+                return None
             chain.add(ref)
             node = _pointer(spec, ref)
         return node
@@ -1204,8 +1207,11 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     def scan_request_body(rb_node: Any, label_prefix: str) -> None:
         nonlocal bodies
         if isinstance(rb_node, dict) and "$ref" in rb_node:
-            scanned_rb_refs.add(rb_node["$ref"].rsplit("/", 1)[-1])
-        rb = chase(rb_node)
+            # record the FULL reference — a basename match from some other
+            # pointer location must not mark a distinct components entry as
+            # scanned (Codex #112 R25)
+            scanned_rb_refs.add(rb_node["$ref"])
+        rb = chase(rb_node, label_prefix)
         if not isinstance(rb, dict):
             return
         for ctype, media in rb.get("content", {}).items():
@@ -1234,7 +1240,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     for cb_name, cb in spec["components"].get("callbacks", {}).items():
         if not isinstance(cb, dict):
             continue
-        cb = chase(cb)  # a reusable callback may itself be a (chained) $ref (R12)
+        cb = chase(cb, f"callbacks[{cb_name}]")  # may itself be a (chained) $ref (R12)
         if not isinstance(cb, dict):
             continue
         pending += [
@@ -1277,7 +1283,9 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                     if cb["$ref"] in visited_refs:
                         continue
                     visited_refs.add(cb["$ref"])
-                cb = chase(cb)
+                cb = chase(cb, f"{path}.callbacks[{cb_name}]")
+                if not isinstance(cb, dict):
+                    continue  # cycle already recorded as unsupported
                 pending += [
                     (f"{path}.callbacks[{cb_name}][{expr}]", item)
                     for expr, item in cb.items()
@@ -1294,7 +1302,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     # x-* is a LEGAL component name inside components maps (extensions attach
     # to the Components Object itself), so there is no name filter (R22).
     for rb_name, rb_node in spec["components"].get("requestBodies", {}).items():
-        if rb_name not in scanned_rb_refs:
+        if f"#/components/requestBodies/{rb_name}" not in scanned_rb_refs:
             scan_request_body(rb_node, f"requestBodies[{rb_name}]")
 
     assert bodies >= 23  # the walk must actually cover the surface, not vacuously pass
