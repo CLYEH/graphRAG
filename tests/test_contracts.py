@@ -1177,8 +1177,21 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             up = body.get("unevaluatedProperties")
             if isinstance(up, dict):
                 check(up, f"{label}.unevaluatedProperties", seen)
-        array_shaped = "array" in type_list or "prefixItems" in body or "items" in body
+        array_shaped = (
+            "array" in type_list
+            or "prefixItems" in body
+            or "items" in body
+            # unevaluatedItems alone also shapes an array — its schema must be
+            # traversed or a nested open object escapes (Codex #112 R26)
+            or "unevaluatedItems" in body
+        )
         if array_shaped:
+            # array keywords are VACUOUS for object instances: without an
+            # explicit `type: array` (and no object-side declaration judged
+            # above) the node still admits arbitrary objects — that is an
+            # open bag, not an array (gate-2 nit on R26)
+            if "array" not in type_list and not object_shaped:
+                silent.add(label)
             max_items = body.get("maxItems", node.get("maxItems"))
             bounded = isinstance(max_items, int) and max_items <= len(body.get("prefixItems") or [])
             if "items" not in body and "unevaluatedItems" not in body and not bounded:
