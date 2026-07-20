@@ -990,9 +990,9 @@ def test_v13_mcp_info_contract(spec: dict[str, Any]) -> None:
 # that one is open on BOTH faces and its closure round must add runtime
 # validation, not just schema text (Codex #112 R3).
 # Closing them is a frozen-contract edit (DR-002: version bump + owner), so
-# this test is a RATCHET, not an allowlist: the pinned legacy set may only
-# SHRINK (delete the entry in the same change that closes its schema); any
-# NEW silently-open node fails the exact-equality assertion immediately.
+# this test is a RATCHET, not an allowlist for legacy debt: the pinned set
+# may only SHRINK (delete the entry in the same change that closes its
+# schema); any NEW silently-open node fails the exact-equality assertion.
 _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS = frozenset(
     {
         "BuildRequest",
@@ -1006,291 +1006,89 @@ _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS = frozenset(
     }
 )
 
+# Keywords carrying no schema shape: annotations plus scalar/collection value
+# constraints. They may appear on any recognized node and are ignored when
+# classifying its shape (they cannot ADMIT anything).
+_SCHEMA_NEUTRAL_KEYWORDS = frozenset(
+    {
+        "title",
+        "description",
+        "default",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "examples",
+        "example",
+        "format",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+    }
+)
+# Shape keywords the recognizer HANDLES. Anything not neutral, not handled,
+# and not x-* is OUTSIDE the safe subset and fails loud.
+_SCHEMA_SHAPE_KEYWORDS = frozenset(
+    {
+        "$ref",
+        "type",
+        "enum",
+        "const",
+        "properties",
+        "required",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "items",
+        "prefixItems",
+        "unevaluatedItems",
+        "oneOf",
+        "anyOf",
+        "allOf",
+    }
+)
+
 
 def test_request_body_object_nodes_declare_additional_properties(spec: dict[str, Any]) -> None:
     """Why: PR #94 added additionalProperties:false to new bodies one review
     round at a time; the rule ("fixed semantics ⇒ closed") only holds forever
-    if silence is mechanically impossible. This walks EVERY requestBody schema
-    (all content types, refs resolved, nested properties/items/combinators)
-    and demands each object node with fixed `properties` declares
-    additionalProperties explicitly — enumerated from the artifact itself, per
-    the #17 universal-test rule, so a new endpoint cannot dodge the sweep."""
+    if silence is mechanically impossible. Judging arbitrary JSON Schema for
+    "can this admit an object?" is an UNBOUNDED denylist — 22 review rounds
+    plus two local batch reviews kept producing constructs that slipped a
+    judging walker (negation, dynamic scopes, conditional algebra, exactly-one
+    combinatorics, …). So this ratchet is STRICT BY CONSTRUCTION instead (the
+    class-14 lesson: finite allowlist > unbounded denylist): every request-body
+    schema node must match a small RECOGNIZED subset — the constructs the
+    frozen contract actually uses — and every recognized object node must
+    declare its openness. Anything outside the subset fails LOUD ("extend the
+    recognizer"), so a novel construct can never pass unjudged: there are no
+    silent paths, only `closed`, `pinned legacy`, or `test failure`.
+
+    Recognized shapes: boolean `false` (rejects everything); bare `$ref` to a
+    recognized target; scalar nodes (`type` in string/integer/number/boolean/
+    null, plus scalar `enum`/`const`); array nodes (`type: array` — `items`
+    or `unevaluatedItems` REQUIRED unless `maxItems` bounds out extra
+    positions); object nodes (`type: object` and/or `properties`/`required` —
+    an `additionalProperties`/`unevaluatedProperties` declaration REQUIRED,
+    else the node lands in the ratchet's silent set); combinator nodes
+    (`oneOf`/`anyOf`/`allOf` of recognized branches); nullable list types of
+    the above. `true`, `{}`, and annotation-only nodes are silently-open bags
+    (flagged); everything else — `not`, `if`/`then`/`else`, `$dynamic*`,
+    `patternProperties`, `dependent*`, `contains`, `contentSchema`, `$defs`,
+    unknown keywords, `$ref` with siblings, non-pointer fragments — is
+    UNSUPPORTED and fails its own assertion."""
     silent: set[str] = set()
-    dynamic: set[str] = set()
-    # EVERY schema-bearing JSON Schema 2020-12 keyword — enumerated as a table
-    # so the sweep is grammar-driven, not example-driven (Codex #112 R3 named
-    # prefixItems/dependentSchemas/if-then-else/patternProperties; listing only
-    # the keywords a finding names is the class-9 anti-pattern)
-    map_keywords = ("properties", "patternProperties", "dependentSchemas", "$defs")
-    list_keywords = ("prefixItems", "oneOf", "anyOf", "allOf")
-    # additionalItems is DEAD in 2020-12 (OpenAPI 3.1's dialect) — deliberately
-    # NOT a known keyword, so any use fails the unknown-keyword assertion loud
-    # instead of masquerading as an item constraint (Codex #112 R19)
-    single_keywords = (
-        "items",
-        "additionalProperties",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-        "propertyNames",
-        "contains",
-        "contentSchema",
-        "if",
-        "then",
-        "else",
-        # `not` is deliberately NOT known: a negation-only schema like
-        # {not: {type: string}} admits every object without declaring
-        # anything, and sound negation analysis is beyond a lint — any use
-        # fails the unknown-keyword assertion until the walker learns it
-        # (Codex #112 R22); the contract uses no `not` today
-    )
-
-    def unconstrained(sub: Any) -> bool:
-        # a schema value that admits ANYTHING: boolean true, {}, or
-        # annotation-only/no-op content (via effective)
-        return sub is True or (isinstance(sub, dict) and effective(sub) == {})
-
-    def walk(
-        node: Any,
-        label: str,
-        seen: frozenset[str],
-        judge: bool = True,
-        composed: bool = False,
-        composed_items: bool = False,
-    ) -> None:
-        # Two suppression flags (Codex #112 R16/R17 + reviewer):
-        # - judge=False is STICKY: predicate positions (if / not /
-        #   propertyNames) TEST instances rather than admit them — flagging
-        #   them (or closing them with additionalProperties) would change or
-        #   invert the predicate's semantics. Threads through the subtree.
-        # - composed=True is ONE-SCOPE: an outer unevaluatedProperties covers
-        #   this node's OWN instance-properties (through in-place applicators)
-        #   but NOT nested child instances, so it propagates only through
-        #   in-place descents and RESETS at child-instance descents (a
-        #   `payload: {}` inside a composed branch is still genuinely open).
-        # Coverage checks (unknown / dynamic keywords) always run.
-        if not isinstance(node, dict):
-            return
-        if "$dynamicRef" in node or "$dynamicAnchor" in node:
-            # real dynamic-scope resolution is out of this lint's league —
-            # fail LOUD instead of silently skipping, so $dynamicRef can never
-            # become a bypass: using it in a request body requires extending
-            # this walker first (Codex #112 R7)
-            dynamic.add(label)
-        for k in node:
-            # closure over the round game (#112 R14): any keyword this walker
-            # does not understand fails LOUD — extend the walker, never let a
-            # novel construct pass unjudged
-            if (
-                k not in known_keywords
-                and not k.startswith("x-")
-                # exact names only — a typo like $dynamicRefTypo must land in
-                # `unknown`, not slip through a prefix exemption (rescue P1)
-                and k not in ("$dynamicRef", "$dynamicAnchor")
-            ):
-                unknown.add(f"{label}::{k}")
-        if "$ref" in node:
-            ref = node["$ref"]
-            # $ref is an in-place applicator: an outer unevaluatedProperties
-            # sibling covers the referenced schema's properties too (R17)
-            t_composed = composed or "unevaluatedProperties" in node
-            t_composed_items = composed_items or "unevaluatedItems" in node
-            # the cycle guard keys on the EVALUATION SCOPE, not the ref alone:
-            # a recursive component first reached under composed suppression
-            # must be re-walked when reached again with weaker coverage (a
-            # nested child instance resets composed — Codex #112 R19)
-            # a sibling `type` that excludes objects composes in-place with
-            # the referenced schema — object judgment is moot there (rescue P2)
-            sib_type = node.get("type")
-            t_judge = judge and (
-                sib_type is None
-                or sib_type == "object"
-                or (isinstance(sib_type, list) and "object" in sib_type)
-            )
-            key = f"{ref}|{t_judge}|{t_composed}|{t_composed_items}"
-            if key not in seen:
-                # the referenced schema gets its own RE-ROOTED walk so one pin
-                # entry covers every endpoint referencing it — while NESTED
-                # nodes extend the path, so a new silent node INSIDE a pinned
-                # component keeps its own identity (Codex #112 R1). Resolve
-                # the FULL pointer (a $defs-nested ref is legal — R3); a
-                # dangling ref raises here, and that is correct fail-loud:
-                # test_openapi_document_is_valid rejects it too.
-                short = ref.removeprefix("#/components/schemas/").replace("/", ".")
-                walk(
-                    _pointer(spec, ref),
-                    short,
-                    seen | {key},
-                    t_judge,
-                    t_composed,
-                    t_composed_items,
-                )
-            # OpenAPI 3.1: a $ref may carry SIBLING schema keywords — judge
-            # them under the ORIGINAL label instead of discarding them with
-            # the ref (Codex #112 R2b); a bare {$ref} node ends here
-            node = {k: v for k, v in node.items() if k != "$ref"}
-            if not node:
-                return
-        # judgment: any OBJECT-SHAPING node must declare its openness. Shaping
-        # markers cover the whole 2020-12 object vocabulary — `type: object`
-        # (incl. the 3.1 nullable list form) plus every object-only applicator
-        # (`{required: [name]}` alone is a valid, silently-open object
-        # constraint — Codex #112 R5/R6). The declaration side accepts
-        # `additionalProperties` OR `unevaluatedProperties`: the latter is an
-        # explicit (composition-aware) closure statement, so flagging it
-        # would be the class-9 over-block dual.
-        node_type = node.get("type")
-        object_typed = node_type == "object" or (
-            isinstance(node_type, list) and "object" in node_type  # 3.1 nullable form
-        )
-        object_markers = (
-            "properties",
-            "patternProperties",
-            "required",
-            "dependentRequired",
-            "dependentSchemas",
-            "propertyNames",
-            "minProperties",
-            "maxProperties",
-        )
-        # a `type` that EXCLUDES "object" makes object instances impossible —
-        # sibling object markers are dead weight, not openness, and in-place
-        # branches compose with that exclusion (rescue P2: `{type: string,
-        # properties: …}` must not be flagged). Child INSTANCE positions
-        # (items etc.) are separate instances and keep their own judgment.
-        objects_possible = "type" not in node or object_typed
-        obj_judge = judge and objects_possible
-        object_shaped = object_typed or any(k in node for k in object_markers)
-        declared = "additionalProperties" in node or "unevaluatedProperties" in node
-        if obj_judge and not composed and object_shaped and not declared:
-            silent.add(label)
-        # an ARRAY node with no item constraint is `items: true` in disguise
-        # (JSON Schema default) — `{type: array}` bare, or prefixItems with the
-        # remaining positions unconstrained, admits arbitrary object elements
-        # (Codex #112 R18). unevaluatedProperties does not cover items, so
-        # `composed` does not suppress this. A `maxItems` bound that leaves no
-        # position beyond prefixItems means no unconstrained slot is reachable
-        # (rescue P2: `{type: array, maxItems: 0}` admits no elements).
-        array_typed = node_type == "array" or (isinstance(node_type, list) and "array" in node_type)
-        items_declared = "items" in node or "unevaluatedItems" in node
-        max_items = node.get("maxItems")
-        items_bounded = isinstance(max_items, int) and max_items <= len(
-            node.get("prefixItems") or []
-        )
-        if (
-            judge
-            and not composed_items
-            and (array_typed or "prefixItems" in node)
-            and not items_declared
-            and not items_bounded
-        ):
-            silent.add(f"{label}[]")
-        # an outer `unevaluatedProperties` declaration is COMPOSITION-AWARE:
-        # per 2020-12 it sees through in-place applicators (allOf/oneOf/anyOf/
-        # then-else/dependentSchemas/$ref), so branches carrying bare
-        # `properties` are already covered — judging them would push authors
-        # toward per-branch additionalProperties:false, which makes sibling
-        # branches reject each other (Codex #112 R17). It does NOT cover
-        # nested child instances, so `composed` resets on those descents.
-        next_composed = composed or "unevaluatedProperties" in node
-        next_composed_items = composed_items or "unevaluatedItems" in node
-        for kw in map_keywords:
-            in_place = kw == "dependentSchemas"
-            for name, sub in (node.get(kw) or {}).items():
-                sub_label = f"{label}.{name}" if kw == "properties" else f"{label}.{kw}[{name}]"
-                # an ADMITTING child position (a property/pattern/dependent
-                # value) that is unconstrained accepts arbitrary object values
-                # without declaring anything (`payload: {}` — Codex #112 R16);
-                # $defs entries are uninstantiated, so they are walked only
-                # dependentSchemas values compose IN-PLACE conjunctively — an
-                # unconstrained one is a no-op like an allOf true member, not
-                # an admitted child value (Codex #112 R21); nontrivial
-                # branches are still walked and node-judged below
-                child_judged = (
-                    obj_judge
-                    and kw not in ("$defs", "dependentSchemas")
-                    and not (in_place and next_composed)
-                )
-                if child_judged and unconstrained(sub):
-                    silent.add(sub_label)
-                    continue
-                # $defs entries admit no request value — coverage-walk them
-                # with judge=False; a REFERENCED definition is judged when its
-                # $ref is traversed (Codex #112 R18)
-                sub_judge = False if kw == "$defs" else obj_judge
-                walk(
-                    sub,
-                    sub_label,
-                    seen,
-                    sub_judge,
-                    next_composed if in_place else False,
-                    next_composed_items if in_place else False,
-                )
-        for kw in list_keywords:
-            in_place = kw != "prefixItems"
-            subs = node.get(kw) or []
-            # allOf with a boolean-false member is unsatisfiable — nothing is
-            # admitted, so its members are coverage-walked only (rescue P2)
-            kw_base = obj_judge if in_place else judge
-            if kw == "allOf" and any(m is False for m in subs):
-                kw_base = False
-            # oneOf demands EXACTLY ONE match: with two or more unconstrained
-            # branches every instance matches several and is REJECTED, so an
-            # unconstrained branch only admits when it is the single one
-            # (rescue P2: `oneOf: [true, true]` admits nothing)
-            open_branches = sum(1 for m in subs if unconstrained(m)) if kw == "oneOf" else None
-            for i, sub in enumerate(subs):
-                # an UNCONSTRAINED oneOf/anyOf branch lets arbitrary objects
-                # through the whole combinator (true ∨ X = true — #112 R14),
-                # and an unconstrained prefixItems slot admits arbitrary
-                # objects at that array position (R16); allOf composes by ∧,
-                # so its true/{} members are handled in effective() instead
-                branch_judged = kw_base and kw != "allOf" and not (in_place and next_composed)
-                if branch_judged and open_branches is not None and open_branches != 1:
-                    branch_judged = False if unconstrained(sub) else branch_judged
-                if branch_judged and unconstrained(sub):
-                    silent.add(f"{label}.{kw}[{i}]")
-                    continue
-                walk(
-                    sub,
-                    f"{label}.{kw}[{i}]",
-                    seen,
-                    kw_base,
-                    next_composed if in_place else False,
-                    next_composed_items if in_place else False,
-                )
-        for kw in single_keywords:
-            sub = node.get(kw)
-            sub_label = f"{label}[]" if kw == "items" else f"{label}.{kw}"
-            # boolean schemas are legal here: `items: true` admits arbitrary
-            # object items and must be judged BEFORE the dict guard (#112 R17)
-            if judge and kw in ("items", "contentSchema") and unconstrained(sub):
-                silent.add(sub_label)
-                continue
-            if not isinstance(sub, dict):
-                continue
-            if kw in ("if", "propertyNames", "contains"):
-                # predicate positions (R16/R20): `contains` only selects which
-                # admitted items COUNT as matches — closing it would change
-                # the match semantics, so it is coverage-walked like if/not
-                walk(sub, sub_label, seen, False)
-                continue
-            # then/else are in-place applicators (composed propagates, and an
-            # object-excluding sibling `type` suppresses their judgment —
-            # rescue P2); the declaration keywords (additionalProperties/
-            # unevaluated*) ARE declarations, and a true/{} then/else is a
-            # conjunctive no-op
-            in_place = kw in ("then", "else")
-            walk(
-                sub,
-                sub_label,
-                seen,
-                obj_judge if in_place else judge,
-                next_composed if in_place else False,
-                next_composed_items if in_place else False,
-            )
+    unsupported: set[str] = set()
 
     def chase(node: Any) -> Any:
-        # guarded $ref chain following: a cycle yields {} instead of a hang
+        # guarded $ref chain following for Reference Objects (request bodies,
+        # callbacks): a cycle yields {} instead of a hang
         chain: set[str] = set()
         while isinstance(node, dict) and "$ref" in node:
             ref = node["$ref"]
@@ -1300,168 +1098,124 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             node = _pointer(spec, ref)
         return node
 
-    annotations = frozenset(
-        {
-            "title",
-            "description",
-            "default",
-            "deprecated",
-            "readOnly",
-            "writeOnly",
-            "examples",
-            "example",
-            "$comment",
-            "externalDocs",
-            "xml",
+    def check(node: Any, label: str, seen: frozenset[str]) -> None:
+        if node is False:
+            return  # rejects every instance — closed by construction
+        if node is True:
+            silent.add(label)  # admits everything without declaring anything
+            return
+        if not isinstance(node, dict):
+            unsupported.add(f"{label}::non-schema value")
+            return
+        body = {
+            k: v
+            for k, v in node.items()
+            if k not in _SCHEMA_NEUTRAL_KEYWORDS and not k.startswith("x-")
         }
-    )
-    # constraints that CANNOT exclude or constrain an OBJECT value (they only
-    # bind strings/numbers/arrays), so a $ref sibling from this set does not
-    # resolve the open-object question (Codex #112 R14: `$ref → {} +
-    # minLength: 1` still admits arbitrary objects)
-    non_object_constraints = frozenset(
-        {
-            "minLength",
-            "maxLength",
-            "pattern",
-            "format",
-            "minimum",
-            "maximum",
-            "exclusiveMinimum",
-            "exclusiveMaximum",
-            "multipleOf",
-            "minItems",
-            "maxItems",
-            "uniqueItems",
-            "minContains",
-            "maxContains",
-            "contentMediaType",
-            "contentEncoding",
-            # array/string APPLICATORS are ignored for OBJECT instances, so a
-            # `{items: {...}}`-only property still admits arbitrary objects —
-            # they resolve nothing about object openness (Codex #112 R20);
-            # a `type` that excludes objects survives the strip and settles it
-            "items",
-            "prefixItems",
-            "contains",
-            "unevaluatedItems",
-            "contentSchema",
-        }
-    )
-    # keywords with NO direct validation effect at all — a schema consisting
-    # solely of these admits everything, so effective() strips them like
-    # annotations (rescue P1: `{$defs: {...}}` alone is an open bag)
-    no_op_keywords = frozenset({"$defs", "$id", "$schema", "$anchor", "discriminator"})
-    # every keyword the walker understands; anything else fails LOUD (below)
-    # instead of silently passing — after #112's long round series the closure
-    # is structural: an unknown construct requires extending the walker first
-    known_keywords = (
-        annotations
-        | non_object_constraints
-        | frozenset(map_keywords)
-        | frozenset(list_keywords)
-        | frozenset(single_keywords)
-        | frozenset(
-            {
-                "$ref",
-                "$id",
-                "$schema",
-                "$anchor",
-                "type",
-                "enum",
-                "const",
-                "required",
-                "dependentRequired",
-                "minProperties",
-                "maxProperties",
-                "discriminator",
-            }
+        if not body:
+            silent.add(label)  # {} / annotation-only — an open bag
+            return
+        alien = [k for k in body if k not in _SCHEMA_SHAPE_KEYWORDS]
+        if alien:
+            # record every unsupported keyword on this node, then stop: shape
+            # conclusions drawn next to an unsupported keyword are unsound
+            for k in alien:
+                unsupported.add(f"{label}::{k}")
+            return
+        if "$ref" in body:
+            if set(body) != {"$ref"}:
+                # sibling keywords change the composite's semantics — outside
+                # the safe subset (close the target or inline the schema)
+                unsupported.add(f"{label}::$ref-with-siblings")
+                return
+            ref = body["$ref"]
+            if ref in seen:
+                unsupported.add(f"{label}::$ref-cycle")
+                return
+            short = ref.removeprefix("#/components/schemas/").replace("/", ".")
+            check(_pointer(spec, ref), short, seen | {ref})
+            return
+        for comb in ("oneOf", "anyOf", "allOf"):
+            for i, sub in enumerate(body.get(comb) or []):
+                check(sub, f"{label}.{comb}[{i}]", seen)
+        enum_values = list(body.get("enum") or [])
+        if "const" in body:
+            enum_values.append(body["const"])
+        for v in enum_values:
+            if isinstance(v, (dict, list)):
+                # an object/array literal admitted via enum/const is out of
+                # the subset — the ratchet cannot vouch for its key set
+                unsupported.add(f"{label}::structured-enum-value")
+        node_type = body.get("type")
+        if isinstance(node_type, str):
+            type_list = [node_type]
+        elif isinstance(node_type, list):
+            type_list = list(node_type)
+        else:
+            type_list = []
+        for t in type_list:
+            if t not in ("object", "array", "string", "integer", "number", "boolean", "null"):
+                unsupported.add(f"{label}::type={t!r}")
+        object_shaped = (
+            "object" in type_list
+            or "properties" in body
+            or "required" in body
+            or "additionalProperties" in body
+            or "unevaluatedProperties" in body
         )
-    )
-    unknown: set[str] = set()
-
-    def effective(node: Any, chain: frozenset[str] = frozenset()) -> Any:
-        # a schema's EFFECTIVE constraint content: drop annotation-only
-        # keywords, x-*, and constraints that cannot bind objects (they
-        # validate nothing about object members — `{description: payload}` and
-        # `$ref + minLength` both admit arbitrary objects, R13/R14), then
-        # follow a $ref left BARE by the drop. A $ref with OBJECT-relevant
-        # siblings stops here — they may close what the target leaves open
-        # (R10) and walk() judges them.
-        while isinstance(node, dict):
-            node = {
-                k: v
-                for k, v in node.items()
-                if k not in annotations
-                and k not in non_object_constraints
-                and k not in no_op_keywords
-                and not k.startswith("x-")
-            }
-            # an `if` with neither `then` nor `else` has no effect, and an
-            # orphaned `then`/`else` without `if` never applies (rescue P1) —
-            # drop the dead halves of the conditional group
-            if "if" in node and "then" not in node and "else" not in node:
-                node = {k: v for k, v in node.items() if k != "if"}
-            if "if" not in node:
-                node = {k: v for k, v in node.items() if k not in ("then", "else")}
-            if "allOf" in node:
-                # a boolean-false member makes the WHOLE allOf unsatisfiable —
-                # nothing is admitted, so the schema is closed (rescue P2):
-                # represent that as the match-nothing `{"enum": []}`
-                if any(m is False for m in node["allOf"]):
-                    return {"enum": []}
-                # X ∧ true = X: drop unconstrained members; an allOf whose
-                # EVERY member is unconstrained (`allOf: [true]`/`[{}]`)
-                # constrains nothing and must not shield the node (#112 R15).
-                # The ref-cycle chain THREADS through the recursion, so a
-                # cyclic allOf resolves to {} instead of RecursionError.
-                members = [
-                    m
-                    for m in node["allOf"]
-                    if not (m is True or (isinstance(m, dict) and effective(m, chain) == {}))
-                ]
-                if members:
-                    node["allOf"] = members
-                else:
-                    node = {k: v for k, v in node.items() if k != "allOf"}
-                    continue  # re-normalize: the node may now be bare/empty
-            if set(node) != {"$ref"}:
-                return node
-            ref = node["$ref"]
-            if ref in chain:
-                return {}
-            chain |= {ref}
-            node = _pointer(spec, ref)
-        return node
+        if object_shaped:
+            if "additionalProperties" not in body and "unevaluatedProperties" not in body:
+                silent.add(label)  # the ratchet: undeclared object openness
+            for pname, sub in (body.get("properties") or {}).items():
+                check(sub, f"{label}.{pname}", seen)
+            ap = body.get("additionalProperties")
+            if isinstance(ap, dict):
+                check(ap, f"{label}.additionalProperties", seen)
+            up = body.get("unevaluatedProperties")
+            if isinstance(up, dict):
+                check(up, f"{label}.unevaluatedProperties", seen)
+        array_shaped = "array" in type_list or "prefixItems" in body or "items" in body
+        if array_shaped:
+            max_items = body.get("maxItems", node.get("maxItems"))
+            bounded = isinstance(max_items, int) and max_items <= len(body.get("prefixItems") or [])
+            if "items" not in body and "unevaluatedItems" not in body and not bounded:
+                silent.add(f"{label}[]")  # implicit items: true
+            if "items" in body:
+                check(body["items"], f"{label}[]", seen)
+            ui = body.get("unevaluatedItems")
+            if isinstance(ui, dict) or ui is True:
+                check(ui, f"{label}.unevaluatedItems", seen)
+            for i, sub in enumerate(body.get("prefixItems") or []):
+                check(sub, f"{label}.prefixItems[{i}]", seen)
+        # a node that is neither object- nor array-shaped and carries no type
+        # is fine ONLY when a combinator or scalar enum/const constrains it;
+        # anything else recognizable-but-shapeless is an open bag
+        if (
+            not object_shaped
+            and not array_shaped
+            and not type_list
+            and not any(c in body for c in ("oneOf", "anyOf", "allOf", "enum", "const"))
+        ):
+            silent.add(label)
 
     bodies = 0
+    scanned_rb_refs: set[str] = set()
 
     def scan_request_body(rb_node: Any, label_prefix: str) -> None:
         nonlocal bodies
-        # a reusable components/requestBodies entry may itself be a Reference
-        # Object, so follow the CHAIN of full pointers (Codex #112 R2/R5); a
-        # dangling ref raises fail-loud and test_openapi_document_is_valid
-        # rejects it independently
+        if isinstance(rb_node, dict) and "$ref" in rb_node:
+            scanned_rb_refs.add(rb_node["$ref"].rsplit("/", 1)[-1])
         rb = chase(rb_node)
         if not isinstance(rb, dict):
             return
         for ctype, media in rb.get("content", {}).items():
             body_label = f"{label_prefix} [{ctype}]"
             schema = media.get("schema") if isinstance(media, dict) else None
-            # an ABSENT, boolean-true, or empty schema accepts arbitrary keys
-            # without declaring anything — that is a silently-open body, not a
-            # skippable one (Codex #112 R8) — and the same judgment applies
-            # through a BARE $ref chain to a true/{} component. A $ref WITH
-            # siblings is left to walk(): the siblings may close it (R10).
-            # `false` rejects every body — explicit and closed, so it passes.
-            resolved = effective(schema) if isinstance(schema, dict) else schema
-            if schema is None or resolved is True or resolved == {}:
-                bodies += 1
-                silent.add(body_label)
+            bodies += 1
+            if schema is None:
+                silent.add(body_label)  # an absent schema accepts anything
                 continue
-            if isinstance(schema, dict):
-                bodies += 1
-                walk(schema, body_label, frozenset())
+            check(schema, body_label, frozenset())
 
     visited_refs: set[str] = set()
     # worklist of (path label, path-item map): top-level paths AND webhooks,
@@ -1469,13 +1223,9 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     # before or without a reference — #112 R11), plus every operation's
     # callbacks (whose path items nest recursively) — a request body outside
     # spec["paths"] must not dodge the sweep (#112 R7)
-    # the Paths Object DOES support x-* specification extensions (possibly
-    # dictionary-valued with method-shaped content) — filter them HERE ONLY;
-    # the name-keyed maps below carry no extensions (R12/R22)
+    # the Paths Object DOES support x-* specification extensions — filter them
+    # HERE ONLY; the name-keyed maps below carry no extensions (R12/R22)
     pending = [(path, ops) for path, ops in spec["paths"].items() if not path.startswith("x-")]
-    # webhooks keys are NAMES (the OpenAPI Object's extensions are root-level
-    # fields, not webhook entries) — no x-* filter, same principle as the
-    # components maps (R22); non-dict values are guarded at the worklist pop
     pending += [(f"webhooks[{name}]", item) for name, item in spec.get("webhooks", {}).items()]
     pending += [
         (f"pathItems[{name}]", item)
@@ -1490,6 +1240,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
         pending += [
             (f"callbacks[{cb_name}][{expr}]", item)
             for expr, item in cb.items()
+            # the Callback OBJECT supports x-* extensions on its expression map
             if not expr.startswith("x-")
         ]
     while pending:
@@ -1514,11 +1265,10 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             if not isinstance(op, dict):
                 continue
             for cb_name, cb in op.get("callbacks", {}).items():
-                # callbacks keys are NAMES too (the Operation Object's
-                # extensions are op-level fields, not callback entries — R22);
-                # the isinstance guard covers malformed values, and the
-                # EXPRESSION-level x-* filters stay (the Callback Object DOES
-                # support extensions)
+                # callbacks keys are NAMES (the Operation Object's extensions
+                # are op-level fields — R22); isinstance covers malformed
+                # values, and the EXPRESSION-level x-* filters stay (the
+                # Callback Object DOES support extensions)
                 if not isinstance(cb, dict):
                     continue
                 if "$ref" in cb:
@@ -1527,12 +1277,11 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                     if cb["$ref"] in visited_refs:
                         continue
                     visited_refs.add(cb["$ref"])
-                cb = chase(cb)  # Callback Object may be a (chained) $ref
+                cb = chase(cb)
                 pending += [
                     (f"{path}.callbacks[{cb_name}][{expr}]", item)
                     for expr, item in cb.items()
-                    # x-* extensions and scalar values are not Path Items
-                    if not expr.startswith("x-") and isinstance(item, dict)
+                    if not expr.startswith("x-")
                 ]
             if "requestBody" not in op:
                 continue
@@ -1540,21 +1289,19 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
 
     # a reusable request body may be DECLARED before (or without) a reference —
     # scan components.requestBodies directly so it cannot sit silently open
-    # while unreferenced (Codex #112 R11)
-    # x-* is a LEGAL component name inside components maps (specification
-    # extensions attach to the Components Object itself, not its maps) — no
-    # name filter here, unlike paths/webhooks/operation maps (Codex #112 R22)
+    # while unreferenced (Codex #112 R11). Bodies already scanned through an
+    # operation's $ref keep their endpoint labels only (stable pin identity).
+    # x-* is a LEGAL component name inside components maps (extensions attach
+    # to the Components Object itself), so there is no name filter (R22).
     for rb_name, rb_node in spec["components"].get("requestBodies", {}).items():
-        scan_request_body(rb_node, f"requestBodies[{rb_name}]")
+        if rb_name not in scanned_rb_refs:
+            scan_request_body(rb_node, f"requestBodies[{rb_name}]")
 
     assert bodies >= 23  # the walk must actually cover the surface, not vacuously pass
-    assert not dynamic, (
-        f"$dynamicRef/$dynamicAnchor in request-body schema(s): {sorted(dynamic)} — this "
-        "ratchet cannot resolve dynamic scopes; extend the walker before using them"
-    )
-    assert not unknown, (
-        f"keyword(s) unknown to this ratchet in request-body schema(s): {sorted(unknown)} — "
-        "extend the walker's known_keywords (and its handling) before using them"
+    assert not unsupported, (
+        f"construct(s) outside this ratchet's safe subset: {sorted(unsupported)} — the "
+        "recognizer only vouches for the shapes the frozen contract uses; restructure "
+        "the schema or extend the recognizer (never let it guess)"
     )
     new_silent = silent - _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS
     closed_legacy = _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS - silent
