@@ -1020,10 +1020,12 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     # the keywords a finding names is the class-9 anti-pattern)
     map_keywords = ("properties", "patternProperties", "dependentSchemas", "$defs")
     list_keywords = ("prefixItems", "oneOf", "anyOf", "allOf")
+    # additionalItems is DEAD in 2020-12 (OpenAPI 3.1's dialect) — deliberately
+    # NOT a known keyword, so any use fails the unknown-keyword assertion loud
+    # instead of masquerading as an item constraint (Codex #112 R19)
     single_keywords = (
         "items",
         "additionalProperties",
-        "additionalItems",
         "unevaluatedItems",
         "unevaluatedProperties",
         "propertyNames",
@@ -1075,7 +1077,16 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 unknown.add(f"{label}::{k}")
         if "$ref" in node:
             ref = node["$ref"]
-            if ref not in seen:
+            # $ref is an in-place applicator: an outer unevaluatedProperties
+            # sibling covers the referenced schema's properties too (R17)
+            t_composed = composed or "unevaluatedProperties" in node
+            t_composed_items = composed_items or "unevaluatedItems" in node
+            # the cycle guard keys on the EVALUATION SCOPE, not the ref alone:
+            # a recursive component first reached under composed suppression
+            # must be re-walked when reached again with weaker coverage (a
+            # nested child instance resets composed — Codex #112 R19)
+            key = f"{ref}|{judge}|{t_composed}|{t_composed_items}"
+            if key not in seen:
                 # the referenced schema gets its own RE-ROOTED walk so one pin
                 # entry covers every endpoint referencing it — while NESTED
                 # nodes extend the path, so a new silent node INSIDE a pinned
@@ -1084,15 +1095,13 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 # dangling ref raises here, and that is correct fail-loud:
                 # test_openapi_document_is_valid rejects it too.
                 short = ref.removeprefix("#/components/schemas/").replace("/", ".")
-                # $ref is an in-place applicator: an outer unevaluatedProperties
-                # sibling covers the referenced schema's properties too (R17)
                 walk(
                     _pointer(spec, ref),
                     short,
-                    seen | {ref},
+                    seen | {key},
                     judge,
-                    composed or "unevaluatedProperties" in node,
-                    composed_items or "unevaluatedItems" in node,
+                    t_composed,
+                    t_composed_items,
                 )
             # OpenAPI 3.1: a $ref may carry SIBLING schema keywords — judge
             # them under the ORIGINAL label instead of discarding them with
@@ -1132,7 +1141,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
         # (Codex #112 R18). unevaluatedProperties does not cover items, so
         # `composed` does not suppress this.
         array_typed = node_type == "array" or (isinstance(node_type, list) and "array" in node_type)
-        items_declared = any(k in node for k in ("items", "additionalItems", "unevaluatedItems"))
+        items_declared = "items" in node or "unevaluatedItems" in node
         if (
             judge
             and not composed_items
