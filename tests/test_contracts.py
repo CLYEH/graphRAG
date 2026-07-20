@@ -1034,7 +1034,11 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
         "if",
         "then",
         "else",
-        "not",
+        # `not` is deliberately NOT known: a negation-only schema like
+        # {not: {type: string}} admits every object without declaring
+        # anything, and sound negation analysis is beyond a lint — any use
+        # fails the unknown-keyword assertion until the walker learns it
+        # (Codex #112 R22); the contract uses no `not` today
     )
 
     def unconstrained(sub: Any) -> bool:
@@ -1220,7 +1224,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 continue
             if not isinstance(sub, dict):
                 continue
-            if kw in ("if", "not", "propertyNames", "contains"):
+            if kw in ("if", "propertyNames", "contains"):
                 # predicate positions (R16/R20): `contains` only selects which
                 # admitted items COUNT as matches — closing it would change
                 # the match semantics, so it is coverage-walked like if/not
@@ -1402,21 +1406,20 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     # before or without a reference — #112 R11), plus every operation's
     # callbacks (whose path items nest recursively) — a request body outside
     # spec["paths"] must not dodge the sweep (#112 R7)
-    # x-* specification extensions are legal in ALL of these maps and may be
-    # dictionary-valued with method-shaped content — never seed them (R12)
+    # the Paths Object DOES support x-* specification extensions (possibly
+    # dictionary-valued with method-shaped content) — filter them HERE ONLY;
+    # the name-keyed maps below carry no extensions (R12/R22)
     pending = [(path, ops) for path, ops in spec["paths"].items() if not path.startswith("x-")]
-    pending += [
-        (f"webhooks[{name}]", item)
-        for name, item in spec.get("webhooks", {}).items()
-        if not name.startswith("x-")
-    ]
+    # webhooks keys are NAMES (the OpenAPI Object's extensions are root-level
+    # fields, not webhook entries) — no x-* filter, same principle as the
+    # components maps (R22); non-dict values are guarded at the worklist pop
+    pending += [(f"webhooks[{name}]", item) for name, item in spec.get("webhooks", {}).items()]
     pending += [
         (f"pathItems[{name}]", item)
         for name, item in spec["components"].get("pathItems", {}).items()
-        if not name.startswith("x-")
     ]
     for cb_name, cb in spec["components"].get("callbacks", {}).items():
-        if cb_name.startswith("x-") or not isinstance(cb, dict):
+        if not isinstance(cb, dict):
             continue
         cb = chase(cb)  # a reusable callback may itself be a (chained) $ref (R12)
         if not isinstance(cb, dict):
@@ -1429,7 +1432,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     while pending:
         path, ops = pending.pop()
         if not isinstance(ops, dict):
-            continue  # x-* Specification Extensions in Paths/webhooks maps
+            continue  # malformed / non-dict path-item values
         # a Path Item may itself be a $ref (3.1); overlap behavior between
         # referenced and inline fields is spec-undefined, so scan BOTH — the
         # inline fields now, the referenced item re-entering the worklist
@@ -1448,8 +1451,13 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             if not isinstance(op, dict):
                 continue
             for cb_name, cb in op.get("callbacks", {}).items():
-                if cb_name.startswith("x-") or not isinstance(cb, dict):
-                    continue  # specification extensions are not Callback Objects
+                # callbacks keys are NAMES too (the Operation Object's
+                # extensions are op-level fields, not callback entries — R22);
+                # the isinstance guard covers malformed values, and the
+                # EXPRESSION-level x-* filters stay (the Callback Object DOES
+                # support extensions)
+                if not isinstance(cb, dict):
+                    continue
                 if "$ref" in cb:
                     # persistent guard: a $ref'd callback expands once — a
                     # self-referential callback graph must drain, not hang
@@ -1470,9 +1478,11 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
     # a reusable request body may be DECLARED before (or without) a reference —
     # scan components.requestBodies directly so it cannot sit silently open
     # while unreferenced (Codex #112 R11)
+    # x-* is a LEGAL component name inside components maps (specification
+    # extensions attach to the Components Object itself, not its maps) — no
+    # name filter here, unlike paths/webhooks/operation maps (Codex #112 R22)
     for rb_name, rb_node in spec["components"].get("requestBodies", {}).items():
-        if not rb_name.startswith("x-"):
-            scan_request_body(rb_node, f"requestBodies[{rb_name}]")
+        scan_request_body(rb_node, f"requestBodies[{rb_name}]")
 
     assert bodies >= 23  # the walk must actually cover the surface, not vacuously pass
     assert not dynamic, (
