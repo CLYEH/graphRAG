@@ -1041,7 +1041,12 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
         return sub is True or (isinstance(sub, dict) and effective(sub) == {})
 
     def walk(
-        node: Any, label: str, seen: frozenset[str], judge: bool = True, composed: bool = False
+        node: Any,
+        label: str,
+        seen: frozenset[str],
+        judge: bool = True,
+        composed: bool = False,
+        composed_items: bool = False,
     ) -> None:
         # Two suppression flags (Codex #112 R16/R17 + reviewer):
         # - judge=False is STICKY: predicate positions (if / not /
@@ -1087,6 +1092,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                     seen | {ref},
                     judge,
                     composed or "unevaluatedProperties" in node,
+                    composed_items or "unevaluatedItems" in node,
                 )
             # OpenAPI 3.1: a $ref may carry SIBLING schema keywords — judge
             # them under the ORIGINAL label instead of discarding them with
@@ -1120,6 +1126,20 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
         declared = "additionalProperties" in node or "unevaluatedProperties" in node
         if judge and not composed and object_shaped and not declared:
             silent.add(label)
+        # an ARRAY node with no item constraint is `items: true` in disguise
+        # (JSON Schema default) — `{type: array}` bare, or prefixItems with the
+        # remaining positions unconstrained, admits arbitrary object elements
+        # (Codex #112 R18). unevaluatedProperties does not cover items, so
+        # `composed` does not suppress this.
+        array_typed = node_type == "array" or (isinstance(node_type, list) and "array" in node_type)
+        items_declared = any(k in node for k in ("items", "additionalItems", "unevaluatedItems"))
+        if (
+            judge
+            and not composed_items
+            and (array_typed or "prefixItems" in node)
+            and not items_declared
+        ):
+            silent.add(f"{label}[]")
         # an outer `unevaluatedProperties` declaration is COMPOSITION-AWARE:
         # per 2020-12 it sees through in-place applicators (allOf/oneOf/anyOf/
         # then-else/dependentSchemas/$ref), so branches carrying bare
@@ -1128,6 +1148,7 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
         # branches reject each other (Codex #112 R17). It does NOT cover
         # nested child instances, so `composed` resets on those descents.
         next_composed = composed or "unevaluatedProperties" in node
+        next_composed_items = composed_items or "unevaluatedItems" in node
         for kw in map_keywords:
             in_place = kw == "dependentSchemas"
             for name, sub in (node.get(kw) or {}).items():
@@ -1140,7 +1161,18 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 if child_judged and unconstrained(sub):
                     silent.add(sub_label)
                     continue
-                walk(sub, sub_label, seen, judge, next_composed if in_place else False)
+                # $defs entries admit no request value — coverage-walk them
+                # with judge=False; a REFERENCED definition is judged when its
+                # $ref is traversed (Codex #112 R18)
+                sub_judge = False if kw == "$defs" else judge
+                walk(
+                    sub,
+                    sub_label,
+                    seen,
+                    sub_judge,
+                    next_composed if in_place else False,
+                    next_composed_items if in_place else False,
+                )
         for kw in list_keywords:
             in_place = kw != "prefixItems"
             for i, sub in enumerate(node.get(kw) or []):
@@ -1153,7 +1185,14 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 if branch_judged and unconstrained(sub):
                     silent.add(f"{label}.{kw}[{i}]")
                     continue
-                walk(sub, f"{label}.{kw}[{i}]", seen, judge, next_composed if in_place else False)
+                walk(
+                    sub,
+                    f"{label}.{kw}[{i}]",
+                    seen,
+                    judge,
+                    next_composed if in_place else False,
+                    next_composed_items if in_place else False,
+                )
         for kw in single_keywords:
             sub = node.get(kw)
             sub_label = f"{label}[]" if kw == "items" else f"{label}.{kw}"
@@ -1171,7 +1210,14 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             # declaration keywords (additionalProperties/unevaluated*) ARE
             # declarations, and a true/{} then/else is a conjunctive no-op
             in_place = kw in ("then", "else")
-            walk(sub, sub_label, seen, judge, next_composed if in_place else False)
+            walk(
+                sub,
+                sub_label,
+                seen,
+                judge,
+                next_composed if in_place else False,
+                next_composed_items if in_place else False,
+            )
 
     def chase(node: Any) -> Any:
         # guarded $ref chain following: a cycle yields {} instead of a hang
