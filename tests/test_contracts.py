@@ -12,6 +12,7 @@ import json
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import unquote
 
 import jsonschema
 import pytest
@@ -141,15 +142,31 @@ def spec() -> dict[str, Any]:
     return cast(dict[str, Any], yaml.safe_load(_OPENAPI.read_text(encoding="utf-8")))
 
 
+def _pointer(spec: dict[str, Any], ref: str) -> Any:
+    """Follow one local JSON Pointer (``#/a/b/c``) to its target.
+
+    RFC 6901 evaluation order: percent-decode the WHOLE URI fragment into the
+    pointer string, split it on ``/``, then apply the ``~1``/``~0`` transforms
+    per token (``display%20name`` → ``display name``; ``%2F`` → a separator).
+    """
+    assert isinstance(ref, str) and ref.startswith("#"), f"non-local $ref: {ref!r}"
+    pointer = unquote(ref[1:])  # the WHOLE fragment decodes to the pointer,
+    # THEN it splits — %2F is a separator once decoded (a literal slash inside
+    # a token is ~1); splitting first mis-tokenizes encoded separators
+    # plain-name $anchor fragments (#name) and $id-scoped resolution are
+    # deliberately unsupported — this asserts LOUD instead of resolving wrong;
+    # extend the resolver before using anchors in contracts/ (rescue P2)
+    assert pointer.startswith("/"), f"non-pointer fragment (e.g. $anchor) unsupported: {ref!r}"
+    cur: Any = spec
+    for part in pointer[1:].split("/"):
+        cur = cur[part.replace("~1", "/").replace("~0", "~")]
+    return cur
+
+
 def _deref(spec: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
     """Resolve local ``$ref`` pointers (``#/components/...``)."""
     while "$ref" in node:
-        ref = node["$ref"]
-        assert isinstance(ref, str) and ref.startswith("#/"), f"non-local $ref: {ref!r}"
-        cur: Any = spec
-        for part in ref[2:].split("/"):
-            cur = cur[part.replace("~1", "/").replace("~0", "~")]
-        node = cast(dict[str, Any], cur)
+        node = cast(dict[str, Any], _pointer(spec, node["$ref"]))
     return node
 
 
@@ -959,3 +976,361 @@ def test_v13_mcp_info_contract(spec: dict[str, Any]) -> None:
         info["properties"]["url"]["type"] == "string"
     )  # non-null: always reachable ⇒ always a url
     assert "path_addressable" not in info["properties"]  # the unreachable branch is gone
+
+
+# H20a — class-24 mechanized (#94/#80): a fixed-semantics request body that
+# does not declare additionalProperties is SILENTLY open (the JSON-Schema
+# default), so a conformant client may send junk keys the contract never
+# promised to accept. Every object node in every request body must therefore
+# DECLARE its openness: `false` (closed — the norm) or `true` (a documented
+# free-form bag). The runtime face already rejects extras on every pinned
+# JSON model below (api/schemas.py: extra="forbid") — EXCEPT the multipart
+# uploads body, which has no model at all: api/routers/uploads.py reads only
+# the `files`/`metadata` form parts and silently ignores unknown ones, so
+# that one is open on BOTH faces and its closure round must add runtime
+# validation, not just schema text (Codex #112 R3).
+# Closing them is a frozen-contract edit (DR-002: version bump + owner), so
+# this test is a RATCHET, not an allowlist for legacy debt: the pinned set
+# may only SHRINK (delete the entry in the same change that closes its
+# schema); any NEW silently-open node fails the exact-equality assertion.
+_LEGACY_SILENT_OPEN_REQUEST_SCHEMAS = frozenset(
+    {
+        "BuildRequest",
+        "IngestRequest",
+        "ProjectCreate",
+        "ProjectUpdate",
+        "QueryRequest",
+        "ReviewDecisionRequest",
+        "SourceCreate",
+        "POST /projects/{project}/uploads [multipart/form-data]",  # inline body
+    }
+)
+
+# Keywords carrying no schema shape: annotations plus scalar/collection value
+# constraints. They may appear on any recognized node and are ignored when
+# classifying its shape (they cannot ADMIT anything).
+_SCHEMA_NEUTRAL_KEYWORDS = frozenset(
+    {
+        "title",
+        "description",
+        "default",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "examples",
+        "example",
+        "format",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+    }
+)
+# Shape keywords the recognizer HANDLES. Anything not neutral, not handled,
+# and not x-* is OUTSIDE the safe subset and fails loud.
+_SCHEMA_SHAPE_KEYWORDS = frozenset(
+    {
+        "$ref",
+        "type",
+        "enum",
+        "const",
+        "properties",
+        "required",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "items",
+        "prefixItems",
+        "unevaluatedItems",
+        "oneOf",
+        "anyOf",
+        "allOf",
+    }
+)
+
+
+def test_request_body_object_nodes_declare_additional_properties(spec: dict[str, Any]) -> None:
+    """Why: PR #94 added additionalProperties:false to new bodies one review
+    round at a time; the rule ("fixed semantics ⇒ closed") only holds forever
+    if silence is mechanically impossible. Judging arbitrary JSON Schema for
+    "can this admit an object?" is an UNBOUNDED denylist — 22 review rounds
+    plus two local batch reviews kept producing constructs that slipped a
+    judging walker (negation, dynamic scopes, conditional algebra, exactly-one
+    combinatorics, …). So this ratchet is STRICT BY CONSTRUCTION instead (the
+    class-14 lesson: finite allowlist > unbounded denylist): every request-body
+    schema node must match a small RECOGNIZED subset — the constructs the
+    frozen contract actually uses — and every recognized object node must
+    declare its openness. Anything outside the subset fails LOUD ("extend the
+    recognizer"), so a novel construct can never pass unjudged: there are no
+    silent paths, only `closed`, `pinned legacy`, or `test failure`.
+
+    Recognized shapes: boolean `false` (rejects everything); bare `$ref` to a
+    recognized target; scalar nodes (`type` in string/integer/number/boolean/
+    null, plus scalar `enum`/`const`); array nodes (`type: array` — `items`
+    or `unevaluatedItems` REQUIRED unless `maxItems` bounds out extra
+    positions); object nodes (`type: object` and/or `properties`/`required` —
+    an `additionalProperties`/`unevaluatedProperties` declaration REQUIRED,
+    else the node lands in the ratchet's silent set); combinator nodes
+    (`oneOf`/`anyOf`/`allOf` of recognized branches); nullable list types of
+    the above. `true`, `{}`, and annotation-only nodes are silently-open bags
+    (flagged); everything else — `not`, `if`/`then`/`else`, `$dynamic*`,
+    `patternProperties`, `dependent*`, `contains`, `contentSchema`, `$defs`,
+    unknown keywords, `$ref` with siblings, non-pointer fragments — is
+    UNSUPPORTED and fails its own assertion."""
+    silent: set[str] = set()
+    unsupported: set[str] = set()
+
+    def chase(node: Any, label: str) -> Any:
+        # guarded $ref chain following for Reference Objects (request bodies,
+        # callbacks): a CYCLE is recorded as unsupported and yields None —
+        # silently returning {} would let the endpoint evade the ratchet
+        # while the bodies floor still passes (Codex #112 R25)
+        chain: set[str] = set()
+        while isinstance(node, dict) and "$ref" in node:
+            ref = node["$ref"]
+            if ref in chain:
+                unsupported.add(f"{label}::$ref-cycle")
+                return None
+            chain.add(ref)
+            node = _pointer(spec, ref)
+        return node
+
+    def check(node: Any, label: str, seen: frozenset[str]) -> None:
+        if node is False:
+            return  # rejects every instance — closed by construction
+        if node is True:
+            silent.add(label)  # admits everything without declaring anything
+            return
+        if not isinstance(node, dict):
+            unsupported.add(f"{label}::non-schema value")
+            return
+        body = {
+            k: v
+            for k, v in node.items()
+            if k not in _SCHEMA_NEUTRAL_KEYWORDS and not k.startswith("x-")
+        }
+        if not body:
+            silent.add(label)  # {} / annotation-only — an open bag
+            return
+        alien = [k for k in body if k not in _SCHEMA_SHAPE_KEYWORDS]
+        if alien:
+            # record every unsupported keyword on this node, then stop: shape
+            # conclusions drawn next to an unsupported keyword are unsound
+            for k in alien:
+                unsupported.add(f"{label}::{k}")
+            return
+        if "$ref" in body:
+            if set(body) != {"$ref"}:
+                # sibling keywords change the composite's semantics — outside
+                # the safe subset (close the target or inline the schema)
+                unsupported.add(f"{label}::$ref-with-siblings")
+                return
+            ref = body["$ref"]
+            if ref in seen:
+                unsupported.add(f"{label}::$ref-cycle")
+                return
+            short = ref.removeprefix("#/components/schemas/").replace("/", ".")
+            check(_pointer(spec, ref), short, seen | {ref})
+            return
+        for comb in ("oneOf", "anyOf", "allOf"):
+            for i, sub in enumerate(body.get(comb) or []):
+                check(sub, f"{label}.{comb}[{i}]", seen)
+        enum_values = list(body.get("enum") or [])
+        if "const" in body:
+            enum_values.append(body["const"])
+        for v in enum_values:
+            if isinstance(v, (dict, list)):
+                # an object/array literal admitted via enum/const is out of
+                # the subset — the ratchet cannot vouch for its key set
+                unsupported.add(f"{label}::structured-enum-value")
+        node_type = body.get("type")
+        if isinstance(node_type, str):
+            type_list = [node_type]
+        elif isinstance(node_type, list):
+            type_list = list(node_type)
+        else:
+            type_list = []
+        for t in type_list:
+            if t not in ("object", "array", "string", "integer", "number", "boolean", "null"):
+                unsupported.add(f"{label}::type={t!r}")
+        object_shaped = (
+            "object" in type_list
+            or "properties" in body
+            or "required" in body
+            or "additionalProperties" in body
+            or "unevaluatedProperties" in body
+        )
+        if object_shaped:
+            if "additionalProperties" not in body and "unevaluatedProperties" not in body:
+                silent.add(label)  # the ratchet: undeclared object openness
+            for pname, sub in (body.get("properties") or {}).items():
+                check(sub, f"{label}.{pname}", seen)
+            ap = body.get("additionalProperties")
+            if isinstance(ap, dict):
+                check(ap, f"{label}.additionalProperties", seen)
+            up = body.get("unevaluatedProperties")
+            if isinstance(up, dict):
+                check(up, f"{label}.unevaluatedProperties", seen)
+        array_shaped = (
+            "array" in type_list
+            or "prefixItems" in body
+            or "items" in body
+            # unevaluatedItems alone also shapes an array — its schema must be
+            # traversed or a nested open object escapes (Codex #112 R26)
+            or "unevaluatedItems" in body
+        )
+        if array_shaped:
+            # array keywords are VACUOUS for object instances: without an
+            # explicit `type: array` (and no object-side declaration judged
+            # above) the node still admits arbitrary objects — that is an
+            # open bag, not an array (gate-2 nit on R26)
+            if "array" not in type_list and not object_shaped:
+                silent.add(label)
+            max_items = body.get("maxItems", node.get("maxItems"))
+            bounded = isinstance(max_items, int) and max_items <= len(body.get("prefixItems") or [])
+            if "items" not in body and "unevaluatedItems" not in body and not bounded:
+                silent.add(f"{label}[]")  # implicit items: true
+            if "items" in body:
+                check(body["items"], f"{label}[]", seen)
+            ui = body.get("unevaluatedItems")
+            if isinstance(ui, dict) or ui is True:
+                check(ui, f"{label}.unevaluatedItems", seen)
+            for i, sub in enumerate(body.get("prefixItems") or []):
+                check(sub, f"{label}.prefixItems[{i}]", seen)
+        # a node that is neither object- nor array-shaped and carries no type
+        # is fine ONLY when a combinator or scalar enum/const constrains it;
+        # anything else recognizable-but-shapeless is an open bag
+        if (
+            not object_shaped
+            and not array_shaped
+            and not type_list
+            and not any(c in body for c in ("oneOf", "anyOf", "allOf", "enum", "const"))
+        ):
+            silent.add(label)
+
+    bodies = 0
+    scanned_rb_refs: set[str] = set()
+
+    def scan_request_body(rb_node: Any, label_prefix: str) -> None:
+        nonlocal bodies
+        if isinstance(rb_node, dict) and "$ref" in rb_node:
+            # record the FULL reference — a basename match from some other
+            # pointer location must not mark a distinct components entry as
+            # scanned (Codex #112 R25)
+            scanned_rb_refs.add(rb_node["$ref"])
+        rb = chase(rb_node, label_prefix)
+        if not isinstance(rb, dict):
+            return
+        for ctype, media in rb.get("content", {}).items():
+            body_label = f"{label_prefix} [{ctype}]"
+            schema = media.get("schema") if isinstance(media, dict) else None
+            bodies += 1
+            if schema is None:
+                silent.add(body_label)  # an absent schema accepts anything
+                continue
+            check(schema, body_label, frozenset())
+
+    visited_refs: set[str] = set()
+    # worklist of (path label, path-item map): top-level paths AND webhooks,
+    # plus reusable components.pathItems/components.callbacks (declarable
+    # before or without a reference — #112 R11), plus every operation's
+    # callbacks (whose path items nest recursively) — a request body outside
+    # spec["paths"] must not dodge the sweep (#112 R7)
+    # the Paths Object DOES support x-* specification extensions — filter them
+    # HERE ONLY; the name-keyed maps below carry no extensions (R12/R22)
+    pending = [(path, ops) for path, ops in spec["paths"].items() if not path.startswith("x-")]
+    pending += [(f"webhooks[{name}]", item) for name, item in spec.get("webhooks", {}).items()]
+    pending += [
+        (f"pathItems[{name}]", item)
+        for name, item in spec["components"].get("pathItems", {}).items()
+    ]
+    for cb_name, cb in spec["components"].get("callbacks", {}).items():
+        if not isinstance(cb, dict):
+            continue
+        cb = chase(cb, f"callbacks[{cb_name}]")  # may itself be a (chained) $ref (R12)
+        if not isinstance(cb, dict):
+            continue
+        pending += [
+            (f"callbacks[{cb_name}][{expr}]", item)
+            for expr, item in cb.items()
+            # the Callback OBJECT supports x-* extensions on its expression map
+            if not expr.startswith("x-")
+        ]
+    while pending:
+        path, ops = pending.pop()
+        if not isinstance(ops, dict):
+            continue  # malformed / non-dict path-item values
+        # a Path Item may itself be a $ref (3.1); overlap behavior between
+        # referenced and inline fields is spec-undefined, so scan BOTH — the
+        # inline fields now, the referenced item re-entering the worklist
+        # (visited_refs bounds ref chains and cycles instead of hanging)
+        if "$ref" in ops:
+            ref = ops["$ref"]
+            ops = {k: v for k, v in ops.items() if k != "$ref"}
+            if ref not in visited_refs:
+                visited_refs.add(ref)
+                pending.append((path, _pointer(spec, ref)))
+        for method, op in ops.items():
+            # only Operation positions — a dict-valued x-* Path Item extension
+            # must be neither crashed on nor misread as an operation (#112 R10)
+            if method not in _HTTP_METHODS:
+                continue
+            if not isinstance(op, dict):
+                continue
+            for cb_name, cb in op.get("callbacks", {}).items():
+                # callbacks keys are NAMES (the Operation Object's extensions
+                # are op-level fields — R22); isinstance covers malformed
+                # values, and the EXPRESSION-level x-* filters stay (the
+                # Callback Object DOES support extensions)
+                if not isinstance(cb, dict):
+                    continue
+                if "$ref" in cb:
+                    # persistent guard: a $ref'd callback expands once — a
+                    # self-referential callback graph must drain, not hang
+                    if cb["$ref"] in visited_refs:
+                        continue
+                    visited_refs.add(cb["$ref"])
+                cb = chase(cb, f"{path}.callbacks[{cb_name}]")
+                if not isinstance(cb, dict):
+                    continue  # cycle already recorded as unsupported
+                pending += [
+                    (f"{path}.callbacks[{cb_name}][{expr}]", item)
+                    for expr, item in cb.items()
+                    if not expr.startswith("x-")
+                ]
+            if "requestBody" not in op:
+                continue
+            scan_request_body(op["requestBody"], f"{method.upper()} {path}")
+
+    # a reusable request body may be DECLARED before (or without) a reference —
+    # scan components.requestBodies directly so it cannot sit silently open
+    # while unreferenced (Codex #112 R11). Bodies already scanned through an
+    # operation's $ref keep their endpoint labels only (stable pin identity).
+    # x-* is a LEGAL component name inside components maps (extensions attach
+    # to the Components Object itself), so there is no name filter (R22).
+    for rb_name, rb_node in spec["components"].get("requestBodies", {}).items():
+        if f"#/components/requestBodies/{rb_name}" not in scanned_rb_refs:
+            scan_request_body(rb_node, f"requestBodies[{rb_name}]")
+
+    assert bodies >= 23  # the walk must actually cover the surface, not vacuously pass
+    assert not unsupported, (
+        f"construct(s) outside this ratchet's safe subset: {sorted(unsupported)} — the "
+        "recognizer only vouches for the shapes the frozen contract uses; restructure "
+        "the schema or extend the recognizer (never let it guess)"
+    )
+    new_silent = silent - _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS
+    closed_legacy = _LEGACY_SILENT_OPEN_REQUEST_SCHEMAS - silent
+    assert not new_silent, (
+        f"new silently-open request-body object node(s): {sorted(new_silent)} — declare "
+        "additionalProperties explicitly (false unless the node is a documented free-form bag)"
+    )
+    assert not closed_legacy, (
+        f"legacy schemas now closed: {sorted(closed_legacy)} — shrink "
+        "_LEGACY_SILENT_OPEN_REQUEST_SCHEMAS in the same change (the ratchet only tightens)"
+    )
