@@ -1212,8 +1212,11 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 continue
             if not isinstance(sub, dict):
                 continue
-            if kw in ("if", "not", "propertyNames"):
-                walk(sub, sub_label, seen, False)  # predicate position (R16)
+            if kw in ("if", "not", "propertyNames", "contains"):
+                # predicate positions (R16/R20): `contains` only selects which
+                # admitted items COUNT as matches — closing it would change
+                # the match semantics, so it is coverage-walked like if/not
+                walk(sub, sub_label, seen, False)
                 continue
             # then/else are in-place applicators (composed propagates); the
             # declaration keywords (additionalProperties/unevaluated*) ARE
@@ -1276,6 +1279,15 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
             "maxContains",
             "contentMediaType",
             "contentEncoding",
+            # array/string APPLICATORS are ignored for OBJECT instances, so a
+            # `{items: {...}}`-only property still admits arbitrary objects —
+            # they resolve nothing about object openness (Codex #112 R20);
+            # a `type` that excludes objects survives the strip and settles it
+            "items",
+            "prefixItems",
+            "contains",
+            "unevaluatedItems",
+            "contentSchema",
         }
     )
     # every keyword the walker understands; anything else fails LOUD (below)
