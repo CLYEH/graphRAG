@@ -20,7 +20,6 @@ report is served) and stays null when there is none.
 
 from __future__ import annotations
 
-import ipaddress
 import uuid
 from typing import Any
 from urllib.parse import quote
@@ -30,8 +29,10 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from api.deps import Conn, neo4j_driver, qdrant_client, response_meta
 from api.envelope import success
+from api.errors import ApiError, ErrorCode
 from api.registry_errors import translate_registry_error
 from core.config import Settings, get_settings
+from core.mcp.addressing import resolved_advertised_host
 from core.observability.health import HealthReport, health_report, latest_eval_payload
 from core.registry import ProjectNotFoundError, get_project
 
@@ -84,42 +85,30 @@ async def get_eval_endpoint(request: Request, project: str, conn: Conn) -> dict[
 
 
 def _advertised_host(settings: Settings, request: Request) -> str:
-    """The host an EXTERNAL agent should dial, as a URL authority.
+    """The host an EXTERNAL agent should dial, via the SHARED resolver in
+    ``core.mcp.addressing`` (the serve-mcp CLI warning uses the same one, so
+    the two can never disagree about what the Console advertises).
 
-    Both decisions here are made on the ADDRESS's own properties, never on how
-    it is spelled: ``ipaddress`` answers "is this the unspecified address?"
-    for every spelling of it (``0.0.0.0``, ``::``, ``0:0:0:0:0:0:0:0``,
-    ``::0.0.0.0``, …) and "is this IPv6?" for the bracketing, where an
-    enumerated wildcard list and a ``":" in host`` proxy each admit the very
-    defect they exist to prevent (class 9 completeness / class 5 proxy —
-    gate-2 reproduced both: an unlisted wildcard spelling advertised verbatim,
-    and an operator-written ``[::1]`` double-bracketed into an invalid URI).
+    The wildcard fallback comes from the client-supplied ``Host`` header the
+    Console reached this API on — same machine in the DR-012 single-host
+    deploy; a reverse proxy that rewrites ``Host`` is exactly when
+    ``mcp_public_host`` becomes mandatory. A caller can only influence its
+    OWN uncached response, so the accident model applies, not the adversarial
+    one.
 
-    Preference order: the explicit ``mcp_public_host`` (the operator's own
-    answer), else the bind host when it names something dialable, else — for
-    an unspecified ("every interface") bind — the host the Console itself was
-    reached on, since the DR-012 deploy runs the gateway on that same machine.
-    That fallback comes from the client-supplied ``Host`` header: a reverse
-    proxy that rewrites ``Host`` is exactly when ``mcp_public_host`` becomes
-    mandatory. A caller can only influence its OWN uncached response, so the
-    accident model applies here, not the adversarial one.
-
-    A value that is not an IP literal (a hostname, or an already-bracketed
-    literal an operator wrote for a URL) is returned untouched — bracketing is
-    idempotent by construction rather than by a second guard.
+    An unusable configured value (host with a port, whitespace, scoped IPv6 —
+    no valid URI can carry these) fails LOUD as a typed INTERNAL error naming
+    the setting, instead of a 200 whose ``url`` violates ``format: uri``.
     """
-    host = settings.mcp_public_host or settings.mcp_http_host
     try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return host  # a hostname, or an already-bracketed literal
-    if ip.is_unspecified:
-        host = request.url.hostname or "localhost"
-        try:
-            ip = ipaddress.ip_address(host)
-        except ValueError:
-            return host
-    return f"[{host}]" if isinstance(ip, ipaddress.IPv6Address) else host
+        host = resolved_advertised_host(settings, reached_host=request.url.hostname or "localhost")
+    except ValueError as exc:
+        raise ApiError(
+            ErrorCode.INTERNAL,
+            f"mcp_public_host/mcp_http_host cannot form a valid URL authority: {exc}",
+        ) from exc
+    assert host is not None  # reached_host was supplied, so None is impossible
+    return host
 
 
 @router.get("/projects/{project}/mcp")

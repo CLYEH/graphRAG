@@ -85,6 +85,68 @@ def test_cli_surface_is_the_frozen_14_set() -> None:
 
 
 @pytest.mark.parametrize(
+    ("settings_host", "public", "expect_advertised"),
+    [
+        # the warning must name what the Console ACTUALLY advertises — the
+        # shared resolver's answer — not the raw bind setting (local batch
+        # review P2: with a public host set, the old message claimed 0.0.0.0)
+        ("0.0.0.0", "mcp.lan", "mcp.lan:8300"),
+        ("10.0.0.7", None, "10.0.0.7:8300"),
+        # a wildcard bind with no public host is request-dependent: the
+        # message must SAY so rather than print an undialable 0.0.0.0
+        ("0.0.0.0", None, "the host each Console request arrives on"),
+    ],
+)
+def test_serve_mcp_divergence_warning_names_the_advertised_address(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    settings_host: str,
+    public: str | None,
+    expect_advertised: str,
+) -> None:
+    import argparse
+
+    monkeypatch.setattr(
+        "cli.main.get_settings",
+        lambda: SimpleNamespace(
+            mcp_http_host=settings_host, mcp_http_port=8300, mcp_public_host=public
+        ),
+    )
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.setattr("core.mcp.gateway.build_gateway", lambda: object())
+
+    assert _serve_mcp(argparse.Namespace(host=None, port=9000)) == 0
+    err = capsys.readouterr().err
+    assert "warning:" in err
+    assert expect_advertised in err
+
+
+def test_serve_mcp_warns_separately_for_an_unusable_public_host(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Why: an invalid mcp_public_host and a wildcard bind BOTH resolve to "no
+    advertised name", but they are different failures — the invalid value must
+    get its own warning and must NOT be relabeled "(wildcard bind)", or the
+    operator chases the wrong cause (gate-2 nit on the batch fixes)."""
+    import argparse
+
+    monkeypatch.setattr(
+        "cli.main.get_settings",
+        lambda: SimpleNamespace(
+            mcp_http_host="127.0.0.1", mcp_http_port=8300, mcp_public_host="bad host"
+        ),
+    )
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.setattr("core.mcp.gateway.build_gateway", lambda: object())
+
+    assert _serve_mcp(argparse.Namespace(host=None, port=9000)) == 0
+    err = capsys.readouterr().err
+    assert "cannot form a valid URL authority" in err
+    assert "nothing usable" in err
+    assert "(wildcard bind)" not in err  # the mislabel this test exists to forbid
+
+
+@pytest.mark.parametrize(
     ("host", "port", "warns"),
     [
         (None, None, False),  # settings only — nothing to diverge
@@ -113,7 +175,9 @@ def test_serve_mcp_warns_only_when_the_bind_diverges_from_the_advertised_setting
 
     monkeypatch.setattr(
         "cli.main.get_settings",
-        lambda: SimpleNamespace(mcp_http_host="127.0.0.1", mcp_http_port=8300),
+        lambda: SimpleNamespace(
+            mcp_http_host="127.0.0.1", mcp_http_port=8300, mcp_public_host=None
+        ),
     )
     bound: dict[str, Any] = {}
     monkeypatch.setattr("uvicorn.run", lambda app, host, port: bound.update(host=host, port=port))

@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -843,6 +843,35 @@ describe("Settings — MCP 連線資訊", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "重試" }));
     expect(await screen.findByText("http://127.0.0.1:8300/mcp/acme")).toBeInTheDocument();
+  });
+
+  it("hides the cached URL when a refetch FAILS — an error must not sit beside a live copy button", async () => {
+    // class 17: on a refetch error React Query keeps the previous data; if the
+    // panel rendered both, the operator would copy an address the error just
+    // disowned. The error branch (with retry) must REPLACE the cached details.
+    let calls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path !== "/projects/{project}/mcp") return Promise.resolve(projectBody(FULL_CONFIG));
+      calls += 1;
+      return calls === 1
+        ? Promise.resolve(mcpBody())
+        : Promise.resolve({
+            data: undefined,
+            error: { error: { code: "STORE_UNAVAILABLE", message: "gateway gone" } },
+          });
+    }) as never);
+    renderSettings();
+    expect(await screen.findByText("http://127.0.0.1:8300/mcp/acme")).toBeInTheDocument();
+
+    // a window refocus triggers React Query's revalidation; the mock now fails
+    await act(async () => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+
+    await screen.findByText(/讀取連線資訊失敗:gateway gone/);
+    expect(screen.queryByText("http://127.0.0.1:8300/mcp/acme")).toBeNull();
+    expect(screen.queryByRole("button", { name: "複製" })).toBeNull();
   });
 
   it("says copying FAILED when the clipboard is unavailable — a silent no-op button is the bug this panel prevents", async () => {

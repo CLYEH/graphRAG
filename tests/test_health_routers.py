@@ -291,3 +291,24 @@ def test_mcp_info_advertises_a_dialable_host(
     r = client.get("/projects/p/mcp")
     assert r.status_code == 200
     assert r.json()["data"]["url"] == f"http://{expected_host}:8300/mcp/p"
+
+
+@pytest.mark.parametrize("bad", ["mcp.example:8443", "bad host", "[fe80::1%eth0]"])
+def test_mcp_info_fails_loud_on_an_unusable_public_host(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    """Why: these values cannot appear in a valid URI authority, so answering
+    200 would emit a `url` violating the frozen `format: uri` — the endpoint
+    must instead fail as a typed INTERNAL whose message NAMES the setting, so
+    the operator fixes mcp_public_host rather than debugging the gateway.
+    """
+    _project_exists(monkeypatch)
+    monkeypatch.setattr(
+        "api.routers.health.get_settings",
+        lambda: SimpleNamespace(mcp_http_host="127.0.0.1", mcp_http_port=8300, mcp_public_host=bad),
+    )
+    r = client.get("/projects/p/mcp")
+    assert r.status_code == 500
+    err = r.json()["error"]
+    assert err["code"] == "INTERNAL"
+    assert "mcp_public_host" in err["message"]  # actionable naming, not a bare 500

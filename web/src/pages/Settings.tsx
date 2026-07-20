@@ -624,7 +624,12 @@ function McpSection({ project }: { project: string }) {
           </button>
         </p>
       )}
-      {info.data && (
+      {/* class 17: a cache backed by a FAILED revalidation is not showable —
+          on a refetch error React Query keeps the previous data, and rendering
+          it beside the error banner leaves a stale URL with a live copy button
+          (the operator copies an address the error just disowned). The error
+          branch above, with its retry, replaces the panel instead. */}
+      {!info.isError && info.data && (
         <dl className="settings__mcp">
           <dt>網址</dt>
           <dd>

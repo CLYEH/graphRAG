@@ -231,6 +231,7 @@ def _serve_mcp(args: argparse.Namespace) -> int:
     command, so it branches before ``_run``'s store plumbing)."""
     import uvicorn
 
+    from core.mcp.addressing import resolved_advertised_host
     from core.mcp.gateway import build_gateway
 
     settings = get_settings()
@@ -244,9 +245,33 @@ def _serve_mcp(args: argparse.Namespace) -> int:
     # divergence be silent (it cannot be an error: overriding is legitimate for
     # one-off local runs).
     if host != settings.mcp_http_host or port != settings.mcp_http_port:
+        # name what the Console ACTUALLY advertises, via the same resolver the
+        # MCP-info endpoint uses (local batch review P2: printing the raw bind
+        # setting here claimed 0.0.0.0 was advertised when mcp_public_host or
+        # the wildcard Host-fallback would say otherwise)
+        invalid = False
+        adv = None
+        try:
+            adv = resolved_advertised_host(settings)
+        except ValueError as exc:
+            # distinct from the wildcard case below: this None means the value
+            # is UNUSABLE, and the panel will 500 — don't relabel it a wildcard
+            invalid = True
+            print(
+                f"warning: mcp_public_host/mcp_http_host cannot form a valid URL "
+                f"authority ({exc}) — the Console's MCP panel will fail loudly "
+                "until the setting is fixed.",
+                file=sys.stderr,
+            )
+        if adv is not None:
+            advertised = f"{adv}:{settings.mcp_http_port}"
+        elif invalid:
+            advertised = "nothing usable (see the warning above)"
+        else:
+            advertised = "the host each Console request arrives on (wildcard bind)"
         print(
             f"warning: serving on {host}:{port}, but the Console advertises "
-            f"{settings.mcp_http_host}:{settings.mcp_http_port} (from settings). "
+            f"{advertised} (from settings). "
             "Set GRAPHRAG_MCP_HTTP_HOST/GRAPHRAG_MCP_HTTP_PORT instead so the "
             "Console's MCP panel shows a URL that reaches this gateway (when "
             "binding a wildcard like 0.0.0.0, also set GRAPHRAG_MCP_PUBLIC_HOST "
