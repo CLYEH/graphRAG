@@ -1166,7 +1166,15 @@ def test_request_body_object_nodes_declare_additional_properties(spec: dict[str,
                 # value) that is unconstrained accepts arbitrary object values
                 # without declaring anything (`payload: {}` — Codex #112 R16);
                 # $defs entries are uninstantiated, so they are walked only
-                child_judged = judge and kw != "$defs" and not (in_place and next_composed)
+                # dependentSchemas values compose IN-PLACE conjunctively — an
+                # unconstrained one is a no-op like an allOf true member, not
+                # an admitted child value (Codex #112 R21); nontrivial
+                # branches are still walked and node-judged below
+                child_judged = (
+                    judge
+                    and kw not in ("$defs", "dependentSchemas")
+                    and not (in_place and next_composed)
+                )
                 if child_judged and unconstrained(sub):
                     silent.add(sub_label)
                     continue
