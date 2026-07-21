@@ -22,13 +22,17 @@ from __future__ import annotations
 
 import uuid
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Request
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from api.deps import Conn, neo4j_driver, qdrant_client, response_meta
 from api.envelope import success
+from api.errors import ApiError, ErrorCode
 from api.registry_errors import translate_registry_error
+from core.config import Settings, get_settings
+from core.mcp.addressing import resolved_advertised_host, validated_advertised_port
 from core.observability.health import HealthReport, health_report, latest_eval_payload
 from core.registry import ProjectNotFoundError, get_project
 
@@ -77,4 +81,75 @@ async def get_eval_endpoint(request: Request, project: str, conn: Conn) -> dict[
         payload,
         **response_meta(request),
         build_id=uuid.UUID(served) if isinstance(served, str) else None,
+    )
+
+
+def _advertised_authority(settings: Settings, request: Request) -> tuple[str, int]:
+    """The host an EXTERNAL agent should dial, via the SHARED resolver in
+    ``core.mcp.addressing`` (the serve-mcp CLI warning uses the same one, so
+    the two can never disagree about what the Console advertises).
+
+    The wildcard fallback comes from the client-supplied ``Host`` header the
+    Console reached this API on — same machine in the DR-012 single-host
+    deploy; a reverse proxy that rewrites ``Host`` is exactly when
+    ``mcp_public_host`` becomes mandatory. A caller can only influence its
+    OWN uncached response, so the accident model applies, not the adversarial
+    one.
+
+    An unusable configured value (host with a port, whitespace, scoped IPv6 —
+    no valid URI can carry these) fails LOUD as a typed INTERNAL error naming
+    the setting, instead of a 200 whose ``url`` violates ``format: uri``.
+    """
+    try:
+        host = resolved_advertised_host(settings, reached_host=request.url.hostname or "localhost")
+        port = validated_advertised_port(settings.mcp_http_port)
+    except ValueError as exc:
+        raise ApiError(
+            ErrorCode.INTERNAL,
+            f"mcp_public_host/mcp_http_host/mcp_http_port cannot form a valid URL authority: {exc}",
+        ) from exc
+    assert host is not None  # reached_host was supplied, so None is impossible
+    return host, port
+
+
+@router.get("/projects/{project}/mcp")
+async def get_mcp_info_endpoint(request: Request, project: str, conn: Conn) -> dict[str, Any]:
+    """The project's DR-012 gateway connection info (contract v1.3).
+
+    The URL is DERIVED from the settings the gateway binds to
+    (``mcp_http_host``/``mcp_http_port``) and the path shape it routes
+    (``/mcp/<project>``), so a settings change moves both together. Two
+    corrections the naive f-string gets wrong (Codex #113 P1):
+
+    * a BIND is an interface, not an address — ``0.0.0.0``/``::`` mean "every
+      interface" and are meaningless to a client, which would resolve them
+      locally and never reach this gateway. ``_advertised_host`` substitutes
+      an address an external agent can actually dial: the explicit
+      ``mcp_public_host`` setting if the operator set one, else the host the
+      Console itself was reached on (same machine in the single-host deploy).
+    * an IPv6 literal needs authority BRACKETS (``[::1]:8300``), or the port
+      colon is ambiguous and the URL is malformed.
+
+    NOTE the one fork the contract leaves open: ``graphrag serve-mcp
+    --host/--port`` overrides the bind for that process WITHOUT changing the
+    settings, and this payload follows the settings (the frozen contract says
+    "derived from the server's GRAPHRAG_MCP_HTTP_HOST/PORT settings"). The CLI
+    warns loudly when an override diverges and names both addresses.
+
+    The project segment is percent-encoded with an empty ``safe`` set: the
+    gateway matches the RAW path and keeps an encoded slash inside its segment
+    (Codex #93 R3), so emitting the raw name would advertise a URL that
+    resolves to a DIFFERENT project.
+
+    ``meta.build_id`` is null: this payload is about the connection surface,
+    not about any build's content (the observation-precedence note above).
+    """
+    await _require_project(conn, project)
+    settings = get_settings()
+    host, port = _advertised_authority(settings, request)
+    url = f"http://{host}:{port}/mcp/{quote(project, safe='')}"
+    return success(
+        {"transport": "streamable-http", "auth": "none", "url": url},
+        **response_meta(request),
+        build_id=None,
     )

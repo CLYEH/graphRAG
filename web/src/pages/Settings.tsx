@@ -8,6 +8,7 @@ import {
   ontologyFromConfig,
   policyFromConfig,
   settingsSaveMutationKey,
+  useMcpInfo,
   useProject,
   useSaveChunking,
   useSaveOntology,
@@ -108,6 +109,7 @@ function SettingsBody({ project }: { project: string }) {
       <OntologySection project={project} config={config} locked={locked} />
       <ChunkingSection project={project} config={config} locked={locked} />
       <PolicySection project={project} config={config} locked={locked} />
+      <McpSection project={project} />
     </div>
   );
 }
@@ -583,6 +585,94 @@ function PolicySection({ project, config, locked }: SectionProps) {
         <summary>進階:圖譜查詢防護(text_to_cypher,唯讀)</summary>
         <pre>{JSON.stringify(pol.cypherBlock ?? DEFAULT_QUERY_POLICY.text_to_cypher, null, 2)}</pre>
       </details>
+    </section>
+  );
+}
+
+// ---- MCP 連線資訊 (MCP1-fe) -------------------------------------------------
+
+// Why this is a READ-ONLY panel and not a computed string: the url comes from
+// the server, which derives it from the DR-012 gateway's own host/port settings
+// and path shape. Composing it in the browser would fork the source — the
+// Console would keep advertising localhost after an operator moved the gateway.
+// Read-only means there is no lock/draft discipline to inherit here; the panel
+// only has to fail loud (an operator copying a stale or blank URL debugs the
+// wrong system) and offer a retry.
+function McpSection({ project }: { project: string }) {
+  const info = useMcpInfo(project);
+  // tri-state, not a boolean: the Clipboard API is unavailable in any
+  // NON-SECURE context — which is exactly this panel's deployment (the Console
+  // served over plain http to a LAN browser, DR-012). A silent no-op button
+  // there is the same failure the panel exists to prevent (the operator thinks
+  // the URL was copied and pastes something else), so an unavailable or
+  // rejecting clipboard must SAY SO and point at manual selection.
+  //
+  // The outcome is stored WITH the url it is about, and the badges render only
+  // while that url is still the one on screen (Codex #113 R4): a refetch can
+  // replace the url without remounting this section, and「已複製」beside a NEW
+  // url while the clipboard holds the OLD one is again the exact bug this
+  // panel exists to prevent. Same for a stale「複製失敗」. Deriving by
+  // comparison (rather than resetting in an effect) also covers the
+  // click→promise-resolution race for free: a late outcome carries the old
+  // url and simply never matches.
+  const [copied, setCopied] = useState<{ url: string; ok: boolean } | null>(null);
+
+  return (
+    <section className="settings__section" aria-label="MCP 連線資訊">
+      <h2>MCP 連線資訊</h2>
+      <p className="settings__muted">
+        外部 AI 代理平台(如導覽助理)用這個網址連到本專案的 MCP 伺服器;需要閘道(
+        <code>graphrag serve-mcp</code>)正在執行。
+      </p>
+      {info.isPending && <p className="settings__line">讀取連線資訊中…</p>}
+      {info.isError && (
+        <p className="settings__line settings__line--error">
+          讀取連線資訊失敗:{message(info.error)}{" "}
+          <button type="button" onClick={() => void info.refetch()}>
+            重試
+          </button>
+        </p>
+      )}
+      {/* class 17: a cache backed by a FAILED revalidation is not showable —
+          on a refetch error React Query keeps the previous data, and rendering
+          it beside the error banner leaves a stale URL with a live copy button
+          (the operator copies an address the error just disowned). The error
+          branch above, with its retry, replaces the panel instead. */}
+      {!info.isError && info.data && (
+        <dl className="settings__mcp">
+          <dt>網址</dt>
+          <dd>
+            <code className="settings__mcp-url">{info.data.url}</code>{" "}
+            <button
+              type="button"
+              onClick={() => {
+                const url = info.data.url;
+                const written = navigator.clipboard?.writeText(url);
+                if (written === undefined) {
+                  setCopied({ url, ok: false }); // no Clipboard API (non-secure context)
+                  return;
+                }
+                void written.then(
+                  () => setCopied({ url, ok: true }),
+                  () => setCopied({ url, ok: false }),
+                );
+              }}
+            >
+              複製
+            </button>
+            {copied?.ok === true && copied.url === info.data.url && (
+              <span className="settings__muted"> 已複製</span>
+            )}
+            {copied?.ok === false && copied.url === info.data.url && (
+              <span className="settings__line--error"> 複製失敗,請手動選取網址</span>
+            )}
+          </dd>
+          <dt>傳輸方式</dt>
+          <dd>{info.data.transport}</dd>
+          <dt>驗證</dt>
+          <dd>{info.data.auth === "none" ? "無(尚未啟用)" : info.data.auth}</dd>
+        </dl>
+      )}
     </section>
   );
 }

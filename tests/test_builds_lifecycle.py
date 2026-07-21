@@ -13,6 +13,7 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -22,7 +23,7 @@ from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from cli.main import _parser, _print_report
+from cli.main import _parser, _print_report, _serve_mcp
 from core.builds.lifecycle import (
     PreflightReport,
     activate,
@@ -81,6 +82,119 @@ def test_cli_surface_is_the_frozen_14_set() -> None:
         "prune",
         "serve-mcp",
     }
+
+
+@pytest.mark.parametrize(
+    ("settings_host", "public", "expect_advertised"),
+    [
+        # the warning must name what the Console ACTUALLY advertises — the
+        # shared resolver's answer — not the raw bind setting (local batch
+        # review P2: with a public host set, the old message claimed 0.0.0.0)
+        ("0.0.0.0", "mcp.lan", "mcp.lan:8300"),
+        ("10.0.0.7", None, "10.0.0.7:8300"),
+        # a wildcard bind with no public host is request-dependent: the
+        # message must SAY so rather than print an undialable 0.0.0.0
+        ("0.0.0.0", None, "the host each Console request arrives on"),
+    ],
+)
+def test_serve_mcp_divergence_warning_names_the_advertised_address(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    settings_host: str,
+    public: str | None,
+    expect_advertised: str,
+) -> None:
+    import argparse
+
+    monkeypatch.setattr(
+        "cli.main.get_settings",
+        lambda: SimpleNamespace(
+            mcp_http_host=settings_host, mcp_http_port=8300, mcp_public_host=public
+        ),
+    )
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.setattr("core.mcp.gateway.build_gateway", lambda: object())
+
+    assert _serve_mcp(argparse.Namespace(host=None, port=9000)) == 0
+    err = capsys.readouterr().err
+    assert "warning:" in err
+    assert expect_advertised in err
+
+
+def test_serve_mcp_warns_separately_for_an_unusable_public_host(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Why: an invalid mcp_public_host and a wildcard bind BOTH resolve to "no
+    advertised name", but they are different failures — the invalid value must
+    get its own warning and must NOT be relabeled "(wildcard bind)", or the
+    operator chases the wrong cause (gate-2 nit on the batch fixes)."""
+    import argparse
+
+    monkeypatch.setattr(
+        "cli.main.get_settings",
+        lambda: SimpleNamespace(
+            mcp_http_host="127.0.0.1", mcp_http_port=8300, mcp_public_host="bad host"
+        ),
+    )
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.setattr("core.mcp.gateway.build_gateway", lambda: object())
+
+    assert _serve_mcp(argparse.Namespace(host=None, port=9000)) == 0
+    err = capsys.readouterr().err
+    assert "cannot form a valid URL authority" in err
+    assert "nothing usable" in err
+    assert "(wildcard bind)" not in err  # the mislabel this test exists to forbid
+
+
+@pytest.mark.parametrize(
+    ("host", "port", "warns"),
+    [
+        (None, None, False),  # settings only — nothing to diverge
+        ("0.0.0.0", None, True),  # the DR-012 LAN case: the discoverable spelling
+        (None, 9000, True),
+        ("127.0.0.1", 8300, False),  # override EQUAL to settings: a no-op, must stay silent
+    ],
+)
+def test_serve_mcp_warns_only_when_the_bind_diverges_from_the_advertised_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    host: str | None,
+    port: int | None,
+    warns: bool,
+) -> None:
+    """Why: the Console's MCP panel advertises the SETTINGS address (the frozen
+    contract derives it from GRAPHRAG_MCP_HTTP_HOST/PORT), so a --host/--port
+    override forks the source — the gateway listens somewhere the copied URL
+    never reaches. This warning is the only thing standing between an operator
+    and that dead link, so it is pinned here, including the discriminating
+    no-op row: an override EQUAL to the settings must NOT warn (a refactor to
+    the obvious `if args.host or args.port:` would cry wolf and train operators
+    to ignore it).
+    """
+    import argparse
+
+    monkeypatch.setattr(
+        "cli.main.get_settings",
+        lambda: SimpleNamespace(
+            mcp_http_host="127.0.0.1", mcp_http_port=8300, mcp_public_host=None
+        ),
+    )
+    bound: dict[str, Any] = {}
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port: bound.update(host=host, port=port))
+    monkeypatch.setattr("core.mcp.gateway.build_gateway", lambda: object())
+
+    assert _serve_mcp(argparse.Namespace(host=host, port=port)) == 0
+    # the gateway binds the RESOLVED address either way
+    assert bound == {"host": host or "127.0.0.1", "port": port or 8300}
+
+    err = capsys.readouterr().err
+    if warns:
+        assert "warning:" in err
+        assert f"{host or '127.0.0.1'}:{port or 8300}" in err  # where it actually serves
+        assert "127.0.0.1:8300" in err  # what the Console advertises
+        assert "GRAPHRAG_MCP_HTTP_HOST" in err  # what to set instead
+    else:
+        assert err == ""
 
 
 async def test_prune_refuses_a_zero_window() -> None:

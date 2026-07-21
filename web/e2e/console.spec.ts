@@ -26,6 +26,17 @@ function projectsResponse(names: string[]) {
   };
 }
 
+function mcpInfoResponse(url = "http://127.0.0.1:8300/mcp/acme") {
+  return {
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: { transport: "streamable-http", auth: "none", url },
+      meta: META,
+    }),
+  };
+}
+
 function healthResponse() {
   return {
     status: 200,
@@ -965,6 +976,7 @@ test("the settings page saves a vocabulary edit over a fresh-spread PATCH", asyn
   };
   await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
   await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  await page.route("**/projects/*/mcp", (route) => route.fulfill(mcpInfoResponse()));
   let patched: { config?: Record<string, unknown> } | null = null;
   await page.route("**/projects/acme", (route) => {
     if (route.request().method() === "PATCH") {
@@ -1099,6 +1111,9 @@ test("the full no-terminal path: create → upload → build → eval → activa
       body: JSON.stringify({ data: proj(), meta: META }),
     });
   });
+  await page.route("**/projects/*/mcp", (route) =>
+    route.fulfill(mcpInfoResponse("http://127.0.0.1:8300/mcp/e2e")),
+  );
   await page.route("**/projects/*/health", (route) =>
     route.fulfill({
       status: 200,

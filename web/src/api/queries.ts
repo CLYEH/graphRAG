@@ -45,6 +45,26 @@ export function useProjects() {
   });
 }
 
+// The project's MCP connection surface (contract v1.3, DR-012 gateway). The
+// server DERIVES the url from the gateway's own host/port settings and path
+// shape, so the Console never builds it client-side — an operator copying this
+// link must reach where the gateway actually serves. Same path-addressability
+// gate as health: a non-addressable name cannot reach the route at all (which
+// is exactly why the contract can promise a non-null url).
+export function useMcpInfo(project: string | undefined) {
+  return useQuery({
+    queryKey: ["mcp-info", project],
+    enabled: project !== undefined && isPathAddressable(project),
+    queryFn: async () => {
+      const { data, error } = await api.GET("/projects/{project}/mcp", {
+        params: { path: { project: project as string } },
+      });
+      if (error) throw new Error(error.error.message);
+      return data.data;
+    },
+  });
+}
+
 // Project Health home (DESIGN §19): status light + counts + drift for the
 // active build. `project` is the decoded key from the route; the query stays
 // disabled until it resolves (a malformed segment never hits the API) and while
