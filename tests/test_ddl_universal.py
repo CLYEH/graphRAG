@@ -37,6 +37,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
+from sqlalchemy.sql.elements import UnaryExpression
 
 from core.config import get_settings
 from core.stores.tables import metadata, review_ledger
@@ -94,16 +95,48 @@ def _identity_cols(fk_cols: tuple[str, ...]) -> set[str]:
     return set(fk_cols) - SCOPE_COLS or set(fk_cols)
 
 
+def _member_col(expr: object) -> str | None:
+    """A member expression's column name, unwrapping SORT modifiers only: a
+    ``col.desc()`` member is still the column (live-side ``indkey`` carries
+    its real attnum; direction lives in indoption), but a genuine function
+    (``lower(col)``/LEAST) is not — Postgres stores attnum 0 for those."""
+    if isinstance(expr, sa.Column):
+        return str(expr.name)
+    if isinstance(expr, UnaryExpression) and isinstance(expr.element, sa.Column):
+        return str(expr.element.name)
+    return None
+
+
+def _plain_expr_cols(ix: sa.Index) -> tuple[str, ...] | None:
+    """The index's key columns IFF every member is a plain column (sort
+    modifiers allowed), else None. ``Index.columns`` is the wrong source
+    (local codex P2): it silently drops expression members (merge pair's
+    LEAST/GREATEST) and can surface a column referenced INSIDE an expression
+    (``lower(col)``) as if the index were on the column itself — the
+    expression list is the true member list."""
+    cols: list[str] = []
+    for expr in ix.expressions:
+        name = _member_col(expr)
+        if name is None:
+            return None
+        cols.append(name)
+    return tuple(cols)
+
+
 def _first_index_cols(table: sa.Table) -> set[str]:
     """First columns of the structures that can serve an FK probe. PARTIAL
     indexes are excluded: they only answer queries implying their predicate,
     so e.g. one_active_build(project) WHERE status='active' cannot support
     builds.project lookups over non-active rows (local codex P2 — deleting
-    builds_by_project must go RED, not hide behind the partial)."""
+    builds_by_project must go RED, not hide behind the partial). Expression
+    members disqualify via _plain_expr_cols: an index leading on
+    ``lower(col)`` cannot serve an equality probe on ``col``."""
     firsts = {
         cols[0]
         for ix in table.indexes
-        if (cols := tuple(ix.columns.keys())) and ix.dialect_options["postgresql"]["where"] is None
+        if ix.dialect_options["postgresql"]["where"] is None
+        and (cols := _plain_expr_cols(ix)) is not None
+        and cols
     }
     firsts.add(tuple(table.primary_key.columns.keys())[0])
     firsts.update(
@@ -112,6 +145,19 @@ def _first_index_cols(table: sa.Table) -> set[str]:
         if isinstance(c, sa.UniqueConstraint) and len(c.columns) > 0
     )
     return firsts
+
+
+def test_expression_index_members_do_not_masquerade_as_columns() -> None:
+    """Pin for the helper itself (local codex P2; no live instance exists to
+    probe): ``Index.columns`` surfaces a column referenced INSIDE an
+    expression (``lower(a)``) as if the index were on the column — the helper
+    must refuse functional members entirely, while a sort modifier's member
+    IS its column."""
+    t = sa.Table("zz_probe_meta", sa.MetaData(), sa.Column("a", sa.Text), sa.Column("b", sa.Text))
+    functional = sa.Index("zz_f", sa.func.lower(t.c.a))
+    sorted_ix = sa.Index("zz_s", t.c.a, t.c.b.desc())
+    assert _plain_expr_cols(functional) is None
+    assert _plain_expr_cols(sorted_ix) == ("a", "b")
 
 
 def test_every_fk_group_has_a_supporting_index() -> None:
@@ -208,8 +254,8 @@ def _metadata_plain_unique_sets(table: sa.Table) -> set[frozenset[str]]:
     for ix in table.indexes:
         if not ix.unique or ix.dialect_options["postgresql"]["where"] is not None:
             continue
-        cols = tuple(ix.columns.keys())
-        if cols and len(cols) == len(list(ix.expressions)):
+        cols = _plain_expr_cols(ix)
+        if cols:
             sets.add(frozenset(cols))
     sets.update(
         frozenset(c.columns.keys()) for c in table.constraints if isinstance(c, sa.UniqueConstraint)
@@ -369,8 +415,8 @@ WHERE c.relnamespace = 'public'::regnamespace
 ORDER BY 1, 2
 """
 
-CONSTRAINT_COLUMN_SETS_SQL = f"""
-SELECT c.relname AS tbl, con.contype::text AS kind,
+PK_COLUMN_SETS_SQL = f"""
+SELECT c.relname AS tbl,
        (SELECT array_agg(att.attname ORDER BY att.attname)
           FROM unnest(con.conkey) AS k(a)
           JOIN pg_attribute att
@@ -379,9 +425,38 @@ FROM pg_constraint con
 JOIN pg_class c ON c.oid = con.conrelid
 WHERE con.connamespace = 'public'::regnamespace
   AND {APP_RELKIND_FILTER}
-  AND con.contype IN ('p', 'f')
+  AND con.contype = 'p'
 ORDER BY 1
 """
+
+# the FULL FK identity (local codex P2: unordered local column-sets alone
+# would accept a migration that references the wrong table/columns, reorders
+# a positional mapping, or swaps CASCADE for RESTRICT): ordered local
+# columns, referenced table, ordered referenced columns, delete action.
+# WITH ORDINALITY preserves constraint-definition order.
+FK_IDENTITY_SQL = f"""
+SELECT c.relname AS tbl,
+       (SELECT array_agg(att.attname ORDER BY k.ord)
+          FROM unnest(con.conkey) WITH ORDINALITY AS k(a, ord)
+          JOIN pg_attribute att
+            ON att.attrelid = con.conrelid AND att.attnum = k.a) AS cols,
+       cf.relname AS ref_tbl,
+       (SELECT array_agg(att.attname ORDER BY k.ord)
+          FROM unnest(con.confkey) WITH ORDINALITY AS k(a, ord)
+          JOIN pg_attribute att
+            ON att.attrelid = con.confrelid AND att.attnum = k.a) AS ref_cols,
+       con.confdeltype::text AS deltype
+FROM pg_constraint con
+JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_class cf ON cf.oid = con.confrelid
+WHERE con.connamespace = 'public'::regnamespace
+  AND {APP_RELKIND_FILTER}
+  AND con.contype = 'f'
+ORDER BY 1
+"""
+
+#: pg_constraint.confdeltype → the ondelete spelling tables.py uses
+DELTYPE = {"a": None, "r": "RESTRICT", "c": "CASCADE", "n": "SET NULL", "d": "SET DEFAULT"}
 
 
 @pytest.fixture()
@@ -446,29 +521,42 @@ async def test_live_schema_matches_metadata_instance_sets(migrated: None) -> Non
     within a table the sets must match exactly, both directions. This is an
     existence/NAMING parity — column TYPES are out of scope (timestamp drift
     is property-checked above; core-table types are pinned offline in
-    test_core_tables_schema)."""
+    test_core_tables_schema). FKs compare by FULL identity (ordered local
+    columns → referenced table + ordered referenced columns + delete
+    action), and the live table set must be EXACTLY metadata ∪
+    {alembic_version} — an extra live table is drift, not tolerance."""
     engine = _engine()
     try:
         async with engine.connect() as conn:
             live_cols: dict[str, set[str]] = {}
             for tbl, name in await _rows(conn, LIVE_COLUMNS_SQL):
                 live_cols.setdefault(tbl, set()).add(name)
+            assert set(live_cols) == set(metadata.tables) | {"alembic_version"}
             live_pks: dict[str, set[frozenset[str]]] = {}
-            live_fks: dict[str, set[frozenset[str]]] = {}
-            for tbl, kind, cols in await _rows(conn, CONSTRAINT_COLUMN_SETS_SQL):
-                if cols is None:
+            for tbl, cols in await _rows(conn, PK_COLUMN_SETS_SQL):
+                if cols is not None:
+                    live_pks.setdefault(tbl, set()).add(frozenset(cols))
+            live_fks: dict[str, set[tuple[Any, ...]]] = {}
+            for tbl, cols, ref_tbl, ref_cols, deltype in await _rows(conn, FK_IDENTITY_SQL):
+                if cols is None or ref_cols is None:
                     continue
-                target = live_pks if kind == "p" else live_fks
-                target.setdefault(tbl, set()).add(frozenset(cols))
+                live_fks.setdefault(tbl, set()).add(
+                    (tuple(cols), ref_tbl, tuple(ref_cols), DELTYPE[deltype])
+                )
             live_uniques = _live_unique_sets(await _rows(conn, UNIQUE_INDEX_COLUMN_SETS_SQL))
 
             for table in metadata.tables.values():
                 name = table.name
-                assert name in live_cols, f"table missing live: {name}"
                 assert live_cols[name] == {c.name for c in table.columns}, name
                 assert live_pks.get(name) == {frozenset(table.primary_key.columns.keys())}, name
                 assert live_fks.get(name, set()) == {
-                    frozenset(fk.column_keys) for fk in table.foreign_key_constraints
+                    (
+                        tuple(fk.column_keys),
+                        fk.referred_table.name,
+                        tuple(el.column.name for el in fk.elements),
+                        fk.ondelete and fk.ondelete.upper(),
+                    )
+                    for fk in table.foreign_key_constraints
                 }, name
                 assert {s for t, s in live_uniques if t == name} == (
                     _metadata_plain_unique_sets(table)
