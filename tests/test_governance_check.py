@@ -41,6 +41,11 @@ YAML_V1 = 'info:\n  title: x\n  version: "1.0"\npaths: {}\n'
 YAML_V2 = 'info:\n  title: x\n  version: "1.1"\npaths: {}\n'
 JSON_V1 = '{"properties": {"schema_version": {"const": "1.0"}}}\n'
 JSON_V2 = '{"properties": {"schema_version": {"const": "1.1"}}}\n'
+# content change WITHOUT a version change — explicit constant, not a string
+# replace: the first version used a .replace() whose needle didn't occur, so
+# the "changed" file was byte-identical, the diff was empty, and the test
+# asserted on a vacuous pass (caught by CI, where jq runs this path)
+JSON_V1_TOUCHED = '{"properties": {"schema_version": {"const": "1.0"}, "x": {}}}\n'
 TASKS_BASE = "# tasks\n- [ ] X1 first task\n- [ ] Y2 second task\n"
 
 
@@ -142,7 +147,7 @@ def test_json_contract_uses_the_schema_version_const_field(tmp_path: Path) -> No
         work,
         "task/X1",
         {
-            "contracts/mcp_response.schema.json": JSON_V1.replace("{}}}", '{}}, "x": {}}'),
+            "contracts/mcp_response.schema.json": JSON_V1_TOUCHED,
             "TASKS.md": TASKS_BASE.replace("- [ ] X1", "- [x] X1"),
         },
     )
