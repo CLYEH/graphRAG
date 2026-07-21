@@ -25,12 +25,14 @@ export default defineConfig({
     environment: "jsdom",
     globals: false,
     setupFiles: ["./src/setupTests.ts"],
-    // Cap the fork fan-out (H21): vitest's default = one worker per core, and
+    // Cap the fork fan-out (H21): vitest's default = max(cores - 1, 1), and
     // on a many-core box the full suite oversubscribes the CPU enough that
     // testing-library's 1s waitFor budgets starve DETERMINISTICALLY
-    // (isolated file green / full suite red / CI green — #112). min() keeps
-    // small CI runners (2–4 cores) at their current worker count; only boxes
-    // with more cores are capped.
-    maxWorkers: Math.min(4, availableParallelism()),
+    // (isolated file green / full suite red / CI green — #112). Mirroring the
+    // default's cores-1 inside the min keeps small CI runners (2–4 cores) at
+    // exactly their current worker count; only boxes with 6+ cores are
+    // capped. NOTE the VITEST_MAX_WORKERS env var still overrides this after
+    // config resolution — viteConfig.test.ts guards oversubscribing values.
+    maxWorkers: Math.min(4, Math.max(availableParallelism() - 1, 1)),
   },
 });
