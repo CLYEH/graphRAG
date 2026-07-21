@@ -11,6 +11,13 @@ import type { Relation } from "../api/queries";
 
 const META = { next_cursor: null, build_id: "b1", request_id: "r", elapsed_ms: 1 };
 
+// Explicit budget for FIRST-SETTLE waits — mount plus the queries a row needs
+// before its buttons reach the asserted state. Under full-suite fork fan-out
+// these are the slow kind (#112/H21: this file's slowest one starved
+// deterministically at the 1s default while every per-interaction wait stayed
+// green), so every first-settle wait in this file carries the budget.
+const FIRST_SETTLE = { timeout: 5000 } as const;
+
 const idemKeyOf = (call: unknown) =>
   (call as { params: { header: Record<string, string> } }).params.header["Idempotency-Key"];
 
@@ -100,8 +107,14 @@ describe("RelationReview", () => {
 
     renderWithProviders(<RelationReview project="acme" />);
 
-    // both actions locked while the pair is unknown
-    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeDisabled());
+    // both actions locked while the pair is unknown. This waits for the LIST
+    // query to settle and the row to first render (the entity-name fetches
+    // above deliberately never settle) — the wait that starved at the 1s
+    // default under fan-out (#112).
+    await waitFor(
+      () => expect(screen.getByRole("button", { name: "保留" })).toBeDisabled(),
+      FIRST_SETTLE,
+    );
     expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
   });
 
@@ -168,7 +181,10 @@ describe("RelationReview", () => {
     );
 
     // names OK → arm the reject confirm; 確定排除 starts enabled
-    await waitFor(() => expect(screen.getByRole("button", { name: "排除" })).toBeEnabled());
+    await waitFor(
+      () => expect(screen.getByRole("button", { name: "排除" })).toBeEnabled(),
+      FIRST_SETTLE,
+    );
     fireEvent.click(screen.getByRole("button", { name: "排除" }));
     expect(await screen.findByRole("button", { name: "確定排除" })).toBeEnabled();
 
@@ -211,7 +227,10 @@ describe("RelationReview", () => {
 
     renderWithProviders(<RelationReview project="acme" />);
     // wait until the pair resolves and the decision unlocks
-    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeEnabled());
+    await waitFor(
+      () => expect(screen.getByRole("button", { name: "保留" })).toBeEnabled(),
+      FIRST_SETTLE,
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "保留" }));
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
@@ -235,7 +254,10 @@ describe("RelationReview", () => {
     } as never);
 
     renderWithProviders(<RelationReview project="acme" />);
-    await waitFor(() => expect(screen.getByRole("button", { name: "排除" })).toBeEnabled());
+    await waitFor(
+      () => expect(screen.getByRole("button", { name: "排除" })).toBeEnabled(),
+      FIRST_SETTLE,
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "排除" }));
     expect(await screen.findByRole("alertdialog", { name: "確認排除" })).toBeInTheDocument();
@@ -282,7 +304,10 @@ describe("RelationReview", () => {
     } as never);
 
     renderWithProviders(<RelationReview project="acme" />);
-    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeEnabled());
+    await waitFor(
+      () => expect(screen.getByRole("button", { name: "保留" })).toBeEnabled(),
+      FIRST_SETTLE,
+    );
     fireEvent.click(screen.getByRole("button", { name: "保留" }));
     await waitFor(() => expect(post).toHaveBeenCalled());
 
@@ -328,7 +353,10 @@ describe("RelationReview", () => {
     } as never);
 
     renderWithProviders(<RelationReview project="acme" />);
-    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeEnabled());
+    await waitFor(
+      () => expect(screen.getByRole("button", { name: "保留" })).toBeEnabled(),
+      FIRST_SETTLE,
+    );
     fireEvent.click(screen.getByRole("button", { name: "保留" }));
     await waitFor(() => expect(post).toHaveBeenCalled());
 
@@ -473,9 +501,11 @@ describe("RelationReview", () => {
 
     renderWithProviders(<RelationReview project="acme" />);
     const keeps = () => screen.getAllByRole("button", { name: "保留" });
-    // names resolve → both rows unlock
-    await waitFor(() => expect(keeps()[0]).toBeEnabled());
-    await waitFor(() => expect(keeps()[1]).toBeEnabled());
+    // names resolve → both rows unlock (both rows read the same entity pair,
+    // so react-query dedupes the fetches — the two waits cover the same
+    // first-settle moment, budgeted for whichever row renders last)
+    await waitFor(() => expect(keeps()[0]).toBeEnabled(), FIRST_SETTLE);
+    await waitFor(() => expect(keeps()[1]).toBeEnabled(), FIRST_SETTLE);
 
     fireEvent.click(keeps()[0]);
     await waitFor(() => expect(keeps()[0]).toBeDisabled());
