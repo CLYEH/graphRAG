@@ -9,7 +9,11 @@ Catalog classes to read for FE diffs (each has 何時比對 + the full rule):
 - **Class 17** — cache-trust predicate × decision-surface four axes (lock
   predicate `isPending || isFetching || isError`; every decision entry point;
   idem-key grain trilogy; retry-the-goal vs retry-the-input). ANY review/
-  decision UI or cached render.
+  decision UI or cached render. **The lock predicate and restore-key axes
+  are MECHANIZED (H20c)**: new decision surfaces use `useDecisionLock` /
+  `useRestoreKeys` from `web/src/api/queries.ts` — re-deriving either
+  inline is a FAIL (that drift is what produced #108 P1); surface-specific
+  terms compose via the hook's `extra`, never replace the core.
 - **Class 19** — derived DAG of a multi-query page (which failure kills which
   cache; page-level vs local verdicts).
 - **Class 20** — mutation host lives at a non-unmounting level; one

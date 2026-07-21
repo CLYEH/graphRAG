@@ -1,10 +1,12 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 
 import {
   useDecideReviewTarget,
+  useDecisionLock,
   useEntity,
   useRelation,
   useRelationReviewList,
+  useRestoreKeys,
 } from "../api/queries";
 
 import type { Relation, ReviewTargetVerb } from "../api/queries";
@@ -75,7 +77,10 @@ function RelationRow({
   const [showEvidence, setShowEvidence] = useState(false);
 
   const namesUnresolved = src.isPending || dst.isPending || src.isError || dst.isError;
-  const locked = decide.isPending || namesUnresolved || listRefreshing;
+  // the shared class-17 lock (H20c) composed with this surface's extra term:
+  // the operator must SEE the pair before deciding (Codex #106 P1b/P1c);
+  // listRefreshing carries the parent list's isFetching||isError
+  const locked = useDecisionLock({ decide, extra: [namesUnresolved, listRefreshing] });
   const namesFailed = src.isError || dst.isError;
 
   const onApprove = () =>
@@ -84,20 +89,19 @@ function RelationRow({
     decide.mutate({ kind: "relation", targetId: r.id, verb: "reject", reason: null });
     setConfirmingReject(false);
   };
-  // ONE key per LOGICAL restore, retained across failed retries and cleared on
-  // success (Codex #108 R2 — a per-click key would double-record on a lost-
-  // response retry; the deterministic key would replay across rejection cycles).
-  const restoreKey = useRef<string | null>(null);
+  // ONE key per LOGICAL restore, not per click (Codex #108 R2) — the mint/
+  // retain/clear cycle semantics live on useRestoreKeys (H20c)
+  const restoreKeys = useRestoreKeys();
   const onRestore = () => {
-    const key = restoreKey.current ?? crypto.randomUUID();
-    restoreKey.current = key;
     decide.mutate(
-      { kind: "relation", targetId: r.id, verb: "approve", reason: null, idempotencyKey: key },
       {
-        onSuccess: () => {
-          restoreKey.current = null;
-        },
+        kind: "relation",
+        targetId: r.id,
+        verb: "approve",
+        reason: null,
+        idempotencyKey: restoreKeys.mint(r.id),
       },
+      { onSuccess: () => restoreKeys.clear(r.id) },
     );
   };
   const retryNames = () => {

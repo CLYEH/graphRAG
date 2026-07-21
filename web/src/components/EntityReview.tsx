@@ -1,6 +1,11 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 
-import { useDecideReviewTarget, useEntityReviewList } from "../api/queries";
+import {
+  useDecideReviewTarget,
+  useDecisionLock,
+  useEntityReviewList,
+  useRestoreKeys,
+} from "../api/queries";
 
 import type { Entity, ReviewTargetVerb } from "../api/queries";
 
@@ -71,11 +76,9 @@ export function EntityReview({ project }: { project: string }) {
   // the entity id awaiting a reject confirm (one at a time; queue view only)
   const [confirmingReject, setConfirmingReject] = useState<string | null>(null);
 
-  // lock on isError too: if the post-decision refetch FAILS, react-query keeps
-  // the old pages and clears isFetching while setting isError — the decided row
-  // would otherwise re-enable and an opposite verb would silently reverse the
-  // decision just made (Codex #108 P1). Decisions stay locked until a clean load.
-  const locked = decide.isPending || list.isFetching || list.isError;
+  // the shared class-17 lock predicate (H20c) — isError never unlocks
+  // (Codex #108 P1); the full rationale lives on useDecisionLock
+  const locked = useDecisionLock({ decide, list });
 
   const onApprove = (id: string) =>
     decide.mutate({ kind: "entity", targetId: id, verb: "approve", reason: null });
@@ -83,20 +86,19 @@ export function EntityReview({ project }: { project: string }) {
     decide.mutate({ kind: "entity", targetId: id, verb: "reject", reason: null });
     setConfirmingReject(null);
   };
-  // ONE key per LOGICAL restore, not per click (Codex #108 R2): the key is minted
-  // on the first attempt for a row and RETAINED across failed retries — a lost
-  // response replayed with the same key returns the stored 200 instead of
-  // appending a second approval (whose newer latest-wins timestamp could override
-  // an intervening decision). Cleared on success, so a later reject→restore cycle
-  // mints a fresh key (the deterministic `${id}:approve` would replay across
-  // cycles — see useDecideReviewTarget).
-  const restoreKeys = useRef(new Map<string, string>());
+  // ONE key per LOGICAL restore, not per click (Codex #108 R2) — the mint/
+  // retain/clear cycle semantics live on useRestoreKeys (H20c)
+  const restoreKeys = useRestoreKeys();
   const onRestore = (id: string) => {
-    const key = restoreKeys.current.get(id) ?? crypto.randomUUID();
-    restoreKeys.current.set(id, key);
     decide.mutate(
-      { kind: "entity", targetId: id, verb: "approve", reason: null, idempotencyKey: key },
-      { onSuccess: () => restoreKeys.current.delete(id) },
+      {
+        kind: "entity",
+        targetId: id,
+        verb: "approve",
+        reason: null,
+        idempotencyKey: restoreKeys.mint(id),
+      },
+      { onSuccess: () => restoreKeys.clear(id) },
     );
   };
 

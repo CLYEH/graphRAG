@@ -1,4 +1,5 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo, useRef } from "react";
 
 import { api } from "./client";
 import { isPathAddressable } from "../project/projectRoute";
@@ -637,6 +638,65 @@ export function useDecideReviewTarget(project: string) {
       void queryClient.invalidateQueries({ queryKey: [kind, project, targetId] });
     },
   });
+}
+
+// --- decision-surface shared predicates (H20c; lesson-catalog class 17) ----------
+
+type DecisionLockInputs = {
+  /** the decide mutation observer — pending means a decision is in flight */
+  decide: { isPending: boolean };
+  /** the queue query the rows come from — refreshing or refetch-FAILED means
+   *  the rows on screen may not be the server's truth */
+  list?: { isFetching: boolean; isError: boolean };
+  /** surface-specific extra lock terms (see-the-pair resolution, scope
+   *  freeze, …) — composed, never a replacement for the core terms */
+  extra?: readonly boolean[];
+};
+
+/** The ONE lock predicate every decision surface derives its affordances
+ * from, so a new surface reuses it instead of re-deriving (and drifting).
+ * `isError` must NEVER unlock (Codex #108 P1): a failed post-decision
+ * refetch keeps the old rows on screen, clears `isFetching`, and sets
+ * `isError` — a predicate without the error term re-enables the decided row
+ * and an opposite verb would silently reverse the decision just made.
+ * `isFetching` covers the stale-while-revalidate window after a decision
+ * (Codex #106 P1d: a second decision there re-hits the now-terminal target
+ * and 409s). Confirm-CANCEL buttons deliberately gate on `decide.isPending`
+ * alone — backing out must stay possible during a refetch. */
+export function useDecisionLock({ decide, list, extra = [] }: DecisionLockInputs): boolean {
+  return (
+    decide.isPending ||
+    (list !== undefined && (list.isFetching || list.isError)) ||
+    extra.some(Boolean)
+  );
+}
+
+/** ONE idempotency key per LOGICAL operation, not per click (Codex #108 R2;
+ * class 17's idem-key trilogy): `mint` creates the key on the first attempt
+ * for a target and RETAINS it across failed retries — a lost-response retry
+ * replays the stored 200 instead of appending a second record (whose newer
+ * latest-wins timestamp could override an intervening decision). `clear` on
+ * success, so a later cycle (reject → restore → reject) mints fresh — the
+ * deterministic `${id}:${verb}` key would replay an EARLIER cycle's stored
+ * response. Map-keyed by target id: a parent rendering many rows and a
+ * per-row instance (one id) both work identically. */
+export function useRestoreKeys(): { mint: (id: string) => string; clear: (id: string) => void } {
+  const keys = useRef(new Map<string, string>());
+  return useMemo(
+    () => ({
+      mint: (id: string) => {
+        const existing = keys.current.get(id);
+        if (existing !== undefined) return existing;
+        const minted = crypto.randomUUID();
+        keys.current.set(id, minted);
+        return minted;
+      },
+      clear: (id: string) => {
+        keys.current.delete(id);
+      },
+    }),
+    [],
+  );
 }
 
 // The graph invocation carried in the contract's `options` channel (DESIGN §27.6).
