@@ -606,7 +606,16 @@ function McpSection({ project }: { project: string }) {
   // there is the same failure the panel exists to prevent (the operator thinks
   // the URL was copied and pastes something else), so an unavailable or
   // rejecting clipboard must SAY SO and point at manual selection.
-  const [copyState, setCopyState] = useState<"idle" | "ok" | "failed">("idle");
+  //
+  // The outcome is stored WITH the url it is about, and the badges render only
+  // while that url is still the one on screen (Codex #113 R4): a refetch can
+  // replace the url without remounting this section, and「已複製」beside a NEW
+  // url while the clipboard holds the OLD one is again the exact bug this
+  // panel exists to prevent. Same for a stale「複製失敗」. Deriving by
+  // comparison (rather than resetting in an effect) also covers the
+  // click→promise-resolution race for free: a late outcome carries the old
+  // url and simply never matches.
+  const [copied, setCopied] = useState<{ url: string; ok: boolean } | null>(null);
 
   return (
     <section className="settings__section" aria-label="MCP 連線資訊">
@@ -637,21 +646,24 @@ function McpSection({ project }: { project: string }) {
             <button
               type="button"
               onClick={() => {
-                const written = navigator.clipboard?.writeText(info.data.url);
+                const url = info.data.url;
+                const written = navigator.clipboard?.writeText(url);
                 if (written === undefined) {
-                  setCopyState("failed"); // no Clipboard API (non-secure context)
+                  setCopied({ url, ok: false }); // no Clipboard API (non-secure context)
                   return;
                 }
                 void written.then(
-                  () => setCopyState("ok"),
-                  () => setCopyState("failed"),
+                  () => setCopied({ url, ok: true }),
+                  () => setCopied({ url, ok: false }),
                 );
               }}
             >
               複製
             </button>
-            {copyState === "ok" && <span className="settings__muted"> 已複製</span>}
-            {copyState === "failed" && (
+            {copied?.ok === true && copied.url === info.data.url && (
+              <span className="settings__muted"> 已複製</span>
+            )}
+            {copied?.ok === false && copied.url === info.data.url && (
               <span className="settings__line--error"> 複製失敗,請手動選取網址</span>
             )}
           </dd>

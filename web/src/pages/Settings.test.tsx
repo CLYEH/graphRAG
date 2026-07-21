@@ -906,4 +906,41 @@ describe("Settings — MCP 連線資訊", () => {
       Object.defineProperty(navigator, "clipboard", { value: original, configurable: true });
     }
   });
+
+  it("drops「已複製」when a refetch replaces the url — the badge must not vouch for a clipboard holding the OLD address", async () => {
+    // Codex #113 R4: the gateway host/port can change server-side, and React
+    // Query then swaps info.data.url in place WITHOUT remounting the section.
+    // A copy badge that survives the swap tells the operator the NEW url is in
+    // the clipboard while the OLD one is — the exact stale-address paste this
+    // panel exists to prevent. The badge must be a fact about the url it sits
+    // beside, not about some url that was once on screen.
+    let calls = 0;
+    vi.spyOn(api, "GET").mockImplementation(((path: string) => {
+      if (path !== "/projects/{project}/mcp") return Promise.resolve(projectBody(FULL_CONFIG));
+      calls += 1;
+      return Promise.resolve(calls === 1 ? mcpBody() : mcpBody("http://10.0.0.7:9300/mcp/acme"));
+    }) as never);
+    const original = navigator.clipboard;
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: () => Promise.resolve() },
+      configurable: true,
+    });
+    try {
+      renderSettings();
+      fireEvent.click(await screen.findByRole("button", { name: "複製" }));
+      expect(await screen.findByText("已複製")).toBeInTheDocument();
+
+      // a window refocus triggers React Query's revalidation; the mock now
+      // serves a DIFFERENT url (the operator moved the gateway)
+      await act(async () => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+
+      expect(await screen.findByText("http://10.0.0.7:9300/mcp/acme")).toBeInTheDocument();
+      expect(screen.queryByText("已複製")).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, "clipboard", { value: original, configurable: true });
+    }
+  });
 });
