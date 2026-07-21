@@ -5,6 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: d673e708-e836-4b8a-8fc7-cb33527c5fc3
+  modified: 2026-07-21T05:52:05.504Z
 ---
 
 散落在已刪除記憶檔裡仍然「活著」的 follow-ups,集中一處(狀態以 TASKS.md/
@@ -40,6 +41,17 @@ GitHub 為準;立案或了結後從本檔劃掉):
 - **MCP auth**:CFG1 gateway 不帶 auth(owner 2026-07-17 預設同意);對外
   曝露後 §23 placeholder 會變真需求,屆時是 DR-002 相關 owner 決策
   (凍結 enum 無 auth 錯誤碼)。
+- **MCP 部署後對外開放**(owner 2026-07-21:「之後如果佈署之後要能開」——
+  僅記需求,未定方案):屆時配套=(i)綁定非 loopback(`serve-mcp --host`/
+  `GRAPHRAG_MCP_HTTP_HOST`)+(ii)`GRAPHRAG_MCP_PUBLIC_HOST` 設對外位址
+  (Console 廣告面,MCP1 已做)+(iii)防火牆/隧道擇一(區網/Tailscale/
+  cloudflared 之別=給誰用)+(iv)**auth 前置**(公網裸奔 auth:none 不可,
+  接上一條)。
+- **空 stages 的 run_build 本體 ~4s**(H20b 期間實測,#115):orchestrator 對
+  「六個 no-op stage」的 build 也要 4 秒(疑似 per-stage 連線/交易開銷或
+  store client 建構),曾把既有 lock 測試的 5s 等待預算壓到確定性餓死
+  (該測試已放寬至 30s 上限)。值得一次 profiling:若是 eager 建構
+  (class 13)或逐 stage 重連,修掉能讓整個 integration tier 提速。
 - **GOV2 gap-list FE 片**(facet api 已於 #109 落地〔GOV2-facet:`filter[confidence]=low`/
   `filter[evidence]=missing`,述詞與 §19 gauge 同 `LOW_CONFIDENCE_BELOW` 常數〕;剩 FE):
   治理頁加「低信心」「缺證據」兩分頁(重用 RelationReview 模式)+ Health `TAB_FOR_COUNT`
