@@ -72,4 +72,9 @@ case "$BRANCH" in
     ;;
 esac
 
+# --- H20d: memory stale-claims (warning annotations only — NEVER gates) ---
+# `|| true` is deliberate fail-open: this tier is advisory (owner decision,
+# TASKS H20d), so a bug in the warning script must not block a PR.
+bash "$(dirname "$0")/memory-stale-claims.sh" TASKS.md .claude/memory || true
+
 exit "$fail"
