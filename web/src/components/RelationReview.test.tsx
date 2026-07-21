@@ -100,8 +100,14 @@ describe("RelationReview", () => {
 
     renderWithProviders(<RelationReview project="acme" />);
 
-    // both actions locked while the pair is unknown
-    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeDisabled());
+    // both actions locked while the pair is unknown. Explicit budget (H21):
+    // this waitFor spans the component's FIRST render after two react-query
+    // fetches settle, which under full-suite fork fan-out is the slowest kind
+    // of wait — the default 1s budget starved deterministically on a
+    // many-core box (#112) while every per-interaction wait stayed green.
+    await waitFor(() => expect(screen.getByRole("button", { name: "保留" })).toBeDisabled(), {
+      timeout: 5000,
+    });
     expect(screen.getByRole("button", { name: "排除" })).toBeDisabled();
   });
 

@@ -44,3 +44,10 @@ FE-specific operational rules:
   state across an identity flip is stale until proven otherwise (#82).
 - **vitest `globals: false` needs explicit RTL `cleanup()`**; npm `overrides`
   for peer conflicts (#65).
+- **Timing-sensitive `waitFor` budgets assume fork fan-out** (H21): the fork
+  pool is capped in `web/vite.config.ts` (`maxWorkers`) because per-core
+  fan-out starved 1s `waitFor` budgets deterministically on many-core boxes
+  (isolated green / full suite red / CI green — #112). A `waitFor` that spans
+  a component's FIRST settle (mount + query resolution), rather than a single
+  interaction, is the slow kind — give it an explicit `timeout` with a comment
+  instead of relying on the 1s default.

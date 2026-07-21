@@ -1,3 +1,5 @@
+import { availableParallelism } from "node:os";
+
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
 
@@ -23,5 +25,12 @@ export default defineConfig({
     environment: "jsdom",
     globals: false,
     setupFiles: ["./src/setupTests.ts"],
+    // Cap the fork fan-out (H21): vitest's default = one worker per core, and
+    // on a many-core box the full suite oversubscribes the CPU enough that
+    // testing-library's 1s waitFor budgets starve DETERMINISTICALLY
+    // (isolated file green / full suite red / CI green — #112). min() keeps
+    // small CI runners (2–4 cores) at their current worker count; only boxes
+    // with more cores are capped.
+    maxWorkers: Math.min(4, availableParallelism()),
   },
 });
