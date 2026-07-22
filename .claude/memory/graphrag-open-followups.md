@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: d673e708-e836-4b8a-8fc7-cb33527c5fc3
-  modified: 2026-07-21T05:52:05.504Z
+  modified: 2026-07-22T03:12:05.804Z
 ---
 
 散落在已刪除記憶檔裡仍然「活著」的 follow-ups,集中一處(狀態以 TASKS.md/
@@ -47,6 +47,11 @@ GitHub 為準;立案或了結後從本檔劃掉):
   (Console 廣告面,MCP1 已做)+(iii)防火牆/隧道擇一(區網/Tailscale/
   cloudflared 之別=給誰用)+(iv)**auth 前置**(公網裸奔 auth:none 不可,
   接上一條)。
+- **push-gate 盲點:驗工作樹、不驗 outgoing commit**(2026-07-22 #116 實證):
+  已審修正未 commit 時,工作樹 hash 與 receipt 相符→push 放行,但推出去的
+  HEAD 不含修正(當場發生一次,一分鐘內補正;gate-2 之後兩輪都以人工
+  flag 防守)。可機械化:push gate 加一條「`git status --porcelain` 除
+  untracked 外必須乾淨」(有 uncommitted tracked 變更即擋),H-task 量級。
 - **空 stages 的 run_build 本體 ~4s**(H20b 期間實測,#115):orchestrator 對
   「六個 no-op stage」的 build 也要 4 秒(疑似 per-stage 連線/交易開銷或
   store client 建構),曾把既有 lock 測試的 5s 等待預算壓到確定性餓死
