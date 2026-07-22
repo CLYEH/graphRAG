@@ -64,12 +64,22 @@ export function RelationRow({
   decide,
   list,
   mode,
+  redecidable = false,
 }: {
   project: string;
   r: Relation;
   decide: ReturnType<typeof useDecideReviewTarget>;
   list: { isFetching: boolean; isError: boolean };
   mode: "queue" | "restore";
+  /** Re-decidable surface (the gap lists): rows never LEAVE the list, so a
+   * reject→restore→reject cycle is reachable and the decided-once
+   * deterministic `${id}:${verb}` key would replay an EARLIER cycle's stored
+   * 200 — silently no-oping the newer decision (Codex #119 P1). Such
+   * surfaces mint one key per LOGICAL decision (retained across failed
+   * retries, cleared on success), exactly the restore discipline. The review
+   * QUEUE keeps the deterministic default: a decision removes its row, so
+   * each (target, verb) is decided at most once from there. */
+  redecidable?: boolean;
 }) {
   const src = useEntity(project, r.src_entity_id);
   const dst = useEntity(project, r.dst_entity_id);
@@ -85,15 +95,34 @@ export function RelationRow({
   const locked = useDecisionLock({ decide, list, extra: [namesUnresolved] });
   const namesFailed = src.isError || dst.isError;
 
+  // ONE key per LOGICAL operation, not per click (Codex #108 R2) — the mint/
+  // retain/clear cycle semantics live on useRestoreKeys (H20c). Restore always
+  // mints; queue decisions mint only on a redecidable surface (see the prop).
+  const restoreKeys = useRestoreKeys();
   const onApprove = () =>
-    decide.mutate({ kind: "relation", targetId: r.id, verb: "approve", reason: null });
+    decide.mutate(
+      {
+        kind: "relation",
+        targetId: r.id,
+        verb: "approve",
+        reason: null,
+        ...(redecidable ? { idempotencyKey: restoreKeys.mint(`${r.id}:approve`) } : {}),
+      },
+      redecidable ? { onSuccess: () => restoreKeys.clear(`${r.id}:approve`) } : undefined,
+    );
   const onConfirmReject = () => {
-    decide.mutate({ kind: "relation", targetId: r.id, verb: "reject", reason: null });
+    decide.mutate(
+      {
+        kind: "relation",
+        targetId: r.id,
+        verb: "reject",
+        reason: null,
+        ...(redecidable ? { idempotencyKey: restoreKeys.mint(`${r.id}:reject`) } : {}),
+      },
+      redecidable ? { onSuccess: () => restoreKeys.clear(`${r.id}:reject`) } : undefined,
+    );
     setConfirmingReject(false);
   };
-  // ONE key per LOGICAL restore, not per click (Codex #108 R2) — the mint/
-  // retain/clear cycle semantics live on useRestoreKeys (H20c)
-  const restoreKeys = useRestoreKeys();
   const onRestore = () => {
     decide.mutate(
       {

@@ -42,6 +42,9 @@ export function RelationGapList({ project, facet }: { project: string; facet: Re
               // (incl. #108 P1's isError-never-unlocks) lives in the shared hook
               list={list}
               mode="queue"
+              // rows never leave a gap list — re-decision cycles are reachable,
+              // so decisions mint per-logical-op keys (Codex #119 P1)
+              redecidable
             />
           ))}
         </ul>
