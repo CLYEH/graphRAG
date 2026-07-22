@@ -60,8 +60,13 @@ EXEMPT_PREDICATES: dict[tuple[str, str], str] = {
 
 def _normalized_predicate(text: object) -> str:
     """Collapse the cosmetic differences between metadata text and
-    ``pg_get_expr`` rendering (parens, casing, whitespace)."""
-    return re.sub(r"[\s()]+", " ", str(text)).strip().lower()
+    ``pg_get_expr`` rendering: parens, casing, whitespace, and the type
+    casts pg adds (``'active'::text``) — metadata says ``status = 'active'``,
+    the catalog says ``((status = 'active'::text))``. Single-word cast names
+    only (no ``double precision`` here; a new multi-word cast would surface
+    as a loud parity mismatch, not a silent pass)."""
+    stripped = re.sub(r"::[a-z_]+", "", str(text))
+    return re.sub(r"[\s()]+", " ", stripped).strip().lower()
 
 
 #: Frozen identity keys (DESIGN §27.3/§27.4) that must each be pinned by a
@@ -245,6 +250,25 @@ def test_unique_key_columns_are_not_null_or_partial_exempt() -> None:
     assert violations == []
 
 
+def _metadata_partial_unique_sets(table: sa.Table) -> set[tuple[frozenset[str], str]]:
+    """(column-set, normalized predicate) per PARTIAL plain-column unique —
+    the identity a partial unique enforces is its columns AND its scope, so
+    parity must compare both (local codex #115: a migration dropping
+    relations_by_signature was invisible — the offline half reads metadata,
+    and every live query excluded partial indexes)."""
+    sets: set[tuple[frozenset[str], str]] = set()
+    for ix in table.indexes:
+        if not ix.unique:
+            continue
+        where = ix.dialect_options["postgresql"]["where"]
+        if where is None:
+            continue
+        cols = _plain_expr_cols(ix)
+        if cols:
+            sets.add((frozenset(cols), _normalized_predicate(where)))
+    return sets
+
+
 def _metadata_plain_unique_sets(table: sa.Table) -> set[frozenset[str]]:
     """Non-partial, plain-column unique column-sets (incl. the PK) — the
     shape both halves can compare exactly. Partial uniques are policy-checked
@@ -405,6 +429,26 @@ WHERE c.relnamespace = 'public'::regnamespace
 ORDER BY 1
 """
 
+# PARTIAL unique indexes with their predicates — excluded from
+# UNIQUE_INDEX_COLUMN_SETS_SQL on purpose (a partial unique is not a plain
+# identity), so they need their own parity channel (local codex #115)
+PARTIAL_UNIQUE_INDEX_SQL = f"""
+SELECT c.relname AS tbl, i.indnkeyatts AS nkeys,
+       (SELECT array_agg(att.attname ORDER BY att.attname)
+          FROM generate_series(0, i.indnkeyatts - 1) AS g(k)
+          JOIN pg_attribute att
+            ON att.attrelid = i.indrelid AND att.attnum = i.indkey[g.k]) AS cols,
+       pg_get_expr(i.indpred, i.indrelid) AS pred
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indrelid
+WHERE c.relnamespace = 'public'::regnamespace
+  AND {APP_RELKIND_FILTER}
+  AND i.indisunique
+  AND i.indpred IS NOT NULL
+  AND i.indisvalid
+ORDER BY 1
+"""
+
 LIVE_COLUMNS_SQL = f"""
 SELECT c.relname AS tbl, a.attname AS name
 FROM pg_attribute a
@@ -544,6 +588,13 @@ async def test_live_schema_matches_metadata_instance_sets(migrated: None) -> Non
                     (tuple(cols), ref_tbl, tuple(ref_cols), DELTYPE[deltype])
                 )
             live_uniques = _live_unique_sets(await _rows(conn, UNIQUE_INDEX_COLUMN_SETS_SQL))
+            live_partials: dict[str, set[tuple[frozenset[str], str]]] = {}
+            for tbl, nkeys, cols, pred in await _rows(conn, PARTIAL_UNIQUE_INDEX_SQL):
+                if cols is None or len(cols) != nkeys:
+                    continue
+                live_partials.setdefault(tbl, set()).add(
+                    (frozenset(cols), _normalized_predicate(pred))
+                )
 
             for table in metadata.tables.values():
                 name = table.name
@@ -561,6 +612,12 @@ async def test_live_schema_matches_metadata_instance_sets(migrated: None) -> Non
                 assert {s for t, s in live_uniques if t == name} == (
                     _metadata_plain_unique_sets(table)
                 ), name
+                # partial uniques carry an identity too (columns AND scope) —
+                # a dropped relations_by_signature must fail HERE, not stay
+                # invisible to every query that excludes partials (codex #115)
+                assert live_partials.get(name, set()) == (_metadata_partial_unique_sets(table)), (
+                    name
+                )
     finally:
         await engine.dispose()
 
