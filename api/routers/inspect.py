@@ -23,6 +23,7 @@ dedicated code lands.
 
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -46,7 +47,7 @@ from api.registry_errors import translate_registry_error
 from api.routers._query import reject_unsupported_query, single_filter_value
 from api.schemas import chunk_dto, document_dto, entity_dto, relation_dto, relation_evidence_dto
 from core.mcp.policy import PolicyError, query_policy_from_mapping
-from core.metadata.schema import filterable_attributes
+from core.metadata.schema import MetadataConfigError, filterable_attributes
 from core.observability.health import LOW_CONFIDENCE_BELOW
 from core.query.graph import subgraph_context
 from core.registry import ProjectNotFoundError, get_project
@@ -183,13 +184,23 @@ def _typed_metadata_value(raw: str, declared: str, name: str) -> str | float | i
             return int(raw)
         except ValueError:
             try:
-                return float(raw)
+                parsed = float(raw)
             except ValueError as exc:
                 raise ApiError(
                     ErrorCode.VALIDATION_ERROR,
                     f"filter[{name}] expects a number (schema-declared type)",
                     details={f"filter[{name}]": raw},
                 ) from exc
+            # NaN/Infinity/1e999 parse as floats but JSONB cannot carry them —
+            # unchecked they 500 at bind time; the upload path rejects the same
+            # class before JSONB (uploads._finite_float), so the filter must too
+            if not math.isfinite(parsed):
+                raise ApiError(
+                    ErrorCode.VALIDATION_ERROR,
+                    f"filter[{name}] expects a finite number",
+                    details={f"filter[{name}]": raw},
+                ) from None
+            return parsed
     if declared == "boolean":
         if raw == "true":
             return True
@@ -221,7 +232,15 @@ async def list_documents_endpoint(
     project_row = await get_project(conn, project)
     if project_row is None:
         raise translate_registry_error(ProjectNotFoundError(project))
-    fattrs = filterable_attributes(dict(project_row.config or {}))
+    try:
+        fattrs = filterable_attributes(dict(project_row.config or {}))
+    except MetadataConfigError as exc:
+        # a malformed metadata_schema is an operator-fixable config problem —
+        # a typed 400 (the uploads/query routers' discipline), never an opaque
+        # 500 that makes every documents list unusable for the project
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR, str(exc), details={"metadata_schema": "invalid"}
+        ) from exc
     # reserved: the lifecycle facet owns filter[status] — a filterable attr of
     # that name is unreachable here (declare a different name); silently
     # letting it shadow the lifecycle facet would flip the meaning of an

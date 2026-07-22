@@ -935,3 +935,39 @@ def test_metadata_attr_named_status_is_reserved_for_the_lifecycle_facet(
     assert r.status_code == 200
     where_strs = [str(w) for w in repo.calls[-1]["where"]]
     assert not any("@>" in w for w in where_strs), where_strs
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "Infinity", "1e999"])
+def test_non_finite_number_filters_are_rejected_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo], bad: str
+) -> None:
+    # Codex #120 R1: NaN/Infinity/overflow parse as floats but JSONB cannot
+    # carry them - unchecked they 500 at bind time; a client-controlled
+    # filter value must be a typed 400 (the uploads _finite_float twin)
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[rating]": bad})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_malformed_metadata_schema_is_a_400_not_a_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R1: a malformed metadata_schema in the freely writable config
+    # is operator-fixable - the documents list must say so (typed 400, the
+    # uploads/query discipline), never turn every request into an opaque 500
+    config = {"metadata_schema": {"attributes": {"t": {"filterable": True}}}}  # missing type
+
+    async def fake_get_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(name=name, config=config)
+
+    async def fake_resolve(conn: Any, project: str) -> Any:
+        return SimpleNamespace(project=project, build_id=_BUILD)
+
+    _stub(monkeypatch, "get_project", fake_get_project)
+    _stub(monkeypatch, "_resolve_active_binding", fake_resolve)
+
+    r = client.get("/projects/p/documents")
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert "type is required" in r.json()["error"]["message"]
