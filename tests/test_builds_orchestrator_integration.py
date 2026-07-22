@@ -645,7 +645,11 @@ async def test_finalize_holds_the_job_lock_across_recording(
         job_id = await _new_job(engine, project)
         runner = asyncio.create_task(run_build(engine, project, job_id, _stages([])))
         try:
-            await asyncio.wait_for(entered.wait(), timeout=5.0)  # terminal txn holds the lock
+            # generous budget (H20b, first-settle twin of the H21 FE lesson):
+            # this wait spans the ENTIRE build up to the terminal txn, and a
+            # bare empty-stage run_build measured 4.03s on a busy dev box —
+            # 5s left near-zero headroom and starved deterministically
+            await asyncio.wait_for(entered.wait(), timeout=30.0)
             async with engine.connect() as b:
                 await b.begin()
                 with pytest.raises(DBAPIError) as ei:  # the row is locked by the finalize
