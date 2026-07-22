@@ -57,6 +57,19 @@ EXEMPT_PREDICATES: dict[tuple[str, str], str] = {
     ("relations", "relation_signature"): "relation_signature is not null",
 }
 
+#: (table, index-name) pairs allowed to have EXPRESSION members in a UNIQUE
+#: index. An expression's nullability cannot be introspected without parsing
+#: SQL text (class 14 — we don't), and Postgres stores attnum 0 for the slot,
+#: so both halves would otherwise silently SKIP the member (Codex #115 R2: a
+#: unique over ``lower(email)`` with nullable email admits repeated NULL keys
+#: unseen). Every expression unique must therefore be exempted BY NAME with a
+#: nullability justification, or the suite fails loudly.
+#: merge_candidates_pair_unique: LEAST/GREATEST over left/right_entity_id —
+#: both NOT NULL (pinned by the column tests), so no NULL key can form.
+EXPRESSION_UNIQUES_OK: set[tuple[str, str]] = {
+    ("merge_candidates", "merge_candidates_pair_unique"),
+}
+
 
 def _normalized_predicate(text: object) -> str:
     """Collapse the cosmetic differences between metadata text and
@@ -222,21 +235,24 @@ def test_unique_key_columns_are_not_null_or_partial_exempt() -> None:
     column silently disables the uniqueness for every NULL-carrying row (the
     no-op-value escape, class 1). The only legal shape for nullable-unique is
     a PARTIAL index whose predicate is exactly `col IS NOT NULL` — pinned per
-    pair in the shared exemption corpus."""
+    pair in the shared exemption corpus. Members are read from
+    ``ix.expressions`` (NOT ``Index.columns``, which silently drops
+    expression members — Codex #115 R2): an EXPRESSION member's nullability
+    is un-introspectable without parsing SQL text (class 14 — we don't), so
+    it is a violation unless the index is name-exempted in
+    EXPRESSION_UNIQUES_OK with a nullability justification."""
     violations: list[tuple[str, str]] = []
     for table in metadata.tables.values():
-        uniques: list[tuple[tuple[str, ...], object]] = [
-            (tuple(ix.columns.keys()), ix.dialect_options["postgresql"]["where"])
-            for ix in table.indexes
-            if ix.unique
-        ]
-        uniques.extend(
-            (tuple(c.columns.keys()), None)
-            for c in table.constraints
-            if isinstance(c, sa.UniqueConstraint)
-        )
-        for cols, where in uniques:
-            for name in cols:
+        for ix in table.indexes:
+            if not ix.unique:
+                continue
+            where = ix.dialect_options["postgresql"]["where"]
+            for expr in ix.expressions:
+                name = _member_col(expr)
+                if name is None:
+                    if (table.name, str(ix.name)) not in EXPRESSION_UNIQUES_OK:
+                        violations.append((table.name, f"expression member in {ix.name}"))
+                    continue
                 if not table.columns[name].nullable:
                     continue
                 expected = EXEMPT_PREDICATES.get((table.name, name))
@@ -246,6 +262,13 @@ def test_unique_key_columns_are_not_null_or_partial_exempt() -> None:
                     and _normalized_predicate(where) == expected
                 )
                 if not ok:
+                    violations.append((table.name, name))
+        for c in table.constraints:
+            if not isinstance(c, sa.UniqueConstraint):
+                continue
+            for name in c.columns.keys():  # noqa: SIM118 — ColumnCollection iteration yields Columns, not names
+                if table.columns[name].nullable:
+                    # constraints have no partial form — nullable is always a violation
                     violations.append((table.name, name))
     assert violations == []
 
@@ -429,6 +452,24 @@ WHERE c.relnamespace = 'public'::regnamespace
 ORDER BY 1
 """
 
+# UNIQUE indexes containing EXPRESSION key slots (indkey[slot] = 0): their
+# member nullability is invisible to the attribute joins above, so each must
+# be name-exempted in EXPRESSION_UNIQUES_OK or fail loudly (Codex #115 R2)
+EXPRESSION_UNIQUE_SQL = f"""
+SELECT c.relname AS tbl, cl.relname AS name
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indrelid
+JOIN pg_class cl ON cl.oid = i.indexrelid
+WHERE c.relnamespace = 'public'::regnamespace
+  AND {APP_RELKIND_FILTER}
+  AND i.indisunique
+  AND EXISTS (
+    SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) AS g(k)
+    WHERE i.indkey[g.k] = 0
+  )
+ORDER BY 1, 2
+"""
+
 # PARTIAL unique indexes with their predicates — excluded from
 # UNIQUE_INDEX_COLUMN_SETS_SQL on purpose (a partial unique is not a plain
 # identity), so they need their own parity channel (local codex #115)
@@ -551,6 +592,14 @@ async def test_live_catalog_holds_every_universal_property(migrated: None) -> No
                 )
             ]
             assert violations == []
+            # expression slots are invisible to the attribute join above —
+            # every expression unique must be name-exempted (Codex #115 R2)
+            unexempted = [
+                (tbl, name)
+                for tbl, name in await _rows(conn, EXPRESSION_UNIQUE_SQL)
+                if (tbl, name) not in EXPRESSION_UNIQUES_OK
+            ]
+            assert unexempted == []
     finally:
         await engine.dispose()
 
@@ -666,6 +715,9 @@ async def test_catalog_queries_flag_a_planted_violator(migrated: None) -> None:
                     """
                 )
             )
+            # a unique over an EXPRESSION of a nullable column — the shape
+            # the attribute joins cannot see (Codex #115 R2)
+            await conn.execute(sa.text(f"CREATE UNIQUE INDEX {name}_expr ON {name} (lower(val))"))
             # the UNIQUE on val incidentally indexes val, not ref — the FK
             # on ref stays uncovered, which is exactly the plant
             assert (name, f"{name}_ref_fkey") in set(
@@ -683,6 +735,8 @@ async def test_catalog_queries_flag_a_planted_violator(migrated: None) -> None:
             assert (name, frozenset({"val"})) in _live_unique_sets(
                 await _rows(conn, UNIQUE_INDEX_COLUMN_SETS_SQL)
             )
+            # the expression-unique detector sees the lower(val) plant
+            assert (name, f"{name}_expr") in set(await _rows(conn, EXPRESSION_UNIQUE_SQL))
             await conn.rollback()
     finally:
         await engine.dispose()
