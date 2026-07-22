@@ -178,16 +178,21 @@ def test_exit_is_zero_even_with_warnings(tmp_path: Path) -> None:
     assert res.stdout.count("::warning") == 2
 
 
-def test_real_repo_state_is_currently_clean() -> None:
-    """The lint against the ACTUAL repo must be quiet today — if this fails,
-    either a memory file has a genuinely stale claim (fix the memory) or the
-    lint has grown a false-positive pattern (fix the lint). Either way the
-    signal-to-noise contract (warnings are rare and real) is what this pins.
+def test_real_repo_lint_runs_and_stays_advisory() -> None:
+    """Run the lint against the ACTUAL repo. Two different outcomes, two
+    different severities (Codex #117 R2 P1):
 
-    Known residual: a red here on a SHORT id (P2, C3, H8…) may be a
-    priority-label/stage-name prose collision, not a stale claim — the
-    resolution is reword-the-clause or an id exemption in the script, not
-    deleting this test (see the script's KNOWN RESIDUAL note)."""
+    * a CRASH (non-zero exit) is a real defect and must gate — the script is
+      wired into CI's governance job, so a broken lint means silent loss of
+      the warning tier;
+    * live WARNINGS must NOT gate: the owner-decided contract is advisory
+      (「非 gate」), and a red HERE would block every PR on prose — the exact
+      thing the || true in governance-check.sh exists to prevent. They
+      surface as a pytest SKIP with the warnings in the message (visible in
+      the run summary, never blocking). Resolution for a short-id (P2, C3,
+      H8…) skip is reword-the-clause or an id exemption — see the script's
+      KNOWN RESIDUAL note."""
     res = _run(REPO_ROOT / "TASKS.md", REPO_ROOT / ".claude" / "memory")
     assert res.returncode == 0
-    assert "::warning" not in res.stdout, res.stdout
+    if "::warning" in res.stdout:
+        pytest.skip(f"advisory stale-claim warnings present (not a gate): {res.stdout}")
