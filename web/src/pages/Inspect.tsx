@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { isScopeNeutral, useChunk, useChunks, useDocument, useDocuments } from "../api/queries";
 import { isPathAddressable, useActiveProject } from "../project/projectRoute";
@@ -323,6 +323,20 @@ function fmt(ts: string | null | undefined): string {
 
 // ---- the two tabs -----------------------------------------------------------
 
+//: SS1b documents search — mirrors the Graph page's server-side entity search
+const DOC_SEARCH_MAX = 256; // the contract's q maxLength
+
+// re-declared from Graph.tsx (page-local on purpose: a pages/ cross-import
+// would couple two routes for three lines)
+function useDebounced<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(id);
+  }, [value, delayMs]);
+  return debounced;
+}
+
 type TabProps = {
   project: string;
   selected: Selection | null;
@@ -331,54 +345,74 @@ type TabProps = {
 
 function DocumentsTab({ project, selected, onSelect }: TabProps) {
   const id = selected?.tab === "documents" ? selected.id : undefined;
-  const list = useDocuments(project);
+  const [search, setSearch] = useState("");
+  // debounced + trimmed: the QUERY the shown rows answer; q rides the hook's
+  // queryKey so a new search restarts from page 1 (SS1b, the Graph pattern)
+  const q = useDebounced(search.trim(), 300) || undefined;
+  const list = useDocuments(project, q);
+  const total = list.data?.pages[0]?.total;
   const detail = useDocument(project, id);
   const doc = detail.data;
 
   return (
-    <PagedList<Document>
-      label="documents"
-      columns={[
-        {
-          header: "文件",
-          // the row leads with the file NAME — the full uri (a filesystem path
-          // in disguise) rides the hover title and the detail pane (UXA3)
-          cell: (d) => <span title={d.source_uri}>{basename(d.source_uri)}</span>,
-        },
-        { header: "類型", cell: (d) => d.mime ?? "—" },
-        { header: "狀態", cell: (d) => (d.status === "ingested" ? "已匯入" : (d.status ?? "—")) },
-        { header: "匯入時間", cell: (d) => fmt(d.ingested_at) },
-      ]}
-      query={list}
-      selectedId={id}
-      onSelect={(rowId) => onSelect("documents", rowId)}
-      detail={
-        id && (
-          <Detail
-            title="Document"
-            isFetching={detail.isFetching}
-            isError={detail.isError}
-            error={detail.error}
-            fields={
-              doc && [
-                ["id", doc.id],
-                ["source_uri", doc.source_uri],
-                ["content_hash", doc.content_hash ?? "—"],
-                [
-                  "metadata",
-                  <pre key="metadata" className="inspect__pre">
-                    {blob(doc.metadata)}
-                  </pre>,
-                ],
-                // `raw` is detail-only — the list omits the key entirely, which is the
-                // whole reason a row click fetches.
-                ["raw", text(doc.raw)],
-              ]
-            }
-          />
-        )
-      }
-    />
+    <>
+      <label className="inspect__search">
+        搜尋
+        <input
+          type="search"
+          value={search}
+          maxLength={DOC_SEARCH_MAX}
+          placeholder="source_uri…"
+          onChange={(e) => setSearch(e.target.value)}
+        />
+      </label>
+      {/* the count is the server's exact total for THIS search — page 1's
+          meta.total, never a loaded-rows count (the honest number) */}
+      {q && total !== undefined ? <p className="inspect__hint">符合 {total} 筆</p> : null}
+      <PagedList<Document>
+        label="documents"
+        columns={[
+          {
+            header: "文件",
+            // the row leads with the file NAME — the full uri (a filesystem path
+            // in disguise) rides the hover title and the detail pane (UXA3)
+            cell: (d) => <span title={d.source_uri}>{basename(d.source_uri)}</span>,
+          },
+          { header: "類型", cell: (d) => d.mime ?? "—" },
+          { header: "狀態", cell: (d) => (d.status === "ingested" ? "已匯入" : (d.status ?? "—")) },
+          { header: "匯入時間", cell: (d) => fmt(d.ingested_at) },
+        ]}
+        query={list}
+        selectedId={id}
+        onSelect={(rowId) => onSelect("documents", rowId)}
+        detail={
+          id && (
+            <Detail
+              title="Document"
+              isFetching={detail.isFetching}
+              isError={detail.isError}
+              error={detail.error}
+              fields={
+                doc && [
+                  ["id", doc.id],
+                  ["source_uri", doc.source_uri],
+                  ["content_hash", doc.content_hash ?? "—"],
+                  [
+                    "metadata",
+                    <pre key="metadata" className="inspect__pre">
+                      {blob(doc.metadata)}
+                    </pre>,
+                  ],
+                  // `raw` is detail-only — the list omits the key entirely, which is the
+                  // whole reason a row click fetches.
+                  ["raw", text(doc.raw)],
+                ]
+              }
+            />
+          )
+        }
+      />
+    </>
   );
 }
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any
 
 import sqlalchemy as sa
@@ -34,11 +35,18 @@ from neo4j.exceptions import Neo4jError, ServiceUnavailable
 from api.deps import Conn, Graph, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
-from api.pagination import decode_chunk_cursor, decode_id_cursor, encode_cursor
+from api.pagination import (
+    decode_chunk_cursor,
+    decode_id_cursor,
+    decode_sorted_cursor,
+    encode_cursor,
+    encode_sorted_cursor,
+)
 from api.registry_errors import translate_registry_error
 from api.routers._query import reject_unsupported_query, single_filter_value
 from api.schemas import chunk_dto, document_dto, entity_dto, relation_dto, relation_evidence_dto
 from core.mcp.policy import PolicyError, query_policy_from_mapping
+from core.metadata.schema import filterable_attributes
 from core.observability.health import LOW_CONFIDENCE_BELOW
 from core.query.graph import subgraph_context
 from core.registry import ProjectNotFoundError, get_project
@@ -93,6 +101,110 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+#: COALESCE floor for the NULLABLE timestamp sorts (SS1b): NULL rows order as
+#: the epoch — deterministically OLDEST, so they land last under desc and
+#: first under asc; the cursor carries the coalesced value, keeping the
+#: keyset tuple total without a NOT NULL migration.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _sorted_page(
+    sort: str | None,
+    cursor: str | None,
+    id_col: Any,
+    where: list[Any],
+    *,
+    text_cols: dict[str, Any],
+    time_cols: dict[str, Any],
+) -> tuple[list[Any], Any]:
+    """ORDER BY + next-cursor minting for the SS1b sort allowlist.
+
+    ``sort`` arrives ALREADY validated by ``reject_unsupported_query``
+    (``extra_sorts``), so an unknown field here would be a wiring bug — it
+    raises KeyError loudly rather than falling back to a wrong order. The
+    default (``sort is None``) keeps the legacy untagged ``(id desc)``
+    cursor shape so in-flight pre-sort cursors stay valid; every sorted
+    order uses a TAGGED cursor bound to its sort spelling
+    (``decode_sorted_cursor`` rejects cross-sort replays). Non-unique sort
+    columns tie-break on ``id`` in the same direction, making every keyset
+    total."""
+    if sort == f"{id_col.name}:desc":
+        sort = None  # an explicit restatement of the default IS the default
+    if sort is None:
+        if cursor:
+            (after_id,) = decode_id_cursor(cursor)
+            where.append(id_col < after_id)
+
+        def mint_default(last: Any) -> str:
+            return encode_cursor((last.id,))
+
+        return [id_col.desc()], mint_default
+
+    field, _, direction = sort.partition(":")
+    ascending = direction == "asc"
+    if field in text_cols:
+        col = text_cols[field]
+        expr = col
+        types: tuple[type, ...] = (str, uuid.UUID)
+
+        def values_of(last: Any) -> tuple[Any, ...]:
+            return (getattr(last, col.name), last.id)
+
+    else:
+        col = time_cols[field]
+        expr = sa.func.coalesce(col, _EPOCH)
+        types = (datetime, uuid.UUID)
+
+        def values_of(last: Any) -> tuple[Any, ...]:
+            return (getattr(last, col.name) or _EPOCH, last.id)
+
+    if cursor:
+        after = decode_sorted_cursor(cursor, sort, types)
+        keyset = sa.tuple_(expr, id_col)
+        where.append(keyset > after if ascending else keyset < after)
+    order = [expr.asc(), id_col.asc()] if ascending else [expr.desc(), id_col.desc()]
+
+    def mint(last: Any) -> str:
+        return encode_sorted_cursor(sort, values_of(last))
+
+    return order, mint
+
+
+def _typed_metadata_value(raw: str, declared: str, name: str) -> str | float | int | bool:
+    """Cast a ``filter[<attr>]`` string to the attribute's DECLARED type for
+    JSONB containment — matching by the schema's type, not by guessing from
+    the spelling. Booleans are STRICT true/false (class 1: a "True"/"1" is a
+    caller typo, not a match-nothing predicate); numbers parse int-first so
+    the containment probe compares numerically either way."""
+    if declared == "string":
+        return raw
+    if declared == "number":
+        try:
+            return int(raw)
+        except ValueError:
+            try:
+                return float(raw)
+            except ValueError as exc:
+                raise ApiError(
+                    ErrorCode.VALIDATION_ERROR,
+                    f"filter[{name}] expects a number (schema-declared type)",
+                    details={f"filter[{name}]": raw},
+                ) from exc
+    if declared == "boolean":
+        if raw == "true":
+            return True
+        if raw == "false":
+            return False
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            f"filter[{name}] expects true or false (schema-declared type)",
+            details={f"filter[{name}]": raw},
+        )
+    raise ApiError(  # unreachable: loader vocabulary-checks declared types
+        ErrorCode.VALIDATION_ERROR, f"unsupported declared type {declared!r} for filter[{name}]"
+    )
+
+
 @router.get("/projects/{project}/documents")
 async def list_documents_endpoint(
     request: Request,
@@ -102,13 +214,33 @@ async def list_documents_endpoint(
     cursor: str | None = None,
     q: str | None = Query(None, min_length=1, max_length=256),
 ) -> dict[str, Any]:
-    reject_unsupported_query(request, "id", allowed_filters=frozenset({"status"}), search=True)
+    # the project row is fetched for its config: metadata_schema's filterable
+    # attributes become live filter[<attr>] facets (DR-010 rule 2 / review
+    # rule 8's SEARCH half, SS1b) — the allowlist is the schema itself, so a
+    # project that declares nothing filterable accepts nothing extra
+    project_row = await get_project(conn, project)
+    if project_row is None:
+        raise translate_registry_error(ProjectNotFoundError(project))
+    fattrs = filterable_attributes(dict(project_row.config or {}))
+    # reserved: the lifecycle facet owns filter[status] — a filterable attr of
+    # that name is unreachable here (declare a different name); silently
+    # letting it shadow the lifecycle facet would flip the meaning of an
+    # existing spelling
+    fattrs.pop("status", None)
+    docs = tables.documents
+    reject_unsupported_query(
+        request,
+        "id",
+        allowed_filters=frozenset({"status"} | fattrs.keys()),
+        search=True,
+        # SS1b sort expansion: recency (nullable — COALESCE keyset)
+        extra_sorts=frozenset({"ingested_at"}),
+    )
     # documents.status is an OPEN vocabulary (no DDL CHECK — the ingest
     # pipeline owns it), so the facet validates blankness only
     status = single_filter_value(request, "status")
     binding = await _bind(conn, project)
     repo = BuildScopedRepo.bound_to(conn, binding)
-    docs = tables.documents
     # SS1b: `q` searches source_uri (the document's visible identifier); content
     # search is the deferred metadata-indexing follow-up. Applied to BOTH the
     # page and the count so total matches the filtered set (a search restricts
@@ -118,14 +250,28 @@ async def list_documents_endpoint(
         filters.append(docs.c.status == status)
     if q is not None:
         filters.append(docs.c.source_uri.ilike(f"%{_escape_like(q)}%", escape="\\"))
+    for attr_name, declared in sorted(fattrs.items()):
+        raw = single_filter_value(request, attr_name)
+        if raw is None:
+            continue
+        value = _typed_metadata_value(raw, declared, attr_name)
+        # JSONB containment down the envelope path — served by the GIN
+        # jsonb_path_ops index (migration 0020); equality is by JSONB value,
+        # so int-vs-float spellings of one number still match
+        filters.append(docs.c.metadata.contains({"context": {"attributes": {attr_name: value}}}))
     total = await repo.fetch_count(docs, *filters)
     where = [*filters]
-    if cursor:
-        (after_id,) = decode_id_cursor(cursor)
-        where.append(docs.c.id < after_id)
-    rows = await repo.fetch_page(docs, *where, order_by=[docs.c.id.desc()], limit=limit + 1)
+    order_by, mint_cursor = _sorted_page(
+        request.query_params.get("sort"),
+        cursor,
+        docs.c.id,
+        where,
+        text_cols={},
+        time_cols={"ingested_at": docs.c.ingested_at},
+    )
+    rows = await repo.fetch_page(docs, *where, order_by=order_by, limit=limit + 1)
     page = rows[:limit]
-    next_cursor = encode_cursor((page[-1].id,)) if len(rows) > limit else None
+    next_cursor = mint_cursor(page[-1]) if len(rows) > limit else None
     return success(
         [document_dto(r) for r in page],
         **response_meta(request),
@@ -209,15 +355,21 @@ async def list_entities_endpoint(
     cursor: str | None = None,
     q: str | None = Query(None, min_length=1, max_length=256),
 ) -> dict[str, Any]:
+    ents = tables.entities
     reject_unsupported_query(
-        request, "id", allowed_filters=frozenset({"type", "status", "review_status"}), search=True
+        request,
+        "id",
+        allowed_filters=frozenset({"type", "status", "review_status"}),
+        search=True,
+        # SS1b sort expansion (owner-approved minimal set): the display name
+        # (NOT NULL, tie-broken on id) and recency (nullable — COALESCE keyset)
+        extra_sorts=frozenset({"canonical_name", "created_at"}),
     )
     etype = single_filter_value(request, "type")
     status = single_filter_value(request, "status", vocabulary=LIFECYCLE_STATUS)
     review_status = single_filter_value(request, "review_status", vocabulary=REVIEW_STATUS)
     binding = await _bind(conn, project)
     repo = BuildScopedRepo.bound_to(conn, binding)
-    ents = tables.entities
     # SS1b: `q` searches canonical_name (substring, case-insensitive). Applied to
     # both the count and the page so total reflects the searched set.
     filters = []
@@ -231,12 +383,17 @@ async def list_entities_endpoint(
         filters.append(ents.c.canonical_name.ilike(f"%{_escape_like(q)}%", escape="\\"))
     total = await repo.fetch_count(ents, *filters)
     where = [*filters]
-    if cursor:
-        (after_id,) = decode_id_cursor(cursor)
-        where.append(ents.c.id < after_id)
-    rows = await repo.fetch_page(ents, *where, order_by=[ents.c.id.desc()], limit=limit + 1)
+    order_by, mint_cursor = _sorted_page(
+        request.query_params.get("sort"),
+        cursor,
+        ents.c.id,
+        where,
+        text_cols={"canonical_name": ents.c.canonical_name},
+        time_cols={"created_at": ents.c.created_at},
+    )
+    rows = await repo.fetch_page(ents, *where, order_by=order_by, limit=limit + 1)
     page = rows[:limit]
-    next_cursor = encode_cursor((page[-1].id,)) if len(rows) > limit else None
+    next_cursor = mint_cursor(page[-1]) if len(rows) > limit else None
     return success(
         [entity_dto(r) for r in page],
         **response_meta(request),

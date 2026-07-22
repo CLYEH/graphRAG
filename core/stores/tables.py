@@ -310,6 +310,19 @@ documents = sa.Table(
 
 documents_by_build = sa.Index("documents_by_build", documents.c.project, documents.c.build_id)
 
+# SS1b (DR-010 rule 2 / review rule 8, the SEARCH half): schema-declared
+# filterable attributes are served by JSONB CONTAINMENT (@>) over the
+# metadata envelope — ONE GIN index covers every attribute key, present and
+# future, so a project adding a filterable field needs no new DDL.
+# jsonb_path_ops: smaller/faster than the default opclass and @> is the only
+# operator this query path uses.
+documents_metadata_gin = sa.Index(
+    "documents_metadata_gin",
+    documents.c.metadata,
+    postgresql_using="gin",
+    postgresql_ops={"metadata": "jsonb_path_ops"},
+)
+
 # DR-006: children reference their parent TOGETHER WITH build_id (composite
 # FKs), so a child row provably lives in its parent's build — cross-build
 # mixing (and cross-build cascade deletes) become unrepresentable instead of

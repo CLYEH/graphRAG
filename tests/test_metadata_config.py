@@ -20,6 +20,7 @@ from core.metadata.schema import (
     MetadataConfigError,
     MetadataValidationError,
     build_envelope,
+    filterable_attributes,
     load_metadata_exposure,
     load_metadata_schema,
 )
@@ -246,3 +247,44 @@ def test_build_envelope_defaults_empty_context_and_governance() -> None:
     assert envelope["context"] == {"title": None, "document_type": None, "attributes": {}}
     assert envelope["governance"] == {}
     assert envelope["system"]["original_filename"] is None
+
+
+# ---- SS1b: the filterable allowlist (rule 8 search half) -------------------------
+
+
+def test_filterable_attributes_returns_only_opted_in_attrs() -> None:
+    # WHY: rule 8 splits "show metadata" from "search BY metadata" - only the
+    # attrs a project explicitly marks filterable become list facets; absent
+    # flag = not filterable (opt-in, never opt-out)
+    config = {
+        "metadata_schema": {
+            "attributes": {
+                "topic": {"type": "string", "filterable": True},
+                "rating": {"type": "number", "filterable": True},
+                "internal": {"type": "string", "filterable": False},
+                "note": {"type": "string"},
+            }
+        }
+    }
+    assert filterable_attributes(config) == {"topic": "string", "rating": "number"}
+
+
+def test_filterable_attributes_empty_without_schema() -> None:
+    assert filterable_attributes({}) == {}
+
+
+def test_filterable_flag_must_be_a_real_boolean() -> None:
+    # class 1 strict-bool: a "true" STRING is a config typo, not an opt-in -
+    # silently treating it either way hides the mistake
+    config = {"metadata_schema": {"attributes": {"t": {"type": "string", "filterable": "true"}}}}
+    with pytest.raises(MetadataConfigError):
+        filterable_attributes(config)
+
+
+def test_filterable_attributes_reuses_the_strict_loader() -> None:
+    # a malformed schema must raise the SAME error the loader raises - not
+    # silently yield nothing-filterable (fail-closed would hide a broken
+    # schema behind an empty facet set)
+    config = {"metadata_schema": {"attributes": {"t": {"filterable": True}}}}  # missing type
+    with pytest.raises(MetadataConfigError):
+        filterable_attributes(config)

@@ -21,7 +21,11 @@ from fastapi.testclient import TestClient
 
 from api.app import create_app
 from api.deps import db_conn
-from api.pagination import decode_chunk_cursor, decode_id_cursor, encode_cursor
+from api.pagination import (
+    decode_chunk_cursor,
+    decode_id_cursor,
+    encode_cursor,
+)
 from core.stores.repo import NoActiveBuildError
 
 pytestmark = pytest.mark.contract
@@ -85,7 +89,9 @@ def _bindable(monkeypatch: pytest.MonkeyPatch) -> None:
     """Project exists and has an active build (the happy binding)."""
 
     async def fake_get_project(conn: Any, name: str) -> Any:
-        return SimpleNamespace(name=name)
+        # config rides along like the real row (the documents endpoint reads
+        # metadata_schema's filterable attributes from it)
+        return SimpleNamespace(name=name, config={})
 
     async def fake_resolve(conn: Any, project: str) -> Any:
         return SimpleNamespace(project=project, build_id=_BUILD)
@@ -777,3 +783,155 @@ def test_facet_vocabularies_match_the_ddl() -> None:
     assert set(REVIEW_STATUS) == set(
         _check_values(_tables.relations, "relations_review_status_valid")
     )
+
+
+# ---- SS1b sort expansion + metadata filterable facets ---------------------------
+
+
+def _filterable_project(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Binding stub whose project config declares filterable metadata attrs."""
+
+    config = {
+        "metadata_schema": {
+            "attributes": {
+                "topic": {"type": "string", "filterable": True},
+                "rating": {"type": "number", "filterable": True},
+                "public": {"type": "boolean", "filterable": True},
+                "note": {"type": "string"},  # NOT filterable
+                "status": {"type": "string", "filterable": True},  # reserved name
+            }
+        }
+    }
+
+    async def fake_get_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(name=name, config=config)
+
+    async def fake_resolve(conn: Any, project: str) -> Any:
+        return SimpleNamespace(project=project, build_id=_BUILD)
+
+    _stub(monkeypatch, "get_project", fake_get_project)
+    _stub(monkeypatch, "_resolve_active_binding", fake_resolve)
+
+
+@pytest.mark.parametrize(
+    ("path", "sort"),
+    [
+        ("/projects/p/entities", "canonical_name:asc"),
+        ("/projects/p/entities", "canonical_name:desc"),
+        ("/projects/p/entities", "created_at:asc"),
+        ("/projects/p/entities", "created_at:desc"),
+        ("/projects/p/documents", "ingested_at:asc"),
+        ("/projects/p/documents", "ingested_at:desc"),
+    ],
+)
+def test_ss1b_sorts_are_accepted_on_their_endpoints(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    repo: type[_FakeRepo],
+    path: str,
+    sort: str,
+) -> None:
+    # WHY: the owner-approved minimal sort set - accepted spellings must map
+    # to a real ORDER BY (the gate and the implementation share the spelling,
+    # so an accepted-but-unimplemented sort cannot exist)
+    _bindable(monkeypatch)
+    r = client.get(path, params={"sort": sort})
+    assert r.status_code == 200, r.text
+    field = sort.split(":")[0]
+    order_strs = [str(o) for o in repo.calls[-1]["order_by"]]
+    assert any(field in o for o in order_strs), order_strs
+    direction = "ASC" if sort.endswith(":asc") else "DESC"
+    assert all(direction in o for o in order_strs), order_strs  # tie-break same way
+
+
+def test_sorted_page_mints_a_tagged_cursor_bound_to_its_sort(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # WHY: a keyset token only means something relative to its ORDER BY - the
+    # sort rides inside the cursor, and replaying it under another sort is a
+    # loud 400, never a silent re-anchor (or a name parsed as a timestamp)
+    _bindable(monkeypatch)
+    rows = [_entity_row() for _ in range(3)]
+    repo.pages = rows
+    r = client.get("/projects/p/entities", params={"limit": 2, "sort": "canonical_name:asc"})
+    token = r.json()["meta"]["next_cursor"]
+    assert token is not None
+
+    ok = client.get("/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": token})
+    assert ok.status_code == 200
+
+    crossed = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": token})
+    assert crossed.status_code == 400
+    assert "issued under" in crossed.json()["error"]["message"]
+
+
+def test_legacy_default_cursor_still_pages_and_rejects_sorted_reuse(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # the pre-SS1b untagged (id,) cursor keeps working for the default order,
+    # and crossing it into a sorted request fails the arity check
+    _bindable(monkeypatch)
+    legacy = encode_cursor((uuid.uuid4(),))
+    assert client.get("/projects/p/entities", params={"cursor": legacy}).status_code == 200
+    crossed = client.get(
+        "/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": legacy}
+    )
+    assert crossed.status_code == 400
+
+
+def test_unknown_sort_fields_stay_rejected(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    _bindable(monkeypatch)
+    r = client.get("/projects/p/entities", params={"sort": "confidence:asc"})
+    assert r.status_code == 400
+    assert "supported sorts" in r.json()["error"]["message"]
+
+
+def test_filterable_metadata_attr_filters_by_containment(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # WHY: rule 8 search half - ONLY schema-declared filterable attrs become
+    # facets, matched by JSONB containment down the envelope path (the shape
+    # the GIN index serves)
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[topic]": "sea"})
+    assert r.status_code == 200, r.text
+    where_strs = [str(w) for w in repo.calls[-1]["where"]]
+    assert any("@>" in w for w in where_strs), where_strs
+
+
+def test_non_filterable_attr_is_rejected_loud(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # `note` exists in the schema but is NOT filterable - accepting it would
+    # promise an index-backed facet the schema never opted into
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[note]": "x"})
+    assert r.status_code == 400
+    assert "supported filters" in r.json()["error"]["message"]
+
+
+def test_metadata_number_and_boolean_values_are_typed(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    _filterable_project(monkeypatch)
+    # declared number: a non-number is a caller error, not a match-nothing
+    assert client.get("/projects/p/documents", params={"filter[rating]": "abc"}).status_code == 400
+    assert client.get("/projects/p/documents", params={"filter[rating]": "5"}).status_code == 200
+    # declared boolean: STRICT true/false (class 1 - "True" is a typo)
+    assert client.get("/projects/p/documents", params={"filter[public]": "True"}).status_code == 400
+    assert client.get("/projects/p/documents", params={"filter[public]": "true"}).status_code == 200
+
+
+def test_metadata_attr_named_status_is_reserved_for_the_lifecycle_facet(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # WHY: filter[status] predates the metadata facets - letting a schema attr
+    # shadow it would silently flip an existing spelling meaning; the
+    # lifecycle facet wins and the attr is unreachable under this name
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[status]": "ingested"})
+    assert r.status_code == 200
+    where_strs = [str(w) for w in repo.calls[-1]["where"]]
+    assert not any("@>" in w for w in where_strs), where_strs

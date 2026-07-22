@@ -425,4 +425,38 @@ describe("Inspect", () => {
 
     expect(await screen.findByText(/no documents in the active build/i)).toBeInTheDocument();
   });
+
+  it("documents search sends server-side q and shows the exact total (SS1b)", async () => {
+    // WHY: the search must be a REAL server-side q over the whole active
+    // build (the Graph discipline), and the count the server's total for
+    // THIS search - never a loaded-pages count (the FE3 false affordance)
+    const get = vi.spyOn(api, "GET");
+    get.mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/documents") {
+        const q = (opts as { params: { query: { q?: string } } }).params.query.q;
+        if (q === "corpus") {
+          return Promise.resolve({
+            data: {
+              data: [doc({ id: "d2", source_uri: "file:///corpus/hit.txt" })],
+              meta: { ...META, total: 1 },
+            },
+            error: undefined,
+          });
+        }
+        return Promise.resolve(ok([doc()]));
+      }
+      return Promise.resolve(ok([]));
+    }) as never);
+    renderInspect();
+    await screen.findByRole("searchbox");
+
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "corpus" } });
+    // debounce (300ms) then the q-keyed refetch
+    expect(await screen.findByText("hit.txt", {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(await screen.findByText(/符合 1 筆/)).toBeInTheDocument();
+    const qs = get.mock.calls
+      .filter((c) => c[0] === "/projects/{project}/documents")
+      .map((c) => requestQuery(c).q);
+    expect(qs).toContain("corpus");
+  });
 });

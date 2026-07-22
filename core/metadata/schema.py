@@ -193,6 +193,30 @@ def load_metadata_schema(config: Mapping[str, Any]) -> MetadataSchema:
     return MetadataSchema(attributes=attributes)
 
 
+def filterable_attributes(config: Mapping[str, Any]) -> dict[str, str]:
+    """``{name: declared_type}`` for attributes marked ``filterable: true`` —
+    the search half of DR-010 rule 2 / review rule 8 (SS1b): 「隨結果呈現」與
+    「用 metadata 搜尋」分開實作,唯有 allowlisted filterable 欄位才進入
+    list-endpoint 的 filter 面。Reuses the strict loader, so a malformed
+    schema raises the same :class:`MetadataConfigError` instead of silently
+    yielding nothing-filterable; ``filterable`` itself must be a real JSON
+    boolean (the class-1 strict-bool rule — a "true" string is a config typo,
+    not an opt-in)."""
+    if "metadata_schema" not in config:
+        return {}
+    schema = load_metadata_schema(config)  # validates shape/types first
+    block = _mapping(config["metadata_schema"], "metadata_schema")
+    raw_attributes = _mapping(block.get("attributes", {}), "metadata_schema.attributes")
+    out: dict[str, str] = {}
+    for name, raw in raw_attributes.items():
+        defn = _mapping(raw, f"metadata_schema.attributes.{name}")
+        if "filterable" not in defn:
+            continue
+        if _bool(defn["filterable"], f"metadata_schema.attributes.{name}.filterable"):
+            out[name] = schema.attributes[name].type
+    return out
+
+
 # --- metadata_exposure -------------------------------------------------------
 
 

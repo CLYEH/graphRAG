@@ -1079,12 +1079,24 @@ function useInspectList<T>(
   });
 }
 
-async function fetchDocuments(project: string, cursor?: string): Promise<InspectPage<Document>> {
+async function fetchDocuments(
+  project: string,
+  cursor?: string,
+  q?: string,
+): Promise<InspectPage<Document>> {
+  // SS1b: q searches source_uri server-side (the same discipline as the
+  // entities list — never a client-side filter over loaded pages); total
+  // reflects the searched set for the「N 筆」readout
   const { data, error } = await api.GET("/projects/{project}/documents", {
-    params: { path: { project }, query: { limit: INSPECT_PAGE, cursor } },
+    params: { path: { project }, query: { limit: INSPECT_PAGE, cursor, q: q || undefined } },
   });
   if (error) throw apiError(error);
-  return { rows: data.data, buildId: data.meta.build_id, next: data.meta.next_cursor ?? undefined };
+  return {
+    rows: data.data,
+    buildId: data.meta.build_id,
+    next: data.meta.next_cursor ?? undefined,
+    total: data.meta.total ?? undefined,
+  };
 }
 
 async function fetchChunks(project: string, cursor?: string): Promise<InspectPage<Chunk>> {
@@ -1095,8 +1107,8 @@ async function fetchChunks(project: string, cursor?: string): Promise<InspectPag
   return { rows: data.data, buildId: data.meta.build_id, next: data.meta.next_cursor ?? undefined };
 }
 
-export const useDocuments = (project: string | undefined) =>
-  useInspectList("documents", project, fetchDocuments);
+export const useDocuments = (project: string | undefined, q?: string) =>
+  useInspectList("documents", project, fetchDocuments, q);
 export const useChunks = (project: string | undefined) =>
   useInspectList("chunks", project, fetchChunks);
 

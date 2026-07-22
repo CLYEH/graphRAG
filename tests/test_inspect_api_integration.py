@@ -19,6 +19,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -635,3 +636,108 @@ async def test_relation_quality_facets_mirror_the_health_gauges(api: Api) -> Non
         },
     )
     assert r.json()["data"] == []
+
+
+async def test_sorted_keyset_walks_pages_without_gaps_or_dupes(api: Api) -> None:
+    # SS1b sort expansion: canonical_name has DUPLICATES on purpose - the id
+    # tie-break is what makes the keyset total, and a broken tie-break shows
+    # up exactly here as a dropped or repeated row across the page boundary.
+    client, conn = api
+    project = await _make_project(client)
+    async with conn.begin_nested():
+        active = await _make_build(conn, project, "active")
+        for name in ["dup", "dup", "dup", "alpha", "zeta"]:
+            await _make_entity(conn, project, active, name)
+
+    seen: list[tuple[str, str]] = []
+    cursor: str | None = None
+    for _ in range(10):
+        params: dict[str, str] = {"limit": "2", "sort": "canonical_name:asc"}
+        if cursor:
+            params["cursor"] = cursor
+        r = await client.get(f"/projects/{project}/entities", params=params)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        seen.extend((e["canonical_name"], e["id"]) for e in body["data"])
+        cursor = body["meta"]["next_cursor"]
+        if cursor is None:
+            break
+    names = [n for n, _ in seen]
+    assert names == sorted(names)  # globally ordered across pages
+    assert len(seen) == 5 and len(set(seen)) == 5  # no gap, no dupe
+
+
+async def test_nullable_timestamp_sort_orders_nulls_deterministically(api: Api) -> None:
+    # ingested_at is NULLABLE - the COALESCE keyset floors NULL at the epoch,
+    # so NULL rows are deterministically OLDEST: last under desc, and a
+    # cursor crossing the NULL boundary must not loop or skip.
+    client, conn = api
+    project = await _make_project(client)
+    async with conn.begin_nested():
+        active = await _make_build(conn, project, "active")
+        await _make_document(conn, project, active, source_uri="file:///new.txt")
+        await conn.execute(
+            documents.update()
+            .where(documents.c.source_uri == "file:///new.txt")
+            .values(ingested_at=func.now())
+        )
+        await _make_document(conn, project, active, source_uri="file:///null.txt")
+
+    r = await client.get(
+        f"/projects/{project}/documents", params={"sort": "ingested_at:desc", "limit": "1"}
+    )
+    assert [d["source_uri"] for d in r.json()["data"]] == ["file:///new.txt"]
+    cursor = r.json()["meta"]["next_cursor"]
+    assert cursor is not None
+    r2 = await client.get(
+        f"/projects/{project}/documents",
+        params={"sort": "ingested_at:desc", "limit": "1", "cursor": cursor},
+    )
+    assert [d["source_uri"] for d in r2.json()["data"]] == ["file:///null.txt"]
+
+
+async def test_metadata_filterable_facet_matches_by_containment(api: Api) -> None:
+    # rule 8 search half, end to end on real SQL: the schema-declared
+    # filterable attr filters via JSONB containment; typed values match by
+    # JSONB value; the non-filterable attr stays a loud 400.
+    client, conn = api
+    name = _proj()
+    schema = {
+        "metadata_schema": {
+            "attributes": {
+                "topic": {"type": "string", "filterable": True},
+                "rating": {"type": "number", "filterable": True},
+                "note": {"type": "string"},
+            }
+        }
+    }
+    assert (
+        await client.post("/projects", json={"name": name, "config": schema})
+    ).status_code == 201
+    async with conn.begin_nested():
+        active = await _make_build(conn, name, "active")
+        await _make_document(
+            conn,
+            name,
+            active,
+            source_uri="file:///sea.txt",
+            metadata={"context": {"attributes": {"topic": "sea", "rating": 5}}},
+        )
+        await _make_document(
+            conn,
+            name,
+            active,
+            source_uri="file:///land.txt",
+            metadata={"context": {"attributes": {"topic": "land", "rating": 3}}},
+        )
+
+    r = await client.get(f"/projects/{name}/documents", params={"filter[topic]": "sea"})
+    assert r.status_code == 200, r.text
+    assert [d["source_uri"] for d in r.json()["data"]] == ["file:///sea.txt"]
+    assert r.json()["meta"]["total"] == 1
+
+    r_num = await client.get(f"/projects/{name}/documents", params={"filter[rating]": "3"})
+    assert [d["source_uri"] for d in r_num.json()["data"]] == ["file:///land.txt"]
+
+    r_bad = await client.get(f"/projects/{name}/documents", params={"filter[note]": "x"})
+    assert r_bad.status_code == 400
