@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { useDecideOntologyProposal, useOntologyProposals } from "../api/queries";
+import { useDecideOntologyProposal, useDecisionLock, useOntologyProposals } from "../api/queries";
 
 import type { OntologyProposal, ProposalVerb } from "../api/queries";
 
@@ -36,13 +36,12 @@ export function ProposalPool({ project }: { project: string }) {
     setConfirming(null);
   };
 
-  // lock the decision controls while a decision posts AND while the pool refreshes
-  // after one: a resolved POST clears decide.isPending before the invalidated GET
-  // drops the decided proposal, so a second decision in that window re-hits the
-  // now-terminal proposal and 409s into a spurious "決定失敗" (Codex #106 P1d — the
-  // same stale-while-revalidate guard as the entity/relation review tabs). 取消
-  // stays usable to back out of a confirm.
-  const locked = decide.isPending || proposals.isFetching;
+  // the shared class-17 lock predicate (H20c; rationale on useDecisionLock).
+  // Note this surface handles a refetch ERROR by replacing the whole pool
+  // below (the class-17 replace-the-panel strategy), so the hook's isError
+  // term is defense-in-depth here — it holds even if that early return is
+  // ever restructured. 取消 stays usable to back out of a confirm.
+  const locked = useDecisionLock({ decide, list: proposals });
 
   if (proposals.isPending) return <p className="review__line">載入提案…</p>;
   if (proposals.isError)

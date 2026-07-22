@@ -1,10 +1,12 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 
 import {
   useDecideReviewTarget,
+  useDecisionLock,
   useEntity,
   useRelation,
   useRelationReviewList,
+  useRestoreKeys,
 } from "../api/queries";
 
 import type { Relation, ReviewTargetVerb } from "../api/queries";
@@ -60,13 +62,13 @@ function RelationRow({
   project,
   r,
   decide,
-  listRefreshing,
+  list,
   mode,
 }: {
   project: string;
   r: Relation;
   decide: ReturnType<typeof useDecideReviewTarget>;
-  listRefreshing: boolean;
+  list: { isFetching: boolean; isError: boolean };
   mode: "queue" | "restore";
 }) {
   const src = useEntity(project, r.src_entity_id);
@@ -75,7 +77,12 @@ function RelationRow({
   const [showEvidence, setShowEvidence] = useState(false);
 
   const namesUnresolved = src.isPending || dst.isPending || src.isError || dst.isError;
-  const locked = decide.isPending || namesUnresolved || listRefreshing;
+  // the shared class-17 lock (H20c): the parent's LIST rides the hook's own
+  // list axis (Codex #116 R1 — passing a pre-derived boolean through `extra`
+  // would fork the list predicate from the shared one, the exact drift this
+  // hook exists to kill); `extra` carries only this surface's see-the-pair
+  // term (Codex #106 P1b/P1c)
+  const locked = useDecisionLock({ decide, list, extra: [namesUnresolved] });
   const namesFailed = src.isError || dst.isError;
 
   const onApprove = () =>
@@ -84,20 +91,19 @@ function RelationRow({
     decide.mutate({ kind: "relation", targetId: r.id, verb: "reject", reason: null });
     setConfirmingReject(false);
   };
-  // ONE key per LOGICAL restore, retained across failed retries and cleared on
-  // success (Codex #108 R2 — a per-click key would double-record on a lost-
-  // response retry; the deterministic key would replay across rejection cycles).
-  const restoreKey = useRef<string | null>(null);
+  // ONE key per LOGICAL restore, not per click (Codex #108 R2) — the mint/
+  // retain/clear cycle semantics live on useRestoreKeys (H20c)
+  const restoreKeys = useRestoreKeys();
   const onRestore = () => {
-    const key = restoreKey.current ?? crypto.randomUUID();
-    restoreKey.current = key;
     decide.mutate(
-      { kind: "relation", targetId: r.id, verb: "approve", reason: null, idempotencyKey: key },
       {
-        onSuccess: () => {
-          restoreKey.current = null;
-        },
+        kind: "relation",
+        targetId: r.id,
+        verb: "approve",
+        reason: null,
+        idempotencyKey: restoreKeys.mint(r.id),
       },
+      { onSuccess: () => restoreKeys.clear(r.id) },
     );
   };
   const retryNames = () => {
@@ -263,9 +269,9 @@ export function RelationReview({ project }: { project: string }) {
               project={project}
               r={r}
               decide={decide}
-              // isError too: a failed post-decision refetch keeps stale pages with
-              // isFetching false — the decided row must stay locked (Codex #108 P1)
-              listRefreshing={list.isFetching || list.isError}
+              // the query itself, not a derived boolean — the lock's list axis
+              // (incl. #108 P1's isError-never-unlocks) lives in the shared hook
+              list={list}
               mode={view === "rejected" ? "restore" : "queue"}
             />
           ))}
