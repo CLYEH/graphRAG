@@ -49,14 +49,19 @@ describe("GovernanceBacklog", () => {
     expect(screen.queryByText("上線中知識庫")).not.toBeInTheDocument();
   });
 
-  it("shows the relation-quality counts as info WITHOUT a link (no facet endpoint yet)", () => {
+  it("deep-links the relation-quality counts into their gap-list tabs (GOV2-fe-5)", () => {
+    // WHY: the #107-era info-only state existed because no list could render
+    // these; the #109 facets + GOV2-fe-5 tabs retired it — an operator
+    // entering through the Overview must reach the SAME actionable lists the
+    // Health page links to (entry-point consistency, class 2)
     renderBacklog({ low_confidence_relations: 149, missing_evidence_relations: 20 });
 
     expect(screen.getByText(/低信心關聯/)).toBeInTheDocument();
     expect(screen.getByText(/缺證據關聯/)).toBeInTheDocument();
-    // WHY: these have no list endpoint yet, so a deep-link would land on a page
-    // that can't render them — show the count as info, not a false affordance
-    expect(screen.queryByRole("link", { name: "前往處理" })).not.toBeInTheDocument();
+    const links = screen.getAllByRole("link", { name: "前往處理" });
+    const hrefs = links.map((l) => l.getAttribute("href") ?? "");
+    expect(hrefs.some((h) => h.includes("tab=low-confidence"))).toBe(true);
+    expect(hrefs.some((h) => h.includes("tab=missing-evidence"))).toBe(true);
   });
 
   it("renders nothing when there are no quality signals (never a fake/empty panel)", () => {

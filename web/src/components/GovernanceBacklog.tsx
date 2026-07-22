@@ -6,9 +6,11 @@ import { Link } from "react-router-dom";
 // project-wide — so a project with proposals and NO active build must not be told
 // the tasks belong to a live knowledge base. Each scope group renders only when it
 // has a non-zero signal, under its own honest label.
-// The three review backlogs deep-link to their governance tab; the two
-// relation-quality counts have NO list endpoint yet (the deferred /relations
-// confidence/evidence facet task), so they show as information only.
+// Every signal deep-links to its governance tab — the two relation-quality
+// counts gained their gap-list tabs in GOV2-fe-5 (the #109 facets), so the
+// old "no list endpoint yet" info-only state is retired. `tab` stays
+// optional: a future signal without a landing list renders as info-only
+// with an honest note instead of a dead link.
 // pending_merge_candidates is deliberately absent: it has its own prominent action
 // card on the Overview already (Codex #78).
 type Scope = "build" | "project";
@@ -21,8 +23,13 @@ const SCOPE_LABEL: Record<Scope, string> = {
 const SIGNALS: { key: string; label: string; scope: Scope; tab?: string }[] = [
   { key: "needs_review_entities", label: "待審知識點", scope: "build", tab: "entity" },
   { key: "needs_review_relations", label: "待審關聯", scope: "build", tab: "relation" },
-  { key: "low_confidence_relations", label: "低信心關聯", scope: "build" },
-  { key: "missing_evidence_relations", label: "缺證據關聯", scope: "build" },
+  { key: "low_confidence_relations", label: "低信心關聯", scope: "build", tab: "low-confidence" },
+  {
+    key: "missing_evidence_relations",
+    label: "缺證據關聯",
+    scope: "build",
+    tab: "missing-evidence",
+  },
   { key: "pending_ontology_proposals", label: "待審本體提案", scope: "project", tab: "proposals" },
 ];
 
@@ -58,7 +65,7 @@ export function GovernanceBacklog({ counts }: { counts: Record<string, number | 
                 {s.tab ? (
                   <Link to={`../review?tab=${s.tab}`}>前往處理</Link>
                 ) : (
-                  <span className="govbacklog__note">(清單待後端 facet)</span>
+                  <span className="govbacklog__note">(尚無對應清單)</span>
                 )}
               </li>
             ))}

@@ -571,6 +571,50 @@ export function useRelationReviewList(project: string | undefined, status: Revie
   });
 }
 
+//: the two ACTIVE-relation quality facets #109 exposed on /relations — CLOSED
+//: values (`confidence=low`, `evidence=missing`), predicate shared with the
+//: §19 gauges via LOW_CONFIDENCE_BELOW (single-source, api/routers/inspect.py)
+export type RelationGapFacet = "confidence" | "evidence";
+
+// The gap lists (GOV2-fe-5): ACTIVE relations flagged by a quality facet.
+// The facet is ORTHOGONAL to lifecycle — gauge parity comes from the
+// COMBINATION `filter[status]=active` + facet (#109 gate-2: a fetch missing
+// either half counts a different population than the Health gauge links
+// from). Keyed INSIDE the "relation-review" family (status slot `gap-…`) so
+// useDecideReviewTarget's existing prefix invalidation refreshes these lists
+// after a decision with no new invalidation wiring.
+export function useRelationGapList(project: string | undefined, facet: RelationGapFacet) {
+  return useInfiniteQuery({
+    queryKey: ["relation-review", project, `gap-${facet}`],
+    enabled: project !== undefined && isPathAddressable(project),
+    initialPageParam: undefined as ReviewPageParam,
+    queryFn: async ({ pageParam }) => {
+      const { data, error } = await api.GET("/projects/{project}/relations", {
+        params: {
+          path: { project: project as string },
+          query: {
+            limit: REVIEW_PAGE,
+            cursor: pageParam?.cursor,
+            filter: {
+              status: "active",
+              ...(facet === "confidence" ? { confidence: "low" } : { evidence: "missing" }),
+            },
+          },
+        },
+      });
+      if (error) throw new Error(error.error.message);
+      if (pageParam !== undefined && data.meta.build_id !== pageParam.buildId)
+        throw new Error("The active build changed while loading the list — retry.");
+      const buildId = pageParam?.buildId ?? data.meta.build_id;
+      return {
+        rows: data.data,
+        next: data.meta.next_cursor ? { cursor: data.meta.next_cursor, buildId } : undefined,
+      };
+    },
+    getNextPageParam: (last: { rows: Relation[]; next: ReviewPageParam }) => last.next,
+  });
+}
+
 export type ReviewTargetKind = "entity" | "relation";
 export type ReviewTargetVerb = "approve" | "reject";
 

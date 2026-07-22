@@ -130,6 +130,35 @@ describe("ReviewQueue", () => {
     expect(screen.getByRole("button", { name: "查看原文證據" })).toBeInTheDocument();
   });
 
+  it.each([
+    ["低信心", { status: "active", confidence: "low" }],
+    ["缺證據", { status: "active", evidence: "missing" }],
+  ] as const)(
+    "the %s tab fetches ACTIVE relations with its facet — BOTH filter halves (GOV2-fe-5)",
+    async (label, expectedFilter) => {
+      // the facet is ORTHOGONAL to lifecycle: gauge parity comes from the
+      // COMBINATION (#109) — a fetch missing filter[status]=active (or the
+      // facet) lists a DIFFERENT population than the Health gauge that
+      // deep-links here, the exact false-affordance this pin forbids
+      const seen: unknown[] = [];
+      vi.spyOn(api, "GET").mockImplementation(((path: string, opts: unknown) => {
+        if (path === "/projects/{project}/relations") {
+          seen.push((opts as { params: { query: { filter: unknown } } }).params.query.filter);
+          return Promise.resolve({
+            data: { data: [relation({ type: "PRACTICED_BY" })], meta: META },
+            error: undefined,
+          });
+        }
+        return Promise.resolve({ data: { data: [], meta: META }, error: undefined });
+      }) as never);
+      renderAt("acme");
+
+      fireEvent.click(await screen.findByRole("tab", { name: label }));
+      expect(await screen.findByText(/PRACTICED_BY/)).toBeInTheDocument();
+      expect(seen).toContainEqual(expectedFilter);
+    },
+  );
+
   it("reports an un-addressable key instead of firing a doomed request", () => {
     // "a/b" opens in the route (base64url) but can't ride the {project} path
     // segment; the page must report that and the list query must stay disabled

@@ -2,6 +2,7 @@ import { useSearchParams } from "react-router-dom";
 
 import { EntityReview } from "../components/EntityReview";
 import { ProposalPool } from "../components/ProposalPool";
+import { RelationGapList } from "../components/RelationGapList";
 import { RelationReview } from "../components/RelationReview";
 import { ReviewCases } from "../components/ReviewCases";
 import { isPathAddressable, useActiveProject } from "../project/projectRoute";
@@ -11,13 +12,17 @@ import type { KeyboardEvent } from "react";
 
 // The governance surface (DESIGN §17 names four review kinds). Tabs: merge
 // candidates (UXA1), entity review (GOV2-fe-1), relation review (GOV2-fe-2),
-// ontology proposals (GOV3-fe). The route stays `review` (deep-links + e2e depend
-// on it); the active tab lives in `?tab=` so Health signals can deep-link a tab.
+// ontology proposals (GOV3-fe), and the two quality gap lists (GOV2-fe-5,
+// consuming #109's /relations facets). The route stays `review` (deep-links +
+// e2e depend on it); the active tab lives in `?tab=` so Health signals can
+// deep-link a tab.
 const TABS = [
   { key: "merge", label: "合併" },
   { key: "entity", label: "知識點" },
   { key: "relation", label: "關聯" },
   { key: "proposals", label: "本體提案" },
+  { key: "low-confidence", label: "低信心" },
+  { key: "missing-evidence", label: "缺證據" },
 ] as const;
 type TabKey = (typeof TABS)[number]["key"];
 
@@ -126,6 +131,26 @@ export function ReviewQueue() {
               採納即加入本體(下次建置生效),拒絕則排除。
             </p>
             <ProposalPool project={project} />
+          </>
+        )}
+        {tab === "low-confidence" && (
+          <>
+            <p className="review__intro">
+              上線知識庫中<strong>信心值偏低</strong>的關聯,可展開原文引文覆核。
+              有誤就排除(自知識庫移除);確認無誤可按保留記錄一筆人工確認——
+              信心值不會因此改變,項目仍會列於此。
+            </p>
+            <RelationGapList project={project} facet="confidence" />
+          </>
+        )}
+        {tab === "missing-evidence" && (
+          <>
+            <p className="review__intro">
+              上線知識庫中<strong>沒有任何原文證據</strong>的關聯。
+              有誤就排除(自知識庫移除);確認無誤可按保留記錄一筆人工確認——
+              證據不會因此出現,項目仍會列於此。
+            </p>
+            <RelationGapList project={project} facet="evidence" />
           </>
         )}
       </div>

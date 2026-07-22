@@ -1029,6 +1029,83 @@ test("the settings page saves a vocabulary edit over a fresh-spread PATCH", asyn
   expect(patched?.config?.["chunking"]).toEqual({ max_chars: 500, overlap: 50 });
 });
 
+test("the 低信心 gap tab deep-links in and fetches ACTIVE relations with the facet (GOV2-fe-5)", async ({
+  page,
+}) => {
+  await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  await page.route("**/projects/*/merge-candidates*", (route) =>
+    route.fulfill(mergeCandidatesResponse()),
+  );
+  const listUrls: string[] = [];
+  await page.route("**/projects/*/relations*", (route) => {
+    listUrls.push(route.request().url());
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: [
+          {
+            id: "r1111111-aaaa-4aaa-8aaa-000000000001",
+            project: "acme",
+            build_id: "b1111111-aaaa-4aaa-8aaa-000000000001",
+            src_entity_id: "e1111111-aaaa-4aaa-8aaa-000000000001",
+            dst_entity_id: "e2222222-aaaa-4aaa-8aaa-000000000002",
+            type: "PRACTICED_BY",
+            attributes: {},
+            relation_signature: null,
+            status: "active",
+            review_status: null,
+            created_by: "extraction",
+            confidence: 0.12,
+            created_at: "2026-07-01T00:00:00Z",
+            updated_at: "2026-07-01T00:00:00Z",
+          },
+        ],
+        meta: { next_cursor: null, build_id: "b1111111-aaaa-4aaa-8aaa-000000000001" },
+      }),
+    });
+  });
+  await page.route("**/projects/*/entities/*", (route) => {
+    const id = new URL(route.request().url()).pathname.split("/").pop() ?? "";
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          id,
+          project: "acme",
+          build_id: "b1111111-aaaa-4aaa-8aaa-000000000001",
+          type: "person",
+          canonical_name: id.startsWith("e1") ? "海祭" : "阿美族",
+          entity_key: `fpv1:${id}`,
+          disambiguator: null,
+          attributes: {},
+          status: "active",
+          review_status: null,
+          created_by: "extraction",
+          created_at: "2026-07-01T00:00:00Z",
+          updated_at: "2026-07-01T00:00:00Z",
+        },
+        meta: { next_cursor: null, build_id: "b1111111-aaaa-4aaa-8aaa-000000000001" },
+      }),
+    });
+  });
+
+  // deep-link straight into the tab — the URL form Health's 前往處理 links emit
+  await page.goto("/p/acme/review?tab=low-confidence");
+  // the pair renders by NAME with the decision affordances the intro promises
+  await expect(page.getByText("海祭")).toBeVisible();
+  await expect(page.getByRole("button", { name: "保留" })).toBeVisible();
+  // gauge parity is the COMBINATION: filter[status]=active AND the facet must
+  // BOTH ride the fetch (#109) — a missing half lists a different population
+  // than the gauge that linked here
+  const gapFetch = listUrls.find((u) => u.includes("confidence"));
+  expect(gapFetch).toBeTruthy();
+  expect(decodeURIComponent(gapFetch ?? "")).toContain("filter[status]=active");
+  expect(decodeURIComponent(gapFetch ?? "")).toContain("filter[confidence]=low");
+});
+
 // UXC2c — the Phase C 目標 as an executable assertion: the FULL operator
 // journey runs in the browser with no terminal — create project → upload →
 // build → eval → activate → query. Every read is a WORLD-STATE stub (flags
