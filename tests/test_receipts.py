@@ -180,6 +180,30 @@ def test_gates_stamp_rejects_unknown_kind(toy_repo: Path) -> None:
     assert "usage" in result.stderr
 
 
+def test_gates_stamp_sweeps_expired_receipts_but_keeps_fresh_ones(toy_repo: Path) -> None:
+    """H19 receipt GC: receipts are content-addressed and single-use, so the
+    dir grows one dead file per gates run forever unless stamping sweeps.
+    Age is the ONLY criterion — a fresh receipt for another tree (a parallel
+    branch's stamp) must survive, or the sweep would force cross-branch
+    re-reviews (the H5 regression this suite exists to prevent)."""
+    import time
+
+    receipts = toy_repo / ".claude" / "receipts"
+    receipts.mkdir(parents=True)
+    old = receipts / ("gates-check-" + "0" * 40)
+    old.write_text("expired\n", encoding="utf-8")
+    expired_at = time.time() - 40 * 86400
+    os.utime(old, (expired_at, expired_at))
+    fresh_other = receipts / ("gates-web-" + "1" * 40)
+    fresh_other.write_text("fresh\n", encoding="utf-8")
+
+    tree = _stamp_gates(toy_repo, "check")
+
+    assert not old.exists()  # 40 days old — swept
+    assert fresh_other.exists()  # fresh, different tree/kind — kept
+    assert (receipts / f"gates-check-{tree}").exists()  # the new stamp itself
+
+
 def test_push_gate_task_lane_requires_gates_receipts(toy_repo: Path) -> None:
     """Task lane, non-web outgoing: review receipt alone is not enough — the
     gate must name the missing 'check' receipt; once web/ files are outgoing it

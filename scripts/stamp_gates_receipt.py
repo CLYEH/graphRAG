@@ -59,12 +59,36 @@ def main() -> int:
 
     receipts = root / ".claude" / "receipts"
     receipts.mkdir(parents=True, exist_ok=True)
+    _gc_old_receipts(receipts)
     stamped_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     (receipts / f"gates-{kind}-{tree}").write_text(
         f"{tree} gates-{kind} {stamped_at}\n", encoding="utf-8"
     )
     print(f"gates receipt stamped: kind={kind} tree={tree}")
     return 0
+
+
+#: Receipts are content-addressed and single-use — once the tree moves on, an
+#: old stamp can never validate again, so anything older than this is dead
+#: weight (H19: the dir otherwise grows one file per gates run, forever).
+GC_MAX_AGE_DAYS = 30
+
+
+def _gc_old_receipts(receipts: Path) -> None:
+    """Best-effort sweep of expired receipts at stamp time. Never fails the
+    stamp: a GC error must not turn a green gates run red (the receipt being
+    written is the product; the sweep is hygiene)."""
+    cutoff = datetime.now(UTC).timestamp() - GC_MAX_AGE_DAYS * 86400
+    try:
+        entries = list(receipts.iterdir())
+    except OSError:
+        return  # the "never fails the stamp" claim covers the dir walk too
+    for f in entries:
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            continue
 
 
 if __name__ == "__main__":
