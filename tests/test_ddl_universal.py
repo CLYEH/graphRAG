@@ -490,8 +490,12 @@ WHERE c.relnamespace = 'public'::regnamespace
 ORDER BY 1
 """
 
+# attnotnull rides along: NULLABILITY is part of column parity (Codex #115
+# R3 — a migration relaxing NOT NULL while tables.py stands still was
+# invisible to every check, and the expression-unique exemption TRUSTS the
+# metadata nullability of its input columns)
 LIVE_COLUMNS_SQL = f"""
-SELECT c.relname AS tbl, a.attname AS name
+SELECT c.relname AS tbl, a.attname AS name, a.attnotnull AS notnull
 FROM pg_attribute a
 JOIN pg_class c ON c.oid = a.attrelid
 WHERE c.relnamespace = 'public'::regnamespace
@@ -612,18 +616,22 @@ async def test_live_schema_matches_metadata_instance_sets(migrated: None) -> Non
     columns, PK, FK column-sets, and plain unique column-sets. Superset on
     the live side is tolerated only for whole tables (alembic_version);
     within a table the sets must match exactly, both directions. This is an
-    existence/NAMING parity — column TYPES are out of scope (timestamp drift
-    is property-checked above; core-table types are pinned offline in
-    test_core_tables_schema). FKs compare by FULL identity (ordered local
-    columns → referenced table + ordered referenced columns + delete
-    action), and the live table set must be EXACTLY metadata ∪
-    {alembic_version} — an extra live table is drift, not tolerance."""
+    existence/naming/NULLABILITY parity — column TYPES are out of scope
+    (timestamp drift is property-checked above; core-table types are pinned
+    offline in test_core_tables_schema). Nullability rides column parity
+    (Codex #115 R3): a migration relaxing NOT NULL while tables.py stands
+    still was invisible everywhere, and the expression-unique exemption
+    TRUSTS metadata nullability for its input columns. FKs compare by FULL
+    identity (ordered local columns → referenced table + ordered referenced
+    columns + delete action), and the live table set must be EXACTLY
+    metadata ∪ {alembic_version} — an extra live table is drift, not
+    tolerance."""
     engine = _engine()
     try:
         async with engine.connect() as conn:
-            live_cols: dict[str, set[str]] = {}
-            for tbl, name in await _rows(conn, LIVE_COLUMNS_SQL):
-                live_cols.setdefault(tbl, set()).add(name)
+            live_cols: dict[str, set[tuple[str, bool]]] = {}
+            for tbl, name, notnull in await _rows(conn, LIVE_COLUMNS_SQL):
+                live_cols.setdefault(tbl, set()).add((name, bool(notnull)))
             assert set(live_cols) == set(metadata.tables) | {"alembic_version"}
             live_pks: dict[str, set[frozenset[str]]] = {}
             for tbl, cols in await _rows(conn, PK_COLUMN_SETS_SQL):
@@ -647,7 +655,7 @@ async def test_live_schema_matches_metadata_instance_sets(migrated: None) -> Non
 
             for table in metadata.tables.values():
                 name = table.name
-                assert live_cols[name] == {c.name for c in table.columns}, name
+                assert live_cols[name] == {(c.name, not c.nullable) for c in table.columns}, name
                 assert live_pks.get(name) == {frozenset(table.primary_key.columns.keys())}, name
                 assert live_fks.get(name, set()) == {
                     (
