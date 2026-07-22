@@ -62,13 +62,13 @@ function RelationRow({
   project,
   r,
   decide,
-  listRefreshing,
+  list,
   mode,
 }: {
   project: string;
   r: Relation;
   decide: ReturnType<typeof useDecideReviewTarget>;
-  listRefreshing: boolean;
+  list: { isFetching: boolean; isError: boolean };
   mode: "queue" | "restore";
 }) {
   const src = useEntity(project, r.src_entity_id);
@@ -77,10 +77,12 @@ function RelationRow({
   const [showEvidence, setShowEvidence] = useState(false);
 
   const namesUnresolved = src.isPending || dst.isPending || src.isError || dst.isError;
-  // the shared class-17 lock (H20c) composed with this surface's extra term:
-  // the operator must SEE the pair before deciding (Codex #106 P1b/P1c);
-  // listRefreshing carries the parent list's isFetching||isError
-  const locked = useDecisionLock({ decide, extra: [namesUnresolved, listRefreshing] });
+  // the shared class-17 lock (H20c): the parent's LIST rides the hook's own
+  // list axis (Codex #116 R1 — passing a pre-derived boolean through `extra`
+  // would fork the list predicate from the shared one, the exact drift this
+  // hook exists to kill); `extra` carries only this surface's see-the-pair
+  // term (Codex #106 P1b/P1c)
+  const locked = useDecisionLock({ decide, list, extra: [namesUnresolved] });
   const namesFailed = src.isError || dst.isError;
 
   const onApprove = () =>
@@ -267,9 +269,9 @@ export function RelationReview({ project }: { project: string }) {
               project={project}
               r={r}
               decide={decide}
-              // isError too: a failed post-decision refetch keeps stale pages with
-              // isFetching false — the decided row must stay locked (Codex #108 P1)
-              listRefreshing={list.isFetching || list.isError}
+              // the query itself, not a derived boolean — the lock's list axis
+              // (incl. #108 P1's isError-never-unlocks) lives in the shared hook
+              list={list}
               mode={view === "rejected" ? "restore" : "queue"}
             />
           ))}
