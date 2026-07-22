@@ -57,12 +57,6 @@ GitHub 為準;立案或了結後從本檔劃掉):
   store client 建構),曾把既有 lock 測試的 5s 等待預算壓到確定性餓死
   (該測試已放寬至 30s 上限)。值得一次 profiling:若是 eager 建構
   (class 13)或逐 stage 重連,修掉能讓整個 integration tier 提速。
-- **GOV2 gap-list FE 片**(facet api 已於 #109 落地〔GOV2-facet:`filter[confidence]=low`/
-  `filter[evidence]=missing`,述詞與 §19 gauge 同 `LOW_CONFIDENCE_BELOW` 常數〕;剩 FE):
-  治理頁加「低信心」「缺證據」兩分頁(重用 RelationReview 模式)+ Health `TAB_FOR_COUNT`
-  的 `low_confidence_relations`/`missing_evidence_relations` 深連結。**測試必斷言同送
-  `filter[status]=active`+facet 兩參數**(facet 正交,gauge parity 靠組合——#109 gate-2 nit
-  明記)。落地後 GOV2 umbrella 的完成準則(每個非零品質訊號皆深連結至可行動清單)即閉合。
 - **RB1-retry-skip 的 entanglement 保守退全導**(#103 R3/R4 follow-up):目前若父有
   「同時被失敗與非失敗 doc 觸及」的實體(或關係),整個重試退回全部重導(fork-C
   紀律),放棄 compute-skip 省成本。真正精細解=只「額外重抽糾纏的成功 docs」(而非

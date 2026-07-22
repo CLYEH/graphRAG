@@ -49,7 +49,7 @@ lesson catalog #106。**GOV2-fe-3**(#107 GovernanceBacklog 治理待辦顯示型
 SS1b/GOV3/RB1 皆切 api/fe;RB1 另切 RB1-retry,再切 core/skip(全數 merge)。
 **GOV2-facet**(#109 `/relations` filter[confidence]=low/filter[evidence]=missing,述詞與
 §19 gauge 同 `LOW_CONFIDENCE_BELOW` 常數,Codex 1 輪〔移除可覆寫參數的 parity 縫〕)亦已
-merge。尚餘 GOV2 gap-list FE 片(兩分頁+Health 深連結;測試斷言同送 filter[status]=active)、
+merge。GOV2 gap-list FE 片=#119 GOV2-fe-5 已 merge(兩分頁+Health/Overview 雙深連結;GOV2 umbrella 隨之收攏)。尚餘 
 relation 影響/impact 抽屜(useSubgraph,follow-up)、
 候選-scoped 發布 preflight(需 per-build health facet=契約變更,owner 決);
 Console MCP URL/健康顯示 = GOV2-fe 後續接 `GET /mcp` 端點。
