@@ -44,11 +44,11 @@ markers='尚餘|尚未|待實作|待做|未立案|還沒|剩下|not yet|remainin
 # co-occurrence is judged per CLAUSE, not per line: a long index/description
 # line legitimately says "GOV3-fe 已 merge; …; 尚餘 gap-list FE 片" — the
 # pending claim and the finished id live in different clauses (first live
-# run caught exactly that). Clause delimiters: ;/;/。/——.
+# run caught exactly that). Clause delimiters: ;/；/。/——.
 find "$memdir" -name '*.md' | sort | while IFS= read -r f; do
   awk -v ids="$id_alt" -v markers="$markers" -v file="$f" '
     $0 ~ markers {
-      m = split($0, segs, /(;|;|。|——)/)
+      m = split($0, segs, /(;|；|。|——)/)
       n = split(ids, arr, "|")
       for (s = 1; s <= m; s++) {
         if (segs[s] !~ markers) continue

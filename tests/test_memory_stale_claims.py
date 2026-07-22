@@ -138,6 +138,21 @@ def test_pending_claim_in_a_DIFFERENT_clause_does_not_warn(tmp_path: Path) -> No
     assert "::warning" not in res.stdout
 
 
+def test_fullwidth_semicolon_also_splits_clauses(tmp_path: Path) -> None:
+    # Codex #117 R1: the delimiter set silently carried TWO ASCII semicolons —
+    # the intended full-width ；(U+FF1B, the common Chinese delimiter) had
+    # been normalized away at write time (the S6 non-ASCII-through-tool-layers
+    # lesson, self-inflicted). 「X 已完成；尚餘 Y」 must not warn about X.
+    tasks, memdir = _fixture(
+        tmp_path,
+        "- [x] H21 web 測試 gate\n",
+        "H21 已完成；尚餘 H20 系列未收\n",
+    )
+    res = _run(tasks, memdir)
+    assert res.returncode == 0
+    assert "::warning" not in res.stdout
+
+
 def test_pending_claim_in_the_SAME_clause_still_warns(tmp_path: Path) -> None:
     # the clause split must not swallow true positives
     tasks, memdir = _fixture(
