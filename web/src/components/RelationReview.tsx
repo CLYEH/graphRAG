@@ -58,7 +58,7 @@ function endpointName(q: ReturnType<typeof useEntity>): string {
 // gates on `locked` (decide posting, list refreshing, names unresolved) — the
 // operator must see the pair before any decision, including a restore that
 // re-adds the relation to the live graph (Codex #106 P1b/P1c/P2/P1d).
-function RelationRow({
+export function RelationRow({
   project,
   r,
   decide,

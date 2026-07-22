@@ -36,12 +36,16 @@ const COUNT_LABELS: Record<string, string> = {
 
 // A non-zero quality count deep-links into its governance tab (`../review?tab=`).
 // GOV3-fe wires the ontology-proposal pool; GOV2-fe adds the entity/relation
-// review and (once the backend facet lands) the low-confidence/missing-evidence
-// tabs. A count with no entry here shows the number without a link.
+// review; GOV2-fe-5 adds the low-confidence/missing-evidence gap lists (the
+// #109 facets share the gauges' predicate, so each link lands on the SAME
+// population the number counts). A count with no entry here shows the number
+// without a link.
 const TAB_FOR_COUNT: Record<string, string> = {
   pending_ontology_proposals: "proposals",
   needs_review_entities: "entity",
   needs_review_relations: "relation",
+  low_confidence_relations: "low-confidence",
+  missing_evidence_relations: "missing-evidence",
 };
 
 export function ProjectHealth() {

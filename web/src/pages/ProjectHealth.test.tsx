@@ -113,6 +113,21 @@ describe("ProjectHealth", () => {
     expect(link.getAttribute("href")).toContain("tab=relation");
   });
 
+  it.each([
+    ["低信心關聯", { low_confidence_relations: 2 }, "tab=low-confidence"],
+    ["缺證據關聯", { missing_evidence_relations: 5 }, "tab=missing-evidence"],
+  ] as const)(
+    "deep-links a non-zero %s count into its gap-list tab (GOV2-fe-5)",
+    async (_label, counts, expectedTab) => {
+      // the #109 facets share the gauges' predicate, so the link lands on the
+      // SAME population the number counts — a bare ../review would land on 合併
+      stubHealth(healthReport({ status: "healthy", counts: { ...counts } }));
+      renderHealthAt(projectRoute("acme"));
+      const link = await screen.findByRole("link", { name: "前往處理" });
+      expect(link.getAttribute("href")).toContain(expectedTab);
+    },
+  );
+
   it("shows the status light, counts, and pending review for a healthy build", async () => {
     stubHealth(
       healthReport({
