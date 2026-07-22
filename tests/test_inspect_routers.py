@@ -25,6 +25,7 @@ from api.pagination import (
     decode_chunk_cursor,
     decode_id_cursor,
     encode_cursor,
+    encode_sorted_cursor,
 )
 from core.stores.repo import NoActiveBuildError
 
@@ -971,3 +972,29 @@ def test_malformed_metadata_schema_is_a_400_not_a_500(
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "VALIDATION_ERROR"
     assert "type is required" in r.json()["error"]["message"]
+
+
+def test_nul_in_metadata_filter_is_rejected_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R2: PostgreSQL JSONB cannot represent U+0000 - a %00 in a
+    # client filter would 500 at bind time; rejected for EVERY declared type
+    # before the containment predicate forms (the uploads _contains_nul twin)
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[topic]": "\x00sea"})
+    assert r.status_code == 400
+    assert "NUL" in r.json()["error"]["message"]
+
+
+def test_tampered_naive_datetime_cursor_is_a_400_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R2: a correctly TAGGED cursor whose timestamp value was
+    # tampered to a timezone-less ISO string parses fine but would raise in
+    # the asyncpg timestamptz encoder (500) - it must be the documented
+    # malformed-cursor 400 instead
+    _bindable(monkeypatch)
+    forged = encode_sorted_cursor("created_at:asc", ("2026-01-01T00:00:00", uuid.uuid4()))
+    r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
+    assert r.status_code == 400
+    assert "malformed cursor" in r.json()["error"]["message"]

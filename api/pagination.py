@@ -48,7 +48,13 @@ def _convert(token: str, parts: list[Any], types: tuple[type, ...]) -> tuple[Any
         out: list[Any] = []
         for part, typ in zip(parts, types, strict=True):
             if typ is datetime:
-                out.append(datetime.fromisoformat(part))
+                parsed = datetime.fromisoformat(part)
+                if parsed.tzinfo is None:
+                    # every column these keysets bind against is timestamptz —
+                    # a (tampered) naive value would raise in the asyncpg
+                    # encoder as a 500, not the documented malformed-cursor 400
+                    raise ValueError("naive datetime in cursor")
+                out.append(parsed)
             elif typ is uuid.UUID:
                 out.append(uuid.UUID(part))
             else:
