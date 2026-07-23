@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { isScopeNeutral, useChunk, useChunks, useDocument, useDocuments } from "../api/queries";
 import { isPathAddressable, useActiveProject } from "../project/projectRoute";
@@ -85,7 +85,12 @@ export function Inspect() {
         className="inspect__panel"
       >
         {tab === "documents" ? (
-          <DocumentsTab project={project} selected={selected} onSelect={select} />
+          <DocumentsTab
+            project={project}
+            selected={selected}
+            onSelect={select}
+            onDeselect={() => setSelected(null)}
+          />
         ) : (
           <ChunksTab project={project} selected={selected} onSelect={select} />
         )}
@@ -98,6 +103,8 @@ export function Inspect() {
 
 type ListProps<T> = {
   label: string;
+  /** search-aware empty text: zero MATCHES is not an empty build (SS1b R3) */
+  emptyMessage?: string;
   columns: { header: string; cell: (row: T) => ReactNode }[];
   query: {
     data?: { pages: InspectPage<T>[] };
@@ -121,6 +128,7 @@ function message(error: unknown): string {
 
 function PagedList<T extends { id: string }>({
   label,
+  emptyMessage,
   columns,
   query,
   selectedId,
@@ -189,7 +197,8 @@ function PagedList<T extends { id: string }>({
   const rows = pages.flatMap((p) => p.rows);
   // An empty table really does mean an empty build: no active build answers 409, not a
   // 200 with no rows, so this cannot mistake an outage for an empty corpus.
-  if (rows.length === 0) return <p className="inspect__muted">No {label} in the active build.</p>;
+  if (rows.length === 0)
+    return <p className="inspect__muted">{emptyMessage ?? `No ${label} in the active build.`}</p>;
 
   return (
     <>
@@ -323,62 +332,115 @@ function fmt(ts: string | null | undefined): string {
 
 // ---- the two tabs -----------------------------------------------------------
 
+//: SS1b documents search — mirrors the Graph page's server-side entity search
+const DOC_SEARCH_MAX = 256; // the contract's q maxLength
+
+// re-declared from Graph.tsx (page-local on purpose: a pages/ cross-import
+// would couple two routes for three lines)
+function useDebounced<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(id);
+  }, [value, delayMs]);
+  return debounced;
+}
+
 type TabProps = {
   project: string;
   selected: Selection | null;
   onSelect: (tab: Tab, id: string) => void;
+  /** clear the selection outright (no toggle) — search changes use this (R5) */
+  onDeselect?: () => void;
 };
 
-function DocumentsTab({ project, selected, onSelect }: TabProps) {
+function DocumentsTab({ project, selected, onSelect, onDeselect }: TabProps) {
   const id = selected?.tab === "documents" ? selected.id : undefined;
-  const list = useDocuments(project);
+  const [search, setSearch] = useState("");
+  // debounced + trimmed: the QUERY the shown rows answer; q rides the hook's
+  // queryKey so a new search restarts from page 1 (SS1b, the Graph pattern)
+  const q = useDebounced(search.trim(), 300) || undefined;
+  const list = useDocuments(project, q);
+  const total = list.data?.pages[0]?.total;
   const detail = useDocument(project, id);
   const doc = detail.data;
 
   return (
-    <PagedList<Document>
-      label="documents"
-      columns={[
-        {
-          header: "文件",
-          // the row leads with the file NAME — the full uri (a filesystem path
-          // in disguise) rides the hover title and the detail pane (UXA3)
-          cell: (d) => <span title={d.source_uri}>{basename(d.source_uri)}</span>,
-        },
-        { header: "類型", cell: (d) => d.mime ?? "—" },
-        { header: "狀態", cell: (d) => (d.status === "ingested" ? "已匯入" : (d.status ?? "—")) },
-        { header: "匯入時間", cell: (d) => fmt(d.ingested_at) },
-      ]}
-      query={list}
-      selectedId={id}
-      onSelect={(rowId) => onSelect("documents", rowId)}
-      detail={
-        id && (
-          <Detail
-            title="Document"
-            isFetching={detail.isFetching}
-            isError={detail.isError}
-            error={detail.error}
-            fields={
-              doc && [
-                ["id", doc.id],
-                ["source_uri", doc.source_uri],
-                ["content_hash", doc.content_hash ?? "—"],
-                [
-                  "metadata",
-                  <pre key="metadata" className="inspect__pre">
-                    {blob(doc.metadata)}
-                  </pre>,
-                ],
-                // `raw` is detail-only — the list omits the key entirely, which is the
-                // whole reason a row click fetches.
-                ["raw", text(doc.raw)],
-              ]
-            }
-          />
-        )
-      }
-    />
+    <>
+      <label className="inspect__search">
+        搜尋
+        <input
+          type="search"
+          value={search}
+          maxLength={DOC_SEARCH_MAX}
+          placeholder="source_uri…"
+          onChange={(e) => {
+            setSearch(e.target.value);
+            // R5: a selection made under one search means nothing under
+            // another — the row may drop out of the new result set while its
+            // detail pane lingers as if it belonged to the filtered rows
+            if (id) onDeselect?.();
+          }}
+        />
+      </label>
+      {/* the count is the server's exact total for THIS search — page 1's
+          meta.total, never a loaded-rows count. Gated on the SAME settled-
+          success condition PagedList shows rows under (SS1b R3 / class 17):
+          during a refetch, or beside a failed one, the cached total is
+          unverified against the current build and must not linger. The label
+          CARRIES the applied term (the GraphBody pattern, R6): while the
+          debounce is pending the box already shows the new input, so the
+          count must say which query it answers. */}
+      {q && total !== undefined && !list.isFetching && !list.isError ? (
+        <p className="inspect__hint">
+          符合「{q}」的文件:{total} 筆
+        </p>
+      ) : null}
+      <PagedList<Document>
+        label="documents"
+        emptyMessage={q ? `沒有符合「${q}」的文件。` : undefined}
+        columns={[
+          {
+            header: "文件",
+            // the row leads with the file NAME — the full uri (a filesystem path
+            // in disguise) rides the hover title and the detail pane (UXA3)
+            cell: (d) => <span title={d.source_uri}>{basename(d.source_uri)}</span>,
+          },
+          { header: "類型", cell: (d) => d.mime ?? "—" },
+          { header: "狀態", cell: (d) => (d.status === "ingested" ? "已匯入" : (d.status ?? "—")) },
+          { header: "匯入時間", cell: (d) => fmt(d.ingested_at) },
+        ]}
+        query={list}
+        selectedId={id}
+        onSelect={(rowId) => onSelect("documents", rowId)}
+        detail={
+          id && (
+            <Detail
+              title="Document"
+              isFetching={detail.isFetching}
+              isError={detail.isError}
+              error={detail.error}
+              fields={
+                doc && [
+                  ["id", doc.id],
+                  ["source_uri", doc.source_uri],
+                  ["content_hash", doc.content_hash ?? "—"],
+                  [
+                    "metadata",
+                    <pre key="metadata" className="inspect__pre">
+                      {blob(doc.metadata)}
+                    </pre>,
+                  ],
+                  // `raw` is detail-only — the list omits the key entirely, which is the
+                  // whole reason a row click fetches.
+                  ["raw", text(doc.raw)],
+                ]
+              }
+            />
+          )
+        }
+      />
+    </>
   );
 }
 

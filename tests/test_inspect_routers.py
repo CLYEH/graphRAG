@@ -9,6 +9,8 @@ are stubbed; the live SQL/scope behavior is the integration suite's job.
 
 from __future__ import annotations
 
+import base64
+import json
 import uuid
 from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime
@@ -21,7 +23,14 @@ from fastapi.testclient import TestClient
 
 from api.app import create_app
 from api.deps import db_conn
-from api.pagination import decode_chunk_cursor, decode_id_cursor, encode_cursor
+from api.pagination import (
+    decode_chunk_cursor,
+    decode_id_cursor,
+    decode_scoped_id_cursor,
+    encode_cursor,
+    encode_sorted_cursor,
+)
+from api.routers.inspect import _scope_fingerprint
 from core.stores.repo import NoActiveBuildError
 
 pytestmark = pytest.mark.contract
@@ -85,7 +94,9 @@ def _bindable(monkeypatch: pytest.MonkeyPatch) -> None:
     """Project exists and has an active build (the happy binding)."""
 
     async def fake_get_project(conn: Any, name: str) -> Any:
-        return SimpleNamespace(name=name)
+        # config rides along like the real row (the documents endpoint reads
+        # metadata_schema's filterable attributes from it)
+        return SimpleNamespace(name=name, config={})
 
     async def fake_resolve(conn: Any, project: str) -> Any:
         return SimpleNamespace(project=project, build_id=_BUILD)
@@ -159,7 +170,8 @@ def test_list_documents_pagination_cursor_round_trips(
     body = r.json()
     assert [d["id"] for d in body["data"]] == [str(rows[0].id), str(rows[1].id)]
     token = body["meta"]["next_cursor"]
-    assert decode_id_cursor(token) == (rows[1].id,)  # last IN-PAGE row, not the probe
+    tag = f"id:desc|{_scope_fingerprint(_BUILD, None, {})}"  # R8: default mints carry scope
+    assert decode_scoped_id_cursor(token, tag) == (rows[1].id,)  # last IN-PAGE row, not the probe
     assert repo.calls[0]["limit"] == 3  # limit+1 probe
 
     client.get("/projects/p/documents", params={"limit": 2, "cursor": token})
@@ -454,7 +466,8 @@ def test_entities_and_relations_paginate_like_documents(
     rows = [_entity_row() for _ in range(3)]
     repo.pages = rows
     r = client.get("/projects/p/entities", params={"limit": 2})
-    assert decode_id_cursor(r.json()["meta"]["next_cursor"]) == (rows[1].id,)
+    tag = f"id:desc|{_scope_fingerprint(_BUILD, None, {})}"  # R8: default mints carry scope
+    assert decode_scoped_id_cursor(r.json()["meta"]["next_cursor"], tag) == (rows[1].id,)
 
     rel_rows = [_relation_row() for _ in range(3)]
     repo.pages = rel_rows
@@ -777,3 +790,449 @@ def test_facet_vocabularies_match_the_ddl() -> None:
     assert set(REVIEW_STATUS) == set(
         _check_values(_tables.relations, "relations_review_status_valid")
     )
+
+
+# ---- SS1b sort expansion + metadata filterable facets ---------------------------
+
+
+def _filterable_project(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Binding stub whose project config declares filterable metadata attrs."""
+
+    config = {
+        "metadata_schema": {
+            "attributes": {
+                "topic": {"type": "string", "filterable": True},
+                "rating": {"type": "number", "filterable": True},
+                "public": {"type": "boolean", "filterable": True},
+                "note": {"type": "string"},  # NOT filterable
+                "status": {"type": "string", "filterable": True},  # reserved name
+            }
+        }
+    }
+
+    async def fake_get_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(name=name, config=config)
+
+    async def fake_resolve(conn: Any, project: str) -> Any:
+        return SimpleNamespace(project=project, build_id=_BUILD)
+
+    _stub(monkeypatch, "get_project", fake_get_project)
+    _stub(monkeypatch, "_resolve_active_binding", fake_resolve)
+
+
+@pytest.mark.parametrize(
+    ("path", "sort"),
+    [
+        ("/projects/p/entities", "canonical_name:asc"),
+        ("/projects/p/entities", "canonical_name:desc"),
+        ("/projects/p/entities", "created_at:asc"),
+        ("/projects/p/entities", "created_at:desc"),
+        ("/projects/p/documents", "ingested_at:asc"),
+        ("/projects/p/documents", "ingested_at:desc"),
+    ],
+)
+def test_ss1b_sorts_are_accepted_on_their_endpoints(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    repo: type[_FakeRepo],
+    path: str,
+    sort: str,
+) -> None:
+    # WHY: the owner-approved minimal sort set - accepted spellings must map
+    # to a real ORDER BY (the gate and the implementation share the spelling,
+    # so an accepted-but-unimplemented sort cannot exist)
+    _bindable(monkeypatch)
+    r = client.get(path, params={"sort": sort})
+    assert r.status_code == 200, r.text
+    field = sort.split(":")[0]
+    order_strs = [str(o) for o in repo.calls[-1]["order_by"]]
+    assert any(field in o for o in order_strs), order_strs
+    direction = "ASC" if sort.endswith(":asc") else "DESC"
+    assert all(direction in o for o in order_strs), order_strs  # tie-break same way
+
+
+def test_sorted_page_mints_a_tagged_cursor_bound_to_its_sort(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # WHY: a keyset token only means something relative to its ORDER BY - the
+    # sort rides inside the cursor, and replaying it under another sort is a
+    # loud 400, never a silent re-anchor (or a name parsed as a timestamp)
+    _bindable(monkeypatch)
+    rows = [_entity_row() for _ in range(3)]
+    repo.pages = rows
+    r = client.get("/projects/p/entities", params={"limit": 2, "sort": "canonical_name:asc"})
+    token = r.json()["meta"]["next_cursor"]
+    assert token is not None
+
+    ok = client.get("/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": token})
+    assert ok.status_code == 200
+
+    crossed = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": token})
+    assert crossed.status_code == 400
+    assert "issued under" in crossed.json()["error"]["message"]
+
+
+def test_legacy_default_cursor_still_pages_and_rejects_sorted_reuse(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # the pre-SS1b untagged (id,) cursor keeps working for the default order,
+    # and crossing it into a sorted request fails the arity check
+    _bindable(monkeypatch)
+    legacy = encode_cursor((uuid.uuid4(),))
+    assert client.get("/projects/p/entities", params={"cursor": legacy}).status_code == 200
+    crossed = client.get(
+        "/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": legacy}
+    )
+    assert crossed.status_code == 400
+
+
+def test_unknown_sort_fields_stay_rejected(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    _bindable(monkeypatch)
+    r = client.get("/projects/p/entities", params={"sort": "confidence:asc"})
+    assert r.status_code == 400
+    assert "supported sorts" in r.json()["error"]["message"]
+
+
+def test_filterable_metadata_attr_filters_by_containment(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # WHY: rule 8 search half - ONLY schema-declared filterable attrs become
+    # facets, matched by JSONB containment down the envelope path (the shape
+    # the GIN index serves)
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[topic]": "sea"})
+    assert r.status_code == 200, r.text
+    where_strs = [str(w) for w in repo.calls[-1]["where"]]
+    assert any("@>" in w for w in where_strs), where_strs
+
+
+def test_non_filterable_attr_is_rejected_loud(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # `note` exists in the schema but is NOT filterable - accepting it would
+    # promise an index-backed facet the schema never opted into
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[note]": "x"})
+    assert r.status_code == 400
+    assert "supported filters" in r.json()["error"]["message"]
+
+
+def test_metadata_number_and_boolean_values_are_typed(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    _filterable_project(monkeypatch)
+    # declared number: a non-number is a caller error, not a match-nothing
+    assert client.get("/projects/p/documents", params={"filter[rating]": "abc"}).status_code == 400
+    assert client.get("/projects/p/documents", params={"filter[rating]": "5"}).status_code == 200
+    # declared boolean: STRICT true/false (class 1 - "True" is a typo)
+    assert client.get("/projects/p/documents", params={"filter[public]": "True"}).status_code == 400
+    assert client.get("/projects/p/documents", params={"filter[public]": "true"}).status_code == 200
+
+
+def test_metadata_attr_named_status_is_reserved_for_the_lifecycle_facet(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # WHY: filter[status] predates the metadata facets - letting a schema attr
+    # shadow it would silently flip an existing spelling meaning; the
+    # lifecycle facet wins and the attr is unreachable under this name
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[status]": "ingested"})
+    assert r.status_code == 200
+    where_strs = [str(w) for w in repo.calls[-1]["where"]]
+    assert not any("@>" in w for w in where_strs), where_strs
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "Infinity", "1e999"])
+def test_non_finite_number_filters_are_rejected_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo], bad: str
+) -> None:
+    # Codex #120 R1: NaN/Infinity/overflow parse as floats but JSONB cannot
+    # carry them - unchecked they 500 at bind time; a client-controlled
+    # filter value must be a typed 400 (the uploads _finite_float twin)
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[rating]": bad})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_malformed_metadata_schema_is_a_400_not_a_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R1: a malformed metadata_schema in the freely writable config
+    # is operator-fixable - the documents list must say so (typed 400, the
+    # uploads/query discipline), never turn every request into an opaque 500
+    config = {"metadata_schema": {"attributes": {"t": {"filterable": True}}}}  # missing type
+
+    async def fake_get_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(name=name, config=config)
+
+    async def fake_resolve(conn: Any, project: str) -> Any:
+        return SimpleNamespace(project=project, build_id=_BUILD)
+
+    _stub(monkeypatch, "get_project", fake_get_project)
+    _stub(monkeypatch, "_resolve_active_binding", fake_resolve)
+
+    r = client.get("/projects/p/documents")
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert "type is required" in r.json()["error"]["message"]
+
+
+def test_nul_in_metadata_filter_is_rejected_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R2: PostgreSQL JSONB cannot represent U+0000 - a %00 in a
+    # client filter would 500 at bind time; rejected for EVERY declared type
+    # before the containment predicate forms (the uploads _contains_nul twin)
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[topic]": "\x00sea"})
+    assert r.status_code == 400
+    assert "NUL" in r.json()["error"]["message"]
+
+
+def test_tampered_naive_datetime_cursor_is_a_400_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R2: a correctly TAGGED cursor whose timestamp value was
+    # tampered to a timezone-less ISO string parses fine but would raise in
+    # the asyncpg timestamptz encoder (500) - it must be the documented
+    # malformed-cursor 400 instead
+    _bindable(monkeypatch)
+    tag = f"created_at:asc|{_scope_fingerprint(_BUILD, None, {})}"
+    forged = encode_sorted_cursor(tag, ("2026-01-01T00:00:00", uuid.uuid4()))
+    r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
+    assert r.status_code == 400
+    assert "malformed cursor" in r.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "bad", [123, True, {"a": 1}, ["x"]], ids=["number", "bool", "object", "array"]
+)
+def test_non_string_uuid_cursor_part_is_a_400_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo], bad: Any
+) -> None:
+    # Codex #120 R4: a correctly TAGGED cursor whose uuid tie-break slot was
+    # tampered to a JSON number/bool/object/array reaches uuid.UUID(), which
+    # dies with AttributeError - outside the ValueError/TypeError translation,
+    # so it was a 500; must be the documented malformed-cursor 400
+    _bindable(monkeypatch)
+    # hand-rolled: encode_cursor str()-ifies every value, so the raw JSON
+    # shapes only exist in a token a client BUILT, never one the server minted
+    tag = f"created_at:asc|{_scope_fingerprint(_BUILD, None, {})}"
+    raw = json.dumps([tag, "2026-01-01T00:00:00+00:00", bad]).encode()
+    forged = base64.urlsafe_b64encode(raw).decode()
+    r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
+    assert r.status_code == 400
+    assert "malformed cursor" in r.json()["error"]["message"]
+
+
+def test_no_active_build_outranks_malformed_metadata_schema(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R5: an existing project with BOTH no active build and a
+    # malformed metadata_schema must surface the documented bootstrap 409 -
+    # a config 400 first would point bootstrap users at the wrong problem
+    config = {"metadata_schema": {"attributes": {"t": {"filterable": True}}}}  # missing type
+
+    async def bad_config_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(name=name, config=config)
+
+    async def no_active(conn: Any, project: str) -> Any:
+        raise NoActiveBuildError(project)
+
+    _stub(monkeypatch, "get_project", bad_config_project)
+    _stub(monkeypatch, "_resolve_active_binding", no_active)
+
+    r = client.get("/projects/p/documents")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "NO_ACTIVE_BUILD"
+
+
+@pytest.mark.parametrize("bad", ["a\u0000b", 123, {"a": 1}], ids=["nul", "number", "object"])
+def test_invalid_text_cursor_part_is_a_400_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo], bad: Any
+) -> None:
+    # Codex #120 R7 (the R2/R4 tampered-cursor family, text slot): PostgreSQL
+    # text cannot carry U+0000, so a tagged cursor with a NUL in the
+    # canonical_name slot reaches the tuple bind and dies server-side; and a
+    # non-str JSON shape would be silently repr-coerced by str(). Both must
+    # be the documented malformed-cursor 400.
+    _bindable(monkeypatch)
+    tag = f"canonical_name:asc|{_scope_fingerprint(_BUILD, None, {})}"
+    raw = json.dumps([tag, bad, str(uuid.uuid4())]).encode()
+    forged = base64.urlsafe_b64encode(raw).decode()
+    r = client.get("/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": forged})
+    assert r.status_code == 400
+    assert "malformed cursor" in r.json()["error"]["message"]
+
+
+def test_cursor_rejects_replay_under_a_different_search_or_filter(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R8: a keyset anchor positions within ONE result set - the
+    # same sort with a different q (or filter) is a DIFFERENT result set, so
+    # replaying the token there would silently skip or duplicate rows; the
+    # scope fingerprint rides in the tag and mismatches 400, exactly like
+    # cross-sort reuse
+    _bindable(monkeypatch)
+    rows = [_entity_row() for _ in range(3)]
+    repo.pages = rows
+    r = client.get(
+        "/projects/p/entities",
+        params={"limit": 2, "sort": "canonical_name:asc", "q": "alpha"},
+    )
+    token = r.json()["meta"]["next_cursor"]
+    assert token is not None
+
+    same = client.get(
+        "/projects/p/entities",
+        params={"sort": "canonical_name:asc", "q": "alpha", "cursor": token},
+    )
+    assert same.status_code == 200  # over-block guard: the SAME scope pages on
+
+    crossed_q = client.get(
+        "/projects/p/entities",
+        params={"sort": "canonical_name:asc", "q": "beta", "cursor": token},
+    )
+    assert crossed_q.status_code == 400
+    assert "issued under" in crossed_q.json()["error"]["message"]
+
+    dropped_q = client.get(
+        "/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": token}
+    )
+    assert dropped_q.status_code == 400  # dropping the search also changes the set
+
+
+def test_default_order_cursor_rejects_filter_swap(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R8, default (id desc) order: newly minted cursors carry the
+    # scope tag too - a filter[status] swap mid-pagination is a 400, while
+    # the identical filter keeps paging
+    _bindable(monkeypatch)
+    rows = [_doc_row() for _ in range(3)]
+    repo.pages = rows
+    r = client.get("/projects/p/documents", params={"limit": 2, "filter[status]": "ingested"})
+    token = r.json()["meta"]["next_cursor"]
+    assert token is not None
+
+    same = client.get(
+        "/projects/p/documents", params={"filter[status]": "ingested", "cursor": token}
+    )
+    assert same.status_code == 200
+
+    swapped = client.get(
+        "/projects/p/documents", params={"filter[status]": "failed", "cursor": token}
+    )
+    assert swapped.status_code == 400
+    assert "issued under" in swapped.json()["error"]["message"]
+
+
+def test_numeric_filter_binds_without_float_precision_loss(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R8: 9007199254740993.0 through binary float rounds to ...992
+    # and JSONB compares NUMERICALLY - the probe must carry the exact value.
+    # Integral spellings bind as exact ints; fractional ones as float only
+    # when the float means the same number; the rest are a typed 400.
+    from api.routers.inspect import _typed_metadata_value
+
+    exact = _typed_metadata_value("9007199254740993.0", "number", "rating")
+    assert exact == 9007199254740993 and isinstance(exact, int)
+    assert _typed_metadata_value("3.14", "number", "rating") == 3.14
+    assert _typed_metadata_value("-2.5e2", "number", "rating") == -250
+
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[rating]": "0.10000000000000000555"})
+    assert r.status_code == 400
+    assert "float precision" in r.json()["error"]["message"]
+
+
+def test_cursor_is_bound_to_the_active_build(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R9: a keyset anchor positions within ONE build's rows - after
+    # the active build flips, replaying build A's cursor into build B would
+    # silently omit/repeat rows (the DR-001/DR-006 "never mix old-version
+    # data" rule, applied to pagination chains)
+    _bindable(monkeypatch)
+    rows = [_entity_row() for _ in range(3)]
+    repo.pages = rows
+    r = client.get("/projects/p/entities", params={"limit": 2, "sort": "canonical_name:asc"})
+    token = r.json()["meta"]["next_cursor"]
+    assert token is not None
+
+    same_build = client.get(
+        "/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": token}
+    )
+    assert same_build.status_code == 200  # over-block guard: same build pages on
+
+    other = uuid.uuid4()
+
+    async def rebound(conn: Any, project: str) -> Any:
+        return SimpleNamespace(project=project, build_id=other)
+
+    _stub(monkeypatch, "_resolve_active_binding", rebound)
+    crossed = client.get(
+        "/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": token}
+    )
+    assert crossed.status_code == 400
+    assert "issued under" in crossed.json()["error"]["message"]
+
+
+def test_cursor_rejects_replay_after_attribute_retype(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R10: a schema edit can RETYPE a filterable attribute between
+    # pages - same raw spelling, different JSONB predicate, so the result set
+    # changed while build/q/filter spellings did not; the declared type rides
+    # in the scope fingerprint and the replay fails loudly
+    _filterable_project(monkeypatch)
+    rows = [_doc_row() for _ in range(3)]
+    repo.pages = rows
+    r = client.get("/projects/p/documents", params={"limit": 2, "filter[topic]": "1"})
+    token = r.json()["meta"]["next_cursor"]
+    assert token is not None
+
+    same = client.get("/projects/p/documents", params={"filter[topic]": "1", "cursor": token})
+    assert same.status_code == 200  # over-block guard: unchanged schema pages on
+
+    retyped = {
+        "metadata_schema": {
+            "attributes": {
+                "topic": {"type": "number", "filterable": True},
+                "rating": {"type": "number", "filterable": True},
+                "public": {"type": "boolean", "filterable": True},
+                "note": {"type": "string"},
+            }
+        }
+    }
+
+    async def retyped_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(name=name, config=retyped)
+
+    _stub(monkeypatch, "get_project", retyped_project)
+    crossed = client.get("/projects/p/documents", params={"filter[topic]": "1", "cursor": token})
+    assert crossed.status_code == 400
+    assert "issued under" in crossed.json()["error"]["message"]
+
+
+def test_blank_string_metadata_filter_selects_blank_values(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R10: ingest admits "" as a stored string attribute value
+    # (isinstance str is the only check), so the facet must be able to SELECT
+    # those rows - a blank filter[topic] is an equality predicate on "", not
+    # a caller error; number attrs still reject blanks via the type parse
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[topic]": ""})
+    assert r.status_code == 200
+    # the containment predicate carried the empty-string probe
+    probes = [str(c) for call in repo.count_calls for c in call["where"]]
+    assert probes, "the blank filter must produce a predicate, not be dropped"
+
+    blank_number = client.get("/projects/p/documents", params={"filter[rating]": ""})
+    assert blank_number.status_code == 400
+    assert "expects a number" in blank_number.json()["error"]["message"]

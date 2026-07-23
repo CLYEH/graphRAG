@@ -425,4 +425,170 @@ describe("Inspect", () => {
 
     expect(await screen.findByText(/no documents in the active build/i)).toBeInTheDocument();
   });
+
+  it("documents search sends server-side q and shows the exact total (SS1b)", async () => {
+    // WHY: the search must be a REAL server-side q over the whole active
+    // build (the Graph discipline), and the count the server's total for
+    // THIS search - never a loaded-pages count (the FE3 false affordance)
+    const get = vi.spyOn(api, "GET");
+    get.mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/documents") {
+        const q = (opts as { params: { query: { q?: string } } }).params.query.q;
+        if (q === "corpus") {
+          return Promise.resolve({
+            data: {
+              data: [doc({ id: "d2", source_uri: "file:///corpus/hit.txt" })],
+              meta: { ...META, total: 1 },
+            },
+            error: undefined,
+          });
+        }
+        return Promise.resolve(ok([doc()]));
+      }
+      return Promise.resolve(ok([]));
+    }) as never);
+    renderInspect();
+    await screen.findByRole("searchbox");
+
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "corpus" } });
+    // debounce (300ms) then the q-keyed refetch
+    expect(await screen.findByText("hit.txt", {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(await screen.findByText(/符合「corpus」的文件:1 筆/)).toBeInTheDocument();
+    const qs = get.mock.calls
+      .filter((c) => c[0] === "/projects/{project}/documents")
+      .map((c) => requestQuery(c).q);
+    expect(qs).toContain("corpus");
+  });
+
+  it("hides the match count while revalidating and beside a failed refetch (SS1b R3)", async () => {
+    // class 17: the total is a claim about the CURRENT build's search - during
+    // a refetch (or beside a failed one) the cached number is unverified and
+    // must vanish with the rows, not linger as a stale claim
+    let calls = 0;
+    const get = vi.spyOn(api, "GET");
+    get.mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/documents") {
+        const q = (opts as { params: { query: { q?: string } } }).params.query.q;
+        if (q === "corpus") {
+          calls += 1;
+          if (calls >= 2) return Promise.resolve(fail(503, "STORE_UNAVAILABLE", "down"));
+          return Promise.resolve({
+            data: {
+              data: [doc({ id: "d2", source_uri: "file:///corpus/hit.txt" })],
+              meta: { ...META, total: 1 },
+            },
+            error: undefined,
+          });
+        }
+        return Promise.resolve(ok([doc()]));
+      }
+      return Promise.resolve(ok([]));
+    }) as never);
+    renderInspect();
+    await screen.findByRole("searchbox");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "corpus" } });
+    expect(
+      await screen.findByText(/符合「corpus」的文件:1 筆/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+
+    // a refocus revalidation now FAILS - count must go with the rows
+    await act(async () => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+    await waitFor(() => expect(screen.queryByText(/符合「corpus」的文件/)).toBeNull());
+  });
+
+  it("zero search matches say so - never『build is empty』(SS1b R3)", async () => {
+    const get = vi.spyOn(api, "GET");
+    get.mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/documents") {
+        const q = (opts as { params: { query: { q?: string } } }).params.query.q;
+        if (q === "nomatch") {
+          return Promise.resolve({
+            data: { data: [], meta: { ...META, total: 0 } },
+            error: undefined,
+          });
+        }
+        return Promise.resolve(ok([doc()]));
+      }
+      return Promise.resolve(ok([]));
+    }) as never);
+    renderInspect();
+    await screen.findByRole("searchbox");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "nomatch" } });
+    expect(
+      await screen.findByText(/沒有符合「nomatch」的文件/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    // the false claim must NOT render: the corpus is not empty, the search is
+    expect(screen.queryByText(/No documents in the active build/)).toBeNull();
+  });
+
+  it("clears the selected document when the search changes (SS1b R5)", async () => {
+    // a selection made under one search means nothing under another - the row
+    // can drop out of the new result set while its detail pane lingers as if
+    // it belonged to the filtered rows
+    const get = vi.spyOn(api, "GET");
+    get.mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/documents/{document_id}") {
+        return Promise.resolve({
+          data: { data: doc({ raw: "the full document text" }), meta: META },
+          error: undefined,
+        });
+      }
+      if (path === "/projects/{project}/documents") {
+        const q = (opts as { params: { query: { q?: string } } }).params.query.q;
+        if (q === "other") {
+          return Promise.resolve(ok([doc({ id: "d9", source_uri: "file:///other.txt" })]));
+        }
+        return Promise.resolve(ok([doc()]));
+      }
+      return Promise.resolve(ok([]));
+    }) as never);
+    renderInspect();
+
+    fireEvent.click(await screen.findByRole("button", { name: /a\.txt/ }));
+    expect(await screen.findByText("the full document text")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "other" } });
+    // assert AFTER the new result set settles: mid-refetch PagedList unmounts
+    // the detail anyway (a transient null that would green a broken guard) -
+    // the leak Codex flagged is the detail RE-appearing under the new rows
+    await screen.findByRole("button", { name: /other\.txt/ }, { timeout: 5000 });
+    expect(screen.queryByText("the full document text")).toBeNull();
+  });
+
+  it("labels the count and empty state with the query they answer (SS1b R6)", async () => {
+    // while the debounce is pending the box already shows the NEW input but
+    // the settled rows/total still answer the OLD query - the label carries
+    // the applied term (the GraphBody pattern) so those claims cannot be
+    // read as answering whatever is currently typed
+    const get = vi.spyOn(api, "GET");
+    get.mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/documents") {
+        const q = (opts as { params: { query: { q?: string } } }).params.query.q;
+        if (q === "corpus") {
+          return Promise.resolve({
+            data: {
+              data: [doc({ id: "d2", source_uri: "file:///corpus/hit.txt" })],
+              meta: { ...META, total: 1 },
+            },
+            error: undefined,
+          });
+        }
+        return Promise.resolve(ok([doc()]));
+      }
+      return Promise.resolve(ok([]));
+    }) as never);
+    renderInspect();
+    await screen.findByRole("searchbox");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "corpus" } });
+    await screen.findByText(/符合「corpus」的文件:1 筆/, {}, { timeout: 5000 });
+
+    // edit the box; BEFORE the 300ms debounce fires, the settled count is
+    // still on screen - its label must still name the term it answers
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "corpus-edited" } });
+    const hint = screen.getByText(/符合「corpus」的文件:1 筆/);
+    expect(hint).toBeInTheDocument();
+  });
 });

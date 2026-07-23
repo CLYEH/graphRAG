@@ -52,6 +52,18 @@ GitHub 為準;立案或了結後從本檔劃掉):
   HEAD 不含修正(當場發生一次,一分鐘內補正;gate-2 之後兩輪都以人工
   flag 防守)。可機械化:push gate 加一條「`git status --porcelain` 除
   untracked 外必須乾淨」(有 uncommitted tracked 變更即擋),H-task 量級。
+- **filterable 保留名 `status` 的 config-time 回饋**(SS1b gate-2 nit):documents
+  端點對 schema 宣告 filterable 的 `status` 屬性靜默讓位給 lifecycle facet
+  (安全預設,已文件化),但專案 owner 得不到「此欄位在 documents 清單不可達」
+  的回饋——宜在 metadata_schema 載入/驗證時警告或拒絕保留名,小任務量級。
+- **PageMeta.total 的 estimate 路徑**(SS1b 收尾時 owner 定案「維持精確」):
+  契約已預留 `total_estimated`;觸發條件出現時(COUNT 顯著變慢/表過十萬列級)
+  再實作 planner 估計路徑,Console 改顯「約 N 筆」;同一 scale 路徑順帶:
+  0020 的 GIN 建索引改 CONCURRENTLY、COALESCE timestamp keyset 補 functional
+  index(目前規模皆不需要,gate-2 nit 記帳)。
+- **metadata 搜尋的 Qdrant 半邊**(rule 8;SS1b 只落 Postgres 清單面):
+  retrieval 時以 metadata 過濾 chunk 候選(Qdrant payload index)屬查詢管線
+  面,需另立任務設計 store filters 與 query API 的接法。
 - **空 stages 的 run_build 本體 ~4s**(H20b 期間實測,#115):orchestrator 對
   「六個 no-op stage」的 build 也要 4 秒(疑似 per-stage 連線/交易開銷或
   store client 建構),曾把既有 lock 測試的 5s 等待預算壓到確定性餓死

@@ -23,6 +23,7 @@ def reject_unsupported_query(
     allowed_filters: frozenset[str] = frozenset(),
     *,
     search: bool = False,
+    extra_sorts: frozenset[str] = frozenset(),
 ) -> None:
     """Reject a non-default ``sort`` or any unsupported ``filter``.
     ``sort_field`` names the single-column desc default an explicit ``sort``
@@ -40,7 +41,14 @@ def reject_unsupported_query(
     is — the contract declares ``q`` on only some lists, so a ``q`` an endpoint
     cannot honor must fail loud, never be silently ignored (the same
     false-affordance discipline as GAPS O4). A search endpoint reads ``q``
-    itself (FastAPI validates its length)."""
+    itself (FastAPI validates its length).
+
+    ``extra_sorts`` (SS1b sort expansion, owner-approved minimal set): field
+    names the endpoint implements as ``field:asc``/``field:desc`` keyset
+    orders IN ADDITION to the restatable default. The endpoint reads the
+    validated ``sort`` itself and owns the matching keyset cursor — this gate
+    only decides accept/reject, so the allowlist and the implementation can't
+    drift apart (the endpoint builds its ORDER BY from the same spelling)."""
     if not search and request.query_params.get("q") is not None:
         raise ApiError(
             ErrorCode.VALIDATION_ERROR,
@@ -67,11 +75,14 @@ def reject_unsupported_query(
     sort = request.query_params.get("sort")
     if sort is None:
         return
-    if sort_field is None or sort != f"{sort_field}:desc":
+    accepted = {f"{name}:{direction}" for name in extra_sorts for direction in ("asc", "desc")}
+    if sort_field is not None:
+        accepted.add(f"{sort_field}:desc")
+    if sort not in accepted:
         supported = (
-            f"only sort={sort_field}:desc is supported"
-            if sort_field
-            else ("explicit sort is not supported on this list")
+            f"supported sorts: {', '.join(sorted(accepted))}"
+            if accepted
+            else "explicit sort is not supported on this list"
         )
         raise ApiError(ErrorCode.VALIDATION_ERROR, supported, details={"sort": sort})
 
@@ -91,7 +102,11 @@ async def reject_null_body(request: Request) -> None:
 
 
 def single_filter_value(
-    request: Request, field: str, *, vocabulary: tuple[str, ...] | None = None
+    request: Request,
+    field: str,
+    *,
+    vocabulary: tuple[str, ...] | None = None,
+    allow_blank: bool = False,
 ) -> str | None:
     """The validated ``filter[<field>]`` value, or None when absent (GOV4/SS1a).
 
@@ -101,6 +116,10 @@ def single_filter_value(
     CHECK vocabularies — pass the SAME tuple a contract test pins against the
     DDL, or drift is silent); None means an open value set (e.g. entity type,
     an ontology-defined vocabulary) where only blank is meaningless.
+    ``allow_blank`` lifts the blank rejection for schema-declared STRING
+    metadata attributes (SS1b R10): ingest validation admits ""/whitespace
+    as stored values, so the facet must reach them — a blank filter is a
+    real equality predicate there, not a caller error.
     """
     values = request.query_params.getlist(f"filter[{field}]")
     if not values:
@@ -118,7 +137,7 @@ def single_filter_value(
             f"unknown {field} {value!r} — one of: {', '.join(sorted(vocabulary))}",
             details={f"filter[{field}]": value},
         )
-    if vocabulary is None and not value.strip():
+    if vocabulary is None and not allow_blank and not value.strip():
         raise ApiError(
             ErrorCode.VALIDATION_ERROR,
             f"filter[{field}] must be a non-blank value",
