@@ -1042,3 +1042,20 @@ def test_no_active_build_outranks_malformed_metadata_schema(
     r = client.get("/projects/p/documents")
     assert r.status_code == 409
     assert r.json()["error"]["code"] == "NO_ACTIVE_BUILD"
+
+
+@pytest.mark.parametrize("bad", ["a\u0000b", 123, {"a": 1}], ids=["nul", "number", "object"])
+def test_invalid_text_cursor_part_is_a_400_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo], bad: Any
+) -> None:
+    # Codex #120 R7 (the R2/R4 tampered-cursor family, text slot): PostgreSQL
+    # text cannot carry U+0000, so a tagged cursor with a NUL in the
+    # canonical_name slot reaches the tuple bind and dies server-side; and a
+    # non-str JSON shape would be silently repr-coerced by str(). Both must
+    # be the documented malformed-cursor 400.
+    _bindable(monkeypatch)
+    raw = json.dumps(["canonical_name:asc", bad, str(uuid.uuid4())]).encode()
+    forged = base64.urlsafe_b64encode(raw).decode()
+    r = client.get("/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": forged})
+    assert r.status_code == 400
+    assert "malformed cursor" in r.json()["error"]["message"]

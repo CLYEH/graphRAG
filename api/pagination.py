@@ -55,6 +55,14 @@ def _convert(token: str, parts: list[Any], types: tuple[type, ...]) -> tuple[Any
                     # encoder as a 500, not the documented malformed-cursor 400
                     raise ValueError("naive datetime in cursor")
                 out.append(parsed)
+            elif typ is str:
+                if not isinstance(part, str) or "\x00" in part:
+                    # PostgreSQL text cannot carry U+0000 — a tampered NUL in
+                    # the text slot would surface as a server error at bind
+                    # time, not the documented malformed-cursor 400; non-str
+                    # JSON shapes would be silently repr-coerced by str()
+                    raise ValueError("invalid text in cursor")
+                out.append(part)
             elif typ is uuid.UUID:
                 if not isinstance(part, str):
                     # uuid.UUID(non-str) dies with AttributeError, which the
