@@ -56,6 +56,12 @@ def _convert(token: str, parts: list[Any], types: tuple[type, ...]) -> tuple[Any
                     raise ValueError("naive datetime in cursor")
                 out.append(parsed)
             elif typ is uuid.UUID:
+                if not isinstance(part, str):
+                    # uuid.UUID(non-str) dies with AttributeError, which the
+                    # clause below does not translate — a tampered JSON
+                    # number/bool/object in the uuid slot must still be the
+                    # documented malformed-cursor 400
+                    raise ValueError("cursor uuid part must be a string")
                 out.append(uuid.UUID(part))
             else:
                 out.append(typ(part))

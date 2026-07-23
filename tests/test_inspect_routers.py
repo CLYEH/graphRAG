@@ -9,6 +9,8 @@ are stubbed; the live SQL/scope behavior is the integration suite's job.
 
 from __future__ import annotations
 
+import base64
+import json
 import uuid
 from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime
@@ -995,6 +997,26 @@ def test_tampered_naive_datetime_cursor_is_a_400_not_500(
     # malformed-cursor 400 instead
     _bindable(monkeypatch)
     forged = encode_sorted_cursor("created_at:asc", ("2026-01-01T00:00:00", uuid.uuid4()))
+    r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
+    assert r.status_code == 400
+    assert "malformed cursor" in r.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "bad", [123, True, {"a": 1}, ["x"]], ids=["number", "bool", "object", "array"]
+)
+def test_non_string_uuid_cursor_part_is_a_400_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo], bad: Any
+) -> None:
+    # Codex #120 R4: a correctly TAGGED cursor whose uuid tie-break slot was
+    # tampered to a JSON number/bool/object/array reaches uuid.UUID(), which
+    # dies with AttributeError - outside the ValueError/TypeError translation,
+    # so it was a 500; must be the documented malformed-cursor 400
+    _bindable(monkeypatch)
+    # hand-rolled: encode_cursor str()-ifies every value, so the raw JSON
+    # shapes only exist in a token a client BUILT, never one the server minted
+    raw = json.dumps(["created_at:asc", "2026-01-01T00:00:00+00:00", bad]).encode()
+    forged = base64.urlsafe_b64encode(raw).decode()
     r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
     assert r.status_code == 400
     assert "malformed cursor" in r.json()["error"]["message"]
