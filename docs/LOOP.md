@@ -191,6 +191,20 @@ loop back to step 3.
    the catalog. Mechanize-first: a preventable class becomes a hook/CI/lint/helper
    (`H<n>`), prose is the fallback.
 
+   **Archive the as-built (owner rule, 2026-07-23):** the task PR's `- [x]` line is
+   the ONE-LINE SUMMARY — the as-built narrative is written during this retro, not in
+   the task PR (the ceiling gate below runs at PR time, so an as-built left inline
+   fails the PR that wrote it). Finish the retro by running
+   `uv run python scripts/archive_task.py <TASK-ID>`. It moves the entry's as-built
+   narrative out of `TASKS.md` into `docs/TASKS_ARCHIVE.md`, leaving the one-line
+   summary the queue actually needs — the loop re-reads `TASKS.md` on every iteration
+   to pick the next task, so prose about finished work is a recurring context tax on
+   a decision it cannot inform (H22: it had reached 83% of the file). The `governance`
+   CI job fails the PR if a `- [x]` line is still over the ceiling, so this is enforced,
+   not remembered. **Never open the archive to read it** — the script appends, and
+   appending needs no read; look entries up with `grep -A40 '^## <TASK-ID>'`. Reading
+   it (to sort, dedupe, or "check the format") just moves the same tax onto every retro.
+
    **Retro routing (owner rule, 2026-07-03):** apply the retro's own follow-ups by lane —
    if they touch only `*.md` (catalog entries, reviewer-checklist sharpening, LOOP/CLAUDE
    clarifications), take the **doc-only fast lane**: no PR, no Codex review requested.
