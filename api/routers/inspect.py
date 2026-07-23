@@ -112,15 +112,22 @@ def _escape_like(value: str) -> str:
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
-def _scope_fingerprint(q: str | None, applied: dict[str, str]) -> str:
+def _scope_fingerprint(build_id: Any, q: str | None, applied: dict[str, str]) -> str:
     """Canonical fingerprint of the non-sort predicates a page answers (R8).
     A keyset anchor positions within ONE result set — replaying it under a
     different q/filter combination silently skips or duplicates rows — so
     this rides in the cursor tag beside the sort and decode rejects a
-    mismatch, exactly as cross-sort reuse is rejected. Raw filter spellings
+    mismatch, exactly as cross-sort reuse is rejected. The ACTIVE BUILD is
+    part of the scope too (R9): a keyset from build A applied to build B
+    would silently omit/repeat rows — the DR-001/DR-006 "never mix
+    old-version data" rule, enforced here for pagination chains. Raw filter spellings
     on purpose: "3" vs "3.0" fingerprint differently, which over-rejects a
     cosmetic respelling but never under-rejects a real predicate change."""
-    scope = json.dumps({"q": q or "", "filters": applied}, sort_keys=True, separators=(",", ":"))
+    scope = json.dumps(
+        {"build": str(build_id), "q": q or "", "filters": applied},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(scope.encode()).hexdigest()[:12]
 
 
@@ -341,7 +348,7 @@ async def list_documents_endpoint(
         cursor,
         docs.c.id,
         where,
-        scope=_scope_fingerprint(q, applied),
+        scope=_scope_fingerprint(binding.build_id, q, applied),
         text_cols={},
         time_cols={"ingested_at": docs.c.ingested_at},
     )
@@ -469,7 +476,7 @@ async def list_entities_endpoint(
         cursor,
         ents.c.id,
         where,
-        scope=_scope_fingerprint(q, applied),
+        scope=_scope_fingerprint(binding.build_id, q, applied),
         text_cols={"canonical_name": ents.c.canonical_name},
         time_cols={"created_at": ents.c.created_at},
     )

@@ -170,7 +170,7 @@ def test_list_documents_pagination_cursor_round_trips(
     body = r.json()
     assert [d["id"] for d in body["data"]] == [str(rows[0].id), str(rows[1].id)]
     token = body["meta"]["next_cursor"]
-    tag = f"id:desc|{_scope_fingerprint(None, {})}"  # R8: default mints carry scope
+    tag = f"id:desc|{_scope_fingerprint(_BUILD, None, {})}"  # R8: default mints carry scope
     assert decode_scoped_id_cursor(token, tag) == (rows[1].id,)  # last IN-PAGE row, not the probe
     assert repo.calls[0]["limit"] == 3  # limit+1 probe
 
@@ -466,7 +466,7 @@ def test_entities_and_relations_paginate_like_documents(
     rows = [_entity_row() for _ in range(3)]
     repo.pages = rows
     r = client.get("/projects/p/entities", params={"limit": 2})
-    tag = f"id:desc|{_scope_fingerprint(None, {})}"  # R8: default mints carry scope
+    tag = f"id:desc|{_scope_fingerprint(_BUILD, None, {})}"  # R8: default mints carry scope
     assert decode_scoped_id_cursor(r.json()["meta"]["next_cursor"], tag) == (rows[1].id,)
 
     rel_rows = [_relation_row() for _ in range(3)]
@@ -1000,7 +1000,7 @@ def test_tampered_naive_datetime_cursor_is_a_400_not_500(
     # the asyncpg timestamptz encoder (500) - it must be the documented
     # malformed-cursor 400 instead
     _bindable(monkeypatch)
-    tag = f"created_at:asc|{_scope_fingerprint(None, {})}"
+    tag = f"created_at:asc|{_scope_fingerprint(_BUILD, None, {})}"
     forged = encode_sorted_cursor(tag, ("2026-01-01T00:00:00", uuid.uuid4()))
     r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
     assert r.status_code == 400
@@ -1020,7 +1020,7 @@ def test_non_string_uuid_cursor_part_is_a_400_not_500(
     _bindable(monkeypatch)
     # hand-rolled: encode_cursor str()-ifies every value, so the raw JSON
     # shapes only exist in a token a client BUILT, never one the server minted
-    tag = f"created_at:asc|{_scope_fingerprint(None, {})}"
+    tag = f"created_at:asc|{_scope_fingerprint(_BUILD, None, {})}"
     raw = json.dumps([tag, "2026-01-01T00:00:00+00:00", bad]).encode()
     forged = base64.urlsafe_b64encode(raw).decode()
     r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
@@ -1060,7 +1060,7 @@ def test_invalid_text_cursor_part_is_a_400_not_500(
     # non-str JSON shape would be silently repr-coerced by str(). Both must
     # be the documented malformed-cursor 400.
     _bindable(monkeypatch)
-    tag = f"canonical_name:asc|{_scope_fingerprint(None, {})}"
+    tag = f"canonical_name:asc|{_scope_fingerprint(_BUILD, None, {})}"
     raw = json.dumps([tag, bad, str(uuid.uuid4())]).encode()
     forged = base64.urlsafe_b64encode(raw).decode()
     r = client.get("/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": forged})
@@ -1148,3 +1148,35 @@ def test_numeric_filter_binds_without_float_precision_loss(
     r = client.get("/projects/p/documents", params={"filter[rating]": "0.10000000000000000555"})
     assert r.status_code == 400
     assert "float precision" in r.json()["error"]["message"]
+
+
+def test_cursor_is_bound_to_the_active_build(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R9: a keyset anchor positions within ONE build's rows - after
+    # the active build flips, replaying build A's cursor into build B would
+    # silently omit/repeat rows (the DR-001/DR-006 "never mix old-version
+    # data" rule, applied to pagination chains)
+    _bindable(monkeypatch)
+    rows = [_entity_row() for _ in range(3)]
+    repo.pages = rows
+    r = client.get("/projects/p/entities", params={"limit": 2, "sort": "canonical_name:asc"})
+    token = r.json()["meta"]["next_cursor"]
+    assert token is not None
+
+    same_build = client.get(
+        "/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": token}
+    )
+    assert same_build.status_code == 200  # over-block guard: same build pages on
+
+    other = uuid.uuid4()
+
+    async def rebound(conn: Any, project: str) -> Any:
+        return SimpleNamespace(project=project, build_id=other)
+
+    _stub(monkeypatch, "_resolve_active_binding", rebound)
+    crossed = client.get(
+        "/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": token}
+    )
+    assert crossed.status_code == 400
+    assert "issued under" in crossed.json()["error"]["message"]
