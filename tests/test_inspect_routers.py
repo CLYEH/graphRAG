@@ -26,9 +26,11 @@ from api.deps import db_conn
 from api.pagination import (
     decode_chunk_cursor,
     decode_id_cursor,
+    decode_scoped_id_cursor,
     encode_cursor,
     encode_sorted_cursor,
 )
+from api.routers.inspect import _scope_fingerprint
 from core.stores.repo import NoActiveBuildError
 
 pytestmark = pytest.mark.contract
@@ -168,7 +170,8 @@ def test_list_documents_pagination_cursor_round_trips(
     body = r.json()
     assert [d["id"] for d in body["data"]] == [str(rows[0].id), str(rows[1].id)]
     token = body["meta"]["next_cursor"]
-    assert decode_id_cursor(token) == (rows[1].id,)  # last IN-PAGE row, not the probe
+    tag = f"id:desc|{_scope_fingerprint(None, {})}"  # R8: default mints carry scope
+    assert decode_scoped_id_cursor(token, tag) == (rows[1].id,)  # last IN-PAGE row, not the probe
     assert repo.calls[0]["limit"] == 3  # limit+1 probe
 
     client.get("/projects/p/documents", params={"limit": 2, "cursor": token})
@@ -463,7 +466,8 @@ def test_entities_and_relations_paginate_like_documents(
     rows = [_entity_row() for _ in range(3)]
     repo.pages = rows
     r = client.get("/projects/p/entities", params={"limit": 2})
-    assert decode_id_cursor(r.json()["meta"]["next_cursor"]) == (rows[1].id,)
+    tag = f"id:desc|{_scope_fingerprint(None, {})}"  # R8: default mints carry scope
+    assert decode_scoped_id_cursor(r.json()["meta"]["next_cursor"], tag) == (rows[1].id,)
 
     rel_rows = [_relation_row() for _ in range(3)]
     repo.pages = rel_rows
@@ -996,7 +1000,8 @@ def test_tampered_naive_datetime_cursor_is_a_400_not_500(
     # the asyncpg timestamptz encoder (500) - it must be the documented
     # malformed-cursor 400 instead
     _bindable(monkeypatch)
-    forged = encode_sorted_cursor("created_at:asc", ("2026-01-01T00:00:00", uuid.uuid4()))
+    tag = f"created_at:asc|{_scope_fingerprint(None, {})}"
+    forged = encode_sorted_cursor(tag, ("2026-01-01T00:00:00", uuid.uuid4()))
     r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
     assert r.status_code == 400
     assert "malformed cursor" in r.json()["error"]["message"]
@@ -1015,7 +1020,8 @@ def test_non_string_uuid_cursor_part_is_a_400_not_500(
     _bindable(monkeypatch)
     # hand-rolled: encode_cursor str()-ifies every value, so the raw JSON
     # shapes only exist in a token a client BUILT, never one the server minted
-    raw = json.dumps(["created_at:asc", "2026-01-01T00:00:00+00:00", bad]).encode()
+    tag = f"created_at:asc|{_scope_fingerprint(None, {})}"
+    raw = json.dumps([tag, "2026-01-01T00:00:00+00:00", bad]).encode()
     forged = base64.urlsafe_b64encode(raw).decode()
     r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
     assert r.status_code == 400
@@ -1054,8 +1060,91 @@ def test_invalid_text_cursor_part_is_a_400_not_500(
     # non-str JSON shape would be silently repr-coerced by str(). Both must
     # be the documented malformed-cursor 400.
     _bindable(monkeypatch)
-    raw = json.dumps(["canonical_name:asc", bad, str(uuid.uuid4())]).encode()
+    tag = f"canonical_name:asc|{_scope_fingerprint(None, {})}"
+    raw = json.dumps([tag, bad, str(uuid.uuid4())]).encode()
     forged = base64.urlsafe_b64encode(raw).decode()
     r = client.get("/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": forged})
     assert r.status_code == 400
     assert "malformed cursor" in r.json()["error"]["message"]
+
+
+def test_cursor_rejects_replay_under_a_different_search_or_filter(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R8: a keyset anchor positions within ONE result set - the
+    # same sort with a different q (or filter) is a DIFFERENT result set, so
+    # replaying the token there would silently skip or duplicate rows; the
+    # scope fingerprint rides in the tag and mismatches 400, exactly like
+    # cross-sort reuse
+    _bindable(monkeypatch)
+    rows = [_entity_row() for _ in range(3)]
+    repo.pages = rows
+    r = client.get(
+        "/projects/p/entities",
+        params={"limit": 2, "sort": "canonical_name:asc", "q": "alpha"},
+    )
+    token = r.json()["meta"]["next_cursor"]
+    assert token is not None
+
+    same = client.get(
+        "/projects/p/entities",
+        params={"sort": "canonical_name:asc", "q": "alpha", "cursor": token},
+    )
+    assert same.status_code == 200  # over-block guard: the SAME scope pages on
+
+    crossed_q = client.get(
+        "/projects/p/entities",
+        params={"sort": "canonical_name:asc", "q": "beta", "cursor": token},
+    )
+    assert crossed_q.status_code == 400
+    assert "issued under" in crossed_q.json()["error"]["message"]
+
+    dropped_q = client.get(
+        "/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": token}
+    )
+    assert dropped_q.status_code == 400  # dropping the search also changes the set
+
+
+def test_default_order_cursor_rejects_filter_swap(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R8, default (id desc) order: newly minted cursors carry the
+    # scope tag too - a filter[status] swap mid-pagination is a 400, while
+    # the identical filter keeps paging
+    _bindable(monkeypatch)
+    rows = [_doc_row() for _ in range(3)]
+    repo.pages = rows
+    r = client.get("/projects/p/documents", params={"limit": 2, "filter[status]": "ingested"})
+    token = r.json()["meta"]["next_cursor"]
+    assert token is not None
+
+    same = client.get(
+        "/projects/p/documents", params={"filter[status]": "ingested", "cursor": token}
+    )
+    assert same.status_code == 200
+
+    swapped = client.get(
+        "/projects/p/documents", params={"filter[status]": "failed", "cursor": token}
+    )
+    assert swapped.status_code == 400
+    assert "issued under" in swapped.json()["error"]["message"]
+
+
+def test_numeric_filter_binds_without_float_precision_loss(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R8: 9007199254740993.0 through binary float rounds to ...992
+    # and JSONB compares NUMERICALLY - the probe must carry the exact value.
+    # Integral spellings bind as exact ints; fractional ones as float only
+    # when the float means the same number; the rest are a typed 400.
+    from api.routers.inspect import _typed_metadata_value
+
+    exact = _typed_metadata_value("9007199254740993.0", "number", "rating")
+    assert exact == 9007199254740993 and isinstance(exact, int)
+    assert _typed_metadata_value("3.14", "number", "rating") == 3.14
+    assert _typed_metadata_value("-2.5e2", "number", "rating") == -250
+
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[rating]": "0.10000000000000000555"})
+    assert r.status_code == 400
+    assert "float precision" in r.json()["error"]["message"]

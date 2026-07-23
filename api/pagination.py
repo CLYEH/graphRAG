@@ -120,31 +120,50 @@ def decode_chunk_cursor(token: str) -> tuple[uuid.UUID, int]:
     return document_id, ordinal
 
 
-def encode_sorted_cursor(sort: str, values: tuple[Any, ...]) -> str:
-    """SS1b sorted keysets: the cursor CARRIES the sort it was minted under.
-    A keyset token only means something relative to its ORDER BY — replaying
-    a canonical_name cursor into a created_at-sorted request would silently
-    page from the wrong spot (or worse, parse a name as a timestamp), so the
-    sort spelling rides inside the opaque token and decode refuses a
-    mismatch. The DEFAULT (id desc) order keeps the legacy untagged shape:
-    in-flight pre-SS1b cursors stay valid, and every cross-shape replay
-    fails the arity check."""
-    return encode_cursor((sort, *values))
+def _scope_mismatch(token: str) -> ApiError:
+    # the fingerprint half of a tag is an opaque hash, so the message names
+    # the CLASS of mismatch rather than echoing gibberish back
+    return ApiError(
+        ErrorCode.VALIDATION_ERROR,
+        "cursor was issued under a different sort/search/filter context — "
+        "restart from the first page",
+        details={"cursor": token},
+    )
 
 
-def decode_sorted_cursor(token: str, sort: str, types: tuple[type, ...]) -> tuple[Any, ...]:
-    """Decode a sorted-keyset cursor, requiring its embedded sort to equal the
-    request's ``sort`` — a cursor issued under a different order is a client
-    error (400), never a silent re-anchor. The tag is checked BEFORE the
-    value-type conversion, so a cross-sort replay reports the actual problem
-    ("issued under sort=X") instead of a misleading type-parse failure."""
+def encode_sorted_cursor(tag: str, values: tuple[Any, ...]) -> str:
+    """SS1b keysets: the cursor CARRIES the query context it was minted under
+    (``sort|scope-fingerprint``, see inspect._scope_fingerprint). A keyset
+    token only positions within ONE result set — replaying it under another
+    sort would page from the wrong spot (or parse a name as a timestamp), and
+    replaying it under another q/filter combination would silently skip or
+    duplicate rows (R8) — so the whole context rides inside the opaque token
+    and decode refuses a mismatch."""
+    return encode_cursor((tag, *values))
+
+
+def decode_sorted_cursor(token: str, tag: str, types: tuple[type, ...]) -> tuple[Any, ...]:
+    """Decode a tagged keyset cursor, requiring its embedded context tag to
+    equal the request's — a cursor issued under a different sort/search/filter
+    combination is a client error (400), never a silent re-anchor. The tag is
+    checked BEFORE the value-type conversion, so a cross-context replay
+    reports the actual problem instead of a misleading type-parse failure."""
     parts = _parts(token)
-    tag = parts[0] if parts else None
-    if tag != sort:
-        raise ApiError(
-            ErrorCode.VALIDATION_ERROR,
-            f"cursor was issued under sort={tag!r} and cannot page a "
-            f"sort={sort!r} request — restart from the first page",
-            details={"cursor": token, "sort": sort},
-        )
+    if (parts[0] if parts else None) != tag:
+        raise _scope_mismatch(token)
     return _convert(token, parts[1:], types)
+
+
+def decode_scoped_id_cursor(token: str, tag: str) -> tuple[uuid.UUID]:
+    """Default-order (id desc) cursor bound to its query scope (R8). Newly
+    minted tokens carry the context tag; the legacy pre-SS1b 1-item ``(id,)``
+    shape stays accepted — those in-flight cursors predate q/filter binding
+    and breaking them buys nothing (the hole closes as they age out)."""
+    parts = _parts(token)
+    if len(parts) == 1:
+        (row_id,) = _convert(token, parts, (uuid.UUID,))
+        return (row_id,)
+    if (parts[0] if parts else None) != tag:
+        raise _scope_mismatch(token)
+    (row_id,) = _convert(token, parts[1:], (uuid.UUID,))
+    return (row_id,)

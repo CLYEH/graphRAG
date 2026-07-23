@@ -23,10 +23,12 @@ dedicated code lands.
 
 from __future__ import annotations
 
-import math
+import hashlib
+import json
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import sqlalchemy as sa
@@ -39,6 +41,7 @@ from api.errors import ApiError, ErrorCode
 from api.pagination import (
     decode_chunk_cursor,
     decode_id_cursor,
+    decode_scoped_id_cursor,
     decode_sorted_cursor,
     encode_cursor,
     encode_sorted_cursor,
@@ -109,12 +112,25 @@ def _escape_like(value: str) -> str:
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
+def _scope_fingerprint(q: str | None, applied: dict[str, str]) -> str:
+    """Canonical fingerprint of the non-sort predicates a page answers (R8).
+    A keyset anchor positions within ONE result set — replaying it under a
+    different q/filter combination silently skips or duplicates rows — so
+    this rides in the cursor tag beside the sort and decode rejects a
+    mismatch, exactly as cross-sort reuse is rejected. Raw filter spellings
+    on purpose: "3" vs "3.0" fingerprint differently, which over-rejects a
+    cosmetic respelling but never under-rejects a real predicate change."""
+    scope = json.dumps({"q": q or "", "filters": applied}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(scope.encode()).hexdigest()[:12]
+
+
 def _sorted_page(
     sort: str | None,
     cursor: str | None,
     id_col: Any,
     where: list[Any],
     *,
+    scope: str,
     text_cols: dict[str, Any],
     time_cols: dict[str, Any],
 ) -> tuple[list[Any], Any]:
@@ -132,15 +148,17 @@ def _sorted_page(
     if sort == f"{id_col.name}:desc":
         sort = None  # an explicit restatement of the default IS the default
     if sort is None:
+        tag = f"{id_col.name}:desc|{scope}"
         if cursor:
-            (after_id,) = decode_id_cursor(cursor)
+            (after_id,) = decode_scoped_id_cursor(cursor, tag)
             where.append(id_col < after_id)
 
         def mint_default(last: Any) -> str:
-            return encode_cursor((last.id,))
+            return encode_sorted_cursor(tag, (last.id,))
 
         return [id_col.desc()], mint_default
 
+    tag = f"{sort}|{scope}"
     field, _, direction = sort.partition(":")
     ascending = direction == "asc"
     if field in text_cols:
@@ -160,13 +178,13 @@ def _sorted_page(
             return (getattr(last, col.name) or _EPOCH, last.id)
 
     if cursor:
-        after = decode_sorted_cursor(cursor, sort, types)
+        after = decode_sorted_cursor(cursor, tag, types)
         keyset = sa.tuple_(expr, id_col)
         where.append(keyset > after if ascending else keyset < after)
     order = [expr.asc(), id_col.asc()] if ascending else [expr.desc(), id_col.desc()]
 
     def mint(last: Any) -> str:
-        return encode_sorted_cursor(sort, values_of(last))
+        return encode_sorted_cursor(tag, values_of(last))
 
     return order, mint
 
@@ -192,24 +210,46 @@ def _typed_metadata_value(raw: str, declared: str, name: str) -> str | float | i
         try:
             return int(raw)
         except ValueError:
-            try:
-                parsed = float(raw)
-            except ValueError as exc:
-                raise ApiError(
-                    ErrorCode.VALIDATION_ERROR,
-                    f"filter[{name}] expects a number (schema-declared type)",
-                    details={f"filter[{name}]": raw},
-                ) from exc
-            # NaN/Infinity/1e999 parse as floats but JSONB cannot carry them —
-            # unchecked they 500 at bind time; the upload path rejects the same
-            # class before JSONB (uploads._finite_float), so the filter must too
-            if not math.isfinite(parsed):
-                raise ApiError(
-                    ErrorCode.VALIDATION_ERROR,
-                    f"filter[{name}] expects a finite number",
-                    details={f"filter[{name}]": raw},
-                ) from None
-            return parsed
+            pass
+        # Decimal, not float (R8): binary float rounds e.g. 9007199254740993.0
+        # to ...992, and JSONB compares NUMERICALLY against the stored decimal
+        # spelling — a rounded probe silently misses (and near values can
+        # false-match). Integral values bind as exact ints; fractional ones as
+        # float only when the float means the same number.
+        try:
+            value = Decimal(raw)
+        except InvalidOperation as exc:
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                f"filter[{name}] expects a number (schema-declared type)",
+                details={f"filter[{name}]": raw},
+            ) from exc
+        # NaN/Infinity would 500 at JSONB bind time; the upload path rejects
+        # the same class before JSONB (uploads._finite_float)
+        if not value.is_finite():
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                f"filter[{name}] expects a finite number",
+                details={f"filter[{name}]": raw},
+            )
+        if value == value.to_integral_value() and abs(value.adjusted()) <= 64:
+            return int(value)
+        try:
+            approx = float(value)
+        except OverflowError:
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                f"filter[{name}] expects a finite number",
+                details={f"filter[{name}]": raw},
+            ) from None
+        if Decimal(str(approx)) != value and Decimal(approx) != value:
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                f"filter[{name}] exceeds binary float precision — use an "
+                "exactly representable spelling",
+                details={f"filter[{name}]": raw},
+            )
+        return approx
     if declared == "boolean":
         if raw == "true":
             return True
@@ -278,14 +318,17 @@ async def list_documents_endpoint(
     # page and the count so total matches the filtered set (a search restricts
     # the row set, so total must reflect it, not the unfiltered table).
     filters = []
+    applied: dict[str, str] = {}
     if status is not None:
         filters.append(docs.c.status == status)
+        applied["status"] = status
     if q is not None:
         filters.append(docs.c.source_uri.ilike(f"%{_escape_like(q)}%", escape="\\"))
     for attr_name, declared in sorted(fattrs.items()):
         raw = single_filter_value(request, attr_name)
         if raw is None:
             continue
+        applied[attr_name] = raw
         value = _typed_metadata_value(raw, declared, attr_name)
         # JSONB containment down the envelope path — served by the GIN
         # jsonb_path_ops index (migration 0020); equality is by JSONB value,
@@ -298,6 +341,7 @@ async def list_documents_endpoint(
         cursor,
         docs.c.id,
         where,
+        scope=_scope_fingerprint(q, applied),
         text_cols={},
         time_cols={"ingested_at": docs.c.ingested_at},
     )
@@ -405,6 +449,11 @@ async def list_entities_endpoint(
     # SS1b: `q` searches canonical_name (substring, case-insensitive). Applied to
     # both the count and the page so total reflects the searched set.
     filters = []
+    applied = {
+        k: v
+        for k, v in (("type", etype), ("status", status), ("review_status", review_status))
+        if v is not None
+    }
     if etype is not None:
         filters.append(ents.c.type == etype)
     if status is not None:
@@ -420,6 +469,7 @@ async def list_entities_endpoint(
         cursor,
         ents.c.id,
         where,
+        scope=_scope_fingerprint(q, applied),
         text_cols={"canonical_name": ents.c.canonical_name},
         time_cols={"created_at": ents.c.created_at},
     )
