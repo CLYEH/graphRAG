@@ -102,7 +102,11 @@ async def reject_null_body(request: Request) -> None:
 
 
 def single_filter_value(
-    request: Request, field: str, *, vocabulary: tuple[str, ...] | None = None
+    request: Request,
+    field: str,
+    *,
+    vocabulary: tuple[str, ...] | None = None,
+    allow_blank: bool = False,
 ) -> str | None:
     """The validated ``filter[<field>]`` value, or None when absent (GOV4/SS1a).
 
@@ -112,6 +116,10 @@ def single_filter_value(
     CHECK vocabularies — pass the SAME tuple a contract test pins against the
     DDL, or drift is silent); None means an open value set (e.g. entity type,
     an ontology-defined vocabulary) where only blank is meaningless.
+    ``allow_blank`` lifts the blank rejection for schema-declared STRING
+    metadata attributes (SS1b R10): ingest validation admits ""/whitespace
+    as stored values, so the facet must reach them — a blank filter is a
+    real equality predicate there, not a caller error.
     """
     values = request.query_params.getlist(f"filter[{field}]")
     if not values:
@@ -129,7 +137,7 @@ def single_filter_value(
             f"unknown {field} {value!r} — one of: {', '.join(sorted(vocabulary))}",
             details={f"filter[{field}]": value},
         )
-    if vocabulary is None and not value.strip():
+    if vocabulary is None and not allow_blank and not value.strip():
         raise ApiError(
             ErrorCode.VALIDATION_ERROR,
             f"filter[{field}] must be a non-blank value",

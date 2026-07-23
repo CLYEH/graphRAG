@@ -1180,3 +1180,59 @@ def test_cursor_is_bound_to_the_active_build(
     )
     assert crossed.status_code == 400
     assert "issued under" in crossed.json()["error"]["message"]
+
+
+def test_cursor_rejects_replay_after_attribute_retype(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R10: a schema edit can RETYPE a filterable attribute between
+    # pages - same raw spelling, different JSONB predicate, so the result set
+    # changed while build/q/filter spellings did not; the declared type rides
+    # in the scope fingerprint and the replay fails loudly
+    _filterable_project(monkeypatch)
+    rows = [_doc_row() for _ in range(3)]
+    repo.pages = rows
+    r = client.get("/projects/p/documents", params={"limit": 2, "filter[topic]": "1"})
+    token = r.json()["meta"]["next_cursor"]
+    assert token is not None
+
+    same = client.get("/projects/p/documents", params={"filter[topic]": "1", "cursor": token})
+    assert same.status_code == 200  # over-block guard: unchanged schema pages on
+
+    retyped = {
+        "metadata_schema": {
+            "attributes": {
+                "topic": {"type": "number", "filterable": True},
+                "rating": {"type": "number", "filterable": True},
+                "public": {"type": "boolean", "filterable": True},
+                "note": {"type": "string"},
+            }
+        }
+    }
+
+    async def retyped_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(name=name, config=retyped)
+
+    _stub(monkeypatch, "get_project", retyped_project)
+    crossed = client.get("/projects/p/documents", params={"filter[topic]": "1", "cursor": token})
+    assert crossed.status_code == 400
+    assert "issued under" in crossed.json()["error"]["message"]
+
+
+def test_blank_string_metadata_filter_selects_blank_values(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R10: ingest admits "" as a stored string attribute value
+    # (isinstance str is the only check), so the facet must be able to SELECT
+    # those rows - a blank filter[topic] is an equality predicate on "", not
+    # a caller error; number attrs still reject blanks via the type parse
+    _filterable_project(monkeypatch)
+    r = client.get("/projects/p/documents", params={"filter[topic]": ""})
+    assert r.status_code == 200
+    # the containment predicate carried the empty-string probe
+    probes = [str(c) for call in repo.count_calls for c in call["where"]]
+    assert probes, "the blank filter must produce a predicate, not be dropped"
+
+    blank_number = client.get("/projects/p/documents", params={"filter[rating]": ""})
+    assert blank_number.status_code == 400
+    assert "expects a number" in blank_number.json()["error"]["message"]

@@ -332,10 +332,17 @@ async def list_documents_endpoint(
     if q is not None:
         filters.append(docs.c.source_uri.ilike(f"%{_escape_like(q)}%", escape="\\"))
     for attr_name, declared in sorted(fattrs.items()):
-        raw = single_filter_value(request, attr_name)
+        # allow_blank: a declared-string attribute validly STORES ""/blank
+        # (ingest only checks isinstance str), so the facet must reach those
+        # rows; for number/boolean the type parse below still rejects blanks
+        raw = single_filter_value(request, attr_name, allow_blank=True)
         if raw is None:
             continue
-        applied[attr_name] = raw
+        # the DECLARED TYPE rides in the scope beside the raw spelling (R10):
+        # a schema edit can retype an attribute between pages — same raw
+        # value, different JSONB predicate — and the cursor must not carry
+        # a keyset anchor across that boundary
+        applied[attr_name] = f"{declared}:{raw}"
         value = _typed_metadata_value(raw, declared, attr_name)
         # JSONB containment down the envelope path — served by the GIN
         # jsonb_path_ops index (migration 0020); equality is by JSONB value,
