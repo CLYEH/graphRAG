@@ -95,3 +95,5 @@ GitHub 為準;立案或了結後從本檔劃掉):
   `BuildStep.error` 與逐項結果都呈現,並把 run-level 說明誠實界定為「唯一仍未
   呈現者」;真解需後端契約變更(RB1-api 加 run-error 投影欄位,或 build→job
   lookup + `GET /jobs` 清單),自成 DR-002 任務。RB1-fe 說明已標 (RB1-api)。
+
+- **relations/review 的 default cursor 未綁 query scope(SS1a-era)**:SS1b(#120 R8/R9/R10)把 entities/documents 的 cursor tag 釘到 sort+q+filters(typed)+build,但 relations 與 review 端點的 default (id,) cursor 仍是無 tag 形——filter 換值/build 切換後重放靜默 re-anchor。SS1a 既有、非 SS1b 回歸;修法=沿用 `_scope_fingerprint` + `decode_scoped_id_cursor`(pattern 見 lesson class 31)。順手時機:任何動 relations/review 分頁的任務。
