@@ -43,8 +43,6 @@ from dataclasses import dataclass, field
 from typing import Any, Final, cast
 
 from mcp.server.fastmcp import FastMCP
-from neo4j.exceptions import DriverError, Neo4jError
-from qdrant_client.http.exceptions import ApiException
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -66,6 +64,7 @@ from core.query.metadata_enrich import enrich_response_metadata
 from core.query.results import McpResponse, QueryWarning
 from core.query.semantic import semantic_search as run_semantic
 from core.query.sql import sql_query as run_sql
+from core.stores.errors import STORE_CLIENT_ERRORS, store_name
 from core.stores.graph import graph_driver
 from core.stores.vectors import vector_client
 
@@ -74,18 +73,14 @@ from core.stores.vectors import vector_client
 #: format-legal sentinel (the warning message says which case happened).
 _NIL_BUILD = "00000000-0000-0000-0000-000000000000"
 
-#: the store CLIENTS' exception families (§22 STORE_UNAVAILABLE): driver-level
-#: trouble from Postgres (DBAPIError — sql.py's own line), Qdrant (ApiException
-#: covers HTTP errors and connection handling), and Neo4j (Neo4jError = server,
-#: DriverError = connectivity). Deliberately NOT Exception: an in-code bug
-#: (ValueError, KeyError, ...) still propagates LOUD — degradation is for
-#: store trouble, never for our own bugs.
-_STORE_ERRORS: tuple[type[BaseException], ...] = (
-    DBAPIError,
-    ApiException,
-    Neo4jError,
-    DriverError,
-)
+#: the store CLIENTS' exception families (§22 STORE_UNAVAILABLE) and their
+#: store names now live in core.stores.errors — hybrid's per-mode guard uses
+#: the same map, so the two degradation surfaces cannot drift (Codex #122 r3).
+#: Deliberately NOT Exception either way: an in-code bug still propagates
+#: LOUD — degradation is for store trouble, never for our own bugs.
+_STORE_ERRORS: tuple[type[BaseException], ...] = STORE_CLIENT_ERRORS
+_store_name = store_name
+
 
 #: entity_mentions.source_kind → §16 source_type (the C6a mapping).
 _MENTION_SOURCE_TYPE = {"text": "chunk", "structured": "row"}
@@ -158,8 +153,8 @@ async def _bounded(
             warnings=(
                 QueryWarning(
                     "STORE_UNAVAILABLE",
-                    f"store unavailable ({type(exc).__name__}) — degraded to an "
-                    "empty typed response (§22)",
+                    f"{_store_name(exc)} unavailable ({type(exc).__name__}) — degraded "
+                    "to an empty typed response (§22)",
                 ),
             ),
         ).to_dict()
@@ -180,7 +175,7 @@ def _introspection_store_error(
         "project": runtime.context.project,
         "build_id": build_id or _NIL_BUILD,
         "subject": subject,
-        "error": f"store unavailable ({type(exc).__name__}) — §22",
+        "error": f"{_store_name(exc)} unavailable ({type(exc).__name__}) — §22",
     }
 
 

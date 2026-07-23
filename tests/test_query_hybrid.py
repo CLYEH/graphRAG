@@ -539,3 +539,87 @@ async def test_caller_params_bypass_linking_entirely(
     assert calls["graph"][0][3] is _GRAPH_PARAMS  # the caller's params, verbatim
     assert response.debug is not None
     assert not any("auto plan" in line for line in response.debug["retrieval_plan"])
+
+
+async def test_a_caller_input_rejection_is_not_reported_as_a_store_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP2: a provider 4xx means the INPUT was rejected — an empty query makes
+    the embeddings API raise 400. The old blanket STORE_UNAVAILABLE told the
+    agent "infrastructure problem, back off and retry", so it retried the
+    identical malformed call forever. A 4xx (except 429) must surface as
+    GUARDRAIL_BLOCKED with change-the-input guidance; a 429 and a plain crash
+    stay STORE_UNAVAILABLE, because retrying THOSE later can genuinely work.
+    """
+
+    class _Rejected(RuntimeError):
+        status_code = 400
+
+    class _Throttled(RuntimeError):
+        status_code = 429
+
+    keeper = _result(rid="kept")
+
+    # 400 → GUARDRAIL_BLOCKED, and the message says to change the input
+    _patch_modes(
+        monkeypatch,
+        semantic=_Rejected("bad input"),
+        global_=_mode_response("global_summary", keeper),
+    )
+    response = await _run(_deps(), _policy())
+    blocked = [w for w in response.warnings if w.code == "GUARDRAIL_BLOCKED"]
+    assert len(blocked) == 1 and "rejected the request input" in blocked[0].message
+    assert "retrying unchanged will fail again" in blocked[0].message
+    assert not any(w.code == "STORE_UNAVAILABLE" for w in response.warnings)
+    assert [r.id for r in response.results] == ["kept"]  # still degrades, not fails
+
+    # 429 is infrastructure-busy: retry CAN work, so it stays STORE_UNAVAILABLE
+    _patch_modes(
+        monkeypatch,
+        semantic=_Throttled("rate limited"),
+        global_=_mode_response("global_summary", keeper),
+    )
+    throttled = await _run(_deps(), _policy())
+    assert any(w.code == "STORE_UNAVAILABLE" for w in throttled.warnings)
+    assert not any(w.code == "GUARDRAIL_BLOCKED" for w in throttled.warnings)
+
+    # 401/403/404 are credentials/permissions/missing-deployment — rewording
+    # the query repairs none of them, and calling them caller-input would hide
+    # a real outage from operators (Codex #122): they stay STORE_UNAVAILABLE
+    for auth_status in (401, 403, 404):
+
+        class _NotInput(RuntimeError):
+            status_code = auth_status
+
+        _patch_modes(
+            monkeypatch,
+            semantic=_NotInput("not an input problem"),
+            global_=_mode_response("global_summary", keeper),
+        )
+        outage = await _run(_deps(), _policy())
+        assert any(w.code == "STORE_UNAVAILABLE" for w in outage.warnings), auth_status
+        assert not any(w.code == "GUARDRAIL_BLOCKED" for w in outage.warnings), auth_status
+
+    # a STORE client's 400 is a projection fault, not the caller's: Qdrant
+    # raises UnexpectedResponse(status=400) for vector-dimension drift, and
+    # only repairing the projection helps — status alone must not classify
+    # (Codex #122 r2)
+    from qdrant_client.http.exceptions import ApiException
+
+    class _QdrantBad(ApiException):
+        status_code = 400
+
+    _patch_modes(
+        monkeypatch,
+        semantic=_QdrantBad("dimension drift"),
+        global_=_mode_response("global_summary", keeper),
+    )
+    store_400 = await _run(_deps(), _policy())
+    assert any(w.code == "STORE_UNAVAILABLE" for w in store_400.warnings)
+    assert not any(w.code == "GUARDRAIL_BLOCKED" for w in store_400.warnings)
+    # ...and the store is NAMED (Codex #122 r3): hybrid is the default tool,
+    # and "semantic mode failed (SomeClientException)" leaves the agent unable
+    # to tell a Qdrant-only outage (route around it) from Postgres down
+    # (everything is dead) — the same distinction the single-mode tools give
+    outage_msgs = [w.message for w in store_400.warnings if w.code == "STORE_UNAVAILABLE"]
+    assert any("qdrant unavailable" in m for m in outage_msgs), outage_msgs

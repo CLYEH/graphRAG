@@ -422,9 +422,13 @@ async def test_the_seed_scan_shares_one_policy_deadline() -> None:
 
 
 async def test_an_unknown_seed_yields_an_empty_result_not_an_error() -> None:
+    """Still a typed §16 response, never an exception — but MCP2 adds the
+    warning that says WHY it is empty (see the dedicated test below); the
+    silent-empty this used to assert is the confidently-wrong-answer trap."""
     graph = _FakeGraph()
     response = await _run(graph, _FakeSoR(), GraphQueryParams(template="neighbors", entity="acme"))
-    assert response.results == () and response.warnings == ()
+    assert response.results == ()
+    assert _codes(response) == ["GUARDRAIL_BLOCKED"]
     assert graph.calls == []  # no seed → nothing to traverse
 
 
@@ -665,18 +669,65 @@ async def test_the_pair_search_shares_one_policy_deadline() -> None:
     assert all(c[1]["timeout_ms"] <= tight.timeout_ms for c in pair_calls)  # remaining budget only
 
 
-async def test_no_seeds_or_no_path_yield_empty_without_warnings() -> None:
+async def test_an_unresolved_name_is_distinguishable_from_a_genuinely_empty_result() -> None:
+    """MCP2 — the two zero-row answers must NOT look alike.
+
+    A name that matches no active entity and a real entity with no path are
+    both `results == ()`. Left identical (the behaviour this test previously
+    pinned), an agent asked "is A related to B?" answers "no, they are not
+    related" when it merely mistyped a name — a confidently wrong answer, and
+    the one failure the caller could actually have recovered from by retrying
+    with a corrected name. So the unresolved case now carries a typed warning
+    naming the offending string; the genuinely-empty case stays silent,
+    because there IS nothing to report.
+    """
     graph, sor, *_ = _path_fixture()
     missing = await _run(
         graph, sor, GraphQueryParams(template="path", entity="nobody", other_entity="c", hops=3)
     )
-    assert missing.results == () and missing.warnings == ()
+    assert missing.results == ()
+    assert _codes(missing) == ["GUARDRAIL_BLOCKED"]
+    # the message must name WHICH string failed and where to check it —
+    # a bare "not found" leaves the agent with the same dead end
+    assert "'nobody'" in missing.warnings[0].message
+    assert "get_entity" in missing.warnings[0].message
+
+    # the resolvable side must not be blamed
+    assert "'c'" not in missing.warnings[0].message
 
     graph_no_path = _FakeGraph(path=None)
     none_found = await _run(
         graph_no_path, sor, GraphQueryParams(template="path", entity="a", other_entity="c", hops=3)
     )
     assert none_found.results == () and none_found.warnings == ()
+
+
+async def test_both_unresolved_path_endpoints_are_each_named() -> None:
+    """Naming only the first failure would send the agent to fix one name and
+    hit the identical wall on the second."""
+    graph, sor, *_ = _path_fixture()
+    response = await _run(
+        graph,
+        sor,
+        GraphQueryParams(template="path", entity="nobody", other_entity="nor-me", hops=3),
+    )
+    assert response.results == ()
+    assert _codes(response) == ["GUARDRAIL_BLOCKED", "GUARDRAIL_BLOCKED"]
+    assert "'nobody'" in response.warnings[0].message
+    assert "'nor-me'" in response.warnings[1].message
+
+
+async def test_an_unresolved_neighbors_seed_warns_instead_of_returning_a_silent_empty() -> None:
+    """The neighbors/subgraph twin of the path case — same trap, same recovery."""
+    for template in ("neighbors", "subgraph"):
+        response = await _run(
+            _FakeGraph(),
+            _FakeSoR(seeds={}),
+            GraphQueryParams(template=template, entity="ZZZ_no_such_entity", hops=1),
+        )
+        assert response.results == (), template
+        assert _codes(response) == ["GUARDRAIL_BLOCKED"], template
+        assert "'ZZZ_no_such_entity'" in response.warnings[0].message, template
 
 
 # -- subgraph ----------------------------------------------------------------------

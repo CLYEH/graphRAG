@@ -286,7 +286,9 @@ async def test_list_schema_maps_db_deadline_and_failures_typed() -> None:
     assert "deadline" in timed_out["error"]  # 57014 IS the §21 deadline
 
     failed = await _list_schema(_runtime(DBAPIError("q", None, _PgOther())))
-    assert failed["error"] == "store unavailable (DBAPIError) — §22"  # unified §22 shape
+    # MCP2: the store is NAMED — "store unavailable" left the agent unable to
+    # tell "route around Qdrant" from "everything is dead" (postgres down)
+    assert failed["error"] == "postgres unavailable (DBAPIError) — §22"
     assert failed["build_id"] == "b-1"
 
     with pytest.raises(ValueError, match="in-code bug"):
