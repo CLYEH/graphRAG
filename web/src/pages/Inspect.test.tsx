@@ -521,4 +521,38 @@ describe("Inspect", () => {
     // the false claim must NOT render: the corpus is not empty, the search is
     expect(screen.queryByText(/No documents in the active build/)).toBeNull();
   });
+
+  it("clears the selected document when the search changes (SS1b R5)", async () => {
+    // a selection made under one search means nothing under another - the row
+    // can drop out of the new result set while its detail pane lingers as if
+    // it belonged to the filtered rows
+    const get = vi.spyOn(api, "GET");
+    get.mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/documents/{document_id}") {
+        return Promise.resolve({
+          data: { data: doc({ raw: "the full document text" }), meta: META },
+          error: undefined,
+        });
+      }
+      if (path === "/projects/{project}/documents") {
+        const q = (opts as { params: { query: { q?: string } } }).params.query.q;
+        if (q === "other") {
+          return Promise.resolve(ok([doc({ id: "d9", source_uri: "file:///other.txt" })]));
+        }
+        return Promise.resolve(ok([doc()]));
+      }
+      return Promise.resolve(ok([]));
+    }) as never);
+    renderInspect();
+
+    fireEvent.click(await screen.findByRole("button", { name: /a\.txt/ }));
+    expect(await screen.findByText("the full document text")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "other" } });
+    // assert AFTER the new result set settles: mid-refetch PagedList unmounts
+    // the detail anyway (a transient null that would green a broken guard) -
+    // the leak Codex flagged is the detail RE-appearing under the new rows
+    await screen.findByRole("button", { name: /other\.txt/ }, { timeout: 5000 });
+    expect(screen.queryByText("the full document text")).toBeNull();
+  });
 });

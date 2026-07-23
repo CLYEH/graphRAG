@@ -85,7 +85,12 @@ export function Inspect() {
         className="inspect__panel"
       >
         {tab === "documents" ? (
-          <DocumentsTab project={project} selected={selected} onSelect={select} />
+          <DocumentsTab
+            project={project}
+            selected={selected}
+            onSelect={select}
+            onDeselect={() => setSelected(null)}
+          />
         ) : (
           <ChunksTab project={project} selected={selected} onSelect={select} />
         )}
@@ -345,9 +350,11 @@ type TabProps = {
   project: string;
   selected: Selection | null;
   onSelect: (tab: Tab, id: string) => void;
+  /** clear the selection outright (no toggle) — search changes use this (R5) */
+  onDeselect?: () => void;
 };
 
-function DocumentsTab({ project, selected, onSelect }: TabProps) {
+function DocumentsTab({ project, selected, onSelect, onDeselect }: TabProps) {
   const id = selected?.tab === "documents" ? selected.id : undefined;
   const [search, setSearch] = useState("");
   // debounced + trimmed: the QUERY the shown rows answer; q rides the hook's
@@ -367,7 +374,13 @@ function DocumentsTab({ project, selected, onSelect }: TabProps) {
           value={search}
           maxLength={DOC_SEARCH_MAX}
           placeholder="source_uri…"
-          onChange={(e) => setSearch(e.target.value)}
+          onChange={(e) => {
+            setSearch(e.target.value);
+            // R5: a selection made under one search means nothing under
+            // another — the row may drop out of the new result set while its
+            // detail pane lingers as if it belonged to the filtered rows
+            if (id) onDeselect?.();
+          }}
         />
       </label>
       {/* the count is the server's exact total for THIS search — page 1's

@@ -1020,3 +1020,25 @@ def test_non_string_uuid_cursor_part_is_a_400_not_500(
     r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
     assert r.status_code == 400
     assert "malformed cursor" in r.json()["error"]["message"]
+
+
+def test_no_active_build_outranks_malformed_metadata_schema(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # Codex #120 R5: an existing project with BOTH no active build and a
+    # malformed metadata_schema must surface the documented bootstrap 409 -
+    # a config 400 first would point bootstrap users at the wrong problem
+    config = {"metadata_schema": {"attributes": {"t": {"filterable": True}}}}  # missing type
+
+    async def bad_config_project(conn: Any, name: str) -> Any:
+        return SimpleNamespace(name=name, config=config)
+
+    async def no_active(conn: Any, project: str) -> Any:
+        raise NoActiveBuildError(project)
+
+    _stub(monkeypatch, "get_project", bad_config_project)
+    _stub(monkeypatch, "_resolve_active_binding", no_active)
+
+    r = client.get("/projects/p/documents")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "NO_ACTIVE_BUILD"

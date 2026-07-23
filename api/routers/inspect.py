@@ -241,6 +241,11 @@ async def list_documents_endpoint(
     project_row = await get_project(conn, project)
     if project_row is None:
         raise translate_registry_error(ProjectNotFoundError(project))
+    # active build resolves BEFORE the config parse: a bootstrap project with
+    # no active build must get its documented 409 even when its
+    # metadata_schema is also malformed — the config 400 would point at the
+    # wrong problem (R5)
+    binding = await _bind(conn, project)
     try:
         fattrs = filterable_attributes(dict(project_row.config or {}))
     except MetadataConfigError as exc:
@@ -267,7 +272,6 @@ async def list_documents_endpoint(
     # documents.status is an OPEN vocabulary (no DDL CHECK — the ingest
     # pipeline owns it), so the facet validates blankness only
     status = single_filter_value(request, "status")
-    binding = await _bind(conn, project)
     repo = BuildScopedRepo.bound_to(conn, binding)
     # SS1b: `q` searches source_uri (the document's visible identifier); content
     # search is the deferred metadata-indexing follow-up. Applied to BOTH the
