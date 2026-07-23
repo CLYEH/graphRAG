@@ -453,7 +453,7 @@ describe("Inspect", () => {
     fireEvent.change(screen.getByRole("searchbox"), { target: { value: "corpus" } });
     // debounce (300ms) then the q-keyed refetch
     expect(await screen.findByText("hit.txt", {}, { timeout: 5000 })).toBeInTheDocument();
-    expect(await screen.findByText(/符合 1 筆/)).toBeInTheDocument();
+    expect(await screen.findByText(/符合「corpus」的文件:1 筆/)).toBeInTheDocument();
     const qs = get.mock.calls
       .filter((c) => c[0] === "/projects/{project}/documents")
       .map((c) => requestQuery(c).q);
@@ -487,14 +487,16 @@ describe("Inspect", () => {
     renderInspect();
     await screen.findByRole("searchbox");
     fireEvent.change(screen.getByRole("searchbox"), { target: { value: "corpus" } });
-    expect(await screen.findByText(/符合 1 筆/, {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(
+      await screen.findByText(/符合「corpus」的文件:1 筆/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
 
     // a refocus revalidation now FAILS - count must go with the rows
     await act(async () => {
       focusManager.setFocused(false);
       focusManager.setFocused(true);
     });
-    await waitFor(() => expect(screen.queryByText(/符合 1 筆/)).toBeNull());
+    await waitFor(() => expect(screen.queryByText(/符合「corpus」的文件/)).toBeNull());
   });
 
   it("zero search matches say so - never『build is empty』(SS1b R3)", async () => {
@@ -516,7 +518,7 @@ describe("Inspect", () => {
     await screen.findByRole("searchbox");
     fireEvent.change(screen.getByRole("searchbox"), { target: { value: "nomatch" } });
     expect(
-      await screen.findByText(/沒有符合搜尋的文件/, {}, { timeout: 5000 }),
+      await screen.findByText(/沒有符合「nomatch」的文件/, {}, { timeout: 5000 }),
     ).toBeInTheDocument();
     // the false claim must NOT render: the corpus is not empty, the search is
     expect(screen.queryByText(/No documents in the active build/)).toBeNull();
@@ -554,5 +556,39 @@ describe("Inspect", () => {
     // the leak Codex flagged is the detail RE-appearing under the new rows
     await screen.findByRole("button", { name: /other\.txt/ }, { timeout: 5000 });
     expect(screen.queryByText("the full document text")).toBeNull();
+  });
+
+  it("labels the count and empty state with the query they answer (SS1b R6)", async () => {
+    // while the debounce is pending the box already shows the NEW input but
+    // the settled rows/total still answer the OLD query - the label carries
+    // the applied term (the GraphBody pattern) so those claims cannot be
+    // read as answering whatever is currently typed
+    const get = vi.spyOn(api, "GET");
+    get.mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/documents") {
+        const q = (opts as { params: { query: { q?: string } } }).params.query.q;
+        if (q === "corpus") {
+          return Promise.resolve({
+            data: {
+              data: [doc({ id: "d2", source_uri: "file:///corpus/hit.txt" })],
+              meta: { ...META, total: 1 },
+            },
+            error: undefined,
+          });
+        }
+        return Promise.resolve(ok([doc()]));
+      }
+      return Promise.resolve(ok([]));
+    }) as never);
+    renderInspect();
+    await screen.findByRole("searchbox");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "corpus" } });
+    await screen.findByText(/符合「corpus」的文件:1 筆/, {}, { timeout: 5000 });
+
+    // edit the box; BEFORE the 300ms debounce fires, the settled count is
+    // still on screen - its label must still name the term it answers
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "corpus-edited" } });
+    const hint = screen.getByText(/符合「corpus」的文件:1 筆/);
+    expect(hint).toBeInTheDocument();
   });
 });

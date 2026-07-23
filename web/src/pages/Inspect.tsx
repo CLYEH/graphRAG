@@ -387,13 +387,18 @@ function DocumentsTab({ project, selected, onSelect, onDeselect }: TabProps) {
           meta.total, never a loaded-rows count. Gated on the SAME settled-
           success condition PagedList shows rows under (SS1b R3 / class 17):
           during a refetch, or beside a failed one, the cached total is
-          unverified against the current build and must not linger. */}
+          unverified against the current build and must not linger. The label
+          CARRIES the applied term (the GraphBody pattern, R6): while the
+          debounce is pending the box already shows the new input, so the
+          count must say which query it answers. */}
       {q && total !== undefined && !list.isFetching && !list.isError ? (
-        <p className="inspect__hint">符合 {total} 筆</p>
+        <p className="inspect__hint">
+          符合「{q}」的文件:{total} 筆
+        </p>
       ) : null}
       <PagedList<Document>
         label="documents"
-        emptyMessage={q ? "沒有符合搜尋的文件。" : undefined}
+        emptyMessage={q ? `沒有符合「${q}」的文件。` : undefined}
         columns={[
           {
             header: "文件",
