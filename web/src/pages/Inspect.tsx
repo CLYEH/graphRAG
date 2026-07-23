@@ -98,6 +98,8 @@ export function Inspect() {
 
 type ListProps<T> = {
   label: string;
+  /** search-aware empty text: zero MATCHES is not an empty build (SS1b R3) */
+  emptyMessage?: string;
   columns: { header: string; cell: (row: T) => ReactNode }[];
   query: {
     data?: { pages: InspectPage<T>[] };
@@ -121,6 +123,7 @@ function message(error: unknown): string {
 
 function PagedList<T extends { id: string }>({
   label,
+  emptyMessage,
   columns,
   query,
   selectedId,
@@ -189,7 +192,8 @@ function PagedList<T extends { id: string }>({
   const rows = pages.flatMap((p) => p.rows);
   // An empty table really does mean an empty build: no active build answers 409, not a
   // 200 with no rows, so this cannot mistake an outage for an empty corpus.
-  if (rows.length === 0) return <p className="inspect__muted">No {label} in the active build.</p>;
+  if (rows.length === 0)
+    return <p className="inspect__muted">{emptyMessage ?? `No ${label} in the active build.`}</p>;
 
   return (
     <>
@@ -367,10 +371,16 @@ function DocumentsTab({ project, selected, onSelect }: TabProps) {
         />
       </label>
       {/* the count is the server's exact total for THIS search — page 1's
-          meta.total, never a loaded-rows count (the honest number) */}
-      {q && total !== undefined ? <p className="inspect__hint">符合 {total} 筆</p> : null}
+          meta.total, never a loaded-rows count. Gated on the SAME settled-
+          success condition PagedList shows rows under (SS1b R3 / class 17):
+          during a refetch, or beside a failed one, the cached total is
+          unverified against the current build and must not linger. */}
+      {q && total !== undefined && !list.isFetching && !list.isError ? (
+        <p className="inspect__hint">符合 {total} 筆</p>
+      ) : null}
       <PagedList<Document>
         label="documents"
+        emptyMessage={q ? "沒有符合搜尋的文件。" : undefined}
         columns={[
           {
             header: "文件",

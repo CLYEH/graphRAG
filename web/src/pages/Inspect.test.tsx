@@ -459,4 +459,66 @@ describe("Inspect", () => {
       .map((c) => requestQuery(c).q);
     expect(qs).toContain("corpus");
   });
+
+  it("hides the match count while revalidating and beside a failed refetch (SS1b R3)", async () => {
+    // class 17: the total is a claim about the CURRENT build's search - during
+    // a refetch (or beside a failed one) the cached number is unverified and
+    // must vanish with the rows, not linger as a stale claim
+    let calls = 0;
+    const get = vi.spyOn(api, "GET");
+    get.mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/documents") {
+        const q = (opts as { params: { query: { q?: string } } }).params.query.q;
+        if (q === "corpus") {
+          calls += 1;
+          if (calls >= 2) return Promise.resolve(fail(503, "STORE_UNAVAILABLE", "down"));
+          return Promise.resolve({
+            data: {
+              data: [doc({ id: "d2", source_uri: "file:///corpus/hit.txt" })],
+              meta: { ...META, total: 1 },
+            },
+            error: undefined,
+          });
+        }
+        return Promise.resolve(ok([doc()]));
+      }
+      return Promise.resolve(ok([]));
+    }) as never);
+    renderInspect();
+    await screen.findByRole("searchbox");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "corpus" } });
+    expect(await screen.findByText(/符合 1 筆/, {}, { timeout: 5000 })).toBeInTheDocument();
+
+    // a refocus revalidation now FAILS - count must go with the rows
+    await act(async () => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+    await waitFor(() => expect(screen.queryByText(/符合 1 筆/)).toBeNull());
+  });
+
+  it("zero search matches say so - never『build is empty』(SS1b R3)", async () => {
+    const get = vi.spyOn(api, "GET");
+    get.mockImplementation(((path: string, opts: unknown) => {
+      if (path === "/projects/{project}/documents") {
+        const q = (opts as { params: { query: { q?: string } } }).params.query.q;
+        if (q === "nomatch") {
+          return Promise.resolve({
+            data: { data: [], meta: { ...META, total: 0 } },
+            error: undefined,
+          });
+        }
+        return Promise.resolve(ok([doc()]));
+      }
+      return Promise.resolve(ok([]));
+    }) as never);
+    renderInspect();
+    await screen.findByRole("searchbox");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "nomatch" } });
+    expect(
+      await screen.findByText(/沒有符合搜尋的文件/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    // the false claim must NOT render: the corpus is not empty, the search is
+    expect(screen.queryByText(/No documents in the active build/)).toBeNull();
+  });
 });
