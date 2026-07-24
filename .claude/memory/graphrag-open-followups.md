@@ -108,3 +108,9 @@ GitHub 為準;立案或了結後從本檔劃掉):
   heuristic 兩度標為「無真審查的自我蓋章」。誤報(輸出含具體查證),但訊號值得
   機械化補強:候選 H-task=write-review-receipt.sh 記錄 verdict 摘要/輪次 context,
   或 LOOP.md 明文 delta-review 協議供 heuristic 對齊。owner 知悉後再立案。
+
+- **`_SelectorLLM` fixture 殘黨(MCP8 #128 retro 發現)**:`tests/test_query_hybrid_integration.py`
+  的 fake LLM class 名與 docstring 仍描述已移除的 LLM 選模行為(「Routes to global +
+  semantic」)——實際上 MCP8 後 deps.llm 只有 sql/NLSQL 路徑會碰。行為無誤(fake 從未被
+  諮詢),純命名/註解過期。順手時機:下一個動 hybrid 整合測試的任務改名為 `_FakeLLM`
+  並修 docstring。

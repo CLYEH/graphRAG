@@ -346,3 +346,7 @@ RunsTable 失敗建置列展開加「失敗診斷」:useBuildSteps/useStepItems 
 ## MCP7
 
 (a) 契約:entity 最低要求 anyOf(chunk mention=uuid-id(format:uuid)+uri+quote(≤512)+offsets|row=table+pk),負向 pin 兩式(裸 ref、rich-but-non-uuid-id 皆須 FAIL);DESIGN §26 DR-014+§27.2+§16 範例同步。(b) 遠端 7 輪+gate-2 多輪 FAIL/nit:r1 四 P2(id format:uuid、graph 面靜默截斷→共用 mention_warnings、掉損 per-entity 曝露、SQL row-value 精確配對);r2 ordinal \d+ 無界(int() 位數上限/PG bind)→[0-9]{1,9},gate-2 sibling 抓 split_row_source_ref 同病;r3 \d 吃 Unicode 數字(١→1 錯引用)→ASCII-only,isdigit sibling 同修,判別器 ٤:abcd:pk;r4 mention 警告過 fusion 的 provenance→訊息具名 entity id+sibling parser,hybrid 對 fused 頁面重建;r5 §16 範例 1.0→1.1;r6 get_chunk 工具+helper 雙層 docstring 過期宣稱;r7 slice-before-validate 三站全掃(neighbors 頁、subgraph edges、REST context edges)各附 round-0 probe 判別測試(edge 首版不判別被 probe 抓出重寫);r8 +1。(c) fast 1449/整合 279 綠;期間 C: 磁碟滿(21MB)清 docker+uv cache ~30GB。
+
+## MCP8
+
+(a) selector 移除=C3b fallback 升格唯一行為,auto-plan 結構性必跑(_MODE_ORDER 位置);deps.llm 僅 sql/NLSQL 用。(b) global 恆置 gated,每呼叫 MODE_SKIPPED 指 global_summary;[global] fusion filters(MCP3 r2-r4 機制)因不可達移除,mention refit 保留。(c) confidence=首模態原始分數 clamp 0..1(§16 score 排序約束故 RRF 值不動);DESIGN §22 MCP4 句依 S7 同步(provenance 非可答性)。(d) 測試:selector 時代 12+ 測試依 test-lifecycle 反轉合併(llm.calls==0 判別);global 融合/報告 pin 反轉;confidence probe 恰紅;整合兩檔 pin 反轉。(e) 遠端 2 輪:r1 P2=eval models_needed 仍假設 selector(keyless hybrid eval 誤炸)→needs_llm=text_to_sql.enabled 綁 hybrid/sql,pin 反轉;r2 +1。gate-2 一輪清掉 5 個被點名的 selector 殘留 nit(retro 時另發現整合測試 fixture `_SelectorLLM` 一處殘黨,入 followups 帳)。(f) 實測:report 0 格、4c/4e、conf=真 cosine、3,078→1,384ms。
