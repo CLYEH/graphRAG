@@ -310,8 +310,10 @@ def build_server(project: str) -> FastMCP:
         query: str = "",
     ) -> dict[str, Any]:
         """Entity-relationship retrieval via the §27.6 parameterized templates
-        (neighbors / path / subgraph). Relation results cite chunk evidence
-        refs — exchange a ref's id for its text with get_chunk."""
+        (neighbors / path / subgraph). Relation results cite evidence refs;
+        a ref with source_type "chunk" carries a chunk UUID exchangeable for
+        its text via get_chunk (row/document evidence refs are other shapes —
+        get_chunk does not accept them)."""
         rt = _rt()
         params = GraphQueryParams(
             template=template, entity=entity, other_entity=other_entity, hops=hops
