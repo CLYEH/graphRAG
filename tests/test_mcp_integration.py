@@ -18,6 +18,7 @@ from typing import Any, cast
 import jsonschema
 import pytest
 import pytest_asyncio
+import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 from llama_index.core.base.embeddings.base import BaseEmbedding
@@ -27,11 +28,12 @@ from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
 from core.mcp.context import ProjectContext
-from core.mcp.server import _get_entity
+from core.mcp.server import _get_chunk, _get_document, _get_entity
+from core.metadata.schema import MetadataExposure
 from core.resolve import fingerprints
 from core.stores.graph import graph_driver
 from core.stores.repo import BuildScopedWriter
-from core.stores.tables import builds, entities
+from core.stores.tables import builds, chunks, documents, entities
 from core.stores.tables import projects as projects_table
 from core.stores.vectors import vector_client
 from tests.conftest import DEMO_QUERY_POLICY, ensure_project
@@ -82,6 +84,10 @@ async def context(migrated: None) -> AsyncIterator[ProjectContext]:
     engine = _engine()
     async with engine.connect() as conn:
         await conn.execute(entities.delete().where(entities.c.project == project))
+        # chunks carry no project column — scope the sweep through the builds
+        project_builds = sa.select(builds.c.id).where(builds.c.project == project)
+        await conn.execute(chunks.delete().where(chunks.c.build_id.in_(project_builds)))
+        await conn.execute(documents.delete().where(documents.c.project == project))
         await conn.execute(builds.delete().where(builds.c.project == project))
         await conn.commit()
     await engine.dispose()
@@ -214,3 +220,124 @@ async def test_a_registered_tool_calls_through_on_live_stores(
     assert unwrapped["sql_enabled"] is False and unwrapped["tables"] == {}
     # the schema snapshot names its build — a later activation is detectable
     assert uuid.UUID(unwrapped["build_id"])  # real, parseable, never nil
+
+
+async def _activate_build_with_content(project: str) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    """Like ``_activate_build`` but the build also carries one document and
+    one chunk — the content ``get_chunk``/``get_document`` exist to serve.
+    Returns ``(build_id, chunk_id, document_id)``."""
+    engine = _engine()
+    async with engine.connect() as conn:
+        await ensure_project(conn, project)
+        await conn.execute(
+            projects_table.update()
+            .where(projects_table.c.name == project)
+            .values(config={"query_policy": DEMO_QUERY_POLICY})
+        )
+        build_id: uuid.UUID = (
+            await conn.execute(
+                builds.insert().values(project=project, status="building").returning(builds.c.id)
+            )
+        ).scalar_one()
+        writer = await BuildScopedWriter.for_building_build(conn, project, build_id)
+        document_id, chunk_id = uuid.uuid4(), uuid.uuid4()
+        await writer.insert(
+            documents,
+            id=document_id,
+            source_uri="file:///guide.md",
+            raw="# 導覽手冊 全票 200 元,優待票 100 元。",
+            content_hash=f"hash-{document_id.hex[:12]}",
+            mime="text/markdown",
+            # a field NO allowlist names — the live DR-010 proof reads it back
+            metadata={"governance": {"classification": "secret"}},
+            ingested_at=NOW,
+        )
+        await writer.insert(
+            chunks,
+            id=chunk_id,
+            document_id=document_id,
+            ordinal=0,
+            text="全票 200 元,優待票 100 元。",
+            token_count=12,
+            start_offset=7,
+            end_offset=22,
+        )
+        await conn.commit()
+        await conn.execute(
+            builds.update()
+            .where(builds.c.project == project, builds.c.status == "active")
+            .values(status="archived")
+        )
+        await conn.execute(builds.update().where(builds.c.id == build_id).values(status="active"))
+        await conn.commit()
+    await engine.dispose()
+    return build_id, chunk_id, document_id
+
+
+async def test_a_chunk_uuid_is_exchangeable_for_its_text(context: ProjectContext) -> None:
+    """MCP5's reason to exist: a relation evidence ref / chunk result id IS a
+    chunk UUID, and before get_chunk nothing on the MCP surface could turn
+    one into the text it cites — citations were decoration. Proven against
+    the live SoR through the same build-scoped repo production binds."""
+    _, chunk_id, document_id = await _activate_build_with_content(context.project)
+    async with context.bound() as deps:
+        payload = await _get_chunk(deps.repo, context.project, str(chunk_id))
+    assert payload["error"] is None
+    assert payload["chunk"]["text"] == "全票 200 元,優待票 100 元。"
+    assert payload["chunk"]["document_id"] == str(document_id)
+
+    async with context.bound() as deps:
+        document = await _get_document(
+            deps.repo, context.project, str(document_id), MetadataExposure(fields=())
+        )
+    assert document["error"] is None
+    assert document["document"]["source_uri"] == "file:///guide.md"
+    assert "全票 200 元" in document["document"]["raw"]  # the full raw rides along
+    # DR-010 live: the stored governance field exists in the SoR row but the
+    # empty (default) allowlist keeps it agent-invisible — fail-closed
+    assert document["document"]["metadata"] == {}
+
+
+async def test_an_archived_builds_chunk_is_invisible_to_the_active_binding(
+    context: ProjectContext,
+) -> None:
+    """DR-006: the repo injects build_id=active — a chunk of a superseded
+    build must read as not-found, never leak (the whole never-mix-versions
+    guarantee, applied to the new introspection read path)."""
+    _, old_chunk_id, _ = await _activate_build_with_content(context.project)
+    await _activate_build(context.project, entity_name="Acme")  # supersedes
+    async with context.bound() as deps:
+        payload = await _get_chunk(deps.repo, context.project, str(old_chunk_id))
+    assert payload["chunk"] is None
+    assert "ACTIVE build" in payload["error"]
+
+
+async def test_a_malformed_chunk_id_never_reaches_the_binding(
+    context: ProjectContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex #125 r3, the ORDERING pin (rule 9: the helper tests alone stay
+    green if the wrapper check moves back below ``bound()``): a malformed id
+    through FastMCP's real dispatch must come back with the NIL build
+    sentinel — the bound path stamps the REAL active build id, so nil holds
+    ONLY when the wrapper rejected before opening the binding."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    import core.mcp.server as server_module
+    from core.mcp.server import _NIL_BUILD, build_server
+
+    monkeypatch.setattr(server_module, "chat_model", lambda: cast(LLM, _FakeLLM()))
+    monkeypatch.setattr(
+        server_module, "embedding_model", lambda: cast(BaseEmbedding, _FakeEmbedder())
+    )
+    await _activate_build(context.project, entity_name="Acme")
+    server = build_server(context.project)
+    async with create_connected_server_and_client_session(server, raise_exceptions=True) as session:
+        result = await session.call_tool("get_chunk", {"chunk_id": "chunk:3626c139ab:0"})
+    unwrapped: Any = result.structuredContent
+    if unwrapped is None:
+        unwrapped = json.loads(result.content[0].text)  # type: ignore[union-attr]
+    if isinstance(unwrapped, dict) and "result" in unwrapped:
+        unwrapped = unwrapped["result"]
+    assert unwrapped["chunk"] is None
+    assert "not yet resolvable" in unwrapped["error"]
+    assert unwrapped["build_id"] == _NIL_BUILD  # binding was never opened

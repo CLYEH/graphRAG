@@ -1,5 +1,5 @@
 """Why: the MCP server is the §9 facade — its TOOL VOCABULARY is frozen by
-DESIGN (the eight names), an invalid policy must kill the server at BUILD
+DESIGN (the ten names), an invalid policy must kill the server at BUILD
 time (a guardrail misconfiguration must never serve queries half-armed), and
 the demo project's shipped config must actually load. The tools' internals
 are the C6 mode functions with their own suites; wiring is proven live in the
@@ -8,12 +8,19 @@ integration test.
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from core.mcp.policy import PolicyError
-from core.mcp.server import build_server
+from core.mcp.server import _get_chunk, _get_document, build_server
+from core.metadata.schema import MetadataExposure
+
+#: DR-010's default: no metadata_exposure block → empty allowlist → nothing leaks
+_NO_EXPOSURE = MetadataExposure(fields=())
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -25,6 +32,8 @@ _FROZEN_TOOLS = {
     "sql_query",
     "hybrid_query",
     "get_entity",
+    "get_chunk",
+    "get_document",
     "list_schema",
     "explain_retrieval",
 }
@@ -146,7 +155,6 @@ async def test_bounded_tools_degrade_typed_at_the_wall_clock_deadline() -> None:
     import uuid
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
-    from typing import Any
 
     from core.mcp.server import _bounded, _Runtime
     from core.query.results import McpResponse
@@ -303,7 +311,6 @@ async def test_store_outages_degrade_typed_but_code_bugs_stay_loud() -> None:
     import uuid
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
-    from typing import Any
 
     import httpx
     from neo4j.exceptions import ServiceUnavailable
@@ -414,8 +421,138 @@ async def test_retrieval_tool_descriptions_state_score_semantics_honestly() -> N
     # means instead of pointing at a field that is empty exactly then
     assert "a page of bare name matches is NOT evidence" in semantic
     # ...and the replacement must not point at another dead end: get_entity
-    # returns ids + mention refs only (no text), and no MCP tool retrieves
-    # chunk/document content yet. REVERSE this pin when MCP5/MCP7 add a real
-    # content-retrieval path — the description should then point to it.
+    # returns ids + mention refs only (no text), and ENTITY content stays
+    # unreachable even after MCP5 — get_chunk takes chunk UUIDs, while an
+    # entity mention ref is the chunk:{content_hash}:{ordinal} string shape
+    # get_chunk deliberately rejects. REVERSE this pin when MCP7 makes
+    # mention refs resolvable — the description should then point there.
     assert "get_entity" not in semantic
     assert "no tool currently retrieves" in semantic
+
+
+class _IntrospectionRepo:
+    """Fake BuildScopedRepo for the introspection helpers: canned rows, and a
+    query log so tests can assert validation happens BEFORE any store read."""
+
+    def __init__(self, rows: list[Any] | None = None) -> None:
+        self.build_id = uuid.uuid4()
+        self.rows = rows or []
+        self.queries = 0
+
+    async def fetch_all(self, table: Any, *where: Any) -> list[Any]:
+        self.queries += 1
+        return self.rows
+
+
+async def test_a_mention_ref_shaped_chunk_id_gets_a_typed_explanation() -> None:
+    """MCP5/MCP7 seam: the OTHER chunk pointer an agent actually holds — an
+    entity mention ref (chunk:{content_hash}:{ordinal}) — is NOT a chunk
+    UUID, and a bare "invalid uuid" error would leave the agent with no idea
+    why its perfectly-real-looking ref fails (the #124 lesson: name the gap,
+    don't point at dead ends). The error must say that shape is not yet
+    resolvable, and validation must not cost a store round-trip."""
+    repo = _IntrospectionRepo()
+    payload = await _get_chunk(repo, "demo", "chunk:3626c139ab:0")
+    assert payload["chunk"] is None
+    assert "not yet resolvable" in payload["error"]
+    assert repo.queries == 0  # rejected before any store read
+
+    document = await _get_document(repo, "demo", "not-a-uuid", _NO_EXPOSURE)
+    assert document["document"] is None and "document UUID" in document["error"]
+    assert repo.queries == 0
+
+
+async def test_a_malformed_id_is_rejected_before_the_store_binding_opens() -> None:
+    """Codex #125 r3: the tool wrappers rejected malformed ids only AFTER
+    ``context.bound()`` — a bad id cost a Postgres active-build resolution,
+    and with a store down the caller saw STORE_UNAVAILABLE instead of the
+    actionable UUID error. The pre-binding check shares the helper's message
+    (one constant, two emitters) and stamps the NIL build sentinel — no
+    build was ever resolved, same convention as the pre-binding timeout."""
+    from core.mcp.server import (
+        _CHUNK_ID_MESSAGE,
+        _DOCUMENT_ID_MESSAGE,
+        _NIL_BUILD,
+        _invalid_chunk_payload,
+        _invalid_document_payload,
+    )
+
+    rejected = _invalid_chunk_payload("demo", "chunk:3626c139ab:0")
+    assert rejected is not None
+    assert rejected["build_id"] == _NIL_BUILD  # binding never happened
+    assert rejected["chunk"] is None and rejected["error"] == _CHUNK_ID_MESSAGE
+
+    doc_rejected = _invalid_document_payload("demo", "not-a-uuid")
+    assert doc_rejected is not None
+    assert doc_rejected["build_id"] == _NIL_BUILD
+    assert doc_rejected["document"] is None and doc_rejected["error"] == _DOCUMENT_ID_MESSAGE
+
+    # a VALID id passes through to the bound path — the check must not
+    # over-block (the §22 dual)
+    assert _invalid_chunk_payload("demo", str(uuid.uuid4())) is None
+    assert _invalid_document_payload("demo", str(uuid.uuid4())) is None
+
+
+async def test_get_chunk_maps_the_row_and_types_not_found() -> None:
+    """MCP5's whole point: a chunk UUID (relation evidence ref / chunk result
+    id) must be exchangeable for the text it cites — before this tool the
+    MCP surface had no citation→content path at all. Unknown ids get a typed
+    not-found naming the ACTIVE build (never an exception: introspection
+    degrades, §22)."""
+    chunk_id, document_id = uuid.uuid4(), uuid.uuid4()
+    row = SimpleNamespace(
+        id=chunk_id,
+        document_id=document_id,
+        ordinal=3,
+        text="全票 200 元",
+        start_offset=10,
+        end_offset=17,
+        token_count=5,
+    )
+    payload = await _get_chunk(_IntrospectionRepo([row]), "demo", str(chunk_id))
+    assert payload["error"] is None
+    assert payload["chunk"]["text"] == "全票 200 元"
+    assert payload["chunk"]["document_id"] == str(document_id)  # provenance rides along
+
+    missing = await _get_chunk(_IntrospectionRepo(), "demo", str(uuid.uuid4()))
+    assert missing["chunk"] is None and "ACTIVE build" in missing["error"]
+
+
+async def test_get_document_emits_raw_whole_and_projects_metadata_fail_closed() -> None:
+    """The document half: raw is emitted WHOLE (REST detail parity — silent
+    truncation would misrepresent the corpus, §22), ingested_at is
+    stringified (introspection payloads are plain JSON — no FastAPI encoder
+    on this path), and metadata obeys DR-010 (Codex #125): the stored
+    envelope is NOT agent-visible — it goes through the SAME fail-closed
+    MetadataExposure projection as retrieval enrichment, so an unlisted
+    governance field never leaks and an empty allowlist yields {}."""
+    from datetime import UTC, datetime
+
+    document_id = uuid.uuid4()
+    row = SimpleNamespace(
+        id=document_id,
+        source_uri="file:///guide.md",
+        mime="text/markdown",
+        content_hash="abc123",
+        metadata={"governance": {"classification": "secret"}, "context": {"title": "導覽"}},
+        ingested_at=datetime(2026, 7, 24, tzinfo=UTC),
+        status=None,
+        raw="# 導覽 " + "全文" * 1000,
+    )
+    hidden = await _get_document(_IntrospectionRepo([row]), "demo", str(document_id), _NO_EXPOSURE)
+    assert hidden["error"] is None
+    doc = hidden["document"]
+    assert doc["raw"] == row.raw  # whole, untruncated
+    assert isinstance(doc["ingested_at"], str)
+    assert doc["metadata"] == {}  # fail-closed: nothing allowlisted, NOTHING leaks
+
+    listed = await _get_document(
+        _IntrospectionRepo([row]),
+        "demo",
+        str(document_id),
+        MetadataExposure(fields=("context.title",)),
+    )
+    assert listed["document"]["metadata"] == {"context": {"title": "導覽"}}  # only the listed path
+
+    missing = await _get_document(_IntrospectionRepo(), "demo", str(uuid.uuid4()), _NO_EXPOSURE)
+    assert missing["document"] is None and "ACTIVE build" in missing["error"]
