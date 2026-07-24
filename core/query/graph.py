@@ -331,8 +331,12 @@ async def _subgraph(
             # path), not post-drop — a stale edge dropping out must not hide
             # that the ceiling clipped the set
             truncated = True
-            edges = edges[:edge_budget]
-        relations, edge_dropped = await _relation_results(repo, edges)
+        # validate-then-allocate (Codex #127 r7's class, edge edition): an
+        # evidence-less edge in a pre-sliced budget would occupy a seat
+        # while the fetched probe edge was never promoted — resolve every
+        # fetched edge, then take the first edge_budget CITABLE ones
+        all_relations, edge_dropped = await _relation_results(repo, edges)
+        relations = all_relations[:edge_budget]
     elif len(node_ids) >= 2:
         if params.hops == 1:
             # every distance-1 neighbor is directly adjacent to the seed, so
@@ -441,14 +445,16 @@ async def subgraph_context(
             limit=edge_budget + 1,  # the truncation probe (policy cap only)
             timeout_ms=remaining_ms,
         )
-        projected = projected[:edge_budget]
+        # validate-then-allocate (Codex #127 r7's class — the REST twin of
+        # the _subgraph edge fix): the budget takes CITABLE edges, so an
+        # evidence-less edge cannot hide the fetched citable probe edge
         triples = [t for edge in projected if (t := _edge_triple(edge)) is not None]
         resolved = await repo.relations_with_evidence(triples)
         citable = [
             relation_id
             for triple, (relation_id, evidence_rows) in resolved.items()
             if any(evidence_ref(row) is not None for row in evidence_rows)
-        ]
+        ][:edge_budget]
         if citable:
             node_set = set(node_ids)
             edge_rows = await repo.fetch_all(tables.relations, tables.relations.c.id.in_(citable))
@@ -585,24 +591,28 @@ async def _neighbor_entities(
     dropped += len(candidates - set(best))  # unreachable via the ACTIVE graph → drift
 
     ordered = sorted(best.items(), key=lambda item: (item[1], item[0]))
-    truncated = fetch_clipped or len(ordered) > policy.max_rows
-    ordered = ordered[: policy.max_rows]
 
-    # SoR re-verification (§27.2): an entity result needs ≥1 RESOLVABLE
-    # mention of a still-active entity (MCP7 v1.1 — refs carry chunk uuid +
-    # uri + quote + offsets via the shared resolution seam); a drifted
-    # (non-active or unresolvable) node yields zero refs and is dropped.
+    # SoR re-verification BEFORE the page slice (§27.2; Codex #127 r7 — the
+    # MCP6 validate-then-allocate rule): resolving only a pre-sliced page let
+    # an uncitable entity occupy a seat while an already-fetched citable
+    # candidate in the probe position was never promoted — max_rows citable
+    # rows available, fewer returned. Resolve every fetched candidate, then
+    # take the first max_rows CITABLE ones (MCP7 v1.1 — refs carry chunk
+    # uuid + uri + quote + offsets via the shared seam); a drifted node
+    # yields zero refs and is dropped without costing the page a seat.
     refs_by_entity, mention_drops, capped = await resolved_mention_refs(
         repo, [entity_id for entity_id, _ in ordered]
     )
     names = await repo.active_entity_names([entity_id for entity_id, _ in ordered])
-    kept: list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]] = []
+    citable: list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]] = []
     for entity_id, distance in ordered:
         refs = refs_by_entity.get(entity_id, ())
         if refs:
-            kept.append((entity_id, distance, refs, names.get(entity_id)))
+            citable.append((entity_id, distance, refs, names.get(entity_id)))
         else:
             dropped += 1
+    truncated = fetch_clipped or len(citable) > policy.max_rows
+    kept = citable[: policy.max_rows]
     # page-exact mention-loss warnings (Codex #127: graph was silently
     # capping/dropping mention refs while semantic warned) — single source
     loss_warnings = mention_warnings(

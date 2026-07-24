@@ -1073,3 +1073,129 @@ async def test_graph_surfaces_mention_cap_and_drop_like_semantic() -> None:
         "unresolvable mention citation(s) omitted on returned entities" in w.message
         for w in response.warnings
     )  # …and the drift loss is surfaced
+
+
+async def test_an_uncitable_page_entity_never_hides_a_fetched_citable_candidate() -> None:
+    """Codex #127 r7 (the MCP6 validate-then-allocate rule, graph edition):
+    slicing to max_rows BEFORE mention resolution let an uncitable entity
+    occupy a page seat while the already-fetched citable probe candidate was
+    never promoted — max_rows citable rows available, fewer returned. The
+    page is now taken from CITABLE candidates."""
+    seed = uuid.uuid4()
+    ids = sorted([uuid.uuid4() for _ in range(_POLICY.max_rows + 1)], key=str)
+    graph = _FakeGraph(neighbor_rows=[{"entity": _node(eid), "distance": 1} for eid in ids])
+    mentions: dict[uuid.UUID, list[tuple[str, str, str | None]]] = {
+        eid: [("text", f"chunk:{eid.hex}:0", "q")] for eid in ids
+    }
+    mentions[ids[0]] = [("text", "not-a-ref", "q")]  # IN-page entity, unresolvable
+    sor = _FakeSoR(
+        seeds={"acme": [seed]},
+        mentions=mentions,
+        pairs={(seed, eid) for eid in ids},  # every edge is valid — only the
+        # mention resolution drops ids[0]
+    )
+    response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
+    # the probe candidate fills the vacated seat — the page stays FULL
+    assert len(response.results) == _POLICY.max_rows
+    assert str(ids[0]) not in [r.id for r in response.results]
+    codes = _codes(response)
+    assert "PARTIAL_RESULTS" in codes  # the drop is surfaced
+    # TRUNCATED still fires — the probe row came back, so the store LIMIT
+    # clipped the fetch and more citable neighbors may exist beyond it (the
+    # fetch-time semantics the sibling truncation test pins)
+    assert "TRUNCATED" in codes
+
+
+async def test_an_evidence_less_edge_never_hides_a_fetched_citable_edge() -> None:
+    """Codex #127 r7's class, EDGE edition (gate-2 sibling sweep): slicing
+    edges to the budget before evidence validation let an uncitable edge
+    occupy a seat while the fetched probe edge was never promoted. Edges are
+    now validated first; the budget takes citable ones."""
+    seed = uuid.uuid4()
+    # max_rows(10) - 9 page entities (seed + 8 neighbors) → edge_budget = 1:
+    # the fetch (budget+1 probe) returns BOTH edges, and round-0 slicing
+    # would keep only the stale one
+    near = [uuid.uuid4() for _ in range(8)]
+    rel_ok, rel_stale = uuid.uuid4(), uuid.uuid4()
+    edge_budget_probe = [
+        # the budget-slot edge has NO evidence (uncitable); the probe edge
+        # (beyond the budget under raw slicing) is fully citable
+        {"src": str(seed), "dst": str(near[0]), "type": "REL_STALE"},
+        {"src": str(near[1]), "dst": str(seed), "type": "REL_OK"},
+    ]
+    graph = _FakeGraph(
+        neighbor_rows=[{"entity": _node(n), "distance": 1} for n in near],
+        edges=edge_budget_probe,
+    )
+    sor = _FakeSoR(
+        seeds={"acme": [seed]},
+        mentions={eid: [("text", f"chunk:{eid.hex}:0", "q")] for eid in [seed, *near]},
+        pairs={(seed, n) for n in near},
+        relations={
+            (near[1], seed, "REL_OK"): (
+                rel_ok,
+                [
+                    {
+                        "evidence_type": "chunk",
+                        "quote": "q",
+                        "source_uri": "s3://e.md",
+                        "start_offset": 0,
+                        "end_offset": 1,
+                        "chunk_id": uuid.uuid4(),
+                        "evidence_ref": "r",
+                    }
+                ],
+            ),
+            # REL_STALE resolves to a relation with NO valid evidence rows
+            (seed, near[0], "REL_STALE"): (rel_stale, []),
+        },
+    )
+    response = await _run(graph, sor, GraphQueryParams(template="subgraph", entity="acme", hops=1))
+    relation_ids = [r.id for r in response.results if r.result_type == "relation"]
+    assert relation_ids == [str(rel_ok)]  # the citable probe edge got the seat
+
+
+async def test_context_edge_budget_takes_citable_edges_first() -> None:
+    """The REST twin of the _subgraph edge fix (Codex #127 r7's class, third
+    sweep site): pre-slicing projected edges to the budget let an
+    evidence-less edge hide the fetched citable probe edge — the context
+    emitted zero edges with one citable available. The budget now caps the
+    CITABLE list."""
+    seed = uuid.uuid4()
+    # 9 page entities (seed + 8 neighbors) → edge_budget = max_rows(10) − 9 = 1
+    near = [uuid.uuid4() for _ in range(8)]
+    rel_ok, rel_stale = uuid.uuid4(), uuid.uuid4()
+    graph = _FakeGraph(
+        neighbor_rows=[{"entity": _node(n), "distance": 1} for n in near],
+        edges=[
+            {"src": str(seed), "dst": str(near[0]), "type": "REL_STALE"},
+            {"src": str(near[1]), "dst": str(seed), "type": "REL_OK"},
+        ],
+    )
+    sor = _SubgraphSoR(
+        seeds={},
+        mentions={eid: [("text", f"chunk:{eid.hex}:0", "q")] for eid in [seed, *near]},
+        pairs={(seed, n) for n in near},
+        relations={
+            (near[1], seed, "REL_OK"): (
+                rel_ok,
+                [
+                    {
+                        "evidence_type": "chunk",
+                        "quote": "q",
+                        "source_uri": "s3://e.md",
+                        "start_offset": 0,
+                        "end_offset": 1,
+                        "chunk_id": uuid.uuid4(),
+                        "evidence_ref": "r",
+                    }
+                ],
+            ),
+            (seed, near[0], "REL_STALE"): (rel_stale, []),
+        },
+        entity_rows=[_sor_entity_row(eid, f"n-{eid}") for eid in [seed, *near]],
+        relation_rows=[_sor_relation_row(rel_ok, near[1], seed)],
+    )
+    context = await _run_subgraph(graph, sor, seed, 1)
+    assert context is not None
+    assert [e["id"] for e in context.edges] == [rel_ok]  # the citable edge got the seat
