@@ -150,11 +150,13 @@ async def _neighbors(
     query: str,
 ) -> McpResponse:
     deadline = time.monotonic() + policy.timeout_ms / 1000.0
-    entities, dropped, truncated, timed_out = await _neighbor_entities(
+    entities, dropped, truncated, timed_out, unresolved = await _neighbor_entities(
         graph, repo, policy, params, deadline
     )
     results = _score(entities)
     warnings = _standard_warnings(policy, truncated, dropped, timed_out)
+    if unresolved:
+        warnings = (*warnings, _unresolved_name_warning(params.entity))
     return _response(graph, query, results, warnings)
 
 
@@ -169,7 +171,16 @@ async def _path(
     src_ids = await repo.entity_ids_by_name(params.entity)
     dst_ids = await repo.entity_ids_by_name(params.other_entity)
     if not src_ids or not dst_ids:
-        return _response(graph, query, (), ())
+        # MCP2: name the side(s) that resolved to nothing — an empty envelope
+        # here is otherwise read as "no path exists between two real entities"
+        missing = [
+            name
+            for name, ids in ((params.entity, src_ids), (params.other_entity, dst_ids))
+            if not ids
+        ]
+        return _response(
+            graph, query, (), tuple(_unresolved_name_warning(name) for name in missing)
+        )
     # A name can resolve to SEVERAL active entities (distinct disambiguators,
     # §27.3) — try every (src, dst) pair in deterministic order until one
     # yields a path that SURVIVES SoR re-verification: a stale/corrupt
@@ -296,7 +307,7 @@ async def _subgraph(
     # the WHOLE subgraph phase — seed traversals AND the edge stage — shares
     # ONE policy deadline (per-stage timeouts would stack, the C6b trap)
     deadline = time.monotonic() + policy.timeout_ms / 1000.0
-    entities, dropped, truncated, timed_out = await _neighbor_entities(
+    entities, dropped, truncated, timed_out, unresolved = await _neighbor_entities(
         graph, repo, policy, params, deadline, include_seeds=True
     )
     # §21: max_rows is the ceiling on the WHOLE response, entities AND
@@ -339,6 +350,8 @@ async def _subgraph(
             truncated = truncated or bool(probe)
     results = _score(entities, relations)
     warnings = _standard_warnings(policy, truncated, dropped + edge_dropped, timed_out)
+    if unresolved:
+        warnings = (*warnings, _unresolved_name_warning(params.entity))
     return _response(graph, query, results, warnings)
 
 
@@ -394,7 +407,7 @@ async def subgraph_context(
 
     deadline = time.monotonic() + policy.timeout_ms / 1000.0
     params = GraphQueryParams(template="subgraph", entity=str(seed), hops=hops)
-    entities, _dropped, _truncated, timed_out = await _neighbor_entities(
+    entities, _dropped, _truncated, timed_out, _unresolved = await _neighbor_entities(
         graph, repo, policy, params, deadline, include_seeds=True, seeds=[seed]
     )
     node_ids = [entity_id for entity_id, _, _, _ in entities]
@@ -464,10 +477,14 @@ async def _neighbor_entities(
     *,
     include_seeds: bool = False,
     seeds: Sequence[uuid.UUID] | None = None,
-) -> tuple[list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]], int, bool, bool]:
+) -> tuple[list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]], int, bool, bool, bool]:
     """Traverse from every seed, merge, re-verify against the SoR.
 
-    Returns ``(kept, dropped, truncated, timed_out)`` where ``kept`` is
+    Returns ``(kept, dropped, truncated, timed_out, unresolved)`` where
+    ``unresolved`` means the seed was NAME-seeded and resolved to nothing
+    (MCP2: the caller must warn — zero rows from a name that matched no
+    active entity is a different answer from an empty neighborhood, and only
+    this flag tells the two apart); ``kept`` is
     ``[(entity_id, distance, mention_refs)]`` ordered nearest-first and capped
     at ``policy.max_rows`` — the probe row (one past the cap) exists only to
     detect the POLICY ceiling (TRUNCATED, §22); ``dropped`` counts hits the
@@ -486,11 +503,16 @@ async def _neighbor_entities(
     dropped as drift. (A candidate clipped from the node set by the fetch cap
     can make a genuinely-reachable node look unreachable — an over-drop, never
     an under-verify, and the clip itself is surfaced as TRUNCATED.)"""
+    named = seeds is None
     if seeds is None:
         # name-seeded (the graph_query templates); BA3c passes SoR-verified ids
         seeds = await repo.entity_ids_by_name(params.entity)
     if not seeds:
-        return [], 0, False, False
+        # MCP2: a name resolving to NOTHING is a different answer from a seed
+        # with no neighbours, but both are zero rows — without this flag the
+        # caller cannot tell them apart, and an agent asked "is A related to
+        # B?" confidently answers "no" when it merely mistyped the name
+        return [], 0, False, False, named
 
     candidates: set[uuid.UUID] = set()
     dropped = 0
@@ -570,7 +592,7 @@ async def _neighbor_entities(
             kept.append((entity_id, distance, refs, names.get(entity_id)))
         else:
             dropped += 1
-    return kept, dropped, truncated, timed_out
+    return kept, dropped, truncated, timed_out, False
 
 
 async def _relation_results(
@@ -766,6 +788,26 @@ def _degrade_warning(exc: Neo4jError | ServiceUnavailable, timeout_ms: int) -> Q
     if "TimedOut" in code or "Timeout" in code:
         return _warn("PARTIAL_RESULTS", f"traversal exceeded the {timeout_ms}ms deadline (§21)")
     return _warn("STORE_UNAVAILABLE", f"graph store unavailable ({type(exc).__name__})")
+
+
+def _unresolved_name_warning(name: str) -> QueryWarning:
+    """MCP2: the seed name matched no ACTIVE entity in this build.
+
+    Zero rows is the same shape whether a name is unknown or its neighbourhood
+    is genuinely empty, so the distinction has to be carried in a warning or
+    the caller cannot recover: replaying the identical call is futile, while
+    replaying a CORRECTED name succeeds. ``GUARDRAIL_BLOCKED`` is the frozen
+    code for "this invocation produced nothing because the input was not
+    usable" (the hops/template rejections' family) — no §27.2 bump needed.
+    Name matching is exact (case-insensitive) equality, so the message points
+    at ``get_entity``, which answers "does this name exist" unambiguously."""
+    return QueryWarning(
+        GUARDRAIL_WARNING_CODE,
+        f"entity name {name!r} matched no active entity in this build — the "
+        "traversal ran against no seed, so an empty result here does NOT mean "
+        "'no relations exist'. Names match exactly (case-insensitive); confirm "
+        "the canonical spelling with get_entity before retrying.",
+    )
 
 
 def _warn(code: str, message: str) -> QueryWarning:

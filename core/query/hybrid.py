@@ -52,6 +52,7 @@ from core.query.results import (
 )
 from core.query.semantic import semantic_search
 from core.query.sql import sql_query
+from core.stores.errors import STORE_CLIENT_ERRORS, store_name
 from core.stores.graph import BuildScopedGraphRepo
 from core.stores.repo import BuildScopedRepo
 from core.stores.sqlreader import BuildScopedSqlReader
@@ -218,13 +219,7 @@ async def hybrid_query(
         except TimeoutError:
             deadline_cut.append(mode)
         except Exception as exc:  # noqa: BLE001 — §22: one store down ≠ hybrid down
-            warnings.append(
-                QueryWarning(
-                    "STORE_UNAVAILABLE",
-                    f"{mode} mode failed ({type(exc).__name__}) — degraded to the "
-                    "remaining modes (§22)",
-                )
-            )
+            warnings.append(_mode_failure_warning(mode, exc))
     if deadline_cut:
         warnings.append(
             QueryWarning(
@@ -288,6 +283,52 @@ def _check_scopes(deps: HybridDeps) -> None:
             f"hybrid deps are bound to different scopes {sorted(scopes, key=str)} — "
             "fusion would mix builds (DR-006)"
         )
+
+
+def _mode_failure_warning(mode: str, exc: Exception) -> QueryWarning:
+    """Classify a mode failure as caller-input vs infrastructure (MCP2).
+
+    The old blanket ``STORE_UNAVAILABLE`` told an agent "back off and retry" for
+    EVERY failure — including ones the agent itself caused (an empty query makes
+    the embeddings API raise 400), so it would retry the identical malformed
+    call forever. Provider 4xx statuses (except 429, which really is
+    "infrastructure busy, retry later") mean the INPUT was rejected: that is
+    ``GUARDRAIL_BLOCKED`` — the frozen code for "this invocation was not
+    usable" — and the message says to change the input, not to wait. The check
+    duck-types on ``status_code`` so core/query stays provider-agnostic (the
+    LLM lives behind the §3 abstraction; importing a vendor's exception types
+    here would leak it).
+    """
+    status = getattr(exc, "status_code", None)
+    # ONLY the statuses that mean "the request content was rejected" (400
+    # bad-request, 422 unprocessable), and ONLY from a non-store source. The
+    # rest of 4xx is NOT input: 401/403 are credentials/permissions and 404 a
+    # missing model/deployment — telling the agent to reword its query cannot
+    # repair any of those, and labelling them caller-input would hide a real
+    # outage from operators (Codex #122). A store client's 400 (Qdrant
+    # dimension drift) is likewise a projection fault, not the caller's.
+    if not isinstance(exc, STORE_CLIENT_ERRORS) and status in (400, 422):
+        return QueryWarning(
+            "GUARDRAIL_BLOCKED",
+            f"{mode} mode rejected the request input ({type(exc).__name__}, "
+            f"HTTP {status}) — the request as issued cannot be served; "
+            "retrying unchanged will fail again (§22)",
+        )
+    if isinstance(exc, STORE_CLIENT_ERRORS):
+        # name the store (Codex #122 r3): hybrid is the DEFAULT tool, and an
+        # anonymous "semantic mode failed (ResponseHandlingException)" leaves
+        # the agent unable to tell a Qdrant-only outage (route around it)
+        # from Postgres down (everything is dead) — the same distinction the
+        # single-mode tools surface via the same core.stores.errors map
+        return QueryWarning(
+            "STORE_UNAVAILABLE",
+            f"{mode} mode failed — {store_name(exc)} unavailable "
+            f"({type(exc).__name__}); degraded to the remaining modes (§22)",
+        )
+    return QueryWarning(
+        "STORE_UNAVAILABLE",
+        f"{mode} mode failed ({type(exc).__name__}) — degraded to the remaining modes (§22)",
+    )
 
 
 def _available_modes(
