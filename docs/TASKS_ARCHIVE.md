@@ -334,3 +334,7 @@ RunsTable 失敗建置列展開加「失敗診斷」:useBuildSteps/useStepItems 
 ## MCP4
 
 (a) 實測方法:真 embedder+真 Qdrant 對 nmmst active build 跑兩輪 battery;簡單 battery(6 IN/6 OOD)完美可分(IN min 0.6068 > OOD max 0.4817)是假象,邊界 battery(泛化措辭域內+主題鄰近域外)擊穿:「海洋大學的入學申請」0.6144 高於「從台北怎麼去」0.4992/「開放時間」0.5065/「適合小孩嗎」0.5176;gap12/gapMed/mean10/entity-link 全不可分。LLM 可答性判準因每查詢加 LLM 延遲(MCP8 反向)不採。(b) 落地=授權結論 b:DESIGN §22 記錄刻意不提供(附數據+重啟條件=真 relevance model);LOW_CONFIDENCE 維持 global-only;confidence 不填;零 contracts 變更;釘測試 probe 各恰紅(插門檻/刪語句)。(c) 遠端 2 輪+服務端 6 次 Unknown error(backoff 重 poke,末次恢復 +1;owner 收推播):r1 P1「judge from returned text」在 entity-only 頁(text null)不可執行→改指 content 並明說 entity 只帶名稱;r2 修正本身又指死路(get_entity 無文字、MCP 無取回工具)→直說「no tool currently retrieves」,absence pin 註明 MCP5/MCP7 落地時反轉改指新工具。
+
+## MCP5
+
+(a) 設計:UUID 驗證先於任何 store 讀取,無效輸入具名 mention-ref 形狀(#124 課:不留死指引);not-found 具名 ACTIVE build;raw 完整不截斷(REST detail 對等);ingested_at 字串化(自省 payload 純 JSON)。(b) 遠端 4 輪:r1 P1 metadata 整包回傳繞過 DR-010 metadata_exposure fail-closed 白名單→改經與 enrichment 同源的 exposure.project(密級欄位 hermetic+live 雙驗證不可見);r2 get_chunk 指引未限定 evidence 形狀(row/document ref 照做會炸)→限定 source_type "chunk",括號用 agent 可見詞彙;r3 wrapper 先 bound() 才驗 id(壞輸入白付 active-build 解析、store 掛掉時錯誤被 STORE_UNAVAILABLE 遮蔽)→抽 pre-binding 拒絕(_NIL_BUILD sentinel、訊息常數單一來源雙發射點),ordering 以真 dispatch 整合測試釘住(nil build 只在跳過 binding 時成立);r4 +1。(c) 測試:單元 5+整合 3(DR-006 archived build 不可見、DR-010 live、ordering pin),probe 各恰紅;check-full 綠。get_entity 同型 bind-then-validate 入 followups。

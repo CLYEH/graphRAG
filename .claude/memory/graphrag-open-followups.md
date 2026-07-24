@@ -97,3 +97,14 @@ GitHub 為準;立案或了結後從本檔劃掉):
   lookup + `GET /jobs` 清單),自成 DR-002 任務。RB1-fe 說明已標 (RB1-api)。
 
 - **relations/review 的 default cursor 未綁 query scope(SS1a-era)**:SS1b(#120 R8/R9/R10)把 entities/documents 的 cursor tag 釘到 sort+q+filters(typed)+build,但 relations 與 review 端點的 default (id,) cursor 仍是無 tag 形——filter 換值/build 切換後重放靜默 re-anchor。SS1a 既有、非 SS1b 回歸;修法=沿用 `_scope_fingerprint` + `decode_scoped_id_cursor`(pattern 見 lesson class 31)。順手時機:任何動 relations/review 分頁的任務。
+
+- **get_entity 的 bind-then-validate(MCP5 #125 r3 同型未修面)**:get_chunk/get_document
+  已改為 wrapper 在 context.bound() 之前拒絕 malformed id(_NIL_BUILD sentinel 慣例),
+  但 get_entity 的空白 name 檢查仍在 binding 之後——壞輸入白付一次 active-build 解析。
+  gate-2 reviewer 附議入帳。順手時機:下一個動 core/mcp/server.py 自省工具的任務
+  (MCP7/MCP9 最近)。
+- **delta-review receipt 被 harness 自動誤旗(#125 期間兩次)**:gate-2 persistent
+  reviewer 依 SendMessage delta-review 協議自查 diff 後蓋章,harness 的 security
+  heuristic 兩度標為「無真審查的自我蓋章」。誤報(輸出含具體查證),但訊號值得
+  機械化補強:候選 H-task=write-review-receipt.sh 記錄 verdict 摘要/輪次 context,
+  或 LOOP.md 明文 delta-review 協議供 heuristic 對齊。owner 知悉後再立案。
