@@ -340,7 +340,11 @@ def test_models_needed_maps_modes_to_clients() -> None:
     assert models_needed(_set("sql"), cast(Any, sql_on)) == (False, True)
     assert models_needed(_set("sql"), cast(Any, sql_off)) == (False, False)  # skipped pre-LLM
     assert models_needed(_set("semantic"), cast(Any, sql_off)) == (True, False)
-    assert models_needed(_set("hybrid"), cast(Any, sql_off)) == (True, True)  # selector LLM
+    # MCP8 REVERSED the selector-LLM pin: hybrid's LLM selector is gone, so
+    # a hybrid case consults the LLM only through its sql mode — keyless
+    # projects can now eval hybrid whenever text_to_sql is disabled
+    assert models_needed(_set("hybrid"), cast(Any, sql_off)) == (True, False)
+    assert models_needed(_set("hybrid"), cast(Any, sql_on)) == (True, True)  # NLSQL
 
 
 async def test_run_eval_refuses_when_the_persist_hits_no_build(
