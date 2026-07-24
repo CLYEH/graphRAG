@@ -394,3 +394,17 @@ def test_active_binding_cannot_be_forged() -> None:
     valid = ActiveBinding("p", uuid.uuid4(), repo_module._BINDING_TOKEN)
     with pytest.raises(RuntimeError, match="resolve_active_binding"):
         dataclasses.replace(valid, build_id=uuid.uuid4())
+
+
+async def test_retrieval_tool_descriptions_state_score_semantics_honestly() -> None:
+    """MCP4/DESIGN §22: v1 deliberately provides no out-of-domain signal —
+    scores rank within a response and cannot flag an unanswerable question
+    (measured: no separating threshold exists). The tool description is the
+    ONLY surface an agent reads before calling, so the honesty statement
+    lives there; this pin keeps a docstring rewrite from silently dropping
+    the statement while the no-warning behavior stays."""
+    server = build_server("demo")
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    for name in ("semantic_search", "hybrid_query"):
+        assert "answerability from the returned text" in (tools[name].description or ""), name
+    assert "no score threshold separates" in (tools["semantic_search"].description or "")
