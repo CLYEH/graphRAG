@@ -83,20 +83,25 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
     # citability is judged over EVERY row (not just up to the ceiling): a
     # memberless row past the break would otherwise count as "clipped" and
     # over-fire TRUNCATED — the flag must be exact in both directions (§22)
-    citable: list[RetrievalResult] = []
+    citable: list[tuple[RetrievalResult, int]] = []
     dropped = 0
     ungrounded = 0
-    refs_capped = 0
     for row in ordered:
         result, bad_refs, capped = _report_result(row, known)
         ungrounded += bad_refs
         if result is None:
             dropped += 1  # no grounded members left — cannot cite (§27.2)
         else:
-            citable.append(result)
-            refs_capped += capped
+            citable.append((result, capped))
 
-    emitted = _scored(citable[:top_k])
+    page = citable[:top_k]
+    emitted = _scored([result for result, _ in page])
+    # capped refs are counted over the EMITTED slice only (Codex #123): a
+    # beyond-top_k report's capped members were never returned at all, and
+    # charging them to "the page" would misrepresent complete results as
+    # incomplete (top_k=1 with an 8-ref top report must not warn about the
+    # runner-up's 12)
+    refs_capped = sum(capped for _, capped in page)
     warnings: list[QueryWarning] = []
     if len(citable) > top_k:
         warnings.append(
@@ -115,8 +120,8 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
             QueryWarning(
                 "TRUNCATED",
                 f"community_report source_refs capped at {_REFS_CAP} grounded member "
-                f"refs each — {refs_capped} ref(s) omitted across the page; the full "
-                "membership is inspectable via the entities of the report (§22)",
+                f"refs each — {refs_capped} ref(s) omitted across the returned "
+                "results (§22)",
             )
         )
     if emitted:

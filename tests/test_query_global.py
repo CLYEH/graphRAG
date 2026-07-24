@@ -268,8 +268,27 @@ async def test_report_refs_are_capped_with_the_omission_named() -> None:
     assert tuple(r.id for r in result.source_refs) == expected
     capped = [w for w in response.warnings if "capped" in w.message]
     assert len(capped) == 1 and capped[0].code == "TRUNCATED"
-    assert "12 ref(s) omitted" in capped[0].message
+    assert "12 ref(s) omitted across the returned results" in capped[0].message
 
     r2 = await _run([_report(1.0, member_ids=list(members[:8]))], top_k=5)
     assert len(r2.results[0].source_refs) == 8
     assert not any("capped" in w.message for w in r2.warnings)
+
+
+async def test_a_beyond_top_k_report_never_charges_its_capped_refs_to_the_page() -> None:
+    """Codex #123: a runner-up report beyond top_k was still adding its capped
+    members to the warning, so a page whose ONLY returned report is complete
+    warned "12 ref(s) omitted" — misrepresenting a complete result as
+    incomplete. The count must come from the emitted slice alone.
+    """
+    small = _report(9.0, member_ids=[uuid.uuid4() for _ in range(1)])
+    big = _report(1.0, member_ids=[uuid.uuid4() for _ in range(20)])
+    response = await _run([small, big], top_k=1)
+    assert [r.id for r in response.results] == [str(small.id)]
+    assert not any("capped" in w.message for w in response.warnings), (
+        "the runner-up's capped refs were never returned — they are not the page's loss"
+    )
+    # ...and when the big report IS emitted, the cap is reported
+    both = await _run([small, big], top_k=2)
+    capped = [w for w in both.warnings if "capped" in w.message]
+    assert len(capped) == 1 and "12 ref(s) omitted" in capped[0].message
