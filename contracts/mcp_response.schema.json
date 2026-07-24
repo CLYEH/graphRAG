@@ -267,6 +267,10 @@
                               "minimum": 0
                             }
                           }
+                        },
+                        "id": {
+                          "type": "string",
+                          "format": "uuid"
                         }
                       },
                       "required": [

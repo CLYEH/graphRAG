@@ -1041,3 +1041,34 @@ async def test_subgraph_context_emits_sor_backed_nodes_and_citable_edges() -> No
         "type": "WORKS_AT",
         "confidence": 0.9,
     }
+
+
+async def test_graph_surfaces_mention_cap_and_drop_like_semantic() -> None:
+    """Codex #127: graph silently discarded the resolver's cap/drop signals
+    while semantic warned — a neighbors page could show 8-of-20 mention refs
+    with no TRUNCATED and lose drifted citations with no PARTIAL_RESULTS.
+    Both warnings come from the SAME single-source builder (mention_warnings),
+    so the two surfaces cannot drift."""
+    seed, heavy = uuid.uuid4(), uuid.uuid4()
+    mentions: dict[uuid.UUID, list[tuple[str, str, str | None]]] = {
+        seed: [("text", f"chunk:{seed.hex}:0", "q")],
+        # 10 resolvable mentions → capped at 8; plus one unresolvable → drop
+        heavy: [
+            *(
+                ("text", f"chunk:{uuid.uuid4().hex}:{i}", cast("str | None", "q"))
+                for i in range(10)
+            ),
+            ("text", "not-a-ref", None),
+        ],
+    }
+    graph = _FakeGraph(neighbor_rows=[{"entity": _node(heavy), "distance": 1}])
+    sor = _FakeSoR(seeds={"acme": [seed]}, mentions=mentions, pairs={(seed, heavy)})
+    response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
+    heavy_result = next(r for r in response.results if r.id == str(heavy))
+    assert len(heavy_result.source_refs) == 8  # capped, deterministic prefix
+    codes = [w.code for w in response.warnings]
+    assert "TRUNCATED" in codes  # the cap is named…
+    assert any("get_entity" in w.message for w in response.warnings)  # …with the real escape hatch
+    assert any(
+        "mention citation(s) on returned entities" in w.message for w in response.warnings
+    )  # …and the drift loss is surfaced

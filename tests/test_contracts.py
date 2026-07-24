@@ -251,13 +251,34 @@ def test_a_v10_bare_entity_mention_ref_no_longer_validates() -> None:
     loosened schema unnoticed): the v1.0-legal bare chunk:{hash}:{ordinal}
     entity ref — the dead citation no endpoint accepted — must now FAIL
     require_sources. Reverting the entity contains-block turns this green."""
+    schema = json.loads(_MCP_SCHEMA.read_text("utf-8"))
+    validator = jsonschema.Draft202012Validator(
+        schema, format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER
+    )
+
     response = _valid_mcp_response()
     entity = next(r for r in response["results"] if r["result_type"] == "entity")
     entity["source_refs"] = [{"source_type": "chunk", "id": "chunk:aa11bb22cc:0"}]
-    schema = json.loads(_MCP_SCHEMA.read_text("utf-8"))
-    validator = jsonschema.Draft202012Validator(schema)
-    errors = list(validator.iter_errors(response))
-    assert errors, "a bare (unresolvable) entity mention ref validated — v1.1 not enforced"
+    assert list(validator.iter_errors(response)), (
+        "a bare (unresolvable) entity mention ref validated — v1.1 not enforced"
+    )
+
+    # Codex #127: uri/quote/offsets alone are not resolvability — the id
+    # itself must be a chunk UUID (format:uuid, checked with FORMAT_CHECKER,
+    # the build_id precedent) or neither get_chunk nor REST can take it
+    rich_but_dead = _valid_mcp_response()
+    entity = next(r for r in rich_but_dead["results"] if r["result_type"] == "entity")
+    entity["source_refs"] = [
+        {
+            "source_type": "chunk",
+            "id": "chunk:aa11bb22cc:0",
+            "source_uri": "s3://x",
+            "metadata": {"quote": "q", "start_offset": 0, "end_offset": 1},
+        }
+    ]
+    assert list(validator.iter_errors(rich_but_dead)), (
+        "a non-UUID mention id validated despite full uri/quote/offsets"
+    )
 
 
 def _valid_mcp_response() -> dict[str, Any]:

@@ -548,3 +548,22 @@ async def test_the_mention_cap_warning_is_page_exact() -> None:
     off_page = await _run(repo, _FakeVectors(hits), top_k=1)
     assert [r.id for r in off_page.results] == [str(plain_entity)]
     assert not any("mention refs capped" in w.message for w in off_page.warnings)
+
+
+async def test_partially_unresolvable_mentions_surface_as_partial_results() -> None:
+    """Codex #127: an entity with one valid + N bad mentions kept its hit, so
+    the hit-level drop counter never noticed the loss — partial provenance
+    was SILENT. The per-entity drop map surfaces it page-exactly: citations
+    lost on RETURNED entities warn PARTIAL_RESULTS; an off-page entity's
+    losses never charge this response."""
+    repo = _FakeRepo()
+    entity_id = uuid.uuid4()
+    _add_mention(repo, entity_id, content_hash="aa11bb22cc", quote="ok")
+    # two unresolvable mentions on the SAME surviving entity
+    repo.mentions[entity_id].append(("text", "chunk:ffffffffff:0", "gone"))
+    repo.mentions[entity_id].append(("text", "not-a-ref", "bad"))
+    response = await _run(repo, _FakeVectors([_entity_hit(entity_id, score=0.9)]))
+    assert len(response.results) == 1  # the hit survives on its valid mention
+    partial = [w for w in response.warnings if w.code == "PARTIAL_RESULTS"]
+    assert len(partial) == 1
+    assert "2 mention citation(s) on returned entities" in partial[0].message

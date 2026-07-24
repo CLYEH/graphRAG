@@ -101,7 +101,7 @@ async def test_resolvable_mentions_become_v11_refs_and_the_rest_drop() -> None:
     assert row_ref.source_type == "row" and row_ref.metadata == {"table": "t", "pk": "42"}
 
     assert uncitable not in refs_by_entity  # zero resolvable mentions → absent
-    assert dropped == 4
+    assert dropped == {uncitable: 4}  # per-entity provenance (page-exact emitters)
     assert repo.queries == 2  # one mention read + one chunk read for the page
 
 
@@ -117,7 +117,7 @@ async def test_the_quote_is_capped_at_the_contract_512() -> None:
     refs_by_entity, dropped, _ = await resolved_mention_refs(
         cast(BuildScopedRepo, repo), [entity_id]
     )
-    assert dropped == 0
+    assert dropped == {}
     quote = refs_by_entity[entity_id][0].metadata["quote"]
     assert len(quote) == 512
 

@@ -34,7 +34,7 @@ from typing import Any
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from core.graph.structured import split_row_source_ref
-from core.query.mentions import resolved_mention_refs
+from core.query.mentions import mention_warnings, resolved_mention_refs
 from core.query.policy import (
     GRAPH_QUERY_TEMPLATES,
     GUARDRAIL_WARNING_CODE,
@@ -148,11 +148,11 @@ async def _neighbors(
     query: str,
 ) -> McpResponse:
     deadline = time.monotonic() + policy.timeout_ms / 1000.0
-    entities, dropped, truncated, timed_out, unresolved = await _neighbor_entities(
+    entities, dropped, truncated, timed_out, unresolved, loss_warnings = await _neighbor_entities(
         graph, repo, policy, params, deadline
     )
     results = _score(entities)
-    warnings = _standard_warnings(policy, truncated, dropped, timed_out)
+    warnings = (*_standard_warnings(policy, truncated, dropped, timed_out), *loss_warnings)
     if unresolved:
         warnings = (*warnings, _unresolved_name_warning(params.entity))
     return _response(graph, query, results, warnings)
@@ -305,7 +305,7 @@ async def _subgraph(
     # the WHOLE subgraph phase — seed traversals AND the edge stage — shares
     # ONE policy deadline (per-stage timeouts would stack, the C6b trap)
     deadline = time.monotonic() + policy.timeout_ms / 1000.0
-    entities, dropped, truncated, timed_out, unresolved = await _neighbor_entities(
+    entities, dropped, truncated, timed_out, unresolved, loss_warnings = await _neighbor_entities(
         graph, repo, policy, params, deadline, include_seeds=True
     )
     # §21: max_rows is the ceiling on the WHOLE response, entities AND
@@ -347,7 +347,10 @@ async def _subgraph(
             )
             truncated = truncated or bool(probe)
     results = _score(entities, relations)
-    warnings = _standard_warnings(policy, truncated, dropped + edge_dropped, timed_out)
+    warnings = (
+        *_standard_warnings(policy, truncated, dropped + edge_dropped, timed_out),
+        *loss_warnings,
+    )
     if unresolved:
         warnings = (*warnings, _unresolved_name_warning(params.entity))
     return _response(graph, query, results, warnings)
@@ -405,7 +408,7 @@ async def subgraph_context(
 
     deadline = time.monotonic() + policy.timeout_ms / 1000.0
     params = GraphQueryParams(template="subgraph", entity=str(seed), hops=hops)
-    entities, _dropped, _truncated, timed_out, _unresolved = await _neighbor_entities(
+    entities, _dropped, _truncated, timed_out, _unresolved, _loss = await _neighbor_entities(
         graph, repo, policy, params, deadline, include_seeds=True, seeds=[seed]
     )
     node_ids = [entity_id for entity_id, _, _, _ in entities]
@@ -475,10 +478,21 @@ async def _neighbor_entities(
     *,
     include_seeds: bool = False,
     seeds: Sequence[uuid.UUID] | None = None,
-) -> tuple[list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]], int, bool, bool, bool]:
+) -> tuple[
+    list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]],
+    int,
+    bool,
+    bool,
+    bool,
+    tuple[QueryWarning, ...],
+]:
     """Traverse from every seed, merge, re-verify against the SoR.
 
-    Returns ``(kept, dropped, truncated, timed_out, unresolved)`` where
+    Returns ``(kept, dropped, truncated, timed_out, unresolved,
+    loss_warnings)`` where ``loss_warnings`` are the page-exact mention
+    cap/drop warnings from the shared builder (Codex #127 — both §16 graph
+    templates append them; the REST subgraph-context path has no warnings
+    channel and discards them, documented at its call site) and
     ``unresolved`` means the seed was NAME-seeded and resolved to nothing
     (MCP2: the caller must warn — zero rows from a name that matched no
     active entity is a different answer from an empty neighborhood, and only
@@ -510,7 +524,7 @@ async def _neighbor_entities(
         # with no neighbours, but both are zero rows — without this flag the
         # caller cannot tell them apart, and an agent asked "is A related to
         # B?" confidently answers "no" when it merely mistyped the name
-        return [], 0, False, False, named
+        return [], 0, False, False, named, ()
 
     candidates: set[uuid.UUID] = set()
     dropped = 0
@@ -578,7 +592,7 @@ async def _neighbor_entities(
     # mention of a still-active entity (MCP7 v1.1 — refs carry chunk uuid +
     # uri + quote + offsets via the shared resolution seam); a drifted
     # (non-active or unresolvable) node yields zero refs and is dropped.
-    refs_by_entity, _, _ = await resolved_mention_refs(
+    refs_by_entity, mention_drops, capped = await resolved_mention_refs(
         repo, [entity_id for entity_id, _ in ordered]
     )
     names = await repo.active_entity_names([entity_id for entity_id, _ in ordered])
@@ -589,7 +603,12 @@ async def _neighbor_entities(
             kept.append((entity_id, distance, refs, names.get(entity_id)))
         else:
             dropped += 1
-    return kept, dropped, truncated, timed_out, False
+    # page-exact mention-loss warnings (Codex #127: graph was silently
+    # capping/dropping mention refs while semantic warned) — single source
+    loss_warnings = mention_warnings(
+        {entity_id for entity_id, _, _, _ in kept}, mention_drops, capped
+    )
+    return kept, dropped, truncated, timed_out, False, loss_warnings
 
 
 async def _relation_results(

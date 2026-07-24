@@ -31,7 +31,7 @@ import uuid
 from typing import Any
 
 from core.graph.structured import split_row_source_ref
-from core.query.results import SourceRef
+from core.query.results import QueryWarning, SourceRef
 from core.stores.repo import BuildScopedRepo
 
 #: ``chunk:{content_hash}:{ordinal}`` — the writer's fixed-width-hex hash
@@ -62,17 +62,19 @@ async def resolved_mention_refs(
     repo: BuildScopedRepo,
     entity_ids: list[uuid.UUID],
     cap: int | None = MENTION_REFS_CAP,
-) -> tuple[dict[uuid.UUID, tuple[SourceRef, ...]], int, set[uuid.UUID]]:
-    """``(refs_by_entity, dropped_mentions, capped_entities)``.
+) -> tuple[dict[uuid.UUID, tuple[SourceRef, ...]], dict[uuid.UUID, int], set[uuid.UUID]]:
+    """``(refs_by_entity, dropped_by_entity, capped_entities)``.
 
     One batched read for the mentions plus one for the chunk resolution —
     the whole page costs two queries regardless of entity count. Refs are
     ordered deterministically (by ref id — DB mention order is not
-    rerun-stable, the #34 rule) and capped at ``cap`` per entity;
-    ``capped_entities`` holds the IDS of entities that lost refs to the cap
-    (ids, not a count — the MCP3 provenance lesson: an emitter must be able
-    to check whether a capped entity is actually on ITS page before warning,
-    or a clipped-off-page cap would mint a false claim)."""
+    rerun-stable, the #34 rule) and capped at ``cap`` per entity. Both loss
+    channels carry PER-ENTITY provenance, never bare counts (the MCP3
+    lesson): ``dropped_by_entity`` maps each entity to its unresolvable
+    mention count and ``capped_entities`` holds the ids that lost refs to
+    the cap — an emitter checks its OWN page before warning, so an off-page
+    loss can never mint a false claim about returned results (see
+    :func:`mention_warnings`)."""
     mentions = await repo.mentions_by_entity(entity_ids)
     pairs = {
         parsed
@@ -83,14 +85,14 @@ async def resolved_mention_refs(
     chunks = await repo.chunks_by_content_ref(pairs)
 
     refs_by_entity: dict[uuid.UUID, tuple[SourceRef, ...]] = {}
-    dropped = 0
+    dropped_by_entity: dict[uuid.UUID, int] = {}
     capped_entities: set[uuid.UUID] = set()
     for entity_id, rows in mentions.items():
         refs: list[SourceRef] = []
         for kind, ref, surface_form in rows:
             resolved = _resolve_one(kind, ref, surface_form, chunks)
             if resolved is None:
-                dropped += 1
+                dropped_by_entity[entity_id] = dropped_by_entity.get(entity_id, 0) + 1
             else:
                 refs.append(resolved)
         if not refs:
@@ -100,7 +102,41 @@ async def resolved_mention_refs(
             capped_entities.add(entity_id)
             refs = refs[:cap]
         refs_by_entity[entity_id] = tuple(refs)
-    return refs_by_entity, dropped, capped_entities
+    return refs_by_entity, dropped_by_entity, capped_entities
+
+
+def mention_warnings(
+    returned_entity_ids: set[uuid.UUID],
+    dropped_by_entity: dict[uuid.UUID, int],
+    capped_entities: set[uuid.UUID],
+) -> tuple[QueryWarning, ...]:
+    """The two mention-loss warnings, PAGE-EXACT (single source for every
+    §16 emitter — semantic and graph must not drift, Codex #127).
+
+    Only losses on RETURNED entities warn: an off-page entity's cap or drop
+    never charged this response (the MCP3 provenance rule). A dropped-whole
+    entity is the emitter's own hit-level drop accounting, not ours."""
+    warnings: list[QueryWarning] = []
+    dropped_on_page = sum(dropped_by_entity.get(eid, 0) for eid in returned_entity_ids)
+    if dropped_on_page:
+        warnings.append(
+            QueryWarning(
+                "PARTIAL_RESULTS",
+                f"{dropped_on_page} mention citation(s) on returned entities were "
+                "unresolvable and omitted (projection drift — see Health)",
+            )
+        )
+    capped_on_page = len(returned_entity_ids & capped_entities)
+    if capped_on_page:
+        warnings.append(
+            QueryWarning(
+                "TRUNCATED",
+                f"entity mention refs capped at {MENTION_REFS_CAP} per entity — "
+                f"{capped_on_page} returned entity(ies) affected; the full mention "
+                "list is available via get_entity (§22)",
+            )
+        )
+    return tuple(warnings)
 
 
 def _resolve_one(

@@ -606,8 +606,10 @@ class BuildScopedRepo:
             return {}
         documents = tables.documents
         chunks = tables.chunks
-        hashes = sorted({content_hash for content_hash, _ in refs})
-        ordinals = sorted({ordinal for _, ordinal in refs})
+        # exact row-value match (Codex #127): independent IN predicates over
+        # hashes × ordinals fetch the Cartesian combination — 100 pairs across
+        # 100 documents could read ~10k rows Python then discards
+        pairs = sorted(set(refs))
         query = (
             sa.select(
                 chunks.c.id,
@@ -622,17 +624,15 @@ class BuildScopedRepo:
                 documents.c.project == self.project,
                 documents.c.build_id == self.build_id,
                 chunks.c.build_id == self.build_id,
-                documents.c.content_hash.in_(hashes),
-                chunks.c.ordinal.in_(ordinals),
+                sa.tuple_(documents.c.content_hash, chunks.c.ordinal).in_(pairs),
             )
             .order_by(chunks.c.id)
         )
         rows = (await self._execute(query)).fetchall()
-        wanted = set(refs)
         resolved: dict[tuple[str, int], Any] = {}
         for row in rows:
             key = (row.content_hash, row.ordinal)
-            if key in wanted and key not in resolved:
+            if key not in resolved:
                 resolved[key] = row
         return resolved
 
