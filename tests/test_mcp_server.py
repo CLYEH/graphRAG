@@ -17,6 +17,10 @@ import pytest
 
 from core.mcp.policy import PolicyError
 from core.mcp.server import _get_chunk, _get_document, build_server
+from core.metadata.schema import MetadataExposure
+
+#: DR-010's default: no metadata_exposure block → empty allowlist → nothing leaks
+_NO_EXPOSURE = MetadataExposure(fields=())
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -453,7 +457,7 @@ async def test_a_mention_ref_shaped_chunk_id_gets_a_typed_explanation() -> None:
     assert "not yet resolvable" in payload["error"]
     assert repo.queries == 0  # rejected before any store read
 
-    document = await _get_document(repo, "demo", "not-a-uuid")
+    document = await _get_document(repo, "demo", "not-a-uuid", _NO_EXPOSURE)
     assert document["document"] is None and "document UUID" in document["error"]
     assert repo.queries == 0
 
@@ -483,11 +487,14 @@ async def test_get_chunk_maps_the_row_and_types_not_found() -> None:
     assert missing["chunk"] is None and "ACTIVE build" in missing["error"]
 
 
-async def test_get_document_emits_raw_whole_and_plain_json() -> None:
+async def test_get_document_emits_raw_whole_and_projects_metadata_fail_closed() -> None:
     """The document half: raw is emitted WHOLE (REST detail parity — silent
-    truncation would misrepresent the corpus, §22), and ingested_at is
-    stringified because introspection payloads are plain JSON (no FastAPI
-    encoder exists on this path — a datetime would crash serialization)."""
+    truncation would misrepresent the corpus, §22), ingested_at is
+    stringified (introspection payloads are plain JSON — no FastAPI encoder
+    on this path), and metadata obeys DR-010 (Codex #125): the stored
+    envelope is NOT agent-visible — it goes through the SAME fail-closed
+    MetadataExposure projection as retrieval enrichment, so an unlisted
+    governance field never leaks and an empty allowlist yields {}."""
     from datetime import UTC, datetime
 
     document_id = uuid.uuid4()
@@ -496,17 +503,25 @@ async def test_get_document_emits_raw_whole_and_plain_json() -> None:
         source_uri="file:///guide.md",
         mime="text/markdown",
         content_hash="abc123",
-        metadata=None,
+        metadata={"governance": {"classification": "secret"}, "context": {"title": "導覽"}},
         ingested_at=datetime(2026, 7, 24, tzinfo=UTC),
         status=None,
         raw="# 導覽 " + "全文" * 1000,
     )
-    payload = await _get_document(_IntrospectionRepo([row]), "demo", str(document_id))
-    assert payload["error"] is None
-    doc = payload["document"]
+    hidden = await _get_document(_IntrospectionRepo([row]), "demo", str(document_id), _NO_EXPOSURE)
+    assert hidden["error"] is None
+    doc = hidden["document"]
     assert doc["raw"] == row.raw  # whole, untruncated
     assert isinstance(doc["ingested_at"], str)
-    assert doc["metadata"] == {}  # DB NULL coalesces to the empty object
+    assert doc["metadata"] == {}  # fail-closed: nothing allowlisted, NOTHING leaks
 
-    missing = await _get_document(_IntrospectionRepo(), "demo", str(uuid.uuid4()))
+    listed = await _get_document(
+        _IntrospectionRepo([row]),
+        "demo",
+        str(document_id),
+        MetadataExposure(fields=("context.title",)),
+    )
+    assert listed["document"]["metadata"] == {"context": {"title": "導覽"}}  # only the listed path
+
+    missing = await _get_document(_IntrospectionRepo(), "demo", str(uuid.uuid4()), _NO_EXPOSURE)
     assert missing["document"] is None and "ACTIVE build" in missing["error"]

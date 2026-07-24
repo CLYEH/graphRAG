@@ -29,6 +29,7 @@ from sqlalchemy.pool import NullPool
 from core.config import get_settings
 from core.mcp.context import ProjectContext
 from core.mcp.server import _get_chunk, _get_document, _get_entity
+from core.metadata.schema import MetadataExposure
 from core.resolve import fingerprints
 from core.stores.graph import graph_driver
 from core.stores.repo import BuildScopedWriter
@@ -247,7 +248,8 @@ async def _activate_build_with_content(project: str) -> tuple[uuid.UUID, uuid.UU
             raw="# 導覽手冊 全票 200 元,優待票 100 元。",
             content_hash=f"hash-{document_id.hex[:12]}",
             mime="text/markdown",
-            metadata={},
+            # a field NO allowlist names — the live DR-010 proof reads it back
+            metadata={"governance": {"classification": "secret"}},
             ingested_at=NOW,
         )
         await writer.insert(
@@ -285,10 +287,15 @@ async def test_a_chunk_uuid_is_exchangeable_for_its_text(context: ProjectContext
     assert payload["chunk"]["document_id"] == str(document_id)
 
     async with context.bound() as deps:
-        document = await _get_document(deps.repo, context.project, str(document_id))
+        document = await _get_document(
+            deps.repo, context.project, str(document_id), MetadataExposure(fields=())
+        )
     assert document["error"] is None
     assert document["document"]["source_uri"] == "file:///guide.md"
     assert "全票 200 元" in document["document"]["raw"]  # the full raw rides along
+    # DR-010 live: the stored governance field exists in the SoR row but the
+    # empty (default) allowlist keeps it agent-invisible — fail-closed
+    assert document["document"]["metadata"] == {}
 
 
 async def test_an_archived_builds_chunk_is_invisible_to_the_active_binding(

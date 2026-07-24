@@ -443,7 +443,9 @@ def build_server(project: str) -> FastMCP:
             async with asyncio.timeout(rt.policy.max_latency_ms / 1000.0):
                 async with rt.context.bound() as deps:
                     bound_build = str(deps.repo.build_id)
-                    return await _get_document(deps.repo, rt.context.project, document_id)
+                    return await _get_document(
+                        deps.repo, rt.context.project, document_id, rt.exposure
+                    )
         except TimeoutError:
             return _introspection_timeout(rt, bound_build, document_id)
         except _STORE_ERRORS as exc:
@@ -608,7 +610,9 @@ async def _get_chunk(repo: Any, project: str, chunk_id: str) -> dict[str, Any]:
     }
 
 
-async def _get_document(repo: Any, project: str, document_id: str) -> dict[str, Any]:
+async def _get_document(
+    repo: Any, project: str, document_id: str, exposure: MetadataExposure
+) -> dict[str, Any]:
     """§9 ``get_document``: document UUID → provenance + the full RAW content.
 
     The document-level half of MCP5. ``raw`` is emitted whole, matching the
@@ -616,7 +620,11 @@ async def _get_document(repo: Any, project: str, document_id: str) -> dict[str, 
     this tool is explicitly asking for the source document; silently
     truncating it would misrepresent the corpus (§22's silence rule).
     ``ingested_at`` is stringified: introspection payloads are plain JSON,
-    there is no FastAPI encoder here."""
+    there is no FastAPI encoder here. ``metadata`` is NOT the stored
+    envelope: DR-010 makes stored metadata agent-invisible unless the
+    project's ``metadata_exposure`` allowlist names it, so the envelope is
+    projected through the SAME fail-closed ``MetadataExposure.project`` the
+    retrieval enrichment path uses (empty allowlist → empty object)."""
     envelope = {"project": project, "build_id": str(repo.build_id), "document_id": document_id}
     try:
         parsed = uuid.UUID(document_id)
@@ -641,7 +649,7 @@ async def _get_document(repo: Any, project: str, document_id: str) -> dict[str, 
             "source_uri": row.source_uri,
             "mime": row.mime,
             "content_hash": row.content_hash,
-            "metadata": row.metadata or {},
+            "metadata": exposure.project(row.metadata or {}),
             "ingested_at": str(row.ingested_at) if row.ingested_at is not None else None,
             "status": row.status,
             "raw": row.raw,
