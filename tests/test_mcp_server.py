@@ -406,5 +406,10 @@ async def test_retrieval_tool_descriptions_state_score_semantics_honestly() -> N
     server = build_server("demo")
     tools = {tool.name: tool for tool in await server.list_tools()}
     for name in ("semantic_search", "hybrid_query"):
-        assert "answerability from the returned text" in (tools[name].description or ""), name
-    assert "no score threshold separates" in (tools["semantic_search"].description or "")
+        assert "answerability from the returned content" in (tools[name].description or ""), name
+    semantic = tools["semantic_search"].description or ""
+    assert "no score threshold separates" in semantic
+    # Codex #124: "read the text" is unfollowable on entity-only pages (text
+    # is null there) — the description must say what a bare name-match page
+    # means instead of pointing at a field that is empty exactly then
+    assert "a page of bare name matches is NOT evidence" in semantic

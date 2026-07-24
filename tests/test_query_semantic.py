@@ -347,7 +347,7 @@ async def test_low_scores_never_mint_a_low_confidence_warning() -> None:
     (gap and mean metrics fail the same way). A LOW_CONFIDENCE minted from
     any score threshold would flag ANSWERABLE questions as untrustworthy —
     worse than no signal. Low-scoring pages emit CLEAN; the agent judges
-    answerability from the returned text (the tool description says so, and
+    answerability from the returned content (the tool description says so, and
     its own test pins that statement)."""
     repo = _FakeRepo()
     c1, c2 = uuid.uuid4(), uuid.uuid4()

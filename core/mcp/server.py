@@ -285,7 +285,11 @@ def build_server(project: str) -> FastMCP:
         chunks, and measured on real data no score threshold separates the
         two cases (topically-close-but-absent questions outscore answerable
         generic ones). No warning flags an out-of-domain question; judge
-        answerability from the returned text, not from the scores."""
+        answerability from the returned content, not from the scores:
+        chunk results carry the matched text, but entity results carry only
+        the matched NAME (title; text is null — inspect via get_entity),
+        so a page of bare name matches is NOT evidence the corpus answers
+        the question."""
         rt = _rt()
 
         async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
@@ -361,7 +365,9 @@ def build_server(project: str) -> FastMCP:
 
         Fused scores are rank-based (RRF), not confidence, and no warning
         flags an out-of-domain question (see semantic_search on why scores
-        cannot) — judge answerability from the returned text itself."""
+        cannot) — judge answerability from the returned content; entity and
+        community_report results carry no chunk text, so weigh only results
+        whose content actually addresses the question."""
         rt = _rt()
         params: GraphQueryParams | None = None
         if graph_template is not None and graph_entity is not None:
