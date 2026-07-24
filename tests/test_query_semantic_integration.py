@@ -232,7 +232,9 @@ async def test_semantic_search_returns_the_nearest_cited_result_end_to_end(
             entity_resp = await semantic_search(repo, vectors, _embedder(), "People Ops", top_k=5)
             _VALIDATOR.validate(entity_resp.to_dict())
             entity_hit = next(r for r in entity_resp.results if r.result_type == "entity")
-            assert entity_hit.title == "People Ops"
+            # MCP6: the title carries the SoR ontology type (same-name entities
+            # across types are otherwise indistinguishable on the page)
+            assert entity_hit.title == "People Ops (Team)"
             assert entity_hit.source_refs[0].source_type == "chunk"
             assert entity_hit.source_refs[0].id == "chunk:h1:0"
     finally:

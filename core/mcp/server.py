@@ -278,8 +278,15 @@ def build_server(project: str) -> FastMCP:
         return rt
 
     @server.tool()
-    async def semantic_search(query: str, top_k: int | None = None) -> dict[str, Any]:
+    async def semantic_search(
+        query: str, top_k: int | None = None, point_type: str | None = None
+    ) -> dict[str, Any]:
         """Fuzzy/topical retrieval over document text (§8 semantic).
+
+        Results mix text chunks and entity name matches; each type is
+        guaranteed up to half the page, and entity titles carry the ontology
+        type — pass point_type="chunk" for passages only, or "entity" for
+        name lookup only.
 
         Scores are cosine similarities: they RANK results within this
         response but do not measure whether the corpus can answer the
@@ -296,7 +303,7 @@ def build_server(project: str) -> FastMCP:
 
         async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
             return await run_semantic(
-                deps.repo, deps.vectors, deps.embedder, query, rt.policy.top_k(top_k)
+                deps.repo, deps.vectors, deps.embedder, query, rt.policy.top_k(top_k), point_type
             )
 
         return await _bounded(rt, "semantic_search", query, _run)

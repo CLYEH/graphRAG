@@ -46,7 +46,11 @@ class _FakeRepo:
     def __init__(self, project: str = _PROJECT, build_id: uuid.UUID = _BUILD) -> None:
         self.project = project
         self.build_id = build_id
-        self.rows: dict[Any, list[dict[str, Any]]] = {tables.chunks: [], tables.documents: []}
+        self.rows: dict[Any, list[dict[str, Any]]] = {
+            tables.chunks: [],
+            tables.documents: [],
+            tables.entities: [],
+        }
         self.mentions: dict[uuid.UUID, list[tuple[str, str]]] = {}
 
     async def fetch_all(self, table: Any, *where: Any) -> list[SimpleNamespace]:
@@ -70,8 +74,15 @@ class _FakeVectors:
     async def search(
         self, vector: list[float], limit: int, point_type: str | None = None
     ) -> list[SimpleNamespace]:
+        # mirrors the real repo's payload filter — MCP6's dual typed search
+        # would otherwise double-count every hit through an unfiltered fake
         self.searched_limit = limit
-        return self._hits[:limit]
+        hits = [
+            hit
+            for hit in self._hits
+            if point_type is None or (hit.payload or {}).get("type") == point_type
+        ]
+        return hits[:limit]
 
 
 class _FakeEmbedder:
@@ -121,13 +132,16 @@ def _add_chunk(repo: _FakeRepo, chunk_id: uuid.UUID, *, uri: str = "s3://d.md") 
     )
 
 
-async def _run(repo: _FakeRepo, vectors: _FakeVectors, top_k: int = 10) -> McpResponse:
+async def _run(
+    repo: _FakeRepo, vectors: _FakeVectors, top_k: int = 10, point_type: str | None = None
+) -> McpResponse:
     return await semantic_search(
         cast(BuildScopedRepo, repo),
         cast(BuildScopedVectorRepo, vectors),
         cast("Any", _FakeEmbedder()),
         "who owns onboarding?",
         top_k,
+        point_type,
     )
 
 
@@ -273,10 +287,13 @@ async def test_empty_hits_yield_an_empty_but_valid_response() -> None:
 
 
 async def test_malformed_or_unmappable_hits_are_dropped_not_crashed_on() -> None:
-    """Qdrant payloads are untrusted at query time (drift, a future point type
-    C6a doesn't handle yet, a payload-less hit): each such hit is DROPPED with a
-    warning, never a KeyError that fails the whole query. Covers the defensive
-    branches a well-formed build never exercises."""
+    """Qdrant payloads are untrusted at query time (drift): a corrupt-but-typed
+    hit is DROPPED with a warning, never a KeyError that fails the whole
+    query. Since MCP6 every search is TYPE-FILTERED at the store, so a
+    payload-less point or an unknown point type can no longer arrive at all
+    (the fake mirrors the real payload filter) — those two are asserted
+    EXCLUDED, while the drop branches stay for the still-reachable corrupt
+    shapes (type matches, everything else rotten)."""
     no_payload = SimpleNamespace(id="x", score=0.9, payload=None)
     unknown_type = SimpleNamespace(
         id="y", score=0.8, payload={"type": "relation", "canonical_id": "r"}
@@ -304,7 +321,8 @@ async def test_malformed_or_unmappable_hits_are_dropped_not_crashed_on() -> None
     response = await _run(_FakeRepo(), vectors)
     assert response.results == ()
     assert response.warnings[0].code == "PARTIAL_RESULTS"
-    assert "6 hit(s)" in response.warnings[0].message
+    # the four corrupt-typed hits drop; the filtered-out two never count
+    assert "4 hit(s)" in response.warnings[0].message
 
 
 async def test_corrupt_payload_display_or_id_never_makes_the_response_invalid() -> None:
@@ -358,3 +376,76 @@ async def test_low_scores_never_mint_a_low_confidence_warning() -> None:
     )
     assert len(response.results) == 2  # low scores still emit — they rank
     assert response.warnings == ()  # and mint NO warning, deliberately
+
+
+async def test_short_queries_still_get_chunks_on_the_page() -> None:
+    """MCP6: chunk and entity points share one collection and one cosine, and
+    the measured index skew (1405 entities vs 442 chunks — 76% entity) let
+    bare name matches crowd every passage off the page: 票價/海科館全票
+    returned 8 entities, 0 chunks. Each type is floored at top_k // 2 slots,
+    so a text passage ALWAYS survives when one exists — and when a type has
+    nothing, the other fills the page (no over-block, the §22 dual)."""
+    repo = _FakeRepo()
+    chunk_hits, entity_hits = [], []
+    for i in range(3):
+        chunk_id = uuid.uuid4()
+        _add_chunk(repo, chunk_id)
+        chunk_hits.append(_chunk_hit(chunk_id, score=0.40 - i * 0.01))
+    for i in range(8):
+        entity_id = uuid.uuid4()
+        repo.mentions[entity_id] = [("text", f"chunk:h{i}:0")]
+        entity_hits.append(_entity_hit(entity_id, score=0.90 - i * 0.01))
+    response = await _run(repo, _FakeVectors(entity_hits + chunk_hits), top_k=6)
+    kinds = [r.result_type for r in response.results]
+    assert kinds.count("chunk") == 3  # floored in despite uniformly lower scores
+    assert kinds.count("entity") == 3
+
+    # entity-only build: the floor must not hold empty seats for chunks
+    only_entities = await _run(repo, _FakeVectors(entity_hits), top_k=6)
+    assert [r.result_type for r in only_entities.results] == ["entity"] * 6
+
+
+async def test_point_type_narrows_and_bad_values_degrade_typed() -> None:
+    """MCP6: point_type gives the agent explicit control (pass "chunk" for
+    passages only); an out-of-vocabulary value degrades to a typed
+    GUARDRAIL_BLOCKED naming the vocabulary (§22) — never a store error."""
+    repo = _FakeRepo()
+    chunk_id, entity_id = uuid.uuid4(), uuid.uuid4()
+    _add_chunk(repo, chunk_id)
+    repo.mentions[entity_id] = [("text", "chunk:h:0")]
+    vectors = _FakeVectors([_entity_hit(entity_id, score=0.9), _chunk_hit(chunk_id, score=0.4)])
+
+    chunks_only = await _run(repo, vectors, point_type="chunk")
+    assert [r.result_type for r in chunks_only.results] == ["chunk"]
+    entities_only = await _run(repo, vectors, point_type="entity")
+    assert [r.result_type for r in entities_only.results] == ["entity"]
+
+    blocked = await _run(repo, vectors, point_type="relation")
+    assert blocked.results == ()
+    assert blocked.warnings[0].code == "GUARDRAIL_BLOCKED"
+    assert "point_type" in blocked.warnings[0].message
+
+
+async def test_same_name_entities_become_distinguishable_by_type() -> None:
+    """MCP6: 1405 active entities share 1285 distinct names — the SAME name
+    recurs across ontology types with IDENTICAL scores (主題館 ×4 ate 4 of 6
+    slots, measured), and §16's result shape has no type field. The ontology
+    type rides in the title (free string, zero contract change); an entity
+    whose SoR row is missing keeps the bare name, never a coerced repr."""
+    repo = _FakeRepo()
+    event_id, facility_id, orphan_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    for entity_id in (event_id, facility_id, orphan_id):
+        repo.mentions[entity_id] = [("text", "chunk:h:0")]
+    repo.rows[tables.entities] = [
+        {"id": event_id, "type": "EVENT"},
+        {"id": facility_id, "type": "FACILITY"},
+        # orphan_id: no SoR row (drift) — bare name
+    ]
+    hits = [
+        _entity_hit(event_id, score=0.8, name="主題館"),
+        _entity_hit(facility_id, score=0.8, name="主題館"),
+        _entity_hit(orphan_id, score=0.7, name="主題館"),
+    ]
+    response = await _run(repo, _FakeVectors(hits))
+    titles = sorted(r.title or "" for r in response.results)
+    assert titles == ["主題館", "主題館 (EVENT)", "主題館 (FACILITY)"]

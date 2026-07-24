@@ -93,12 +93,17 @@ def _payload_str(raw: object) -> str | None:
     return raw if isinstance(raw, str) else None
 
 
+#: semantic_search's caller-selectable point types — the §4 index vocabulary.
+_POINT_TYPES = ("chunk", "entity")
+
+
 async def semantic_search(
     repo: BuildScopedRepo,
     vectors: BuildScopedVectorRepo,
     embedder: BaseEmbedding,
     query: str,
     top_k: int,
+    point_type: str | None = None,
 ) -> McpResponse:
     """§8 semantic kNN over the active build, as a §16 response.
 
@@ -106,7 +111,9 @@ async def semantic_search(
     ``(project, build_id)`` — the caller resolves the active build once and
     mints both (DR-001). ``embedder`` must be the model the index step used, so
     query and stored vectors share a space (§3); only
-    :meth:`aget_text_embedding` is used.
+    :meth:`aget_text_embedding` is used. ``point_type`` narrows the search to
+    one point type; when omitted BOTH types are searched with a per-type page
+    floor (MCP6 — see :func:`_fair_page`).
     """
     if (repo.project, repo.build_id) != (vectors.project, vectors.build_id):
         raise ValueError(
@@ -132,12 +139,36 @@ async def semantic_search(
             ),
         )
 
+    if point_type is not None and point_type not in _POINT_TYPES:
+        return McpResponse(
+            query=query,
+            tool=_TOOL,
+            project=repo.project,
+            build_id=str(repo.build_id),
+            results=(),
+            warnings=(
+                QueryWarning(
+                    "GUARDRAIL_BLOCKED",
+                    f"point_type must be one of {_POINT_TYPES} (or omitted for both), "
+                    f"got {point_type!r}",
+                ),
+            ),
+        )
+
     query_vector = await embedder.aget_text_embedding(query)
-    hits = await vectors.search(query_vector, limit=top_k)
+    if point_type is not None:
+        hits = await vectors.search(query_vector, limit=top_k, point_type=point_type)
+    else:
+        hits = _fair_page(
+            await vectors.search(query_vector, limit=top_k, point_type="chunk"),
+            await vectors.search(query_vector, limit=top_k, point_type="entity"),
+            top_k,
+        )
 
     chunk_ids, entity_ids = _partition_hit_source_ids(hits)
     chunk_by_id, source_uri_by_chunk = await _load_chunk_provenance(repo, chunk_ids)
     mentions_by_entity = await repo.mentions_by_entity(list(entity_ids))
+    types_by_entity = await _entity_types(repo, entity_ids)
 
     results: list[RetrievalResult] = []
     dropped = 0
@@ -147,7 +178,12 @@ async def semantic_search(
             dropped += 1
             continue
         result = _build_result(
-            payload, hit.score, chunk_by_id, source_uri_by_chunk, mentions_by_entity
+            payload,
+            hit.score,
+            chunk_by_id,
+            source_uri_by_chunk,
+            mentions_by_entity,
+            types_by_entity,
         )
         if result is None:
             dropped += 1
@@ -214,19 +250,56 @@ async def _load_chunk_provenance(
     return chunk_by_id, source_uri_by_chunk
 
 
+def _fair_page(
+    chunk_hits: list[models.ScoredPoint],
+    entity_hits: list[models.ScoredPoint],
+    top_k: int,
+) -> list[models.ScoredPoint]:
+    """MCP6 page fairness: chunk and entity points share ONE collection and
+    one cosine, and the measured build skew (1405 entities vs 442 chunks —
+    76% of the index) let bare name matches crowd every text passage off the
+    page: 票價/海科館全票 returned 8 entities, 0 chunks. Each type gets a
+    floor of ``top_k // 2`` slots (or all it has — a scarce type never
+    blocks the other, the §22 over-block dual); the remaining slots go by
+    score with the id tiebreak (#34: rerun-stable). Final §16 ordering is
+    re-imposed downstream by ``ordered_results``."""
+    floor = top_k // 2
+    take_chunks = min(floor, len(chunk_hits))
+    take_entities = min(floor, len(entity_hits))
+    page = chunk_hits[:take_chunks] + entity_hits[:take_entities]
+    rest = sorted(
+        chunk_hits[take_chunks:] + entity_hits[take_entities:],
+        key=lambda hit: (-hit.score, str(hit.id)),
+    )
+    return page + rest[: top_k - len(page)]
+
+
+async def _entity_types(repo: BuildScopedRepo, entity_ids: set[uuid.UUID]) -> dict[uuid.UUID, Any]:
+    """Ontology type per entity hit, from the SoR (the payload carries only
+    the point type). Measured (MCP6): 1405 active entities share 1285
+    distinct names — the SAME name recurs across ontology types (主題館 =
+    EVENT/EXHIBIT/FACILITY/LOCATION) with IDENTICAL scores, so without the
+    type an agent can neither tell the copies apart nor dedup them."""
+    if not entity_ids:
+        return {}
+    rows = await repo.fetch_all(tables.entities, tables.entities.c.id.in_(list(entity_ids)))
+    return {row.id: row.type for row in rows}
+
+
 def _build_result(
     payload: dict[str, Any],
     score: float,
     chunk_by_id: dict[uuid.UUID, Any],
     source_uri_by_chunk: dict[uuid.UUID, str | None],
     mentions_by_entity: dict[uuid.UUID, list[tuple[str, str]]],
+    types_by_entity: dict[uuid.UUID, Any],
 ) -> RetrievalResult | None:
     """One hit → one §16 result, or None if it cannot be cited (drop it)."""
     point_type = payload.get("type")
     if point_type == "chunk":
         return _chunk_result(payload, score, chunk_by_id, source_uri_by_chunk)
     if point_type == "entity":
-        return _entity_result(payload, score, mentions_by_entity)
+        return _entity_result(payload, score, mentions_by_entity, types_by_entity)
     return None  # an unknown point type cannot be mapped to a §16 result_type
 
 
@@ -262,6 +335,7 @@ def _entity_result(
     payload: dict[str, Any],
     score: float,
     mentions_by_entity: dict[uuid.UUID, list[tuple[str, str]]],
+    types_by_entity: dict[uuid.UUID, Any],
 ) -> RetrievalResult | None:
     entity_id = _payload_uuid(payload.get("entity_id"))
     if entity_id is None:
@@ -273,6 +347,14 @@ def _entity_result(
     )
     if not refs:
         return None  # §27.2 entity ref needs ≥1 chunk/row mention; none survived
+    name = _payload_str(payload.get("text"))
+    # the ontology type rides in the title (MCP6): the SAME name recurs
+    # across types with identical scores, and §16's result shape has no type
+    # field — the title is the one display slot that can tell them apart
+    # (free string, no contract change). SoR type only; a missing row keeps
+    # the bare name (never a coerced repr).
+    etype = types_by_entity.get(entity_id)
+    title = f"{name} ({etype})" if name is not None and isinstance(etype, str) and etype else name
     return RetrievalResult(
         result_type="entity",
         # id from the VALIDATED uuid, never the untrusted payload canonical_id:
@@ -281,5 +363,5 @@ def _entity_result(
         id=str(entity_id),
         score=score,
         source_refs=refs,
-        title=_payload_str(payload.get("text")),
+        title=title,
     )
