@@ -322,3 +322,7 @@ a terminal `failed` build can't resume (`core/builds/orchestrator.py:97` `BuildN
 ## RB1-fe
 
 RunsTable 失敗建置列展開加「失敗診斷」:useBuildSteps/useStepItems 下鑽 §27.7 步驟→失敗/跳過項(item_ref=重試鍵),useRetryBuild 的重試動作(每意圖一 Idempotency-Key 成功 reset/失敗保留、安全重試、顯示新 job)+ parent_build_id lineage(「重試自」)。**標籤誠實**:目前核心 retry 重跑全部下游(逐項 skip 待 RB1-retry-skip),故按鈕作「重試此建置」非「只重試失敗項」+附說明(Codex #102 P1);step items 分頁 load-more 非全鏈耗盡(P2);null 計數顯「—」非 0(P2)。判別性 vitest 8 測(下鑽/retry-POST-帶-key/拒絕顯示/idem-key 失敗重用+成功新鍵〔mutation-probe〕/lineage/null計數/分頁)+ e2e 14 綠無回歸;瀏覽器 QA 驗 RunsTable 渲染(無失敗建置可觀失敗流,由判別性測試涵蓋)。
+
+## MCP2
+
+(a) graph seed 名稱解析失敗發 GUARDRAIL_BLOCKED(凍結碼、免 DR-002),訊息指名字串並指向 get_entity,path 兩端各自具名;_neighbor_entities 多回 unresolved 旗標;兩個釘住舊「靜默空信封」的測試依 class 26 test-lifecycle 刻意反轉。(b) hybrid 無差別 except 讓輸入錯誤偽裝成 store 故障=agent 無限重試;_mode_failure_warning 以 (來源, status) 兩軸分類:400/422 且非 store-client 例外 → GUARDRAIL_BLOCKED(「retrying unchanged will fail again」),401/403/404/429/5xx/store-client 一律 STORE_UNAVAILABLE。(c) STORE_UNAVAILABLE 具名 store(postgres/qdrant/neo4j):抽共用 core/stores/errors.py,單模態 _bounded 與 hybrid per-mode 兩個降級面同源。遠端 4 輪:r1 4xx 全掃太寬(401/403/404 是憑證/佈署問題,換措辭修不了)→收窄 (400,422);r2 status 單軸誤分類 Qdrant 400(維度漂移是投影故障)→補來源軸;r3 P1 修了單模態卻漏 hybrid(預設工具)=degradation sibling 面沒掃;r4 clean。測試 79 過,probe 各恰紅。
