@@ -9,7 +9,7 @@
 - [graphRAG 架構定案](graphrag-architecture.md) — 動架構/MCP/store 前查:多專案 hybrid RAG 平台的凍結決策
 - [graphRAG 工作方式](graphrag-working-style.md) — 協作模式:agent 全開發、使用者握定案權
 - [Codex +1 才能 merge](codex-plus-one-merge-gate.md) — merge 前查:硬門檻無例外,PreToolUse hook 機械強制
-- [Lesson classes 目錄](graphrag-lesson-classes.md) — **LOOP step 8 retro + 開工前 prep 必查**:30 個 class(附「何時比對」+機械化狀態)+ S 常備規則 + owner 定案;retro 只更新 class 條目、不寫 per-PR 敘事;即時狀態一律查 TASKS.md/GitHub 非本檔
+- [Lesson classes 目錄](graphrag-lesson-classes.md) — **LOOP step 8 retro + 開工前 prep 必查**:32 個 class(附「何時比對」+機械化狀態)+ S 常備規則 + owner 定案;retro 只更新 class 條目、不寫 per-PR 敘事;即時狀態一律查 TASKS.md/GitHub 非本檔
 - [CI 先於 Codex](graphrag-ci-before-codex.md) — push 後流程查:先修 CI 再 triage Codex;watch-codex 用法與 fresh-state check
 - [BA 真實 LLM 兩 lane](graphrag-ba-real-llm.md) — 動 model/eval 前查:hermetic vs 真實 LLM 兩 lane 紀律
 - [初期落地場景:博物館導覽](graphrag-goal-museum-guide.md) — 產品方向查:MCP 對外場景與「不失一般性」硬約束

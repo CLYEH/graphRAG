@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: d673e708-e836-4b8a-8fc7-cb33527c5fc3
-  modified: 2026-07-21T02:09:53.583Z
+  modified: 2026-07-24T05:40:39.586Z
 ---
 
 # 使用方式(step 8 / prep 協定)
@@ -22,8 +22,8 @@ metadata:
 - **S3 壓輪次**:Codex 一輪傾向只給一條;收到任何 finding,主動掃整個 diff 的同類問題一次修完(#33:模板/參數類 sibling 同輪掃)。**升級對策(owner 2026-07-20,#112 實證)**:遠端連續擠牙膏時改用本地 codex-rescue 對全 diff 批次審查(一輪 8-10 條,相當遠端 8-10 輪),修完批次、理想上本地審到乾淨才回去 poke 遠端。[部分機械化:codex-rescue 批次審查]
 - **S4 review race**:push 後 thread 可能仍指舊 head;先對現 head 驗證 thread 內容再 triage;已修者回覆指向 commit 並 resolve。[部分機械化:merge gate 要求 +1 晚於 head commit]
 - **S5 doc-only fast lane**:純 `*.md` → `docs/<id>` → doc-reviewer PASS 蓋章 → push → CI 綠 → ff main;**鐵序:CI 綠 → push main → 才刪分支**(先刪=孤兒 commit+CI 取消,#88)。並行注意:doc lane 先落地會讓等待中 PR 需 rebase/新 +1——快 +1 的 PR 前後,doc push 要排序(PR #15)。[已機械化:push-gate hook 雙 lane]
-- **S6 ops 衛生**:背景鏈第一條指令必是 `cd <絕對 repo 根>`(繼承 cwd 曾整鏈靜默死,#92;bash cwd 會漂,#84);GitHub 分支改名會**關閉** open PR——先改名再開 PR,分支名須等於 TASKS.md `<id>`(#23);pipeline 出口碼:`cmd | tail` 回傳 tail 的碼、被 kill 的 pytest 讓鏈繼續——先擷取出口碼再接管線(#73);寫非 ASCII 經任何工具層後,讀回**檔案位元組**驗證(heredoc 會毀 backslash/全半形,#77/#85;#117 自我實證:regex 分隔符集裡的全形 ； 被寫入層靜默正規化成 ASCII,od/hex 級驗證才現形);#120 兩度重演+#121 三度(\n 壓進 python 源成語法錯誤/探針比對不中,連記錄本條的 retro 腳本自己也踩):heredoc 對 backslash-escape 是**確定性毀損**,規則升級為絕對禁令——含任何 escape 的腳本一律 Write 工具寫 scratchpad 再執行、修改一律 Edit 工具、probe 備份也一律 scratchpad[可機械化→PreToolUse warn on heredoc-with-escapes];vitest full-suite fan-out 餓死 timing-sensitive 測試(隔離綠/全套紅/CI 綠,#112)——durable fix 已落地(H21:vite.config.ts `maxWorkers: min(4, max(cores-1,1))`;`VITEST_MAX_WORKERS` 不再需要,且 >4 的覆寫會被 viteConfig.test.ts pin 響亮擋下——env var 是 config 之後才套用的旁路);「跨首次 settle 的 waitFor」要顯式 timeout(規則在 fe.md checklist);git-bash 的 /tmp 與 Windows python 的 /tmp 是不同目錄——跨工具傳檔用絕對路徑(#112 差點掉了 980 行測試檔,git HEAD 救回)。[prose/pattern]
-- **S7 TASKS.md 勾稽**:任務勾稽隨該任務 PR;**triage 改了設計就同步改已勾稽任務的驗收文字**(任務帳=呈現面,#105)。[部分機械化:governance-check.sh 勾稽 lint]
+- **S6 ops 衛生**:背景鏈第一條指令必是 `cd <絕對 repo 根>`(繼承 cwd 曾整鏈靜默死,#92;bash cwd 會漂,#84);GitHub 分支改名會**關閉** open PR——先改名再開 PR,分支名須等於 TASKS.md `<id>`(#23);pipeline 出口碼:`cmd | tail` 回傳 tail 的碼、被 kill 的 pytest 讓鏈繼續——先擷取出口碼再接管線(#73);寫非 ASCII 經任何工具層後,讀回**檔案位元組**驗證(heredoc 會毀 backslash/全半形,#77/#85;#117 自我實證:regex 分隔符集裡的全形 ； 被寫入層靜默正規化成 ASCII,od/hex 級驗證才現形);#120 兩度重演+#121 三度(\n 壓進 python 源成語法錯誤/探針比對不中,連記錄本條的 retro 腳本自己也踩):heredoc 對 backslash-escape 是**確定性毀損**,規則升級為絕對禁令——含任何 escape 的腳本一律 Write 工具寫 scratchpad 再執行、修改一律 Edit 工具、probe 備份也一律 scratchpad;**probe 還原也一律從 scratchpad 備份還原,絕不用 `git checkout --`**(#123:它還原的是 committed 版,把未 commit 的修正一併毀掉;靠合併重跑轉紅才抓回,兩處修正重打)[可機械化→PreToolUse warn on heredoc-with-escapes];vitest full-suite fan-out 餓死 timing-sensitive 測試(隔離綠/全套紅/CI 綠,#112)——durable fix 已落地(H21:vite.config.ts `maxWorkers: min(4, max(cores-1,1))`;`VITEST_MAX_WORKERS` 不再需要,且 >4 的覆寫會被 viteConfig.test.ts pin 響亮擋下——env var 是 config 之後才套用的旁路);「跨首次 settle 的 waitFor」要顯式 timeout(規則在 fe.md checklist);git-bash 的 /tmp 與 Windows python 的 /tmp 是不同目錄——跨工具傳檔用絕對路徑(#112 差點掉了 980 行測試檔,git HEAD 救回)。[prose/pattern]
+- **S7 TASKS.md 勾稽**:任務勾稽隨該任務 PR;**triage 改了設計就同步改已勾稽任務的驗收文字**(任務帳=呈現面,#105);**勾稽時同掃「被本任務改變事實」的 sibling 待辦文字**——完成的任務會把相鄰任務的前提改假(#123:MCP3 發出 LOW_CONFIDENCE 後,MCP4「從未被發出——實作或移除」變假且會誤導後續工作,Codex r3 抓到)。[部分機械化:governance-check.sh 勾稽 lint]
 - **S8 receipt 樹衛生**:content-addressed receipt 覆蓋 tracked+untracked;雜物(test-results/ 等)會讓章失效——root .gitignore 收乾淨(#75);**註解/純文字修改也改 tree**,PASS 後任何編輯都要重章(#106)。[已機械化:push-gate 精確樹比對 + H15 gates-receipt]
 - **S9 額度逃生閥**:Codex 額度用盡且 gates 全綠+小幅已驗證 delta 時,由 **owner 本人**決定是否親自 merge——是 owner 決策,不是 agent 例外。
 
@@ -135,6 +135,9 @@ Mutation 回呼綁在會瞬時 re-key/unmount 的元件上=靜默蒸發——完
 
 **Class 30 — FE dossier 讀到 worker 消費層**(何時比對:FE 任務 prep)[prose]
 FE dossier 必須讀到 worker 實際消費層(connectors/stages/config),不只 api/schemas;run-gate 判準=「會不會讀操作者登記的路徑」,不是「不會失敗」(#70)。
+
+**Class 32 — 警告/註記必須攜帶主體身分**(何時比對:發任何描述「部分結果」的 warning;該回應會被下游 fuse/filter/裁切時)[pattern:builder/parser 同居 helper(refs_cap_warning/capped_report_id 模式)]
+聚合式警告(「N 筆被省略」)在回應被下游裁切後會與其主體脫鉤——主體被裁掉、警告留著=對倖存結果的錯誤指控。#123 r2–r4 三輪同一類:LOW_CONFIDENCE 全裁才丟(r2)→refs-cap 用 len>=cap 代理(r3)→代理殘角被反例擊穿(r4),最終解=警告訊息**具名主體 id**,下游按 provenance 精確過濾。兩個判準:(1) 修警告洩漏時第一問「警告能不能直接指名主體」——代理修法(存在性/長度/計數)每個都招來下一輪反例,provenance 一步到位;(2) **凍結 schema 只限制結構、不限制訊息內容**——身分可以放訊息文字裡,builder 與 parser 相鄰同居(訊息形狀單一擁有者)+ round-trip 測試釘住。同 class:訊息宣稱的復原管道必須真的存在(r1「membership 可由 entities 查回」查無 endpoint→撤)。
 
 **Class 31 — continuation token 釘全結果集身分**(何時比對:mint 任何 cursor/token/resume 句柄)[pattern:scope-fingerprint helper]
 Keyset cursor=某結果集內的位置;tag 必須釘住**定義該結果集的一切**:sort、q、filters(含宣告型別——schema 可改型使同 raw 值換 predicate)、active build(DR-001/DR-006 跨版不混)。漏一軸=該軸變更後舊 anchor 靜默套新結果集(跳列/重複/跨版混資料)。#120 R8/R9/R10 三輪各補一軸(predicates→build→declared type)——開工時列全軸清單一次做完,別等 reviewer 逐軸擠。fingerprint=正規化 JSON 的 sha256 前綴;raw 拼寫入 fp=寧過拒不漏拒;錯誤訊息 class 級(fp 亂碼不回顯);legacy 無 tag cursor 顯式豁免並註記老化自閉;sibling 未修面(relations/review)入 followups 帳。同型教訓的檔案面(#121 五輪各補一格):**檔案突變工具開工即列兩張矩陣**——crash 矩陣={每個寫入點中斷}×{重跑行為}(冪等、原子 swap、torn marker、body 驗證各一格),gate 覆蓋矩陣={每種 CI 事件}×{gate 是否真的跑}(PR-only gate 錯過 doc-lane push);逐格自查一次做完,別等 reviewer 五輪逐格擠。
