@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid as _uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +43,11 @@ from llama_index.core.llms import LLM, ChatMessage, MessageRole
 from core.query.global_reports import capped_report_id, global_summary
 from core.query.graph import GraphQueryParams, graph_query
 from core.query.linking import GraphPlan, plan_graph_query
+from core.query.mentions import (
+    mention_warnings,
+    parse_mention_cap_warning,
+    parse_mention_drop_warning,
+)
 from core.query.policy import TextToCypher, TextToSql
 from core.query.results import (
     McpResponse,
@@ -261,6 +267,17 @@ async def hybrid_query(
         for w in warnings
         if (cap_id := capped_report_id(w.message)) is None or cap_id in report_ids
     ]
+    # Same discipline for the semantic/graph MENTION-loss warnings (Codex
+    # #127 r4): their messages name the affected entity ids (builder/parser
+    # siblings in core.query.mentions), so each is REBUILT for the fused
+    # page — a clipped entity's cap or drop never survives into a claim
+    # about results that no longer carry it.
+    fused_entity_ids = {
+        parsed
+        for result in fused
+        if result.result_type == "entity" and (parsed := _entity_uuid(result.id)) is not None
+    }
+    warnings = _refit_mention_warnings(warnings, fused_entity_ids)
     if truncated:
         warnings.append(
             QueryWarning("TRUNCATED", f"result truncated to the top_k={policy.top_k} ceiling (§21)")
@@ -289,6 +306,40 @@ async def hybrid_query(
         }
 
     return _response(deps, query, fused, tuple(warnings), debug)
+
+
+def _entity_uuid(raw: str) -> _uuid.UUID | None:
+    try:
+        return _uuid.UUID(raw)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _refit_mention_warnings(
+    warnings: list[QueryWarning], fused_entity_ids: set[_uuid.UUID]
+) -> list[QueryWarning]:
+    """Rebuild [mode]-prefixed mention-loss warnings for the FUSED page.
+
+    A mode computed its warning against its OWN page; fusion may clip the
+    affected entities. The message names them (core.query.mentions builder/
+    parser siblings), so this re-derives each warning with only the entities
+    still on the fused page — dropped entirely when none survive, counts
+    exact when some do (the MCP3 provenance rule, applied to mentions)."""
+    refitted: list[QueryWarning] = []
+    for warning in warnings:
+        dropped = parse_mention_drop_warning(warning.message)
+        capped = parse_mention_cap_warning(warning.message)
+        if dropped is None and capped is None:
+            refitted.append(warning)
+            continue
+        prefix = warning.message.split("] ", 1)[0] + "] " if warning.message.startswith("[") else ""
+        rebuilt = mention_warnings(
+            fused_entity_ids,
+            dropped or {},
+            capped or set(),
+        )
+        refitted.extend(QueryWarning(new.code, f"{prefix}{new.message}") for new in rebuilt)
+    return refitted
 
 
 def _check_scopes(deps: HybridDeps) -> None:

@@ -1070,5 +1070,6 @@ async def test_graph_surfaces_mention_cap_and_drop_like_semantic() -> None:
     assert "TRUNCATED" in codes  # the cap is named…
     assert any("get_entity" in w.message for w in response.warnings)  # …with the real escape hatch
     assert any(
-        "mention citation(s) on returned entities" in w.message for w in response.warnings
+        "unresolvable mention citation(s) omitted on returned entities" in w.message
+        for w in response.warnings
     )  # …and the drift loss is surfaced

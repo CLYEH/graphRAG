@@ -539,7 +539,8 @@ async def test_the_mention_cap_warning_is_page_exact() -> None:
     # capped entity ON the page → the warning fires, counting page entities
     on_page = await _run(repo, _FakeVectors([_entity_hit(capped_entity, score=0.9)]), top_k=2)
     capped_warnings = [w for w in on_page.warnings if "mention refs capped" in w.message]
-    assert len(capped_warnings) == 1 and "1 returned entity(ies)" in capped_warnings[0].message
+    assert len(capped_warnings) == 1
+    assert str(capped_entity) in capped_warnings[0].message  # NAMES its entity (r4)
     assert "get_entity" in capped_warnings[0].message  # the REAL escape hatch
 
     # capped entity clipped OFF the page (top_k=1, plain entity outranks it
@@ -566,4 +567,7 @@ async def test_partially_unresolvable_mentions_surface_as_partial_results() -> N
     assert len(response.results) == 1  # the hit survives on its valid mention
     partial = [w for w in response.warnings if w.code == "PARTIAL_RESULTS"]
     assert len(partial) == 1
-    assert "2 mention citation(s) on returned entities" in partial[0].message
+    # the message NAMES the entity with its per-entity count (r4: hybrid
+    # rebuilds these for its fused page via the sibling parser)
+    assert "2 unresolvable mention citation(s) omitted on returned entities" in partial[0].message
+    assert f"{entity_id}=2" in partial[0].message

@@ -293,8 +293,10 @@ def build_server(project: str) -> FastMCP:
         generic ones). No warning flags an out-of-domain question; judge
         answerability from the returned content, not from the scores:
         chunk results carry the matched text; entity results carry the
-        matched NAME plus quoted mention citations whose ids are chunk
-        UUIDs — exchange one for its full text with get_chunk. A page of
+        matched NAME plus quoted mention citations — a citation with
+        source_type "chunk" has a chunk UUID id (exchange it for full text
+        with get_chunk), one with source_type "row" cites a structured
+        table+pk instead (get_chunk does not accept those). A page of
         bare name matches is still NOT evidence the corpus answers the
         question."""
         rt = _rt()
@@ -597,10 +599,11 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
 #: gap) instead of a bare "invalid" (#124: no dead ends). One constant, two
 #: emitters: the helper (direct callers) and the pre-binding wrapper check.
 _CHUNK_ID_MESSAGE = (
-    "chunk_id must be a chunk UUID (the id of a chunk result, a relation "
-    "evidence ref, or an entity mention ref — all carry chunk UUIDs since "
-    "v1.1); a raw chunk:{content_hash}:{ordinal} string is the STORED form "
-    "and is not accepted"
+    "chunk_id must be a chunk UUID (the id of a chunk result, a chunk "
+    "evidence ref, or an entity CHUNK mention ref — those carry chunk UUIDs "
+    "since v1.1; row mention/evidence refs cite table+pk and are not chunks); "
+    "a raw chunk:{content_hash}:{ordinal} string is the STORED form and is "
+    "not accepted"
 )
 
 #: get_document's invalid-id message (same two-emitter single source).

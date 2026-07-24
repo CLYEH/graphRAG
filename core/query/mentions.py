@@ -112,6 +112,15 @@ async def resolved_mention_refs(
     return refs_by_entity, dropped_by_entity, capped_entities
 
 
+#: Message stems for the two mention-loss warnings. The affected entity ids
+#: ride IN the message (builder/parser siblings — the MCP3 refs-cap
+#: precedent): hybrid fuses mode responses and clips entities, so it must be
+#: able to re-derive each warning for ITS page or a clipped entity's loss
+#: would mint a false claim about the fused results (Codex #127 r4).
+MENTION_DROP_STEM = "unresolvable mention citation(s) omitted on returned entities"
+MENTION_CAP_STEM = f"entity mention refs capped at {MENTION_REFS_CAP} per entity"
+
+
 def mention_warnings(
     returned_entity_ids: set[uuid.UUID],
     dropped_by_entity: dict[uuid.UUID, int],
@@ -122,28 +131,70 @@ def mention_warnings(
 
     Only losses on RETURNED entities warn: an off-page entity's cap or drop
     never charged this response (the MCP3 provenance rule). A dropped-whole
-    entity is the emitter's own hit-level drop accounting, not ours."""
+    entity is the emitter's own hit-level drop accounting, not ours. The
+    messages NAME the affected entity ids (with per-entity counts on the
+    drop side) so hybrid can rebuild them exactly for its fused page via the
+    sibling parsers below."""
     warnings: list[QueryWarning] = []
-    dropped_on_page = sum(dropped_by_entity.get(eid, 0) for eid in returned_entity_ids)
+    dropped_on_page = {
+        str(eid): count
+        for eid in sorted(returned_entity_ids, key=str)
+        if (count := dropped_by_entity.get(eid, 0))
+    }
     if dropped_on_page:
+        detail = ", ".join(f"{eid}={count}" for eid, count in dropped_on_page.items())
         warnings.append(
             QueryWarning(
                 "PARTIAL_RESULTS",
-                f"{dropped_on_page} mention citation(s) on returned entities were "
-                "unresolvable and omitted (projection drift — see Health)",
+                f"{sum(dropped_on_page.values())} {MENTION_DROP_STEM}: {detail} "
+                "(projection drift — see Health)",
             )
         )
-    capped_on_page = len(returned_entity_ids & capped_entities)
+    capped_on_page = sorted((str(eid) for eid in returned_entity_ids & capped_entities), key=str)
     if capped_on_page:
         warnings.append(
             QueryWarning(
                 "TRUNCATED",
-                f"entity mention refs capped at {MENTION_REFS_CAP} per entity — "
-                f"{capped_on_page} returned entity(ies) affected; the full mention "
-                "list is available via get_entity (§22)",
+                f"{MENTION_CAP_STEM} — returned entity(ies) {', '.join(capped_on_page)} "
+                "affected; the full mention list is available via get_entity (§22)",
             )
         )
     return tuple(warnings)
+
+
+def parse_mention_drop_warning(message: str) -> dict[uuid.UUID, int] | None:
+    """``{entity_id: dropped_count}`` a drop warning names — None for any
+    other message. Accepts hybrid's ``[mode] `` origin prefix; the parser
+    lives beside the builder (one owner of the message shape)."""
+    text = message.split("] ", 1)[-1] if message.startswith("[") else message
+    marker = f" {MENTION_DROP_STEM}: "
+    if marker not in text:
+        return None
+    detail = text.split(marker, 1)[1].split(" (", 1)[0]
+    parsed: dict[uuid.UUID, int] = {}
+    for pair in detail.split(", "):
+        raw_id, sep, raw_count = pair.partition("=")
+        if not sep:
+            return None
+        try:
+            parsed[uuid.UUID(raw_id)] = int(raw_count)
+        except (ValueError, AttributeError):
+            return None
+    return parsed or None
+
+
+def parse_mention_cap_warning(message: str) -> set[uuid.UUID] | None:
+    """The capped entity ids a cap warning names — None for any other
+    message. Same prefix tolerance and ownership as the drop parser."""
+    text = message.split("] ", 1)[-1] if message.startswith("[") else message
+    marker = f"{MENTION_CAP_STEM} — returned entity(ies) "
+    if not text.startswith(marker):
+        return None
+    listed = text[len(marker) :].split(" affected", 1)[0]
+    try:
+        return {uuid.UUID(raw_id) for raw_id in listed.split(", ")}
+    except (ValueError, AttributeError):
+        return None
 
 
 def _resolve_one(
