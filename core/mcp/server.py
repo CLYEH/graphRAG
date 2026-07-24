@@ -277,7 +277,19 @@ def build_server(project: str) -> FastMCP:
 
     @server.tool()
     async def semantic_search(query: str, top_k: int | None = None) -> dict[str, Any]:
-        """Fuzzy/topical retrieval over document text (§8 semantic)."""
+        """Fuzzy/topical retrieval over document text (§8 semantic).
+
+        Scores are cosine similarities: they RANK results within this
+        response but do not measure whether the corpus can answer the
+        question — an unanswerable question still returns its nearest
+        chunks, and measured on real data no score threshold separates the
+        two cases (topically-close-but-absent questions outscore answerable
+        generic ones). No warning flags an out-of-domain question; judge
+        answerability from the returned content, not from the scores:
+        chunk results carry the matched text, but entity results carry only
+        the matched NAME — no tool currently retrieves their underlying
+        content — so a page of bare name matches is NOT evidence the
+        corpus answers the question."""
         rt = _rt()
 
         async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
@@ -349,7 +361,13 @@ def build_server(project: str) -> FastMCP:
         """The default entry (§9): route across every available mode and fuse.
         Supply graph_template + graph_entity to run YOUR graph invocation;
         without them the router derives a safe plan itself when the question
-        names a build entity (QP1 auto plan — see the routing trace)."""
+        names a build entity (QP1 auto plan — see the routing trace).
+
+        Fused scores are rank-based (RRF), not confidence, and no warning
+        flags an out-of-domain question (see semantic_search on why scores
+        cannot) — judge answerability from the returned content; entity and
+        community_report results carry no chunk text, so weigh only results
+        whose content actually addresses the question."""
         rt = _rt()
         params: GraphQueryParams | None = None
         if graph_template is not None and graph_entity is not None:

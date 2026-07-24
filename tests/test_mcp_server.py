@@ -394,3 +394,28 @@ def test_active_binding_cannot_be_forged() -> None:
     valid = ActiveBinding("p", uuid.uuid4(), repo_module._BINDING_TOKEN)
     with pytest.raises(RuntimeError, match="resolve_active_binding"):
         dataclasses.replace(valid, build_id=uuid.uuid4())
+
+
+async def test_retrieval_tool_descriptions_state_score_semantics_honestly() -> None:
+    """MCP4/DESIGN §22: v1 deliberately provides no out-of-domain signal —
+    scores rank within a response and cannot flag an unanswerable question
+    (measured: no separating threshold exists). The tool description is the
+    ONLY surface an agent reads before calling, so the honesty statement
+    lives there; this pin keeps a docstring rewrite from silently dropping
+    the statement while the no-warning behavior stays."""
+    server = build_server("demo")
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    for name in ("semantic_search", "hybrid_query"):
+        assert "answerability from the returned content" in (tools[name].description or ""), name
+    semantic = tools["semantic_search"].description or ""
+    assert "no score threshold separates" in semantic
+    # Codex #124: "read the text" is unfollowable on entity-only pages (text
+    # is null there) — the description must say what a bare name-match page
+    # means instead of pointing at a field that is empty exactly then
+    assert "a page of bare name matches is NOT evidence" in semantic
+    # ...and the replacement must not point at another dead end: get_entity
+    # returns ids + mention refs only (no text), and no MCP tool retrieves
+    # chunk/document content yet. REVERSE this pin when MCP5/MCP7 add a real
+    # content-retrieval path — the description should then point to it.
+    assert "get_entity" not in semantic
+    assert "no tool currently retrieves" in semantic

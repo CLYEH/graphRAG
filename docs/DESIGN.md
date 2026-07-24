@@ -241,6 +241,7 @@ graphRAG/
 - 投影 drift：Health 標示，`graphrag reproject <project> <build>` 重建投影。
 - build 中途失敗：`failed`，active 不受影響。
 - query 逾時：回部分結果 + warning，不 500。
+- **域外問題不發 LOW_CONFIDENCE(v1 刻意不提供;MCP4 2026-07-24 實測定案)**:semantic/hybrid 對「語料答不出的問題」不從分數發警告——cosine 量的是主題鄰近不是可答性,實測(nmmst)無任何門檻可分:域外「海洋大學的入學申請」top1 0.6144 **高於**域內「從台北怎麼去」0.4992/「開放時間」0.5065/「適合小孩嗎」0.5176;gap/mean 同樣不可分。錯誤的 LOW_CONFIDENCE(把答得出的問題標低信心)比沒有更糟;LLM 可答性判準因每查詢加一次 LLM 延遲(與 MCP8 方向相反)不採。`LOW_CONFIDENCE` 僅由 `global_summary` 發出(語意:結果未經查詢比對,MCP3);`confidence` 欄位維持不填。工具描述已誠實聲明「分數是回應內排序,不是可答性」。重啟條件:真正的 relevance model(非裸分數門檻)。
 
 ## 23. 角色與權限
 單一 principal（本機/單人），介面預留：所有 API `Depends(auth) → Principal{id, roles}`。角色草案 `viewer|curator|operator|admin`；動作→角色集中於 policy 表。接真實 auth 只換 `auth` 實作。🟡 多人 auth 方案。

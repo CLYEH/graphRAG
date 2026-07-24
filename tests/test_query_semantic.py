@@ -336,3 +336,25 @@ async def test_corrupt_payload_display_or_id_never_makes_the_response_invalid() 
     assert by_type["entity"]["title"] is None  # corrupt object text → None
     assert by_type["chunk"]["text"] is None  # corrupt numeric text → None
     assert response.warnings == ()  # both hits kept — they are citable
+
+
+async def test_low_scores_never_mint_a_low_confidence_warning() -> None:
+    """MCP4 (deliberate non-provision, DESIGN §22): cosine measures topical
+    proximity, not answerability — measured on the real nmmst build
+    (2026-07-24) NO threshold separates the two: out-of-domain
+    「海洋大學的入學申請」 scored top1 0.6144 while answerable
+    「從台北怎麼去」/「開放時間」/「適合小孩嗎」 scored 0.4992/0.5065/0.5176
+    (gap and mean metrics fail the same way). A LOW_CONFIDENCE minted from
+    any score threshold would flag ANSWERABLE questions as untrustworthy —
+    worse than no signal. Low-scoring pages emit CLEAN; the agent judges
+    answerability from the returned content (the tool description says so, and
+    its own test pins that statement)."""
+    repo = _FakeRepo()
+    c1, c2 = uuid.uuid4(), uuid.uuid4()
+    _add_chunk(repo, c1)
+    _add_chunk(repo, c2)
+    response = await _run(
+        repo, _FakeVectors([_chunk_hit(c1, score=0.27), _chunk_hit(c2, score=0.31)])
+    )
+    assert len(response.results) == 2  # low scores still emit — they rank
+    assert response.warnings == ()  # and mint NO warning, deliberately

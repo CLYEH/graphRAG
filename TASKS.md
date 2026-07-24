@@ -166,7 +166,7 @@ Keep items small enough to finish in one loop.
 ### P0 — 會導致 agent 給出錯誤答案
 - [x] MCP2 warning 分類正確性(review 第 1/4/13 條:seed 未解析警告、輸入錯誤與 store 故障分流、STORE_UNAVAILABLE 具名 store)
 - [x] MCP3 global_summary 的「未經查詢比對」必須可見(review 第 2 條:LOW_CONFIDENCE 誠實警告 + community_report refs 上限 8)
-- [ ] MCP4 語意/混合路徑的域外信心訊號(review 第 3 條;MCP3 後改寫)— 原任務是「`LOW_CONFIDENCE` 實作或移除」,但 MCP3 已讓 `global_summary` 發出它(語意:global 結果未經查詢比對),**移除選項已死**——代碼已在生產路徑使用。剩下的缺口:**semantic/hybrid 對語料答不出來的問題照樣回 20 筆通過 schema 驗證、附完整引用、無警告的結果**,optional `confidence` 欄位也從未被填。而且門檻在原理上取不出來——實測「有恐龍化石展嗎」(語料沒有)最高分 0.5494 **贏過**「從台北怎麼去」(語料有)的正確答案 0.4478,單純 cosine 門檻不可行。任務:為 semantic/hybrid 定義域外訊號來源(相對分數落差、與 build 詞彙的重疊度、或 LLM 判準)並在低信心時發 `LOW_CONFIDENCE` / 填 `confidence`;若結論是原理上不可行,則在 DESIGN 記錄為刻意不提供並在工具描述誠實聲明。
+- [x] MCP4 域外信心訊號:實測定案**刻意不提供**(DESIGN §22 記錄;semantic/hybrid 工具描述誠實聲明「分數是回應內排序,不是可答性」;擴大 battery 實測無門檻可分——域外 0.6144 高於三個域內 0.4992/0.5065/0.5176)
 
 ### P1 — agent 拿不到可用內容
 - [ ] MCP5 MCP 面補原文取回工具(review 第 6 條)— 八個工具全是查詢或自省,**沒有 `get_chunk`/`get_document`**;REST 早有 `GET /projects/{p}/chunks/{chunk_id}` 與 `/documents/{document_id}`,但沒做成工具。後果:即使 agent 拿到完全合法可解的 chunk UUID(relation 的 evidence ref 就是),在 MCP 面上也**沒有工具能把它換成文字**,引用退化成純裝飾。純新增,不動契約(自省形狀,非 §16——`tool` enum 已凍結,比照 `get_entity`)。
