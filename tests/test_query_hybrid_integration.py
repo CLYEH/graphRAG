@@ -179,11 +179,17 @@ async def test_hybrid_routes_fuses_and_traces_on_live_stores(
         response = await hybrid_query(deps, policy, "what is acme about")
         _VALIDATOR.validate(response.to_dict())
 
-        # the global report came through fusion, cited by its member entity
+        # MCP8 REVERSED the report-through-fusion pin that stood here: global
+        # is no longer fused (rating-ranked corpus overview, never
+        # query-matched — MCP3), and the skip is SAID with the real path
         report_hits = [r for r in response.results if r.result_type == "community_report"]
-        assert len(report_hits) == 1 and report_hits[0].title == "Acme cluster"
-        assert report_hits[0].source_refs[0].source_type == "entity"
-        assert report_hits[0].source_refs[0].id == str(member)
+        assert report_hits == []
+        global_skip = [
+            w.message
+            for w in response.warnings
+            if w.code == "MODE_SKIPPED" and "global_summary" in w.message
+        ]
+        assert len(global_skip) == 1
 
         # gated modes are surfaced, never silently absent — and the QP1 auto
         # plan changed graph's fate here: "what is acme about" NAMES the
@@ -197,9 +203,10 @@ async def test_hybrid_routes_fuses_and_traces_on_live_stores(
         # the trace tells the truth about the live run
         assert response.debug is not None
         decision = response.debug["routing_decision"]
-        # ordered insert (Codex #89 R1): graph sits at its _MODE_ORDER slot
-        assert decision["selected"] == ["semantic", "graph", "global"]
-        assert decision["skipped"] == ["sql"]
+        # deterministic fan-out (MCP8): graph at its _MODE_ORDER slot;
+        # global always in skipped (not fused)
+        assert decision["selected"] == ["semantic", "graph"]
+        assert sorted(decision["skipped"]) == ["global", "sql"]
         assert "auto plan" in response.debug["retrieval_plan"][0]
         assert "Acme" in response.debug["retrieval_plan"][0]
         assert "postgres" in response.debug["stores_used"]

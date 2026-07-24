@@ -4,16 +4,19 @@ The §8 ``hybrid`` modality and §9's default entry (``hybrid_query``): route on
 question across the four single-mode retrievers, fuse their results, and emit
 the routing trace in the §16 ``debug`` block (gated by ``expose_debug``).
 
-**Selection** is LLM-assisted but never LLM-trusted (the C3b rule): the
-selector's answer is strictly validated against the AVAILABLE mode set, and
-ANY failure — transport, parse, wrong shape, out-of-vocabulary modes, empty
-selection — falls back to running EVERY available mode with the failure named
-in the routing reason. Over-selection costs latency; silent under-selection
-costs answers (§22 degrades breadth-first, never silence-first). Availability
-is policy/parameter-gated before the selector ever sees a mode: ``sql`` needs
+**Selection** is DETERMINISTIC (MCP8): every AVAILABLE mode runs, always.
+The v1 LLM selector was measured at 1,525ms — half the hybrid latency — and
+its under-selection was the top quality defect (the C3b fallback "any
+failure → run everything" was the better behavior all along, so it is now
+the only behavior). Availability is policy/parameter-gated: ``sql`` needs
 ``text_to_sql.enabled``; ``graph`` needs caller-supplied
-:class:`~core.query.graph.GraphQueryParams` (a bare NL question carries no
-template/seed — the router does not invent them).
+:class:`~core.query.graph.GraphQueryParams` or a QP1 auto plan (a bare NL
+question carries no template/seed — the router does not invent them). The
+``global`` mode is NOT fused (MCP8): community reports are rating-ranked
+corpus overview, never query-matched (MCP3), so fusing them spent 3-5 page
+slots on results irrelevant to the question — corpus overview stays
+available via the ``global_summary`` tool, and every hybrid call says so
+with a MODE_SKIPPED warning.
 
 **Fusion** is reciprocal-rank (RRF, k=60): scores from different modes are not
 comparable (cosine vs positional), ranks are. Duplicates (same result_type +
@@ -31,16 +34,14 @@ are aggregated into the hybrid response.
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 import uuid as _uuid
 from dataclasses import dataclass
 from typing import Any
 
 from llama_index.core.base.embeddings.base import BaseEmbedding
-from llama_index.core.llms import LLM, ChatMessage, MessageRole
+from llama_index.core.llms import LLM
 
-from core.query.global_reports import capped_report_id, global_summary
 from core.query.graph import GraphQueryParams, graph_query
 from core.query.linking import GraphPlan, plan_graph_query
 from core.query.mentions import (
@@ -68,7 +69,7 @@ _TOOL = "hybrid_query"
 
 #: Fixed mode order — selection, fusion tie-breaks, and duplicate-merge
 #: precedence all derive from it, so the response is deterministic.
-_MODE_ORDER = ("semantic", "graph", "sql", "global")
+_MODE_ORDER = ("semantic", "graph", "sql")
 
 #: RRF's standard damping constant — rank 1 scores 1/61; the exact value only
 #: shifts absolute scores, never the relative order for a single list.
@@ -79,19 +80,7 @@ _MODE_STORES = {
     "semantic": ("qdrant", "postgres"),
     "graph": ("neo4j", "postgres"),
     "sql": ("postgres",),
-    "global": ("postgres",),
 }
-
-_SELECTOR_SYSTEM = """\
-You route a question to retrieval modes. Reply with ONLY a JSON object shaped
-exactly: {"modes": ["<mode>", ...], "reason": "<one short sentence>"}
-Available modes and what they are good at:
-- semantic: fuzzy/topical questions over document text
-- graph: relationships between named entities (who connects to whom, paths)
-- sql: precise filters/lookups over structured rows
-- global: corpus-wide themes and summaries
-Pick every mode that could plausibly help; prefer more over fewer.
-"""
 
 
 @dataclass(frozen=True)
@@ -134,7 +123,7 @@ class HybridPolicy:
     expose_debug: bool
     #: the WHOLE-call wall-clock budget (§21 max_latency_ms): per-mode DB
     #: timeouts alone don't bound the request — modes run sequentially and
-    #: selector/embedding work carries no DB deadline, so the router enforces
+    #: auto-plan/embedding work carries no DB deadline, so the router enforces
     #: one shared deadline across everything it does
     max_latency_ms: int = 30_000
 
@@ -182,33 +171,12 @@ async def hybrid_query(
             graph_params = auto_plan.params
 
     available, gated = _available_modes(policy, graph_params)
-
-    # (the per-mode DB timeouts are already clamped to the shared deadline,
-    # but modes run SEQUENTIALLY and the selector/embedding work has no DB
-    # deadline — so every stage below runs on the remaining budget: the
-    # C6b/C6c per-phase lesson, applied to the router itself)
-    try:
-        async with asyncio.timeout(max(_remaining(), 0.001)):
-            selected, unselected, reason = await _select_modes(deps.llm, query, available)
-    except TimeoutError:
-        selected, unselected, reason = (
-            list(available),
-            [],
-            "selector timed out — ran every available mode",
-        )
-    if auto_plan is not None and "graph" in available and "graph" not in selected:
-        # QP1: an auto-planned graph run is deterministic — the question
-        # demonstrably names build entities, the templates are cheap and
-        # parameterized, and RRF fusion sinks irrelevant hits. Golden cases
-        # that NEED a relation path must not hinge on an LLM selector's mood
-        # (C3b: LLM-assisted, never LLM-trusted), so the plan always runs —
-        # inserted at its _MODE_ORDER position, NOT appended: modes execute
-        # sequentially against the shared deadline, and a last-place graph
-        # would be the first mode cut on a tight budget, silently defeating
-        # the very guarantee this block exists for (Codex #89 R1).
-        chosen = {*selected, "graph"}
-        selected = [mode for mode in _MODE_ORDER if mode in chosen]
-        unselected = [mode for mode in unselected if mode != "graph"]
+    # deterministic fan-out (MCP8): every available mode runs — no LLM
+    # selector (measured 1,525ms and the top under-selection defect; its
+    # any-failure fallback was the better behavior, now the only one)
+    selected = list(available)
+    reason = "all available modes (deterministic fan-out — no LLM selector, MCP8)"
+    if auto_plan is not None:
         reason = f"{reason}; graph joined by auto plan (linked entities in the question)"
 
     mode_responses: dict[str, McpResponse] = {}
@@ -245,28 +213,6 @@ async def hybrid_query(
         [mode_responses[mode].results for mode in _MODE_ORDER if mode in mode_responses],
         policy.top_k,
     )
-    reports = [result for result in fused if result.result_type == "community_report"]
-    if not reports:
-        # MCP3: the global mode's LOW_CONFIDENCE qualifies COMMUNITY REPORTS
-        # (rating-ranked, never query-matched). When fusion clips every report
-        # off the page, the warning would instead indict the surviving
-        # results — which ARE query-matched — so it dies with its subjects.
-        warnings = [
-            w
-            for w in warnings
-            if not (w.code == "LOW_CONFIDENCE" and w.message.startswith("[global]"))
-        ]
-    # Same discipline for the refs-cap TRUNCATED (Codex #123 r3/r4): each cap
-    # warning NAMES its report (provenance lives in the message; the parser is
-    # the builder's sibling in global_reports) — keep it only while that exact
-    # report is on the fused page, so a clipped capped report can never leave
-    # a false "refs omitted" claim behind a surviving complete one.
-    report_ids = {report.id for report in reports}
-    warnings = [
-        w
-        for w in warnings
-        if (cap_id := capped_report_id(w.message)) is None or cap_id in report_ids
-    ]
     # Same discipline for the semantic/graph MENTION-loss warnings (Codex
     # #127 r4): their messages name the affected entity ids (builder/parser
     # siblings in core.query.mentions), so each is REBUILT for the fused
@@ -299,7 +245,7 @@ async def hybrid_query(
             + [f"{mode}: {len(mode_responses[mode].results)} result(s)" for mode in ran],
             "routing_decision": {
                 "selected": list(selected),
-                "skipped": [mode for mode, _ in gated] + list(unselected),
+                "skipped": [mode for mode, _ in gated],
                 "reason": reason,
             },
             "latency_ms": max(0, int((time.monotonic() - started) * 1000)),
@@ -409,8 +355,8 @@ def _available_modes(
 ) -> tuple[list[str], list[tuple[str, str]]]:
     """The modes this request CAN run, and the (mode, reason) pairs it can't.
 
-    Gating happens BEFORE selection so the selector can never pick a mode the
-    policy forbids or the request cannot parameterize."""
+    Gating happens before the fan-out — the fan-out never runs a
+    policy-forbidden or unparameterizable mode."""
     available: list[str] = []
     gated: list[tuple[str, str]] = []
     for mode in _MODE_ORDER:
@@ -426,74 +372,18 @@ def _available_modes(
             )
         else:
             available.append(mode)
-    return available, gated
-
-
-async def _select_modes(
-    llm: LLM, query: str, available: list[str]
-) -> tuple[list[str], list[str], str | None]:
-    """LLM-assisted mode selection over the AVAILABLE set.
-
-    Returns ``(selected, unselected, reason)`` in fixed mode order. The
-    answer is untrusted (C3b): any failure — transport, parse, shape,
-    out-of-vocabulary, empty intersection — selects EVERYTHING available,
-    with the failure named in the reason (breadth over silence, §22)."""
-    if len(available) <= 1:
-        return list(available), [], "single available mode — selector not consulted"
-    try:
-        answer = await llm.achat(
-            [
-                ChatMessage(role=MessageRole.SYSTEM, content=_SELECTOR_SYSTEM),
-                ChatMessage(
-                    role=MessageRole.USER,
-                    content=json.dumps({"question": query, "available": available}),
-                ),
-            ]
+    # global is NEVER fused (MCP8): rating-ranked corpus overview, not
+    # query-matched (MCP3) — fusing it spent 3-5 page slots on results
+    # irrelevant to the question. The skip is SAID on every call (the same
+    # honesty as policy gating); corpus overview lives in global_summary.
+    gated.append(
+        (
+            "global",
+            "not fused: community reports are rating-ranked corpus overview, "
+            "never query-matched — use global_summary for corpus overview",
         )
-        payload = _parse_selection(answer.message.content or "")
-        picked = [mode for mode in available if mode in payload["modes"]]
-        extras = [mode for mode in payload["modes"] if mode not in available]
-        if extras:
-            # a MIXED answer (valid + hallucinated/unavailable modes) is not
-            # half-trusted: one out-of-vocabulary member marks the whole
-            # selection unreliable, and honoring the valid half would silently
-            # narrow retrieval — the documented failure rule (any
-            # out-of-vocabulary output → breadth) applies to the whole answer
-            return (
-                list(available),
-                [],
-                f"selector named unavailable mode(s) {extras} — ran every available mode",
-            )
-        if not picked:
-            return (
-                list(available),
-                [],
-                "selector picked no available mode — ran every available mode",
-            )
-        reason = payload["reason"]
-        return picked, [mode for mode in available if mode not in picked], reason
-    except Exception:  # noqa: BLE001 — a broken selector must not silence modes (§22)
-        return list(available), [], "selector failed — ran every available mode"
-
-
-def _parse_selection(text: str) -> dict[str, Any]:
-    """Strictly parse the selector's JSON (C3b value tree: absent field, wrong
-    type, wrong item types all raise — the caller falls back to breadth)."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:]
-    payload = json.loads(cleaned)
-    if not isinstance(payload, dict):
-        raise ValueError("selection must be a JSON object")
-    modes = payload.get("modes")
-    if not isinstance(modes, list) or not all(isinstance(mode, str) for mode in modes):
-        raise ValueError("modes must be a list of strings")
-    reason = payload.get("reason")
-    if reason is not None and not isinstance(reason, str):
-        raise ValueError("reason must be a string or null")
-    return {"modes": modes, "reason": reason}
+    )
+    return available, gated
 
 
 async def _run_mode(
@@ -514,8 +404,7 @@ async def _run_mode(
         return await sql_query(
             deps.sql_reader, deps.llm, policy.text_to_sql, query, policy.max_sql_rows
         )
-    assert mode == "global"
-    return await global_summary(deps.repo, query, policy.top_k)
+    raise ValueError(f"unknown hybrid mode {mode!r}")  # _MODE_ORDER is the vocabulary
 
 
 def _fuse(
@@ -551,7 +440,13 @@ def _fuse(
             source_refs=tuple(merged_refs[key]),
             title=base.title,
             text=base.text,
-            confidence=base.confidence,
+            # MCP8: RRF flattens every score to ~1/61 — the agent's only
+            # confidence signal died in fusion (measured: 0.0164 vs the real
+            # cosines 0.7224/0.5025). The origin mode's RAW score rides in
+            # confidence (first mode's, same winner as the payload; clamped —
+            # cosine can stray outside 0..1): comparable WITHIN a mode, not
+            # across modes; `score` stays the rank-fusion ordering value.
+            confidence=max(0.0, min(1.0, base.score)),
         )
         for key, base in first.items()
     ]
