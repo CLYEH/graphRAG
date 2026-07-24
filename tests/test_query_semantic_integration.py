@@ -197,10 +197,10 @@ async def test_semantic_search_returns_the_nearest_cited_result_end_to_end(
     try:
         async with engine.connect() as conn:
             writer = await _new_build(conn, project)
-            doc = await _document(writer, "h1", "s3://acme/onboarding.md")
+            doc = await _document(writer, "aa11bb22cc33", "s3://acme/onboarding.md")
             await _chunk(writer, doc, 0, "alpha onboarding process")
             await _chunk(writer, doc, 1, "unrelated beta content")
-            await _entity_with_mention(writer, "People Ops", "chunk:h1:0")
+            await _entity_with_mention(writer, "People Ops", "chunk:aa11bb22cc33:0")
             await conn.commit()
 
             await _index(conn, qdrant, writer)
@@ -235,8 +235,14 @@ async def test_semantic_search_returns_the_nearest_cited_result_end_to_end(
             # MCP6: the title carries the SoR ontology type (same-name entities
             # across types are otherwise indistinguishable on the page)
             assert entity_hit.title == "People Ops (Team)"
-            assert entity_hit.source_refs[0].source_type == "chunk"
-            assert entity_hit.source_refs[0].id == "chunk:h1:0"
+            mention_ref = entity_hit.source_refs[0]
+            assert mention_ref.source_type == "chunk"
+            # MCP7 (v1.1): resolved through the LIVE two-segment join — the id
+            # is the real chunk UUID (get_chunk-ready), never the raw string
+            assert uuid.UUID(mention_ref.id)
+            assert mention_ref.source_uri == "s3://acme/onboarding.md"
+            assert mention_ref.metadata is not None
+            assert mention_ref.metadata["quote"] == "People Ops"
     finally:
         await engine.dispose()
         await _cleanup(qdrant, project)
@@ -291,7 +297,7 @@ async def test_a_rejected_entity_with_a_stale_point_is_dropped_not_surfaced(
     try:
         async with engine.connect() as conn:
             writer = await _new_build(conn, project)
-            entity_id = await _entity_with_mention(writer, "People Ops", "chunk:h1:0")
+            entity_id = await _entity_with_mention(writer, "People Ops", "chunk:aa11bb22cc33:0")
             await conn.commit()
             await _index(conn, qdrant, writer)  # point projected while active
             await conn.commit()

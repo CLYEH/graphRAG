@@ -34,6 +34,7 @@ from typing import Any
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from core.graph.structured import split_row_source_ref
+from core.query.mentions import resolved_mention_refs
 from core.query.policy import (
     GRAPH_QUERY_TEMPLATES,
     GUARDRAIL_WARNING_CODE,
@@ -51,9 +52,6 @@ from core.stores.graph import BuildScopedGraphRepo
 from core.stores.repo import BuildScopedRepo
 
 _TOOL = "graph_query"
-
-#: entity_mentions.source_kind → §16 source_type (same mapping as C6a).
-_MENTION_SOURCE_TYPE = {"text": "chunk", "structured": "row"}
 
 
 @dataclass(frozen=True)
@@ -576,18 +574,17 @@ async def _neighbor_entities(
     truncated = fetch_clipped or len(ordered) > policy.max_rows
     ordered = ordered[: policy.max_rows]
 
-    # SoR re-verification (§27.2): an entity result needs ≥1 mention of a
-    # still-active entity; mentions_by_entity filters status='active', so a
-    # drifted (non-active) node resolves to zero mentions and is dropped.
-    mentions = await repo.mentions_by_entity([entity_id for entity_id, _ in ordered])
+    # SoR re-verification (§27.2): an entity result needs ≥1 RESOLVABLE
+    # mention of a still-active entity (MCP7 v1.1 — refs carry chunk uuid +
+    # uri + quote + offsets via the shared resolution seam); a drifted
+    # (non-active or unresolvable) node yields zero refs and is dropped.
+    refs_by_entity, _, _ = await resolved_mention_refs(
+        repo, [entity_id for entity_id, _ in ordered]
+    )
     names = await repo.active_entity_names([entity_id for entity_id, _ in ordered])
     kept: list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]] = []
     for entity_id, distance in ordered:
-        refs = tuple(
-            SourceRef(source_type=source_type, id=source_ref)
-            for kind, source_ref in mentions.get(entity_id, [])
-            if (source_type := _MENTION_SOURCE_TYPE.get(kind)) is not None
-        )
+        refs = refs_by_entity.get(entity_id, ())
         if refs:
             kept.append((entity_id, distance, refs, names.get(entity_id)))
         else:

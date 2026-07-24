@@ -419,15 +419,15 @@ async def test_retrieval_tool_descriptions_state_score_semantics_honestly() -> N
     # Codex #124: "read the text" is unfollowable on entity-only pages (text
     # is null there) — the description must say what a bare name-match page
     # means instead of pointing at a field that is empty exactly then
-    assert "a page of bare name matches is NOT evidence" in semantic
-    # ...and the replacement must not point at another dead end: get_entity
-    # returns ids + mention refs only (no text), and ENTITY content stays
-    # unreachable even after MCP5 — get_chunk takes chunk UUIDs, while an
-    # entity mention ref is the chunk:{content_hash}:{ordinal} string shape
-    # get_chunk deliberately rejects. REVERSE this pin when MCP7 makes
-    # mention refs resolvable — the description should then point there.
+    assert "bare name matches is still NOT evidence" in semantic
+    # MCP7 REVERSED the MCP4/MCP5-era "no tool currently retrieves" pin (its
+    # comment named exactly this trigger): entity mention refs now carry
+    # chunk UUIDs (v1.1), so the description must point at the REAL path —
+    # get_chunk — and the old impossibility claim must be gone. get_entity
+    # remains a dead end for content and must stay unmentioned.
+    assert "no tool currently retrieves" not in semantic
+    assert "get_chunk" in semantic
     assert "get_entity" not in semantic
-    assert "no tool currently retrieves" in semantic
 
 
 class _IntrospectionRepo:
@@ -445,16 +445,15 @@ class _IntrospectionRepo:
 
 
 async def test_a_mention_ref_shaped_chunk_id_gets_a_typed_explanation() -> None:
-    """MCP5/MCP7 seam: the OTHER chunk pointer an agent actually holds — an
-    entity mention ref (chunk:{content_hash}:{ordinal}) — is NOT a chunk
-    UUID, and a bare "invalid uuid" error would leave the agent with no idea
-    why its perfectly-real-looking ref fails (the #124 lesson: name the gap,
-    don't point at dead ends). The error must say that shape is not yet
-    resolvable, and validation must not cost a store round-trip."""
+    """The raw chunk:{content_hash}:{ordinal} string is the STORED mention
+    form — since MCP7 (v1.1) emitted entity refs carry chunk UUIDs, so an
+    agent holding the raw string got it from somewhere stale; the error must
+    NAME that (the #124 lesson: no bare "invalid", no dead ends) and
+    validation must not cost a store round-trip."""
     repo = _IntrospectionRepo()
     payload = await _get_chunk(repo, "demo", "chunk:3626c139ab:0")
     assert payload["chunk"] is None
-    assert "not yet resolvable" in payload["error"]
+    assert "STORED form" in payload["error"]
     assert repo.queries == 0  # rejected before any store read
 
     document = await _get_document(repo, "demo", "not-a-uuid", _NO_EXPOSURE)

@@ -143,10 +143,34 @@ async def test_run_eval_scores_a_projected_build_and_persists(project: str, tmp_
                     created_at=NOW,
                     updated_at=NOW,
                 )
+                # MCP7 (v1.1): back the mention with a doc + chunk so it
+                # RESOLVES — an unresolvable mention now drops the entity
+                mention_hash = f"aa{entity_id.hex[:10]}"
+                document_id = uuid.uuid4()
+                await writer.insert(
+                    tables.documents,
+                    id=document_id,
+                    source_uri="file:///eval.md",
+                    raw=f"{name} appears here",
+                    content_hash=mention_hash,
+                    mime="text/markdown",
+                    metadata={},
+                    ingested_at=NOW,
+                )
+                await writer.insert(
+                    tables.chunks,
+                    id=uuid.uuid4(),
+                    document_id=document_id,
+                    ordinal=0,
+                    text=f"{name} appears here",
+                    token_count=3,
+                    start_offset=0,
+                    end_offset=20,
+                )
                 await writer.insert_entity_mention(
                     entity_id=entity_id,
                     source_kind="text",
-                    source_ref=f"chunk-{entity_id}",
+                    source_ref=f"chunk:{mention_hash}:0",
                     surface_form=name,
                     confidence=1.0,
                 )

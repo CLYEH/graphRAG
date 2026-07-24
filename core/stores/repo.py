@@ -536,9 +536,12 @@ class BuildScopedRepo:
 
     async def mentions_by_entity(
         self, entity_ids: Sequence[uuid.UUID]
-    ) -> dict[uuid.UUID, list[tuple[str, str]]]:
-        """``(source_kind, source_ref)`` mentions per entity, scoped through the
-        parent entity (§4: ``entity_mentions`` has no build_id of its own).
+    ) -> dict[uuid.UUID, list[tuple[str, str, str | None]]]:
+        """``(source_kind, source_ref, surface_form)`` mentions per entity,
+        scoped through the parent entity (§4: ``entity_mentions`` has no
+        build_id of its own). ``surface_form`` is the mention's quoted text —
+        MCP7 resolution emits it as the ref's ``quote``; nullable in the DDL,
+        so consumers must tolerate None.
 
         C6a builds §27.2 entity source_refs from these — an entity result must
         cite ≥1 mention (chunk or row), and only the ``source_kind`` tells the
@@ -562,7 +565,12 @@ class BuildScopedRepo:
         mentions = tables.entity_mentions
         entities = tables.entities
         query = (
-            sa.select(mentions.c.entity_id, mentions.c.source_kind, mentions.c.source_ref)
+            sa.select(
+                mentions.c.entity_id,
+                mentions.c.source_kind,
+                mentions.c.source_ref,
+                mentions.c.surface_form,
+            )
             .select_from(mentions.join(entities, entities.c.id == mentions.c.entity_id))
             .where(
                 entities.c.project == self.project,
@@ -572,10 +580,61 @@ class BuildScopedRepo:
             )
         )
         rows = (await self._execute(query)).fetchall()
-        grouped: dict[uuid.UUID, list[tuple[str, str]]] = {}
+        grouped: dict[uuid.UUID, list[tuple[str, str, str | None]]] = {}
         for row in rows:
-            grouped.setdefault(row.entity_id, []).append((row.source_kind, row.source_ref))
+            grouped.setdefault(row.entity_id, []).append(
+                (row.source_kind, row.source_ref, row.surface_form)
+            )
         return grouped
+
+    async def chunks_by_content_ref(
+        self, refs: Collection[tuple[str, int]]
+    ) -> dict[tuple[str, int], Any]:
+        """Resolve ``(content_hash, ordinal)`` pairs to their chunk rows —
+        the MCP7 read that makes an entity mention ref RESOLVABLE.
+
+        A text mention's stored ref is ``chunk:{content_hash}:{ordinal}``
+        (rebuild-stable by design) while ``chunks.id`` is a UUID no column
+        relates to that string — resolution is the two-segment join this
+        method performs, build-scoped on BOTH sides (DR-006). Measured on the
+        dev corpus: zero duplicate ``(build_id, content_hash)`` groups, so a
+        pair resolves to at most one chunk; a duplicate would make the ref
+        ambiguous and this method keeps the FIRST row deterministically
+        (ordered by chunk id). Returns rows exposing ``id``/``start_offset``/
+        ``end_offset``/``source_uri``."""
+        if not refs:
+            return {}
+        documents = tables.documents
+        chunks = tables.chunks
+        hashes = sorted({content_hash for content_hash, _ in refs})
+        ordinals = sorted({ordinal for _, ordinal in refs})
+        query = (
+            sa.select(
+                chunks.c.id,
+                chunks.c.ordinal,
+                chunks.c.start_offset,
+                chunks.c.end_offset,
+                documents.c.content_hash,
+                documents.c.source_uri,
+            )
+            .select_from(chunks.join(documents, documents.c.id == chunks.c.document_id))
+            .where(
+                documents.c.project == self.project,
+                documents.c.build_id == self.build_id,
+                chunks.c.build_id == self.build_id,
+                documents.c.content_hash.in_(hashes),
+                chunks.c.ordinal.in_(ordinals),
+            )
+            .order_by(chunks.c.id)
+        )
+        rows = (await self._execute(query)).fetchall()
+        wanted = set(refs)
+        resolved: dict[tuple[str, int], Any] = {}
+        for row in rows:
+            key = (row.content_hash, row.ordinal)
+            if key in wanted and key not in resolved:
+                resolved[key] = row
+        return resolved
 
     async def active_entity_names(self, entity_ids: Collection[uuid.UUID]) -> dict[uuid.UUID, str]:
         """canonical_name per ACTIVE entity id (scoped) — the inverse of

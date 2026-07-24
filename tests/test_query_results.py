@@ -58,12 +58,22 @@ def _chunk_result(score: float = 0.9, rid: str = _CHUNK) -> RetrievalResult:
 
 
 def _entity_result(score: float = 0.8, rid: str = _ENTITY) -> RetrievalResult:
+    # v1.1 (MCP7): an entity's chunk mention ref is RESOLVED — chunk UUID id,
+    # source_uri, quote + offsets (the v1.0 bare chunk:{hash}:{ordinal}
+    # string was a dead citation no endpoint accepted)
     return RetrievalResult(
         result_type="entity",
         id=rid,
         score=score,
         title="People Ops",
-        source_refs=(SourceRef(source_type="chunk", id="chunk:h1:0"),),
+        source_refs=(
+            SourceRef(
+                source_type="chunk",
+                id=_CHUNK,
+                source_uri="s3://acme/onboarding.md",
+                metadata={"quote": "People Ops", "start_offset": 0, "end_offset": 10},
+            ),
+        ),
     )
 
 
@@ -91,7 +101,7 @@ def test_serialized_response_validates_against_the_frozen_schema() -> None:
     # the envelope names the build it read (DR-001) and semantic has no router
     assert payload["build_id"] == _BUILD
     assert payload["graph_context"] is None and payload["debug"] is None
-    assert payload["schema_version"] == "1.0"
+    assert payload["schema_version"] == "1.1"  # v1.1: MCP7 entity-ref tightening (DESIGN §26)
 
 
 def test_require_sources_is_enforced_at_construction() -> None:

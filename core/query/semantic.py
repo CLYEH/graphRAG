@@ -41,6 +41,7 @@ from typing import Any
 from llama_index.core.embeddings import BaseEmbedding
 from qdrant_client import models
 
+from core.query.mentions import MENTION_REFS_CAP, resolved_mention_refs
 from core.query.results import (
     McpResponse,
     QueryWarning,
@@ -53,12 +54,6 @@ from core.stores.repo import BuildScopedRepo
 from core.stores.vectors import BuildScopedVectorRepo
 
 _TOOL = "semantic_search"
-
-#: §27.2 entity source_ref: a mention's ``source_kind`` decides which citable
-#: source_type it is (a ``text`` mention came from a chunk, a ``structured``
-#: one from a table row). The two values are the frozen entity_mentions CHECK
-#: vocabulary, so this map is total.
-_MENTION_SOURCE_TYPE = {"text": "chunk", "structured": "row"}
 
 
 def _payload_uuid(raw: object) -> uuid.UUID | None:
@@ -167,7 +162,7 @@ async def semantic_search(
     all_hits = [hit for hits in hit_lists for hit in hits]
     chunk_ids, entity_ids = _partition_hit_source_ids(all_hits)
     chunk_by_id, source_uri_by_chunk = await _load_chunk_provenance(repo, chunk_ids)
-    mentions_by_entity = await repo.mentions_by_entity(list(entity_ids))
+    refs_by_entity, _, capped_entities = await resolved_mention_refs(repo, list(entity_ids))
     types_by_entity = await _entity_types(repo, entity_ids)
 
     # EVERY fetched hit is validated before any page slot is allocated
@@ -189,7 +184,7 @@ async def semantic_search(
                     hit.score,
                     chunk_by_id,
                     source_uri_by_chunk,
-                    mentions_by_entity,
+                    refs_by_entity,
                     types_by_entity,
                 )
                 if payload is not None
@@ -206,15 +201,34 @@ async def semantic_search(
     else:
         results = _fair_page(validated_lists[0], validated_lists[1], top_k)
 
-    warnings: tuple[QueryWarning, ...] = ()
+    warnings_list: list[QueryWarning] = []
     if dropped:
-        warnings = (
+        warnings_list.append(
             QueryWarning(
                 "PARTIAL_RESULTS",
                 f"{dropped} hit(s) omitted: no citable source in the active build "
                 "(projection drift — see Health)",
-            ),
+            )
         )
+    # the MCP3 refs-cap discipline, provenance-exact: warn only about capped
+    # entities actually ON this page (a capped entity clipped off the page
+    # never charged its omission here); the escape hatch (get_entity,
+    # uncapped) is a real path (#124)
+    page_capped = sum(
+        1
+        for r in results
+        if r.result_type == "entity" and any(str(eid) == r.id for eid in capped_entities)
+    )
+    if page_capped:
+        warnings_list.append(
+            QueryWarning(
+                "TRUNCATED",
+                f"entity mention refs capped at {MENTION_REFS_CAP} per entity — "
+                f"{page_capped} returned entity(ies) affected; the full mention "
+                "list is available via get_entity (§22)",
+            )
+        )
+    warnings = tuple(warnings_list)
 
     return McpResponse(
         query=query,
@@ -309,7 +323,7 @@ def _build_result(
     score: float,
     chunk_by_id: dict[uuid.UUID, Any],
     source_uri_by_chunk: dict[uuid.UUID, str | None],
-    mentions_by_entity: dict[uuid.UUID, list[tuple[str, str]]],
+    refs_by_entity: dict[uuid.UUID, tuple[SourceRef, ...]],
     types_by_entity: dict[uuid.UUID, Any],
 ) -> RetrievalResult | None:
     """One hit → one §16 result, or None if it cannot be cited (drop it)."""
@@ -317,7 +331,7 @@ def _build_result(
     if point_type == "chunk":
         return _chunk_result(payload, score, chunk_by_id, source_uri_by_chunk)
     if point_type == "entity":
-        return _entity_result(payload, score, mentions_by_entity, types_by_entity)
+        return _entity_result(payload, score, refs_by_entity, types_by_entity)
     return None  # an unknown point type cannot be mapped to a §16 result_type
 
 
@@ -352,19 +366,19 @@ def _chunk_result(
 def _entity_result(
     payload: dict[str, Any],
     score: float,
-    mentions_by_entity: dict[uuid.UUID, list[tuple[str, str]]],
+    refs_by_entity: dict[uuid.UUID, tuple[SourceRef, ...]],
     types_by_entity: dict[uuid.UUID, Any],
 ) -> RetrievalResult | None:
     entity_id = _payload_uuid(payload.get("entity_id"))
     if entity_id is None:
         return None
-    refs = tuple(
-        SourceRef(source_type=source_type, id=source_ref)
-        for kind, source_ref in mentions_by_entity.get(entity_id, [])
-        if (source_type := _MENTION_SOURCE_TYPE.get(kind)) is not None
-    )
+    # MCP7 (contract v1.1): refs arrive RESOLVED — chunk-mention refs carry
+    # the chunk UUID + source_uri + quote + offsets (get_chunk accepts the id
+    # directly), row mentions carry table+pk. Resolution lives in
+    # core/query/mentions.py, shared by every entity-emitting surface.
+    refs = refs_by_entity.get(entity_id, ())
     if not refs:
-        return None  # §27.2 entity ref needs ≥1 chunk/row mention; none survived
+        return None  # §27.2 entity ref needs ≥1 RESOLVABLE mention; none survived
     name = _payload_str(payload.get("text"))
     # the ontology type rides in the title (MCP6): the SAME name recurs
     # across types with identical scores, and §16's result shape has no type

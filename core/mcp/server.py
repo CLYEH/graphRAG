@@ -61,6 +61,7 @@ from core.query.global_reports import global_summary as run_global
 from core.query.graph import GraphQueryParams
 from core.query.graph import graph_query as run_graph
 from core.query.hybrid import hybrid_query as run_hybrid
+from core.query.mentions import resolved_mention_refs
 from core.query.metadata_enrich import enrich_response_metadata
 from core.query.results import McpResponse, QueryWarning
 from core.query.semantic import semantic_search as run_semantic
@@ -82,10 +83,6 @@ _NIL_BUILD = "00000000-0000-0000-0000-000000000000"
 #: LOUD — degradation is for store trouble, never for our own bugs.
 _STORE_ERRORS: tuple[type[BaseException], ...] = STORE_CLIENT_ERRORS
 _store_name = store_name
-
-
-#: entity_mentions.source_kind → §16 source_type (the C6a mapping).
-_MENTION_SOURCE_TYPE = {"text": "chunk", "structured": "row"}
 
 
 async def _bounded(
@@ -295,10 +292,11 @@ def build_server(project: str) -> FastMCP:
         two cases (topically-close-but-absent questions outscore answerable
         generic ones). No warning flags an out-of-domain question; judge
         answerability from the returned content, not from the scores:
-        chunk results carry the matched text, but entity results carry only
-        the matched NAME — no tool currently retrieves their underlying
-        content — so a page of bare name matches is NOT evidence the
-        corpus answers the question."""
+        chunk results carry the matched text; entity results carry the
+        matched NAME plus quoted mention citations whose ids are chunk
+        UUIDs — exchange one for its full text with get_chunk. A page of
+        bare name matches is still NOT evidence the corpus answers the
+        question."""
         rt = _rt()
 
         async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
@@ -566,7 +564,13 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
             "entities": [],
         }
     entity_ids = await repo.entity_ids_by_name(name)
-    mentions = await repo.mentions_by_entity(entity_ids)
+    # MCP7 (v1.1): mentions arrive RESOLVED — a chunk mention carries the
+    # chunk UUID (get_chunk accepts it directly), source_uri, and the quote
+    # + offsets; a row mention carries table+pk. The shared seam is
+    # core/query/mentions.py; an unresolvable mention is omitted (§22) and
+    # an entity may surface with zero mentions here (introspection shows
+    # the uncited state rather than dropping the entity).
+    refs_by_entity, _, _ = await resolved_mention_refs(repo, entity_ids, cap=None)
     return {
         "project": project,
         "build_id": str(repo.build_id),
@@ -575,9 +579,13 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
             {
                 "id": str(entity_id),
                 "mentions": [
-                    {"source_type": source_type, "id": source_ref}
-                    for kind, source_ref in mentions.get(entity_id, [])
-                    if (source_type := _MENTION_SOURCE_TYPE.get(kind)) is not None
+                    {
+                        "source_type": ref.source_type,
+                        "id": ref.id,
+                        "source_uri": ref.source_uri,
+                        "metadata": ref.metadata,
+                    }
+                    for ref in refs_by_entity.get(entity_id, ())
                 ],
             }
             for entity_id in entity_ids
@@ -589,9 +597,10 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
 #: gap) instead of a bare "invalid" (#124: no dead ends). One constant, two
 #: emitters: the helper (direct callers) and the pre-binding wrapper check.
 _CHUNK_ID_MESSAGE = (
-    "chunk_id must be a chunk UUID (the id of a chunk result or a relation "
-    "evidence ref); entity mention refs (chunk:{content_hash}:{ordinal}) "
-    "are a different shape and not yet resolvable"
+    "chunk_id must be a chunk UUID (the id of a chunk result, a relation "
+    "evidence ref, or an entity mention ref — all carry chunk UUIDs since "
+    "v1.1); a raw chunk:{content_hash}:{ordinal} string is the STORED form "
+    "and is not accepted"
 )
 
 #: get_document's invalid-id message (same two-emitter single source).
