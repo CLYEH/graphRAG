@@ -202,7 +202,7 @@ graphRAG/
 ## 16. MCP Response Contract（凍結交付物，DR-002）
 `contracts/mcp_response.schema.json`，所有 retrieval 工具共用：
 ```json
-{ "schema_version": "1.0", "query": "…", "tool": "hybrid_query", "project": "…", "build_id": "uuid",
+{ "schema_version": "1.1", "query": "…", "tool": "hybrid_query", "project": "…", "build_id": "uuid",
   "results": [{ "result_type": "chunk|entity|relation|path|row|community_report",
     "id": "uuid", "title": "…", "text": "…", "score": 0.87, "confidence": 0.91,
     "source_refs": [{ "source_type": "document|chunk|entity|relation|row", "id":"uuid", "source_uri":"…", "metadata":{} }] }],
