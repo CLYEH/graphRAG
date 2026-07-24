@@ -292,3 +292,26 @@ async def test_a_beyond_top_k_report_never_charges_its_capped_refs_to_the_page()
     both = await _run([small, big], top_k=2)
     capped = [w for w in both.warnings if "capped" in w.message]
     assert len(capped) == 1 and "12 ref(s) omitted" in capped[0].message
+
+
+async def test_duplicate_member_ids_are_one_member_not_many() -> None:
+    """Codex #123 r2: member_entity_ids permits repeated uuids (bare array,
+    no uniqueness constraint) — counting repeats minted identical refs, spent
+    the _REFS_CAP on copies, and crowded real members out of the citation:
+    eight copies of the lexically smallest id + one other member cited eight
+    identical refs and dropped the other member entirely. A duplicate is the
+    SAME member — cite the distinct set, uncapped.
+    """
+    small = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    other = uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")
+    response = await _run([_report(5.0, member_ids=[small] * 8 + [other])])
+    refs = [ref.id for ref in response.results[0].source_refs]
+    assert refs == [str(small), str(other)]  # distinct members, both cited
+    assert not any("capped" in w.message for w in response.warnings)
+
+    # the ungrounded axis counts distinct too: one bogus id claimed twice is
+    # ONE missing member, not two
+    bogus = uuid.uuid4()
+    partial = await _run([_report(5.0, member_ids=[small, bogus, bogus])], known={small, other})
+    warning = next(w for w in partial.warnings if w.code == "PARTIAL_RESULTS")
+    assert "and 1 member ref(s) omitted" in warning.message

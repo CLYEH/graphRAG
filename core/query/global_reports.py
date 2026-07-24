@@ -192,7 +192,10 @@ def _report_result(row: Any, known: set[Any]) -> tuple[RetrievalResult | None, i
     ≥1 grounded ref, not the roster; the cap keeps the first N in the same
     deterministic order, and the caller reports the omission (silent
     truncation would read as the full membership)."""
-    claimed = [m for m in (row.member_entity_ids or []) if m is not None]
+    # the array permits repeated uuids — a duplicate is the SAME member, not
+    # another ref: counting repeats minted identical refs, spent the cap on
+    # copies, and crowded real members out of the citation (Codex #123 r2)
+    claimed = {m for m in (row.member_entity_ids or []) if m is not None}
     members = [m for m in claimed if m in known]
     bad_refs = len(claimed) - len(members)
     if not members:

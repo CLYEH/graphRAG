@@ -239,6 +239,16 @@ async def hybrid_query(
         [mode_responses[mode].results for mode in _MODE_ORDER if mode in mode_responses],
         policy.top_k,
     )
+    if not any(result.result_type == "community_report" for result in fused):
+        # MCP3: the global mode's LOW_CONFIDENCE qualifies COMMUNITY REPORTS
+        # (rating-ranked, never query-matched). When fusion clips every report
+        # off the page, the warning would instead indict the surviving
+        # results — which ARE query-matched — so it dies with its subjects.
+        warnings = [
+            w
+            for w in warnings
+            if not (w.code == "LOW_CONFIDENCE" and w.message.startswith("[global]"))
+        ]
     if truncated:
         warnings.append(
             QueryWarning("TRUNCATED", f"result truncated to the top_k={policy.top_k} ceiling (§21)")

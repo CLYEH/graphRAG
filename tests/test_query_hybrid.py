@@ -313,6 +313,42 @@ async def test_mode_warnings_are_aggregated_with_their_origin(
     assert any(w.message.startswith("[sql]") for w in truncs)
 
 
+async def test_globals_low_confidence_dies_with_its_reports_in_fusion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #123 r2: the global mode's LOW_CONFIDENCE qualifies COMMUNITY
+    REPORTS (rating-ranked, never query-matched). When fusion clips every
+    report off the page, propagating it anyway tells the agent the surviving,
+    query-matched results are unreliable — the warning must live and die with
+    its subjects."""
+    low_conf = QueryWarning("LOW_CONFIDENCE", "global results are ranked by community rating …")
+    _patch_modes(
+        monkeypatch,
+        semantic=_mode_response("semantic_search", _result(rid="a-hit")),
+        global_=_mode_response(
+            "global_summary",
+            _result(
+                result_type="community_report",
+                rid="z-report",
+                # §27.2/§16: a community_report result must cite entity refs
+                source_refs=(SourceRef(source_type="entity", id=str(uuid.uuid4())),),
+            ),
+            warnings=(low_conf,),
+        ),
+    )
+    # equal RRF (both rank 1) → id ASC tie-break: "a-hit" wins, the report is
+    # clipped by top_k=1 — no community_report on the page, no warning
+    clipped = await _run(_deps(), _policy(top_k=1))
+    assert [r.id for r in clipped.results] == ["a-hit"]
+    assert not any(w.code == "LOW_CONFIDENCE" for w in clipped.warnings)
+
+    # when the report DOES survive fusion, the warning survives with it
+    kept = await _run(_deps(), _policy(top_k=10))
+    assert any(r.result_type == "community_report" for r in kept.results)
+    low = [w for w in kept.warnings if w.code == "LOW_CONFIDENCE"]
+    assert len(low) == 1 and low[0].message.startswith("[global]")
+
+
 async def test_fusion_merges_duplicates_and_ranks_by_rrf() -> None:
     """RRF: mode scores are incomparable, ranks are the shared currency. A
     result found by TWO modes accumulates both rank contributions (so it
