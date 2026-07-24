@@ -51,6 +51,8 @@ _TOOLS = {
     "sql_query",
     "hybrid_query",
     "get_entity",
+    "get_chunk",
+    "get_document",
     "list_schema",
     "explain_retrieval",
 }

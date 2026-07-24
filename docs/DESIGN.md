@@ -144,7 +144,7 @@ pipeline_step_items(id uuid pk, step_id uuid, item_kind text, item_ref text,  --
 | hybrid | router | RouterQueryEngine 選擇+融合，產 routing trace（§16） |
 
 ## 9. MCP 介面（每專案一 server,經單一 gateway 供應）
-工具：`semantic_search` · `graph_query` · `global_summary` · `sql_query` · `hybrid_query`（預設入口）· `get_entity` · `list_schema` · `explain_retrieval`。所有 retrieval 工具回傳統一 contract（§16），查詢綁定 active build。Transport 🔧 stdio/http。**DR-012（CFG1）**:HTTP 供應形狀=`graphrag serve-mcp` 單一 gateway process,每專案一個「邏輯」server 實例掛於 `http://<host>:<port>/mcp/<project_name>`(一 port 多專案;registry 驅動 lazy mount——建完專案免重啟即可連);query_policy/metadata_exposure 一律讀 registry `projects.config`(單一 SoR,廢除 `projects/<name>/config.yaml` 與每專案手寫 entrypoint);gateway 無 auth(§23 placeholder,限內網/tunnel)。
+工具：`semantic_search` · `graph_query` · `global_summary` · `sql_query` · `hybrid_query`（預設入口）· `get_entity` · `get_chunk` · `get_document`（MCP5:引用→原文的取回路徑;自省形狀,非 §16）· `list_schema` · `explain_retrieval`。所有 retrieval 工具回傳統一 contract（§16），查詢綁定 active build。Transport 🔧 stdio/http。**DR-012（CFG1）**:HTTP 供應形狀=`graphrag serve-mcp` 單一 gateway process,每專案一個「邏輯」server 實例掛於 `http://<host>:<port>/mcp/<project_name>`(一 port 多專案;registry 驅動 lazy mount——建完專案免重啟即可連);query_policy/metadata_exposure 一律讀 registry `projects.config`(單一 SoR,廢除 `projects/<name>/config.yaml` 與每專案手寫 entrypoint);gateway 無 auth(§23 placeholder,限內網/tunnel)。
 
 ## 10. Web Console
 ### 10.1 後端 API（FastAPI，`api/`）

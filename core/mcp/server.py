@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -64,6 +65,7 @@ from core.query.metadata_enrich import enrich_response_metadata
 from core.query.results import McpResponse, QueryWarning
 from core.query.semantic import semantic_search as run_semantic
 from core.query.sql import sql_query as run_sql
+from core.stores import tables
 from core.stores.errors import STORE_CLIENT_ERRORS, store_name
 from core.stores.graph import graph_driver
 from core.stores.vectors import vector_client
@@ -308,7 +310,8 @@ def build_server(project: str) -> FastMCP:
         query: str = "",
     ) -> dict[str, Any]:
         """Entity-relationship retrieval via the §27.6 parameterized templates
-        (neighbors / path / subgraph)."""
+        (neighbors / path / subgraph). Relation results cite chunk evidence
+        refs — exchange a ref's id for its text with get_chunk."""
         rt = _rt()
         params = GraphQueryParams(
             template=template, entity=entity, other_entity=other_entity, hops=hops
@@ -409,6 +412,42 @@ def build_server(project: str) -> FastMCP:
             return _introspection_timeout(rt, bound_build, name)
         except _STORE_ERRORS as exc:
             return _introspection_store_error(rt, bound_build, name, exc)
+
+    @server.tool()
+    async def get_chunk(chunk_id: str) -> dict[str, Any]:
+        """Exchange a chunk UUID for its TEXT (plus document provenance) —
+        the id of a chunk result or a relation evidence ref. Introspection
+        shape — NOT a §16 response. Entity mention refs
+        (chunk:{content_hash}:{ordinal}) are a different shape and not yet
+        resolvable."""
+        rt = _rt()
+        bound_build: str | None = None
+        try:
+            async with asyncio.timeout(rt.policy.max_latency_ms / 1000.0):
+                async with rt.context.bound() as deps:
+                    bound_build = str(deps.repo.build_id)
+                    return await _get_chunk(deps.repo, rt.context.project, chunk_id)
+        except TimeoutError:
+            return _introspection_timeout(rt, bound_build, chunk_id)
+        except _STORE_ERRORS as exc:
+            return _introspection_store_error(rt, bound_build, chunk_id, exc)
+
+    @server.tool()
+    async def get_document(document_id: str) -> dict[str, Any]:
+        """Exchange a document UUID (a chunk's document_id) for its source
+        provenance and full RAW content. Introspection shape — NOT a §16
+        response."""
+        rt = _rt()
+        bound_build: str | None = None
+        try:
+            async with asyncio.timeout(rt.policy.max_latency_ms / 1000.0):
+                async with rt.context.bound() as deps:
+                    bound_build = str(deps.repo.build_id)
+                    return await _get_document(deps.repo, rt.context.project, document_id)
+        except TimeoutError:
+            return _introspection_timeout(rt, bound_build, document_id)
+        except _STORE_ERRORS as exc:
+            return _introspection_store_error(rt, bound_build, document_id, exc)
 
     @server.tool()
     async def list_schema() -> dict[str, Any]:
@@ -523,6 +562,91 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
             }
             for entity_id in entity_ids
         ],
+    }
+
+
+async def _get_chunk(repo: Any, project: str, chunk_id: str) -> dict[str, Any]:
+    """§9 ``get_chunk``: chunk UUID → its text + provenance from the SoR.
+
+    THE citation-to-content path (MCP5): a relation's evidence ref and a
+    chunk result's id both carry a chunk UUID, and before this tool nothing
+    on the MCP surface could exchange one for the text it cites — citations
+    were decoration. Accepts only the UUID form; an entity MENTION ref
+    (``chunk:{content_hash}:{ordinal}``) is a different, currently
+    unresolvable shape (the MCP7 gap), and the error NAMES that instead of
+    a bare "invalid" so an agent holding one learns why it cannot be used.
+    """
+    envelope = {"project": project, "build_id": str(repo.build_id), "chunk_id": chunk_id}
+    try:
+        parsed = uuid.UUID(chunk_id)
+    except (AttributeError, TypeError, ValueError):
+        return {
+            **envelope,
+            "chunk": None,
+            "error": (
+                "chunk_id must be a chunk UUID (the id of a chunk result or a relation "
+                "evidence ref); entity mention refs (chunk:{content_hash}:{ordinal}) "
+                "are a different shape and not yet resolvable"
+            ),
+        }
+    rows = await repo.fetch_all(tables.chunks, tables.chunks.c.id == parsed)
+    if not rows:
+        return {**envelope, "chunk": None, "error": "no chunk with this id in the ACTIVE build"}
+    row = rows[0]
+    return {
+        **envelope,
+        "chunk": {
+            "id": str(row.id),
+            "document_id": str(row.document_id),
+            "ordinal": row.ordinal,
+            "text": row.text,
+            "start_offset": row.start_offset,
+            "end_offset": row.end_offset,
+            "token_count": row.token_count,
+        },
+        "error": None,
+    }
+
+
+async def _get_document(repo: Any, project: str, document_id: str) -> dict[str, Any]:
+    """§9 ``get_document``: document UUID → provenance + the full RAW content.
+
+    The document-level half of MCP5. ``raw`` is emitted whole, matching the
+    REST detail contract ("returned on detail GET only") — an agent calling
+    this tool is explicitly asking for the source document; silently
+    truncating it would misrepresent the corpus (§22's silence rule).
+    ``ingested_at`` is stringified: introspection payloads are plain JSON,
+    there is no FastAPI encoder here."""
+    envelope = {"project": project, "build_id": str(repo.build_id), "document_id": document_id}
+    try:
+        parsed = uuid.UUID(document_id)
+    except (AttributeError, TypeError, ValueError):
+        return {
+            **envelope,
+            "document": None,
+            "error": "document_id must be a document UUID (a chunk's document_id field)",
+        }
+    rows = await repo.fetch_all(tables.documents, tables.documents.c.id == parsed)
+    if not rows:
+        return {
+            **envelope,
+            "document": None,
+            "error": "no document with this id in the ACTIVE build",
+        }
+    row = rows[0]
+    return {
+        **envelope,
+        "document": {
+            "id": str(row.id),
+            "source_uri": row.source_uri,
+            "mime": row.mime,
+            "content_hash": row.content_hash,
+            "metadata": row.metadata or {},
+            "ingested_at": str(row.ingested_at) if row.ingested_at is not None else None,
+            "status": row.status,
+            "raw": row.raw,
+        },
+        "error": None,
     }
 
 
