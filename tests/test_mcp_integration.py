@@ -310,3 +310,34 @@ async def test_an_archived_builds_chunk_is_invisible_to_the_active_binding(
         payload = await _get_chunk(deps.repo, context.project, str(old_chunk_id))
     assert payload["chunk"] is None
     assert "ACTIVE build" in payload["error"]
+
+
+async def test_a_malformed_chunk_id_never_reaches_the_binding(
+    context: ProjectContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex #125 r3, the ORDERING pin (rule 9: the helper tests alone stay
+    green if the wrapper check moves back below ``bound()``): a malformed id
+    through FastMCP's real dispatch must come back with the NIL build
+    sentinel — the bound path stamps the REAL active build id, so nil holds
+    ONLY when the wrapper rejected before opening the binding."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    import core.mcp.server as server_module
+    from core.mcp.server import _NIL_BUILD, build_server
+
+    monkeypatch.setattr(server_module, "chat_model", lambda: cast(LLM, _FakeLLM()))
+    monkeypatch.setattr(
+        server_module, "embedding_model", lambda: cast(BaseEmbedding, _FakeEmbedder())
+    )
+    await _activate_build(context.project, entity_name="Acme")
+    server = build_server(context.project)
+    async with create_connected_server_and_client_session(server, raise_exceptions=True) as session:
+        result = await session.call_tool("get_chunk", {"chunk_id": "chunk:3626c139ab:0"})
+    unwrapped: Any = result.structuredContent
+    if unwrapped is None:
+        unwrapped = json.loads(result.content[0].text)  # type: ignore[union-attr]
+    if isinstance(unwrapped, dict) and "result" in unwrapped:
+        unwrapped = unwrapped["result"]
+    assert unwrapped["chunk"] is None
+    assert "not yet resolvable" in unwrapped["error"]
+    assert unwrapped["build_id"] == _NIL_BUILD  # binding was never opened

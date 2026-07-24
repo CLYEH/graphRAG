@@ -462,6 +462,37 @@ async def test_a_mention_ref_shaped_chunk_id_gets_a_typed_explanation() -> None:
     assert repo.queries == 0
 
 
+async def test_a_malformed_id_is_rejected_before_the_store_binding_opens() -> None:
+    """Codex #125 r3: the tool wrappers rejected malformed ids only AFTER
+    ``context.bound()`` — a bad id cost a Postgres active-build resolution,
+    and with a store down the caller saw STORE_UNAVAILABLE instead of the
+    actionable UUID error. The pre-binding check shares the helper's message
+    (one constant, two emitters) and stamps the NIL build sentinel — no
+    build was ever resolved, same convention as the pre-binding timeout."""
+    from core.mcp.server import (
+        _CHUNK_ID_MESSAGE,
+        _DOCUMENT_ID_MESSAGE,
+        _NIL_BUILD,
+        _invalid_chunk_payload,
+        _invalid_document_payload,
+    )
+
+    rejected = _invalid_chunk_payload("demo", "chunk:3626c139ab:0")
+    assert rejected is not None
+    assert rejected["build_id"] == _NIL_BUILD  # binding never happened
+    assert rejected["chunk"] is None and rejected["error"] == _CHUNK_ID_MESSAGE
+
+    doc_rejected = _invalid_document_payload("demo", "not-a-uuid")
+    assert doc_rejected is not None
+    assert doc_rejected["build_id"] == _NIL_BUILD
+    assert doc_rejected["document"] is None and doc_rejected["error"] == _DOCUMENT_ID_MESSAGE
+
+    # a VALID id passes through to the bound path — the check must not
+    # over-block (the §22 dual)
+    assert _invalid_chunk_payload("demo", str(uuid.uuid4())) is None
+    assert _invalid_document_payload("demo", str(uuid.uuid4())) is None
+
+
 async def test_get_chunk_maps_the_row_and_types_not_found() -> None:
     """MCP5's whole point: a chunk UUID (relation evidence ref / chunk result
     id) must be exchangeable for the text it cites — before this tool the

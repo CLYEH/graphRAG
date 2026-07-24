@@ -423,6 +423,11 @@ def build_server(project: str) -> FastMCP:
         (chunk:{content_hash}:{ordinal}) are a different shape and not yet
         resolvable."""
         rt = _rt()
+        # parsing needs no store — reject a malformed id BEFORE the binding
+        # opens one (Codex #125 r3: a store outage must not mask this error)
+        rejected = _invalid_chunk_payload(rt.context.project, chunk_id)
+        if rejected is not None:
+            return rejected
         bound_build: str | None = None
         try:
             async with asyncio.timeout(rt.policy.max_latency_ms / 1000.0):
@@ -440,6 +445,10 @@ def build_server(project: str) -> FastMCP:
         provenance and full RAW content. Introspection shape — NOT a §16
         response."""
         rt = _rt()
+        # same pre-binding rejection as get_chunk (Codex #125 r3)
+        rejected = _invalid_document_payload(rt.context.project, document_id)
+        if rejected is not None:
+            return rejected
         bound_build: str | None = None
         try:
             async with asyncio.timeout(rt.policy.max_latency_ms / 1000.0):
@@ -569,6 +578,57 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
     }
 
 
+#: get_chunk's invalid-id message — NAMES the mention-ref shape (the MCP7
+#: gap) instead of a bare "invalid" (#124: no dead ends). One constant, two
+#: emitters: the helper (direct callers) and the pre-binding wrapper check.
+_CHUNK_ID_MESSAGE = (
+    "chunk_id must be a chunk UUID (the id of a chunk result or a relation "
+    "evidence ref); entity mention refs (chunk:{content_hash}:{ordinal}) "
+    "are a different shape and not yet resolvable"
+)
+
+#: get_document's invalid-id message (same two-emitter single source).
+_DOCUMENT_ID_MESSAGE = "document_id must be a document UUID (a chunk's document_id field)"
+
+
+def _parse_uuid(raw: str) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(raw)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _invalid_chunk_payload(project: str, chunk_id: str) -> dict[str, Any] | None:
+    """Typed rejection for a malformed chunk_id BEFORE store binding, or None
+    when the id parses (Codex #125 r3): parsing needs no store, so a bad id
+    must never open the binding — and when a store is down the caller still
+    gets the actionable UUID error, not STORE_UNAVAILABLE. ``build_id`` is
+    the nil sentinel: no build was ever resolved (the same convention as the
+    pre-binding timeout envelope)."""
+    if _parse_uuid(chunk_id) is not None:
+        return None
+    return {
+        "project": project,
+        "build_id": _NIL_BUILD,
+        "chunk_id": chunk_id,
+        "chunk": None,
+        "error": _CHUNK_ID_MESSAGE,
+    }
+
+
+def _invalid_document_payload(project: str, document_id: str) -> dict[str, Any] | None:
+    """get_document's pre-binding twin of :func:`_invalid_chunk_payload`."""
+    if _parse_uuid(document_id) is not None:
+        return None
+    return {
+        "project": project,
+        "build_id": _NIL_BUILD,
+        "document_id": document_id,
+        "document": None,
+        "error": _DOCUMENT_ID_MESSAGE,
+    }
+
+
 async def _get_chunk(repo: Any, project: str, chunk_id: str) -> dict[str, Any]:
     """§9 ``get_chunk``: chunk UUID → its text + provenance from the SoR.
 
@@ -579,20 +639,13 @@ async def _get_chunk(repo: Any, project: str, chunk_id: str) -> dict[str, Any]:
     (``chunk:{content_hash}:{ordinal}``) is a different, currently
     unresolvable shape (the MCP7 gap), and the error NAMES that instead of
     a bare "invalid" so an agent holding one learns why it cannot be used.
+    Validation also runs pre-binding in the tool wrapper; it repeats here so
+    DIRECT callers of this helper get the same guarantee.
     """
     envelope = {"project": project, "build_id": str(repo.build_id), "chunk_id": chunk_id}
-    try:
-        parsed = uuid.UUID(chunk_id)
-    except (AttributeError, TypeError, ValueError):
-        return {
-            **envelope,
-            "chunk": None,
-            "error": (
-                "chunk_id must be a chunk UUID (the id of a chunk result or a relation "
-                "evidence ref); entity mention refs (chunk:{content_hash}:{ordinal}) "
-                "are a different shape and not yet resolvable"
-            ),
-        }
+    parsed = _parse_uuid(chunk_id)
+    if parsed is None:
+        return {**envelope, "chunk": None, "error": _CHUNK_ID_MESSAGE}
     rows = await repo.fetch_all(tables.chunks, tables.chunks.c.id == parsed)
     if not rows:
         return {**envelope, "chunk": None, "error": "no chunk with this id in the ACTIVE build"}
@@ -628,14 +681,9 @@ async def _get_document(
     projected through the SAME fail-closed ``MetadataExposure.project`` the
     retrieval enrichment path uses (empty allowlist → empty object)."""
     envelope = {"project": project, "build_id": str(repo.build_id), "document_id": document_id}
-    try:
-        parsed = uuid.UUID(document_id)
-    except (AttributeError, TypeError, ValueError):
-        return {
-            **envelope,
-            "document": None,
-            "error": "document_id must be a document UUID (a chunk's document_id field)",
-        }
+    parsed = _parse_uuid(document_id)
+    if parsed is None:
+        return {**envelope, "document": None, "error": _DOCUMENT_ID_MESSAGE}
     rows = await repo.fetch_all(tables.documents, tables.documents.c.id == parsed)
     if not rows:
         return {
