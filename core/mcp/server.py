@@ -425,10 +425,10 @@ def build_server(project: str) -> FastMCP:
     @server.tool()
     async def get_chunk(chunk_id: str) -> dict[str, Any]:
         """Exchange a chunk UUID for its TEXT (plus document provenance) —
-        the id of a chunk result or a relation evidence ref. Introspection
-        shape — NOT a §16 response. Entity mention refs
-        (chunk:{content_hash}:{ordinal}) are a different shape and not yet
-        resolvable."""
+        the id of a chunk result, a chunk evidence ref, or an entity chunk
+        mention citation (all carry chunk UUIDs since v1.1). Introspection
+        shape — NOT a §16 response. Row mention/evidence refs cite a
+        structured table+pk and are not accepted here."""
         rt = _rt()
         # parsing needs no store — reject a malformed id BEFORE the binding
         # opens one (Codex #125 r3: a store outage must not mask this error)
@@ -651,15 +651,15 @@ def _invalid_document_payload(project: str, document_id: str) -> dict[str, Any] 
 async def _get_chunk(repo: Any, project: str, chunk_id: str) -> dict[str, Any]:
     """§9 ``get_chunk``: chunk UUID → its text + provenance from the SoR.
 
-    THE citation-to-content path (MCP5): a relation's evidence ref and a
-    chunk result's id both carry a chunk UUID, and before this tool nothing
-    on the MCP surface could exchange one for the text it cites — citations
-    were decoration. Accepts only the UUID form; an entity MENTION ref
-    (``chunk:{content_hash}:{ordinal}``) is a different, currently
-    unresolvable shape (the MCP7 gap), and the error NAMES that instead of
-    a bare "invalid" so an agent holding one learns why it cannot be used.
-    Validation also runs pre-binding in the tool wrapper; it repeats here so
-    DIRECT callers of this helper get the same guarantee.
+    THE citation-to-content path (MCP5): a chunk result's id, a chunk
+    evidence ref, and — since v1.1 (MCP7) — an entity CHUNK mention
+    citation all carry chunk UUIDs this helper resolves; row mention/
+    evidence refs cite a structured table+pk and are not chunks. Accepts
+    only the UUID form: the raw ``chunk:{content_hash}:{ordinal}`` string
+    is the STORED mention format (never emitted since v1.1), and the error
+    NAMES that instead of a bare "invalid" so an agent holding a stale one
+    learns why it cannot be used. Validation also runs pre-binding in the
+    tool wrapper; it repeats here so DIRECT callers get the same guarantee.
     """
     envelope = {"project": project, "build_id": str(repo.build_id), "chunk_id": chunk_id}
     parsed = _parse_uuid(chunk_id)
