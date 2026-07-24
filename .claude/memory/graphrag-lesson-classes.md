@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: d673e708-e836-4b8a-8fc7-cb33527c5fc3
-  modified: 2026-07-24T05:40:39.586Z
+  modified: 2026-07-24T08:13:59.934Z
 ---
 
 # 使用方式(step 8 / prep 協定)
@@ -54,7 +54,7 @@ Schema/DDL 只驗結構不驗值=漏洞:每欄位要 type/range/length/non-empty
 Meta-rule 不得自相矛盾——驗證每個被允許的分支都能產出規則要求的證據;業務規則單一來源。寫服務既有概念的查詢前,先 grep 既定述詞(別重新發明佇列定義,#59)。新建 diff/path gate 前先讀在庫 sibling gate(push gate、governance-check)的旗標與模式——#111 兩輪 Codex(rename 摺疊要 `--no-renames`、capture-first 防 SIGPIPE)全是 sibling 已解教訓的重導輪。
 
 **Class 4 — 工具語意實測**(何時比對:依賴 CLI/API/庫的邊緣行為)[prose;宣稱須執行驗證]
-rename folding、分頁預設、text≠value、locale、statement_timeout 範圍、accessible-name 計算——先實測再依賴。對「工具預設值」的宣稱同樣要對**安裝的 dist** 驗證:vitest maxWorkers 預設是 `max(cores-1,1)` 非 per-core,「CI 不受影響」的推理錯了兩輪、修正措辭又寫回舊詞一輪(#114;本地 codex 直接 rg 進 node_modules 查實作裁決)。時鐘**穩定度等級**(txn/statement/call)是正確性契約的一部分:PG `now()` 是 transaction-stable,逐決策序要 `clock_timestamp()`(#59);排序時戳單一時鐘源,絕不混 app clock(#38)。asyncio.timeout 只在 await 邊界搶佔——純 CPU 掃描要注入檢查點(#89);邊界規則按書寫系統分派(Latin 詞界/CJK 包含;isalnum 對 CJK 誤判,#89)。「anchor」的同秒 tie 語意分兩種:anchor 是對話方=回覆(未處理);anchor 是事件自身時戳=自己(已處理)(#29/#90)。截斷識別字只對 opaque 定寬域安全;複合/變長 id 顯示全長(#69)。FastAPI sync-def dep 走 threadpool→check-then-set 不原子,用 async def(#57)。
+rename folding、分頁預設、text≠value、locale、statement_timeout 範圍、accessible-name 計算——先實測再依賴。對「工具預設值」的宣稱同樣要對**安裝的 dist** 驗證:vitest maxWorkers 預設是 `max(cores-1,1)` 非 per-core,「CI 不受影響」的推理錯了兩輪、修正措辭又寫回舊詞一輪(#114;本地 codex 直接 rg 進 node_modules 查實作裁決)。時鐘**穩定度等級**(txn/statement/call)是正確性契約的一部分:PG `now()` 是 transaction-stable,逐決策序要 `clock_timestamp()`(#59);排序時戳單一時鐘源,絕不混 app clock(#38)。asyncio.timeout 只在 await 邊界搶佔——純 CPU 掃描要注入檢查點(#89);邊界規則按書寫系統分派(Latin 詞界/CJK 包含;isalnum 對 CJK 誤判,#89)。「anchor」的同秒 tie 語意分兩種:anchor 是對話方=回覆(未處理);anchor 是事件自身時戳=自己(已處理)(#29/#90)。截斷識別字只對 opaque 定寬域安全;複合/變長 id 顯示全長(#69)。FastAPI sync-def dep 走 threadpool→check-then-set 不原子,用 async def(#57)。**可行性實測要含邊界 battery**(#124):簡單 battery(語意上遠離的 IN/OOD)給出假可分性(門檻完美分開),加入「措辭泛化的域內」與「主題鄰近的域外」邊界查詢後才現形不可分——先設計會讓假設失敗的案例,再下可行性結論。
 
 **Class 5 — 檢查者/消費者分岔**(何時比對:寫任何「檢查」「鏡像」「fixture」)[pattern:共用述詞/共用語料]
 Checker 探測的≠consumer 實際做的——checker 參數從 consumer 原始碼導出;資料交接完整性(skip 分支掉交接,#22);list-vs-detail 欄位、fresh-DB CI vs 有料 DB。定義重用要掃**每一軸**(述詞、scope、排序——統一一軸≠統一定義,#62);共用 helper 擁有不變量,surface 綁定的教訓不會轉移到晚生 surface(#60);指向環境的 fixture 要**自我驗證**(斷言解析後設定真指向宣稱處,#91);fixture 須供給被檢查的性質(#35);rowcount 當正確性輸入→兩端都驗(n 與 0,#100);多型契約值的 consumer 先讀**所有** producer 的發射面(#88);hermetic 假件按 prompt 前綴分派、skip-only 契約證明(CI 無鑰綠+本地真跑,#49;兩 lane 紀律見 [[graphrag-ba-real-llm]]);api 端點與 CLI 警告要對同一問題(廣告位址)給同一答案→共用 resolver 抽到 core(#113:CLI 曾自算並報錯位址);config-value pin 探測的是**原始 config 文本**、consumer 吃的是**解析後值**——分岔面要逐一補 guard:truthiness 解析(0=缺席=退回預設)、env var 在 config 解析後無條件覆寫(pin 恆綠、pool 卻跑 16)、空字串 env=未設(guard 要鏡射 runtime 真值判定,否則誤紅)(#114)。
@@ -137,7 +137,7 @@ Mutation 回呼綁在會瞬時 re-key/unmount 的元件上=靜默蒸發——完
 FE dossier 必須讀到 worker 實際消費層(connectors/stages/config),不只 api/schemas;run-gate 判準=「會不會讀操作者登記的路徑」,不是「不會失敗」(#70)。
 
 **Class 32 — 警告/註記必須攜帶主體身分**(何時比對:發任何描述「部分結果」的 warning;該回應會被下游 fuse/filter/裁切時)[pattern:builder/parser 同居 helper(refs_cap_warning/capped_report_id 模式)]
-聚合式警告(「N 筆被省略」)在回應被下游裁切後會與其主體脫鉤——主體被裁掉、警告留著=對倖存結果的錯誤指控。#123 r2–r4 三輪同一類:LOW_CONFIDENCE 全裁才丟(r2)→refs-cap 用 len>=cap 代理(r3)→代理殘角被反例擊穿(r4),最終解=警告訊息**具名主體 id**,下游按 provenance 精確過濾。兩個判準:(1) 修警告洩漏時第一問「警告能不能直接指名主體」——代理修法(存在性/長度/計數)每個都招來下一輪反例,provenance 一步到位;(2) **凍結 schema 只限制結構、不限制訊息內容**——身分可以放訊息文字裡,builder 與 parser 相鄰同居(訊息形狀單一擁有者)+ round-trip 測試釘住。同 class:訊息宣稱的復原管道必須真的存在(r1「membership 可由 entities 查回」查無 endpoint→撤)。
+聚合式警告(「N 筆被省略」)在回應被下游裁切後會與其主體脫鉤——主體被裁掉、警告留著=對倖存結果的錯誤指控。#123 r2–r4 三輪同一類:LOW_CONFIDENCE 全裁才丟(r2)→refs-cap 用 len>=cap 代理(r3)→代理殘角被反例擊穿(r4),最終解=警告訊息**具名主體 id**,下游按 provenance 精確過濾。兩個判準:(1) 修警告洩漏時第一問「警告能不能直接指名主體」——代理修法(存在性/長度/計數)每個都招來下一輪反例,provenance 一步到位;(2) **凍結 schema 只限制結構、不限制訊息內容**——身分可以放訊息文字裡,builder 與 parser 相鄰同居(訊息形狀單一擁有者)+ round-trip 測試釘住。同 class:訊息宣稱的復原管道必須真的存在(r1「membership 可由 entities 查回」查無 endpoint→撤);**#124 r1→r2 同病連發**:修死指引時換上的新指引(get_entity)自己也是死路(只回 id+mention ref、無文字、MCP 無取回工具)——指引裡指名的每條路徑都要**讀它的實際回傳形狀**驗證可走,走不通就直說「目前不可」;手法=absence pin(`"get_entity" not in description`)+ 註解記反轉條件(MCP5/MCP7 落地時改指新工具)。
 
 **Class 31 — continuation token 釘全結果集身分**(何時比對:mint 任何 cursor/token/resume 句柄)[pattern:scope-fingerprint helper]
 Keyset cursor=某結果集內的位置;tag 必須釘住**定義該結果集的一切**:sort、q、filters(含宣告型別——schema 可改型使同 raw 值換 predicate)、active build(DR-001/DR-006 跨版不混)。漏一軸=該軸變更後舊 anchor 靜默套新結果集(跳列/重複/跨版混資料)。#120 R8/R9/R10 三輪各補一軸(predicates→build→declared type)——開工時列全軸清單一次做完,別等 reviewer 逐軸擠。fingerprint=正規化 JSON 的 sha256 前綴;raw 拼寫入 fp=寧過拒不漏拒;錯誤訊息 class 級(fp 亂碼不回顯);legacy 無 tag cursor 顯式豁免並註記老化自閉;sibling 未修面(relations/review)入 followups 帳。同型教訓的檔案面(#121 五輪各補一格):**檔案突變工具開工即列兩張矩陣**——crash 矩陣={每個寫入點中斷}×{重跑行為}(冪等、原子 swap、torn marker、body 驗證各一格),gate 覆蓋矩陣={每種 CI 事件}×{gate 是否真的跑}(PR-only gate 錯過 doc-lane push);逐格自查一次做完,別等 reviewer 五輪逐格擠。
