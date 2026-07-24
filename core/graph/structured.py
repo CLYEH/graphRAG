@@ -75,7 +75,10 @@ def split_row_source_ref(ref: str) -> tuple[str, str] | None:
     # promises the uncitable drop. A legitimate prefix is len(table), two
     # digits at most under Postgres's 63-byte identifier limit; 9 mirrors
     # the chunk-ordinal bound.
-    if not sep or not head.isdigit() or len(head) > 9:
+    # isascii() first (Codex #127 r3 sibling): isdigit() accepts Unicode
+    # digits (١), which int() happily converts — a corrupt ref would split
+    # into a (table, pk) the writer never encoded instead of dropping
+    if not sep or not head.isascii() or not head.isdigit() or len(head) > 9:
         return None
     length = int(head)
     if len(rest) < length + 1 or rest[length] != ":":

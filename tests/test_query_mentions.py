@@ -65,6 +65,10 @@ def test_the_stored_ref_parses_strictly() -> None:
     assert parse_chunk_mention_ref("chunk:aa11bb22cc:1234567890") is None
     assert parse_chunk_mention_ref("chunk:aa11bb22cc:" + "9" * 5000) is None
     assert parse_chunk_mention_ref("chunk:aa11bb22cc:999999999") == ("aa11bb22cc", 999999999)
+    # Codex #127 r3: \d matches Unicode digits — ١ would int() to 1 and CITE
+    # a chunk the stored writer-format ref never identified (worse than a
+    # crash: a wrong citation); ASCII-only [0-9] drops it
+    assert parse_chunk_mention_ref("chunk:aa11bb22cc:١") is None
     assert parse_chunk_mention_ref("") is None
     assert parse_chunk_mention_ref(cast(Any, None)) is None
 

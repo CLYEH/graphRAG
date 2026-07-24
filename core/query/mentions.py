@@ -36,12 +36,14 @@ from core.stores.repo import BuildScopedRepo
 
 #: ``chunk:{content_hash}:{ordinal}`` — the writer's fixed-width-hex hash
 #: guarantees the ``:`` separators cannot collide (core/graph/documents.py).
-#: The ordinal is BOUNDED at 9 digits (Codex #127 r2): an unbounded ``\d+``
+#: The ordinal is ASCII-ONLY ``[0-9]`` (Codex #127 r3: ``\d`` matches
+#: Unicode digits — ``١`` would int() to 1 and cite a chunk the stored ref
+#: never identified) and BOUNDED at 9 digits (r2): an unbounded ``\d+``
 #: let a corrupt ref raise instead of dropping — ``int()`` fails past
 #: CPython's digit limit and anything over 2^31-1 fails at the Postgres
 #: INTEGER bind; 9 digits stays inside both, and the writer's real ordinals
 #: are tiny.
-_CHUNK_MENTION_RE = re.compile(r"^chunk:([0-9a-f]{8,}):(\d{1,9})$")
+_CHUNK_MENTION_RE = re.compile(r"^chunk:([0-9a-f]{8,}):([0-9]{1,9})$")
 
 
 def parse_chunk_mention_ref(ref: str) -> tuple[str, int] | None:
