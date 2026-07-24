@@ -257,13 +257,13 @@ async def test_global_results_always_carry_the_not_query_matched_warning() -> No
 async def test_report_refs_are_capped_with_the_omission_named() -> None:
     """MCP3: a 58-member community expanded to 58 uuid refs and source_refs
     became 83% of a hybrid payload. Section 27.2 needs >=1 grounded ref, not
-    the roster - cap at _REFS_CAP deterministically and NAME the omitted
+    the roster - cap at REFS_CAP deterministically and NAME the omitted
     count: a silent cap would read as the full membership.
     """
     members = [uuid.uuid4() for _ in range(20)]
     response = await _run([_report(1.0, member_ids=list(members))], top_k=5)
     (result,) = response.results
-    assert len(result.source_refs) == 8  # _REFS_CAP
+    assert len(result.source_refs) == 8  # REFS_CAP
     expected = tuple(str(m) for m in sorted(members, key=str)[:8])
     assert tuple(r.id for r in result.source_refs) == expected
     capped = [w for w in response.warnings if "capped" in w.message]
@@ -297,7 +297,7 @@ async def test_a_beyond_top_k_report_never_charges_its_capped_refs_to_the_page()
 async def test_duplicate_member_ids_are_one_member_not_many() -> None:
     """Codex #123 r2: member_entity_ids permits repeated uuids (bare array,
     no uniqueness constraint) — counting repeats minted identical refs, spent
-    the _REFS_CAP on copies, and crowded real members out of the citation:
+    the REFS_CAP on copies, and crowded real members out of the citation:
     eight copies of the lexically smallest id + one other member cited eight
     identical refs and dropped the other member entirely. A duplicate is the
     SAME member — cite the distinct set, uncapped.

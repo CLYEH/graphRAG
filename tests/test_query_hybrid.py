@@ -21,6 +21,7 @@ import jsonschema
 import pytest
 
 import core.query.hybrid as hybrid_module
+from core.query.global_reports import REFS_CAP, REFS_CAP_MESSAGE
 from core.query.graph import GraphQueryParams
 from core.query.hybrid import HybridDeps, HybridPolicy, _fuse, hybrid_query
 from core.query.policy import (
@@ -347,6 +348,49 @@ async def test_globals_low_confidence_dies_with_its_reports_in_fusion(
     assert any(r.result_type == "community_report" for r in kept.results)
     low = [w for w in kept.warnings if w.code == "LOW_CONFIDENCE"]
     assert len(low) == 1 and low[0].message.startswith("[global]")
+
+
+async def test_globals_refs_cap_warning_needs_a_surviving_report_at_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #123 r3: the [global] refs-cap TRUNCATED claims "N ref(s)
+    omitted across the returned results" — false whenever fusion clips every
+    capped report off the page. A capped report always carries exactly
+    REFS_CAP refs, so the warning must not outlive the last at-cap report on
+    the fused page."""
+    cap_warning = QueryWarning(
+        "TRUNCATED", f"{REFS_CAP_MESSAGE} — 12 ref(s) omitted across the returned results (§22)"
+    )
+
+    def _entity_refs(count: int) -> tuple[SourceRef, ...]:
+        return tuple(SourceRef(source_type="entity", id=str(uuid.uuid4())) for _ in range(count))
+
+    _patch_modes(
+        monkeypatch,
+        semantic=_mode_response("semantic_search", _result(rid="a-hit")),
+        global_=_mode_response(
+            "global_summary",
+            _result(result_type="community_report", rid="b-rep", source_refs=_entity_refs(2)),
+            _result(
+                result_type="community_report", rid="z-rep", source_refs=_entity_refs(REFS_CAP)
+            ),
+            warnings=(cap_warning,),
+        ),
+    )
+    # top_k=2 keeps "a-hit" + "b-rep" (both rank 1 → id ASC) — a report
+    # survives, but BELOW the cap: no returned result was capped, so the
+    # warning goes (dropping only when zero reports survive would keep it)
+    below_cap = await _run(_deps(), _policy(top_k=2))
+    assert [r.id for r in below_cap.results] == ["a-hit", "b-rep"]
+    assert not any(
+        w.message.startswith("[global] community_report source_refs") for w in below_cap.warnings
+    )
+
+    # the at-cap report on the page is what makes the warning true — kept
+    kept = await _run(_deps(), _policy(top_k=10))
+    assert any(len(r.source_refs) >= REFS_CAP for r in kept.results)
+    capped = [w for w in kept.warnings if "source_refs capped" in w.message]
+    assert len(capped) == 1 and capped[0].message.startswith("[global]")
 
 
 async def test_fusion_merges_duplicates_and_ranks_by_rrf() -> None:

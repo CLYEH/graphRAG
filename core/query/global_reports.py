@@ -119,9 +119,8 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
         warnings.append(
             QueryWarning(
                 "TRUNCATED",
-                f"community_report source_refs capped at {_REFS_CAP} grounded member "
-                f"refs each — {refs_capped} ref(s) omitted across the returned "
-                "results (§22)",
+                f"{REFS_CAP_MESSAGE} — {refs_capped} ref(s) omitted across the "
+                "returned results (§22)",
             )
         )
     if emitted:
@@ -149,7 +148,12 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
 #: source_refs became 83% of a hybrid payload. Deterministic first-N of the
 #: sorted grounded members; the response carries a TRUNCATED warning naming
 #: the omitted count so the cap is never mistaken for the full membership.
-_REFS_CAP = 8
+REFS_CAP = 8
+
+#: The refs-cap warning's message prefix — public because hybrid_query matches
+#: on it to drop the warning when fusion leaves no report at the cap on the
+#: fused page (a capped report always carries exactly REFS_CAP refs).
+REFS_CAP_MESSAGE = f"community_report source_refs capped at {REFS_CAP} grounded member refs each"
 
 #: Grounding lookups run in batches of this many ids per query: the IN
 #: predicate binds one parameter per id, and PostgreSQL's extended protocol
@@ -186,7 +190,7 @@ def _report_result(row: Any, known: set[Any]) -> tuple[RetrievalResult | None, i
     nullable display fields — emitted as-is when strings, null otherwise
     (§16 allows null; no coerced reprs).
 
-    Refs are CAPPED at ``_REFS_CAP`` (MCP3): a large community claims dozens
+    Refs are CAPPED at ``REFS_CAP`` (MCP3): a large community claims dozens
     of members (58 measured), and expanding every uuid made source_refs 83%
     of a hybrid payload — noise an agent pays for on every call. §27.2 needs
     ≥1 grounded ref, not the roster; the cap keeps the first N in the same
@@ -201,9 +205,9 @@ def _report_result(row: Any, known: set[Any]) -> tuple[RetrievalResult | None, i
     if not members:
         return None, bad_refs, 0
     grounded = sorted(members, key=str)
-    capped = max(0, len(grounded) - _REFS_CAP)
+    capped = max(0, len(grounded) - REFS_CAP)
     refs = tuple(
-        SourceRef(source_type="entity", id=str(entity_id)) for entity_id in grounded[:_REFS_CAP]
+        SourceRef(source_type="entity", id=str(entity_id)) for entity_id in grounded[:REFS_CAP]
     )
     title = row.title if isinstance(row.title, str) and row.title.strip() else None
     summary = row.summary if isinstance(row.summary, str) and row.summary.strip() else None

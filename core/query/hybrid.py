@@ -39,7 +39,7 @@ from typing import Any
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.llms import LLM, ChatMessage, MessageRole
 
-from core.query.global_reports import global_summary
+from core.query.global_reports import REFS_CAP, REFS_CAP_MESSAGE, global_summary
 from core.query.graph import GraphQueryParams, graph_query
 from core.query.linking import GraphPlan, plan_graph_query
 from core.query.policy import TextToCypher, TextToSql
@@ -239,7 +239,8 @@ async def hybrid_query(
         [mode_responses[mode].results for mode in _MODE_ORDER if mode in mode_responses],
         policy.top_k,
     )
-    if not any(result.result_type == "community_report" for result in fused):
+    reports = [result for result in fused if result.result_type == "community_report"]
+    if not reports:
         # MCP3: the global mode's LOW_CONFIDENCE qualifies COMMUNITY REPORTS
         # (rating-ranked, never query-matched). When fusion clips every report
         # off the page, the warning would instead indict the surviving
@@ -248,6 +249,19 @@ async def hybrid_query(
             w
             for w in warnings
             if not (w.code == "LOW_CONFIDENCE" and w.message.startswith("[global]"))
+        ]
+    if not any(len(report.source_refs) >= REFS_CAP for report in reports):
+        # Same rule for the refs-cap TRUNCATED (Codex #123 r3): a capped report
+        # always carries exactly REFS_CAP refs, so a fused page with no report
+        # at the cap cannot contain that warning's subject — "refs omitted
+        # across the returned results" would be false. (The response does not
+        # say WHICH reports were capped, so an at-cap survivor keeps the
+        # warning even if the actually-capped report was clipped — the closest
+        # honest proxy the §16 contract allows.)
+        warnings = [
+            w
+            for w in warnings
+            if not (w.code == "TRUNCATED" and w.message.startswith(f"[global] {REFS_CAP_MESSAGE}"))
         ]
     if truncated:
         warnings.append(
