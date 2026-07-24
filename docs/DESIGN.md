@@ -141,7 +141,7 @@ pipeline_step_items(id uuid pk, step_id uuid, item_kind text, item_ref text,  --
 | graph | Neo4j | 多跳/路徑；NL→Cypher（§21 guardrail） |
 | sql | Postgres | NLSQLTableQueryEngine（唯讀角色、白名單、§21） |
 | global | Postgres | community_reports |
-| hybrid | router | RouterQueryEngine 選擇+融合，產 routing trace（§16） |
+| hybrid | router | 決定性 fan-out(semantic+graph+sql,無 LLM selector——MCP8 實測 selector 1,525ms 且為漏選元兇)+RRF 融合(`confidence`=來源模態原始分數);global 不融合(未經查詢比對,MCP3/MCP8——corpus overview 走 global_summary,每呼叫 MODE_SKIPPED 明示);產 routing trace(§16) |
 
 ## 9. MCP 介面（每專案一 server,經單一 gateway 供應）
 工具：`semantic_search` · `graph_query` · `global_summary` · `sql_query` · `hybrid_query`（預設入口）· `get_entity` · `get_chunk` · `get_document`（MCP5:引用→原文的取回路徑;自省形狀,非 §16）· `list_schema` · `explain_retrieval`。所有 retrieval 工具回傳統一 contract（§16），查詢綁定 active build。Transport 🔧 stdio/http。**DR-012（CFG1）**:HTTP 供應形狀=`graphrag serve-mcp` 單一 gateway process,每專案一個「邏輯」server 實例掛於 `http://<host>:<port>/mcp/<project_name>`(一 port 多專案;registry 驅動 lazy mount——建完專案免重啟即可連);query_policy/metadata_exposure 一律讀 registry `projects.config`(單一 SoR,廢除 `projects/<name>/config.yaml` 與每專案手寫 entrypoint);gateway 無 auth(§23 placeholder,限內網/tunnel)。
@@ -241,7 +241,7 @@ graphRAG/
 - 投影 drift：Health 標示，`graphrag reproject <project> <build>` 重建投影。
 - build 中途失敗：`failed`，active 不受影響。
 - query 逾時：回部分結果 + warning，不 500。
-- **域外問題不發 LOW_CONFIDENCE(v1 刻意不提供;MCP4 2026-07-24 實測定案)**:semantic/hybrid 對「語料答不出的問題」不從分數發警告——cosine 量的是主題鄰近不是可答性,實測(nmmst)無任何門檻可分:域外「海洋大學的入學申請」top1 0.6144 **高於**域內「從台北怎麼去」0.4992/「開放時間」0.5065/「適合小孩嗎」0.5176;gap/mean 同樣不可分。錯誤的 LOW_CONFIDENCE(把答得出的問題標低信心)比沒有更糟;LLM 可答性判準因每查詢加一次 LLM 延遲(與 MCP8 方向相反)不採。`LOW_CONFIDENCE` 僅由 `global_summary` 發出(語意:結果未經查詢比對,MCP3);`confidence` 欄位維持不填。工具描述已誠實聲明「分數是回應內排序,不是可答性」。重啟條件:真正的 relevance model(非裸分數門檻)。
+- **域外問題不發 LOW_CONFIDENCE(v1 刻意不提供;MCP4 2026-07-24 實測定案)**:semantic/hybrid 對「語料答不出的問題」不從分數發警告——cosine 量的是主題鄰近不是可答性,實測(nmmst)無任何門檻可分:域外「海洋大學的入學申請」top1 0.6144 **高於**域內「從台北怎麼去」0.4992/「開放時間」0.5065/「適合小孩嗎」0.5176;gap/mean 同樣不可分。錯誤的 LOW_CONFIDENCE(把答得出的問題標低信心)比沒有更糟;LLM 可答性判準因每查詢加一次 LLM 延遲(與 MCP8 方向相反)不採。`LOW_CONFIDENCE` 僅由 `global_summary` 發出(語意:結果未經查詢比對,MCP3);`confidence` 欄位自 MCP8 起由 hybrid 填入**來源模態原始分數**(模態內可比、跨模態不可比;semantic=真 cosine)——這是 provenance,不是可答性判準,域外訊號的不可行結論不變。工具描述已誠實聲明「分數是回應內排序,不是可答性」。重啟條件:真正的 relevance model(非裸分數門檻)。
 
 ## 23. 角色與權限
 單一 principal（本機/單人），介面預留：所有 API `Depends(auth) → Principal{id, roles}`。角色草案 `viewer|curator|operator|admin`；動作→角色集中於 policy 表。接真實 auth 只換 `auth` 實作。🟡 多人 auth 方案。

@@ -72,16 +72,15 @@ def _model_identity() -> dict[str, str]:
 def models_needed(golden: GoldenSet, policy: QueryPolicy) -> tuple[bool, bool]:
     """(needs_embedder, needs_llm) for this golden set UNDER this policy —
     graph/global cases touch neither model client; semantic needs only the
-    embedder; hybrid needs both (its selector prompts the LLM and its
-    semantic mode embeds; semantic+global are never gated, so the selector
-    is always consulted). An ``sql`` case needs the LLM only when the
-    policy actually ENABLES text_to_sql — disabled, sql_query returns
-    MODE_SKIPPED before touching the model, and a keyless project must
-    still be able to score and persist that (failing) report rather than
-    be refused into staying unscored."""
+    embedder. Since MCP8 removed hybrid's LLM selector, hybrid consults the
+    LLM only through its sql mode — so BOTH hybrid and sql cases need the
+    LLM exactly when the policy ENABLES text_to_sql; disabled, the sql mode
+    is gated (MODE_SKIPPED) before touching the model, and a keyless
+    project must still be able to score and persist that report rather
+    than be refused into staying unscored."""
     needs_embedder = any(case.mode in ("semantic", "hybrid") for case in golden.cases)
-    needs_llm = any(case.mode == "hybrid" for case in golden.cases) or (
-        policy.text_to_sql.enabled and any(case.mode == "sql" for case in golden.cases)
+    needs_llm = policy.text_to_sql.enabled and any(
+        case.mode in ("hybrid", "sql") for case in golden.cases
     )
     return needs_embedder, needs_llm
 

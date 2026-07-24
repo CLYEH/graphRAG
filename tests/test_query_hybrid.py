@@ -1,11 +1,12 @@
-"""Why: hybrid_query is §9's default entry — one question fanned across four
-modes, fused, traced. What must hold: the selector's untrusted answer can
-gate NOTHING silently (any failure → every available mode runs, §22 breadth
-over silence), policy/parameter gating happens before selection, one mode's
-crash degrades to the remaining modes (§22 verbatim), fusion is deterministic
-rank-based merging (mode scores are incomparable), the trace tells the truth
-about what ran, and the debug block obeys expose_debug. Every response is
-validated against the frozen §16 schema — including the debug shape.
+"""Why: hybrid_query fans one question across the three fused modes
+(semantic/graph/sql) DETERMINISTICALLY (MCP8: the LLM selector is gone —
+every available mode runs, always; global is never fused and the skip is
+said). What must hold: policy/parameter gating is surfaced, one mode's crash
+degrades to the remaining modes (§22 verbatim), fusion is deterministic
+rank-based merging with the origin mode's raw score preserved in confidence,
+the trace tells the truth about what ran, and the debug block obeys
+expose_debug. Every response is validated against the frozen §16 schema —
+including the debug shape.
 """
 
 from __future__ import annotations
@@ -21,7 +22,6 @@ import jsonschema
 import pytest
 
 import core.query.hybrid as hybrid_module
-from core.query.global_reports import refs_cap_warning
 from core.query.graph import GraphQueryParams
 from core.query.hybrid import HybridDeps, HybridPolicy, _fuse, hybrid_query
 from core.query.mentions import mention_warnings
@@ -70,7 +70,7 @@ def _deps(llm: _FakeLLM | None = None, graph_build: uuid.UUID = _BUILD) -> Hybri
         embedder=cast(Any, object()),
         sql_reader=cast(Any, _Scoped()),
         graph=cast(Any, _Scoped(build_id=graph_build)),
-        llm=cast(Any, llm or _FakeLLM(_pick_all())),
+        llm=cast(Any, llm or _FakeLLM()),
     )
 
 
@@ -102,10 +102,6 @@ def _policy(
         expose_debug=expose_debug,
         max_latency_ms=max_latency_ms,
     )
-
-
-def _pick_all() -> str:
-    return json.dumps({"modes": ["semantic", "graph", "sql", "global"], "reason": "run everything"})
 
 
 def _result(result_type: str = "chunk", rid: str | None = None, **kwargs: Any) -> RetrievalResult:
@@ -147,11 +143,11 @@ def _patch_modes(
     semantic: Any = None,
     graph: Any = None,
     sql: Any = None,
-    global_: Any = None,
 ) -> dict[str, list[Any]]:
-    """Replace the four mode functions; record calls. A value of None installs
-    an empty-result stub; an Exception instance installs a raiser."""
-    calls: dict[str, list[Any]] = {"semantic": [], "graph": [], "sql": [], "global": []}
+    """Replace the three fused mode functions; record calls. A value of None
+    installs an empty-result stub; an Exception instance installs a raiser.
+    (global is NOT fused since MCP8 — hybrid never calls it.)"""
+    calls: dict[str, list[Any]] = {"semantic": [], "graph": [], "sql": []}
 
     def _install(name: str, target: str, canned: Any, maker: Any) -> None:
         async def stub(*args: Any, **kwargs: Any) -> McpResponse:
@@ -165,7 +161,6 @@ def _patch_modes(
     _install("semantic", "semantic_search", semantic, lambda: _mode_response("semantic_search"))
     _install("graph", "graph_query", graph, lambda: _mode_response("graph_query"))
     _install("sql", "sql_query", sql, lambda: _mode_response("sql_query"))
-    _install("global", "global_summary", global_, lambda: _mode_response("global_summary"))
     return calls
 
 
@@ -203,79 +198,44 @@ async def test_an_out_of_contract_top_k_degrades_typed(
     assert response.results == () and _codes(response) == ["GUARDRAIL_BLOCKED"]
 
 
-async def test_the_selector_narrows_and_the_trace_tells_the_truth(
+async def test_every_available_mode_runs_and_no_llm_is_consulted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A valid selection runs ONLY those modes; the routing trace reports
-    selected vs skipped (gated + unselected) with the selector's reason."""
+    """MCP8 REVERSED the v1 LLM-selector pins that stood here (narrowing,
+    eight broken-answer fallbacks, raising-selector fallback): selection is
+    now DETERMINISTIC — every available mode runs, the LLM is never asked
+    (measured: the selector cost 1,525ms, half the hybrid latency, and its
+    under-selection was the top quality defect; its any-failure fallback was
+    the better behavior all along). The trace says so, and global is always
+    listed skipped (not fused — MCP3's not-query-matched rule)."""
     calls = _patch_modes(monkeypatch)
-    llm = _FakeLLM(json.dumps({"modes": ["semantic", "global"], "reason": "topical question"}))
+    llm = _FakeLLM(json.dumps({"modes": ["semantic"], "reason": "should never be read"}))
     response = await _run(_deps(llm), _policy())
-    assert len(calls["semantic"]) == 1 and len(calls["global"]) == 1
-    assert calls["sql"] == [] and calls["graph"] == []
+    assert llm.calls == 0  # the selector is GONE, not just ignored
+    assert all(len(calls[mode]) == 1 for mode in ("semantic", "graph", "sql"))
     assert response.debug is not None
     decision = response.debug["routing_decision"]
-    assert decision["selected"] == ["semantic", "global"]
-    assert sorted(decision["skipped"]) == ["graph", "sql"]
-    assert decision["reason"] == "topical question"
+    assert decision["selected"] == ["semantic", "graph", "sql"]
+    assert "global" in decision["skipped"]
+    assert "deterministic fan-out" in decision["reason"]
 
 
-@pytest.mark.parametrize(
-    "answer",
-    [
-        "not json",
-        json.dumps(["a", "list"]),
-        json.dumps({"reason": "no modes field"}),
-        json.dumps({"modes": "semantic", "reason": "wrong type"}),
-        json.dumps({"modes": [1, 2], "reason": "wrong item types"}),
-        json.dumps({"modes": ["teleport"], "reason": "out of vocabulary"}),
-        json.dumps({"modes": ["semantic", "teleport"], "reason": "MIXED valid + hallucinated"}),
-        json.dumps({"modes": [], "reason": "empty"}),
-    ],
-)
-async def test_a_broken_selector_runs_every_available_mode(
-    monkeypatch: pytest.MonkeyPatch, answer: str
-) -> None:
-    """The selector's answer is UNTRUSTED (C3b): any failure — parse, shape,
-    out-of-vocabulary, empty — must widen to every available mode, never
-    silently drop one (§22: breadth over silence)."""
-    calls = _patch_modes(monkeypatch)
-    response = await _run(_deps(_FakeLLM(answer)), _policy())
-    assert all(len(calls[mode]) == 1 for mode in ("semantic", "graph", "sql", "global"))
-    assert response.debug is not None
-    assert sorted(response.debug["routing_decision"]["selected"]) == [
-        "global",
-        "graph",
-        "semantic",
-        "sql",
-    ]
-
-
-async def test_a_raising_selector_also_runs_everything(
+async def test_gated_modes_are_surfaced_with_reasons(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Policy/parameter gating: a disabled sql mode and a graph mode without
+    params are skipped with reasons (MODE_SKIPPED) — and since MCP8 global
+    is ALWAYS in the skipped set (not fused; the reason points the agent at
+    global_summary for corpus overview)."""
     calls = _patch_modes(monkeypatch)
-    response = await _run(_deps(_FakeLLM(raise_exc=RuntimeError("llm down"))), _policy())
-    assert all(len(calls[mode]) == 1 for mode in ("semantic", "graph", "sql", "global"))
-    assert response.debug is not None
-    assert "selector failed" in response.debug["routing_decision"]["reason"]
-
-
-async def test_gated_modes_never_reach_the_selector_and_are_surfaced(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Policy/parameter gating happens BEFORE selection: a disabled sql mode
-    and a graph mode without params are skipped with reasons (MODE_SKIPPED)
-    and the selector cannot pick them."""
-    calls = _patch_modes(monkeypatch)
-    llm = _FakeLLM(_pick_all())
-    response = await _run(_deps(llm), _policy(sql_enabled=False), graph_params=None)
+    response = await _run(_deps(), _policy(sql_enabled=False), graph_params=None)
     assert calls["sql"] == [] and calls["graph"] == []
     skipped_warnings = [w.message for w in response.warnings if w.code == "MODE_SKIPPED"]
     assert any("sql mode skipped" in m for m in skipped_warnings)
     assert any("graph mode skipped" in m for m in skipped_warnings)
+    assert any("global_summary" in m for m in skipped_warnings)  # the real path
     assert response.debug is not None
-    assert sorted(response.debug["routing_decision"]["skipped"]) == ["graph", "sql"]
+    assert sorted(response.debug["routing_decision"]["skipped"]) == ["global", "graph", "sql"]
 
 
 async def test_a_crashing_mode_degrades_to_the_remaining_modes(
@@ -288,7 +248,7 @@ async def test_a_crashing_mode_degrades_to_the_remaining_modes(
     _patch_modes(
         monkeypatch,
         semantic=RuntimeError("qdrant refused"),
-        global_=_mode_response("global_summary", keeper),
+        sql=_mode_response("sql_query", keeper),
     )
     response = await _run(_deps(), _policy())
     assert [r.id for r in response.results] == ["kept"]
@@ -315,80 +275,25 @@ async def test_mode_warnings_are_aggregated_with_their_origin(
     assert any(w.message.startswith("[sql]") for w in truncs)
 
 
-async def test_globals_low_confidence_dies_with_its_reports_in_fusion(
+async def test_global_is_never_fused_and_the_skip_names_the_real_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex #123 r2: the global mode's LOW_CONFIDENCE qualifies COMMUNITY
-    REPORTS (rating-ranked, never query-matched). When fusion clips every
-    report off the page, propagating it anyway tells the agent the surviving,
-    query-matched results are unreliable — the warning must live and die with
-    its subjects."""
-    low_conf = QueryWarning("LOW_CONFIDENCE", "global results are ranked by community rating …")
-    _patch_modes(
-        monkeypatch,
-        semantic=_mode_response("semantic_search", _result(rid="a-hit")),
-        global_=_mode_response(
-            "global_summary",
-            _result(
-                result_type="community_report",
-                rid="z-report",
-                # §27.2/§16: a community_report result must cite entity refs
-                source_refs=(SourceRef(source_type="entity", id=str(uuid.uuid4())),),
-            ),
-            warnings=(low_conf,),
-        ),
+    """MCP8 REVERSED the MCP3-era fusion-filter pins that stood here (the
+    [global] LOW_CONFIDENCE and refs-cap warnings dying with their clipped
+    reports): global is no longer fused AT ALL — community reports are
+    rating-ranked corpus overview, never query-matched (MCP3's own finding),
+    and fusing them spent 3-5 page slots on results irrelevant to the
+    question. Every call SAYS so (MODE_SKIPPED naming global_summary — a
+    real path, #124), so the exclusion is never silent."""
+    calls = _patch_modes(
+        monkeypatch, semantic=_mode_response("semantic_search", _result(rid="hit"))
     )
-    # equal RRF (both rank 1) → id ASC tie-break: "a-hit" wins, the report is
-    # clipped by top_k=1 — no community_report on the page, no warning
-    clipped = await _run(_deps(), _policy(top_k=1))
-    assert [r.id for r in clipped.results] == ["a-hit"]
-    assert not any(w.code == "LOW_CONFIDENCE" for w in clipped.warnings)
-
-    # when the report DOES survive fusion, the warning survives with it
-    kept = await _run(_deps(), _policy(top_k=10))
-    assert any(r.result_type == "community_report" for r in kept.results)
-    low = [w for w in kept.warnings if w.code == "LOW_CONFIDENCE"]
-    assert len(low) == 1 and low[0].message.startswith("[global]")
-
-
-async def test_globals_refs_cap_warning_dies_when_the_named_report_is_clipped(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Codex #123 r4: the cap warning must track PROVENANCE, not a length
-    proxy — a COMPLETE report with exactly REFS_CAP refs surviving fusion
-    while the actually-capped report is clipped would keep a false "refs
-    omitted" claim under any len(source_refs)-based rule. The warning names
-    its report; it lives exactly as long as that report is on the fused
-    page."""
-    cap_warning = refs_cap_warning("z-capped", 12)
-
-    def _entity_refs(count: int) -> tuple[SourceRef, ...]:
-        return tuple(SourceRef(source_type="entity", id=str(uuid.uuid4())) for _ in range(count))
-
-    _patch_modes(
-        monkeypatch,
-        semantic=_mode_response("semantic_search", _result(rid="a-hit")),
-        global_=_mode_response(
-            "global_summary",
-            # b-full is COMPLETE at exactly REFS_CAP members — the length-proxy trap
-            _result(result_type="community_report", rid="b-full", source_refs=_entity_refs(8)),
-            _result(result_type="community_report", rid="z-capped", source_refs=_entity_refs(8)),
-            warnings=(cap_warning,),
-        ),
-    )
-    # top_k=2 keeps "a-hit" + "b-full" (rank-1 tie → id ASC; z-capped at
-    # rank 2 is clipped): the warning's named report is gone, so the warning
-    # goes too — even though an at-cap-length report survived
-    clipped = await _run(_deps(), _policy(top_k=2))
-    assert [r.id for r in clipped.results] == ["a-hit", "b-full"]
-    assert not any("source_refs capped" in w.message for w in clipped.warnings)
-
-    # the named report on the page is what makes the warning true — kept
-    kept = await _run(_deps(), _policy(top_k=10))
-    assert any(r.id == "z-capped" for r in kept.results)
-    capped = [w for w in kept.warnings if "source_refs capped" in w.message]
-    assert len(capped) == 1 and capped[0].message.startswith("[global]")
-    assert "z-capped" in capped[0].message
+    response = await _run(_deps(), _policy())
+    assert "global" not in calls  # the harness has no global seam left to call
+    assert all(r.result_type != "community_report" for r in response.results)
+    skip = [w for w in response.warnings if w.code == "MODE_SKIPPED" and "global" in w.message]
+    assert len(skip) == 1 and "global_summary" in skip[0].message
+    assert not any(w.code == "LOW_CONFIDENCE" for w in response.warnings)
 
 
 async def test_fusion_merges_duplicates_and_ranks_by_rrf() -> None:
@@ -437,40 +342,11 @@ async def test_debug_is_null_when_not_exposed(monkeypatch: pytest.MonkeyPatch) -
     assert response.to_dict()["debug"] is None
 
 
-async def test_a_single_available_mode_skips_the_selector(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """One available mode = nothing to select — the LLM is not consulted
-    (latency and an untrusted surface avoided for free)."""
-    calls = _patch_modes(monkeypatch)
-    llm = _FakeLLM(_pick_all())
-    monkeypatch.setattr(hybrid_module, "_MODE_ORDER", ("semantic",))
-    await _run(_deps(llm), _policy())
-    assert llm.calls == 0  # selector never consulted
-    assert len(calls["semantic"]) == 1
-
-
-async def test_a_mode_outside_the_offered_set_distrusts_the_whole_answer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The selector is TOLD the available set; naming a real-but-GATED mode is
-    the same non-compliance as a hallucinated one — the whole answer is
-    distrusted and every available mode runs (silently honoring the valid
-    half would narrow retrieval without a warning)."""
-    calls = _patch_modes(monkeypatch)
-    llm = _FakeLLM(json.dumps({"modes": ["semantic", "sql"], "reason": "sql is gated"}))
-    response = await _run(_deps(llm), _policy(sql_enabled=False))  # sql gated by policy
-    assert calls["sql"] == []  # the gate still holds absolutely
-    assert len(calls["semantic"]) == 1 and len(calls["graph"]) == 1 and len(calls["global"]) == 1
-    assert response.debug is not None
-    assert "unavailable mode" in response.debug["routing_decision"]["reason"]
-
-
 async def test_the_whole_call_shares_one_wall_clock_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """§21: max_latency_ms bounds the WHOLE hybrid call — per-mode DB timeouts
-    alone don't, because modes run sequentially and selector/embedding work
+    alone don't, because modes run sequentially and auto-plan/embedding work
     has no DB deadline. A mode that overruns the remaining budget is cut
     (typed PARTIAL_RESULTS naming the deadline), later modes past the budget
     never start, and the trace reports only what ran."""
@@ -493,7 +369,7 @@ async def test_the_whole_call_shares_one_wall_clock_deadline(
 async def test_a_generous_deadline_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _patch_modes(monkeypatch)
     response = await _run(_deps(), _policy(max_latency_ms=30_000))
-    assert all(len(calls[mode]) == 1 for mode in ("semantic", "graph", "sql", "global"))
+    assert all(len(calls[mode]) == 1 for mode in ("semantic", "graph", "sql"))
     assert not any("deadline" in w.message for w in response.warnings)
 
 
@@ -523,7 +399,7 @@ def _linkable_deps(
         embedder=cast(Any, object()),
         sql_reader=cast(Any, _Scoped()),
         graph=cast(Any, _Scoped()),
-        llm=cast(Any, llm or _FakeLLM(_pick_all())),
+        llm=cast(Any, llm or _FakeLLM()),
     )
     return deps, repo
 
@@ -562,19 +438,16 @@ async def test_auto_plan_two_entities_takes_the_path_template(
     assert params.hops == 3  # the policy ceiling (max_graph_hops), not a guess
 
 
-async def test_auto_planned_graph_survives_a_selector_that_skips_it(
+async def test_auto_planned_graph_runs_at_its_mode_order_position(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The golden cases need relation-path questions to RUN graph mode — that
-    guarantee cannot hinge on an LLM selector's mood (C3b: LLM-assisted,
-    never LLM-trusted). An auto-planned graph mode always runs."""
+    """The golden cases need relation-path questions to RUN graph mode. With
+    the LLM selector removed (MCP8) the guarantee is structural — an
+    auto-planned graph mode is simply available and therefore runs, at its
+    _MODE_ORDER position (modes run sequentially against one shared
+    deadline; a last-place graph would be the first cut on a tight budget)."""
     calls = _patch_modes(monkeypatch)
-    # the selector picks modes that come AFTER graph in _MODE_ORDER — the
-    # discriminating case: append-last would run graph LAST, ordered insert
-    # runs it before them (a same-prefix selection like ["semantic"] cannot
-    # tell the two apart — the first probe of this pin was false-green)
-    picky = _FakeLLM(json.dumps({"modes": ["sql", "global"], "reason": "prose only"}))
-    deps, _repo = _linkable_deps(["區域探索廳"], llm=picky)
+    deps, _repo = _linkable_deps(["區域探索廳"])
     response = await hybrid_query(deps, _policy(), "區域探索廳和誰有關?", None)
 
     assert len(calls["graph"]) == 1
@@ -586,7 +459,7 @@ async def test_auto_planned_graph_survives_a_selector_that_skips_it(
     # sequentially against one shared deadline, and a last-place graph would
     # be the first cut on a tight budget — silently defeating the guarantee
     # this test exists for (Codex #89 R1)
-    assert routing["selected"] == ["graph", "sql", "global"]
+    assert routing["selected"] == ["semantic", "graph", "sql"]  # _MODE_ORDER position
 
 
 async def test_no_link_keeps_graph_gated_with_the_reason(
@@ -642,7 +515,7 @@ async def test_a_caller_input_rejection_is_not_reported_as_a_store_outage(
     _patch_modes(
         monkeypatch,
         semantic=_Rejected("bad input"),
-        global_=_mode_response("global_summary", keeper),
+        sql=_mode_response("sql_query", keeper),
     )
     response = await _run(_deps(), _policy())
     blocked = [w for w in response.warnings if w.code == "GUARDRAIL_BLOCKED"]
@@ -655,7 +528,7 @@ async def test_a_caller_input_rejection_is_not_reported_as_a_store_outage(
     _patch_modes(
         monkeypatch,
         semantic=_Throttled("rate limited"),
-        global_=_mode_response("global_summary", keeper),
+        sql=_mode_response("sql_query", keeper),
     )
     throttled = await _run(_deps(), _policy())
     assert any(w.code == "STORE_UNAVAILABLE" for w in throttled.warnings)
@@ -672,7 +545,7 @@ async def test_a_caller_input_rejection_is_not_reported_as_a_store_outage(
         _patch_modes(
             monkeypatch,
             semantic=_NotInput("not an input problem"),
-            global_=_mode_response("global_summary", keeper),
+            sql=_mode_response("sql_query", keeper),
         )
         outage = await _run(_deps(), _policy())
         assert any(w.code == "STORE_UNAVAILABLE" for w in outage.warnings), auth_status
@@ -690,7 +563,7 @@ async def test_a_caller_input_rejection_is_not_reported_as_a_store_outage(
     _patch_modes(
         monkeypatch,
         semantic=_QdrantBad("dimension drift"),
-        global_=_mode_response("global_summary", keeper),
+        sql=_mode_response("sql_query", keeper),
     )
     store_400 = await _run(_deps(), _policy())
     assert any(w.code == "STORE_UNAVAILABLE" for w in store_400.warnings)
@@ -748,3 +621,31 @@ async def test_mention_loss_warnings_are_refit_to_the_fused_page(
     clipped = await _run(_deps(), _policy(top_k=1))
     assert [r.id for r in clipped.results] == ["a-hit"]
     assert not any("mention" in w.message for w in clipped.warnings)
+
+
+async def test_fused_results_carry_the_origin_modes_raw_score_as_confidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP8: RRF flattens every score to ~1/61 (measured 0.0164 vs the real
+    cosines 0.7224/0.5025) — the agent's only confidence signal died in
+    fusion. The origin mode's RAW score now rides in `confidence` (first
+    mode's on duplicate merge, same winner as the payload; clamped to the
+    schema's 0..1), while `score` stays the rank-fusion ordering value."""
+    shared = "shared-id"
+    _patch_modes(
+        monkeypatch,
+        semantic=_mode_response(
+            "semantic_search",
+            _result(rid=shared, score=0.7224),
+            _result(rid="only-semantic", score=0.5025),
+        ),
+        sql=_mode_response("sql_query", _result(rid=shared, score=1.0)),
+    )
+    response = await _run(_deps(), _policy())
+    by_id = {r.id: r for r in response.results}
+    assert by_id["only-semantic"].confidence == 0.5025  # the real cosine survives
+    assert by_id[shared].confidence == 0.7224  # duplicate merge: FIRST mode's raw score
+    # ordering is still rank-fusion — the duplicate (two rank contributions)
+    # outranks the single-mode hit despite its lower origin score
+    assert response.results[0].id == shared
+    assert response.results[0].score != 0.7224  # score stays the RRF value

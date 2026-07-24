@@ -204,8 +204,9 @@ async def test_graph_and_hybrid_end_to_end_over_the_shared_seam(
             app.router.lifespan_context(app),
             AsyncClient(transport=transport, base_url="http://t") as client,
         ):
-            # hybrid: broken selector → breadth; broken semantic → typed
-            # degradation; global still serves — the fusion carries its report
+            # deterministic fan-out (MCP8): broken semantic → typed
+            # degradation; global is NOT fused (MODE_SKIPPED names
+            # global_summary) — the REVERSED report-through-fusion pin
             r = await client.post(
                 f"/projects/{project}/query/hybrid", json={"query": "main hall", "top_k": 5}
             )
@@ -213,18 +214,18 @@ async def test_graph_and_hybrid_end_to_end_over_the_shared_seam(
             data = r.json()["data"]
             assert data["mode"] == "hybrid"
             assert data["build_id"] == str(build_id)
-            assert "community_report" in [res["result_type"] for res in data["results"]]
+            assert "community_report" not in [res["result_type"] for res in data["results"]]
             codes = [w["code"] for w in data["warnings"]]
             assert "STORE_UNAVAILABLE" in codes  # semantic degraded, not fatal (§22)
-            # QP1 flipped graph's fate here: "main hall" NAMES the seeded
-            # entity, so the auto plan links it and graph RUNS (neighbors over
-            # live Neo4j; the unprojected node yields no hits, but the mode is
-            # selected and traced) — only sql remains policy-skipped
-            assert codes.count("MODE_SKIPPED") == 1
+            # QP1: "main hall" NAMES the seeded entity, so the auto plan links
+            # it and graph RUNS — sql stays policy-skipped and global is
+            # always skipped (not fused, MCP8)
+            assert codes.count("MODE_SKIPPED") == 2
             routing = data["debug"]["routing_decision"]
-            assert "global" in routing["selected"]
+            assert "global" not in routing["selected"]
+            assert "global" in routing["skipped"]
             assert "graph" in routing["selected"]
-            assert "selector failed" in routing["reason"]
+            assert "deterministic fan-out" in routing["reason"]  # MCP8: no selector
             assert any("auto plan" in line for line in data["debug"]["retrieval_plan"])
 
             # graph: the hop ceiling degrades IN-ENVELOPE over the live stack

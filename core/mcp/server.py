@@ -370,16 +370,21 @@ def build_server(project: str) -> FastMCP:
         graph_other_entity: str | None = None,
         graph_hops: int = 1,
     ) -> dict[str, Any]:
-        """The default entry (§9): route across every available mode and fuse.
-        Supply graph_template + graph_entity to run YOUR graph invocation;
-        without them the router derives a safe plan itself when the question
-        names a build entity (QP1 auto plan — see the routing trace).
+        """Fan every AVAILABLE mode out over the question and fuse: semantic
+        + graph + sql, deterministically (no LLM routing). Community reports
+        are NOT fused — they are rating-ranked corpus overview, never
+        query-matched; use global_summary for that. Supply graph_template +
+        graph_entity to run YOUR graph invocation; without them the router
+        derives a safe plan itself when the question names a build entity
+        (QP1 auto plan — see the routing trace).
 
-        Fused scores are rank-based (RRF), not confidence, and no warning
+        `score` is rank-fusion (RRF) ordering, not confidence; each result's
+        `confidence` carries its origin mode's RAW score (cosine for
+        semantic) — comparable within a mode, not across modes. No warning
         flags an out-of-domain question (see semantic_search on why scores
-        cannot) — judge answerability from the returned content; entity and
-        community_report results carry no chunk text, so weigh only results
-        whose content actually addresses the question."""
+        cannot) — judge answerability from the returned content. For factual
+        text questions, semantic_search alone is often faster and returns
+        more readable passages."""
         rt = _rt()
         params: GraphQueryParams | None = None
         if graph_template is not None and graph_entity is not None:
