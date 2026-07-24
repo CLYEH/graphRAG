@@ -287,9 +287,9 @@ def build_server(project: str) -> FastMCP:
         generic ones). No warning flags an out-of-domain question; judge
         answerability from the returned content, not from the scores:
         chunk results carry the matched text, but entity results carry only
-        the matched NAME (title; text is null — inspect via get_entity),
-        so a page of bare name matches is NOT evidence the corpus answers
-        the question."""
+        the matched NAME — no tool currently retrieves their underlying
+        content — so a page of bare name matches is NOT evidence the
+        corpus answers the question."""
         rt = _rt()
 
         async def _run(deps: Any, _remaining_ms: int) -> McpResponse:

@@ -413,3 +413,9 @@ async def test_retrieval_tool_descriptions_state_score_semantics_honestly() -> N
     # is null there) — the description must say what a bare name-match page
     # means instead of pointing at a field that is empty exactly then
     assert "a page of bare name matches is NOT evidence" in semantic
+    # ...and the replacement must not point at another dead end: get_entity
+    # returns ids + mention refs only (no text), and no MCP tool retrieves
+    # chunk/document content yet. REVERSE this pin when MCP5/MCP7 add a real
+    # content-retrieval path — the description should then point to it.
+    assert "get_entity" not in semantic
+    assert "no tool currently retrieves" in semantic
