@@ -342,3 +342,7 @@ RunsTable 失敗建置列展開加「失敗診斷」:useBuildSteps/useStepItems 
 ## MCP6
 
 (a) 設計:_fair_page 名額配在 **SoR 驗證後的 citable results** 上(r1 Codex P2:配在原始 hits 會讓 drift 髒 hit 佔名額再被丟,擠掉已抓回的合法 chunk——恰在 drift 時破功);餘位分數+id tiebreak(#34);typed 檢索使 payload-less/未知型別點 store 端即到不了,drop-branch 測試語意同步(4 drop+2 excluded);fake vectors 鏡射真 repo 型別過濾(否則雙檢索重複計數)。(b) gate-2 兩輪:首輪 PASS 附 ripple nit(hybrid/eval 繼承新行為=MCP8 方向,有意);r1 復審 **FAIL 抓到 false-green 測試**——單 entity 時 raw-slot 頁面不飽和,rest 回填救回 valid chunk,我的 probe 突變又不忠實於 round-0;處方=兩 entity 飽和頁面,reviewer 對真 round-0 復驗紅。(c) 遠端 2 輪(r1 P2→修;r2 +1);整合 279 綠(People Ops title pin 依 MCP6 翻轉並註明)。
+
+## MCP7
+
+(a) 契約:entity 最低要求 anyOf(chunk mention=uuid-id(format:uuid)+uri+quote(≤512)+offsets|row=table+pk),負向 pin 兩式(裸 ref、rich-but-non-uuid-id 皆須 FAIL);DESIGN §26 DR-014+§27.2+§16 範例同步。(b) 遠端 7 輪+gate-2 多輪 FAIL/nit:r1 四 P2(id format:uuid、graph 面靜默截斷→共用 mention_warnings、掉損 per-entity 曝露、SQL row-value 精確配對);r2 ordinal \d+ 無界(int() 位數上限/PG bind)→[0-9]{1,9},gate-2 sibling 抓 split_row_source_ref 同病;r3 \d 吃 Unicode 數字(١→1 錯引用)→ASCII-only,isdigit sibling 同修,判別器 ٤:abcd:pk;r4 mention 警告過 fusion 的 provenance→訊息具名 entity id+sibling parser,hybrid 對 fused 頁面重建;r5 §16 範例 1.0→1.1;r6 get_chunk 工具+helper 雙層 docstring 過期宣稱;r7 slice-before-validate 三站全掃(neighbors 頁、subgraph edges、REST context edges)各附 round-0 probe 判別測試(edge 首版不判別被 probe 抓出重寫);r8 +1。(c) fast 1449/整合 279 綠;期間 C: 磁碟滿(21MB)清 docker+uv cache ~30GB。
