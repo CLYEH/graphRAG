@@ -86,13 +86,15 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
     citable: list[RetrievalResult] = []
     dropped = 0
     ungrounded = 0
+    refs_capped = 0
     for row in ordered:
-        result, bad_refs = _report_result(row, known)
+        result, bad_refs, capped = _report_result(row, known)
         ungrounded += bad_refs
         if result is None:
             dropped += 1  # no grounded members left — cannot cite (§27.2)
         else:
             citable.append(result)
+            refs_capped += capped
 
     emitted = _scored(citable[:top_k])
     warnings: list[QueryWarning] = []
@@ -108,8 +110,41 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
                 "not grounded in this build's entities (§27.2)",
             )
         )
+    if refs_capped:
+        warnings.append(
+            QueryWarning(
+                "TRUNCATED",
+                f"community_report source_refs capped at {_REFS_CAP} grounded member "
+                f"refs each — {refs_capped} ref(s) omitted across the page; the full "
+                "membership is inspectable via the entities of the report (§22)",
+            )
+        )
+    if emitted:
+        # MCP3: v1 global ranking is rating-desc and NEVER consults the query
+        # (the docstrings below say so, but an agent cannot read docstrings).
+        # These results sit in the same scored array as genuinely query-matched
+        # hits, so without this warning an agent treats corpus-overview reports
+        # as evidence FOR its question — measured: hybrid("票價") returned 10
+        # such reports about coral restoration and shipwrecks. LOW_CONFIDENCE
+        # is the frozen code whose meaning fits exactly: the relevance of these
+        # results to THIS query is unestablished.
+        warnings.append(
+            QueryWarning(
+                "LOW_CONFIDENCE",
+                "global results are ranked by community rating and are NOT matched "
+                "against the query — treat them as corpus overview, not as evidence "
+                "for this question (v1 has no global relevance model)",
+            )
+        )
     return _response(repo, query, emitted, tuple(warnings))
 
+
+#: Per-report source_refs ceiling (MCP3). §27.2 requires ≥1 grounded member
+#: ref, not the whole roster — a 58-member community expanded to 58 uuids and
+#: source_refs became 83% of a hybrid payload. Deterministic first-N of the
+#: sorted grounded members; the response carries a TRUNCATED warning naming
+#: the omitted count so the cap is never mistaken for the full membership.
+_REFS_CAP = 8
 
 #: Grounding lookups run in batches of this many ids per query: the IN
 #: predicate binds one parameter per id, and PostgreSQL's extended protocol
@@ -135,8 +170,8 @@ async def _known_entity_ids(repo: BuildScopedRepo, claimed: set[Any]) -> set[Any
     return known
 
 
-def _report_result(row: Any, known: set[Any]) -> tuple[RetrievalResult | None, int]:
-    """One SoR report row → ``(result-or-None, ungrounded-ref count)``.
+def _report_result(row: Any, known: set[Any]) -> tuple[RetrievalResult | None, int, int]:
+    """One SoR report row → ``(result-or-None, ungrounded-ref count, capped-ref count)``.
 
     The members ARE the citation (§27.2), and only ids GROUNDED in this
     build's entities may become refs (the array has no FK — a malformed or
@@ -144,25 +179,38 @@ def _report_result(row: Any, known: set[Any]) -> tuple[RetrievalResult | None, i
     A report with zero grounded members drops; one with some survives on the
     grounded subset, with the omissions counted. ``title``/``summary`` are
     nullable display fields — emitted as-is when strings, null otherwise
-    (§16 allows null; no coerced reprs)."""
+    (§16 allows null; no coerced reprs).
+
+    Refs are CAPPED at ``_REFS_CAP`` (MCP3): a large community claims dozens
+    of members (58 measured), and expanding every uuid made source_refs 83%
+    of a hybrid payload — noise an agent pays for on every call. §27.2 needs
+    ≥1 grounded ref, not the roster; the cap keeps the first N in the same
+    deterministic order, and the caller reports the omission (silent
+    truncation would read as the full membership)."""
     claimed = [m for m in (row.member_entity_ids or []) if m is not None]
     members = [m for m in claimed if m in known]
     bad_refs = len(claimed) - len(members)
     if not members:
-        return None, bad_refs
+        return None, bad_refs, 0
+    grounded = sorted(members, key=str)
+    capped = max(0, len(grounded) - _REFS_CAP)
     refs = tuple(
-        SourceRef(source_type="entity", id=str(entity_id)) for entity_id in sorted(members, key=str)
+        SourceRef(source_type="entity", id=str(entity_id)) for entity_id in grounded[:_REFS_CAP]
     )
     title = row.title if isinstance(row.title, str) and row.title.strip() else None
     summary = row.summary if isinstance(row.summary, str) and row.summary.strip() else None
-    return RetrievalResult(
-        result_type="community_report",
-        id=str(row.id),
-        score=0.0,  # placeholder; _scored assigns the positional value
-        source_refs=refs,
-        title=title,
-        text=summary,
-    ), bad_refs
+    return (
+        RetrievalResult(
+            result_type="community_report",
+            id=str(row.id),
+            score=0.0,  # placeholder; _scored assigns the positional value
+            source_refs=refs,
+            title=title,
+            text=summary,
+        ),
+        bad_refs,
+        capped,
+    )
 
 
 def _scored(results: list[RetrievalResult]) -> tuple[RetrievalResult, ...]:

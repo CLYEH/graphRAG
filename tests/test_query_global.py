@@ -96,7 +96,7 @@ async def test_reports_rank_by_rating_desc_unrated_last_deterministically() -> N
     ids = [r.id for r in forward.results]
     assert ids == [str(high.id), str(low.id), str(unrated.id)]  # rating desc, None last
     assert ids == [r.id for r in backward.results]  # order is fetch-order-proof
-    assert forward.warnings == ()
+    assert _codes(forward) == ["LOW_CONFIDENCE"]  # MCP3: the not-query-matched warning
 
 
 async def test_every_result_cites_its_member_entities() -> None:
@@ -128,7 +128,7 @@ async def test_a_memberless_row_is_dropped_and_surfaced_never_uncitable() -> Non
     bad = _report(9.0, member_ids=[])
     response = await _run([good, bad])
     assert [r.id for r in response.results] == [str(good.id)]
-    assert _codes(response) == ["PARTIAL_RESULTS"]
+    assert _codes(response) == ["PARTIAL_RESULTS", "LOW_CONFIDENCE"]
 
 
 async def test_truncation_is_exact_over_citable_rows_only() -> None:
@@ -139,13 +139,13 @@ async def test_truncation_is_exact_over_citable_rows_only() -> None:
     citable = [_report(float(i)) for i in range(3)]
     response = await _run(citable, top_k=2)
     assert len(response.results) == 2
-    assert _codes(response) == ["TRUNCATED"]
+    assert _codes(response) == ["TRUNCATED", "LOW_CONFIDENCE"]
 
     # exactly top_k citable + one memberless straggler → NOT truncated
     rows = [_report(9.0), _report(8.0), _report(1.0, member_ids=[])]
     response = await _run(rows, top_k=2)
     assert len(response.results) == 2
-    assert _codes(response) == ["PARTIAL_RESULTS"]  # the drop, but no TRUNCATED
+    assert _codes(response) == ["PARTIAL_RESULTS", "LOW_CONFIDENCE"]  # the drop, but no TRUNCATED
 
 
 @pytest.mark.parametrize("bad", [0, -1, True, "3", 2.5])
@@ -186,7 +186,7 @@ async def test_an_ungrounded_member_ref_is_dropped_not_emitted() -> None:
     response = await _run([row], known={real})
     result = response.results[0]
     assert [ref.id for ref in result.source_refs] == [str(real)]  # bogus never emitted
-    assert _codes(response) == ["PARTIAL_RESULTS"]
+    assert _codes(response) == ["PARTIAL_RESULTS", "LOW_CONFIDENCE"]
 
 
 async def test_a_report_with_no_grounded_members_drops_entirely() -> None:
@@ -199,7 +199,7 @@ async def test_a_report_with_no_grounded_members_drops_entirely() -> None:
         known={m for m in good.member_entity_ids},
     )
     assert [r.id for r in response.results] == [str(good.id)]
-    assert _codes(response) == ["PARTIAL_RESULTS"]
+    assert _codes(response) == ["PARTIAL_RESULTS", "LOW_CONFIDENCE"]
 
 
 async def test_grounding_lookups_are_batched_under_the_bind_cap(
@@ -233,4 +233,43 @@ async def test_grounding_lookups_are_batched_under_the_bind_cap(
     _VALIDATOR.validate(response.to_dict())
     assert [len(b) for b in batches] == [2, 2, 1]  # ceil(5 / 2) batched queries
     assert len(response.results[0].source_refs) == 5  # all grounded across batches
-    assert response.warnings == ()
+    assert _codes(response) == ["LOW_CONFIDENCE"]  # MCP3: only the honesty warning
+
+
+async def test_global_results_always_carry_the_not_query_matched_warning() -> None:
+    """MCP3 (review finding 2): v1 global ranking is rating-desc and never
+    consults the query, yet the results sit in the same scored array as
+    genuinely matched hits - measured: hybrid("PRICE") returned 10 corpus-
+    overview reports that an agent then cites as evidence for the question.
+    LOW_CONFIDENCE is the machine-readable "these were not matched against
+    your query"; an empty page carries no such claim, so it must NOT warn.
+    """
+    response = await _run([_report(1.0)], top_k=5)
+    low = [w for w in response.warnings if w.code == "LOW_CONFIDENCE"]
+    assert len(low) == 1
+    assert "NOT matched against the query" in low[0].message
+    assert "rating" in low[0].message
+
+    empty = await _run([], top_k=5)
+    assert empty.results == () and empty.warnings == ()
+
+
+async def test_report_refs_are_capped_with_the_omission_named() -> None:
+    """MCP3: a 58-member community expanded to 58 uuid refs and source_refs
+    became 83% of a hybrid payload. Section 27.2 needs >=1 grounded ref, not
+    the roster - cap at _REFS_CAP deterministically and NAME the omitted
+    count: a silent cap would read as the full membership.
+    """
+    members = [uuid.uuid4() for _ in range(20)]
+    response = await _run([_report(1.0, member_ids=list(members))], top_k=5)
+    (result,) = response.results
+    assert len(result.source_refs) == 8  # _REFS_CAP
+    expected = tuple(str(m) for m in sorted(members, key=str)[:8])
+    assert tuple(r.id for r in result.source_refs) == expected
+    capped = [w for w in response.warnings if "capped" in w.message]
+    assert len(capped) == 1 and capped[0].code == "TRUNCATED"
+    assert "12 ref(s) omitted" in capped[0].message
+
+    r2 = await _run([_report(1.0, member_ids=list(members[:8]))], top_k=5)
+    assert len(r2.results[0].source_refs) == 8
+    assert not any("capped" in w.message for w in r2.warnings)
