@@ -449,3 +449,37 @@ async def test_same_name_entities_become_distinguishable_by_type() -> None:
     response = await _run(repo, _FakeVectors(hits))
     titles = sorted(r.title or "" for r in response.results)
     assert titles == ["主題館", "主題館 (EVENT)", "主題館 (FACILITY)"]
+
+
+async def test_a_stale_floor_slot_never_evicts_a_fetched_valid_chunk() -> None:
+    """Codex #126: allocating floor slots from RAW hits let a drift-stale
+    chunk occupy the quota and then drop at enrichment — the response had
+    zero chunks while a fetched, perfectly citable lower-ranked chunk was
+    discarded, breaking the very guarantee the floor exists for. Slots are
+    allocated over SoR-VALIDATED results: the stale hits surface only in the
+    drift warning, the valid chunk keeps its seat.
+
+    TWO citable entities saturate the raw-slot page (2 stale chunks + 2
+    entities = top_k with an EMPTY rest) — with only one entity the rest
+    backfill would rescue the valid chunk even under the bug and the test
+    would be false-green (the gate-2 reviewer reproduced exactly that
+    against the round-0 code)."""
+    repo = _FakeRepo()
+    stale_a, stale_b, valid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    _add_chunk(repo, valid)  # only this chunk has SoR rows — the others drifted
+    entity_a, entity_b = uuid.uuid4(), uuid.uuid4()
+    repo.mentions[entity_a] = [("text", "chunk:h:0")]
+    repo.mentions[entity_b] = [("text", "chunk:h:1")]
+    hits = [
+        _chunk_hit(stale_a, score=0.95),
+        _chunk_hit(stale_b, score=0.90),
+        _chunk_hit(valid, score=0.30),
+        _entity_hit(entity_a, score=0.85),
+        _entity_hit(entity_b, score=0.80),
+    ]
+    response = await _run(repo, _FakeVectors(hits), top_k=4)
+    kinds = [r.result_type for r in response.results]
+    assert kinds.count("chunk") == 1  # the valid one made the page
+    assert any(r.id == str(valid) for r in response.results)
+    assert response.warnings[0].code == "PARTIAL_RESULTS"
+    assert "2 hit(s)" in response.warnings[0].message  # the drift is surfaced

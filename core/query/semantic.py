@@ -157,38 +157,54 @@ async def semantic_search(
 
     query_vector = await embedder.aget_text_embedding(query)
     if point_type is not None:
-        hits = await vectors.search(query_vector, limit=top_k, point_type=point_type)
+        hit_lists = [await vectors.search(query_vector, limit=top_k, point_type=point_type)]
     else:
-        hits = _fair_page(
+        hit_lists = [
             await vectors.search(query_vector, limit=top_k, point_type="chunk"),
             await vectors.search(query_vector, limit=top_k, point_type="entity"),
-            top_k,
-        )
+        ]
 
-    chunk_ids, entity_ids = _partition_hit_source_ids(hits)
+    all_hits = [hit for hits in hit_lists for hit in hits]
+    chunk_ids, entity_ids = _partition_hit_source_ids(all_hits)
     chunk_by_id, source_uri_by_chunk = await _load_chunk_provenance(repo, chunk_ids)
     mentions_by_entity = await repo.mentions_by_entity(list(entity_ids))
     types_by_entity = await _entity_types(repo, entity_ids)
 
-    results: list[RetrievalResult] = []
+    # EVERY fetched hit is validated before any page slot is allocated
+    # (Codex #126): slicing the raw hits first let a drift-stale hit occupy a
+    # floor slot and then drop at enrichment — evicting a fetched, perfectly
+    # citable lower-ranked chunk and returning zero chunks despite one being
+    # available. The drop count covers the whole fetched window: under the
+    # quota any stale hit in it displaced the allocation, and the warning's
+    # job is surfacing drift (§19/Health).
+    validated_lists: list[list[RetrievalResult]] = []
     dropped = 0
-    for hit in hits:
-        payload = hit.payload
-        if payload is None:
-            dropped += 1
-            continue
-        result = _build_result(
-            payload,
-            hit.score,
-            chunk_by_id,
-            source_uri_by_chunk,
-            mentions_by_entity,
-            types_by_entity,
-        )
-        if result is None:
-            dropped += 1
-            continue
-        results.append(result)
+    for hits in hit_lists:
+        validated: list[RetrievalResult] = []
+        for hit in hits:
+            payload = hit.payload
+            result = (
+                _build_result(
+                    payload,
+                    hit.score,
+                    chunk_by_id,
+                    source_uri_by_chunk,
+                    mentions_by_entity,
+                    types_by_entity,
+                )
+                if payload is not None
+                else None
+            )
+            if result is None:
+                dropped += 1
+            else:
+                validated.append(result)
+        validated_lists.append(validated)
+
+    if point_type is not None:
+        results = validated_lists[0][:top_k]
+    else:
+        results = _fair_page(validated_lists[0], validated_lists[1], top_k)
 
     warnings: tuple[QueryWarning, ...] = ()
     if dropped:
@@ -251,25 +267,27 @@ async def _load_chunk_provenance(
 
 
 def _fair_page(
-    chunk_hits: list[models.ScoredPoint],
-    entity_hits: list[models.ScoredPoint],
+    chunk_results: list[RetrievalResult],
+    entity_results: list[RetrievalResult],
     top_k: int,
-) -> list[models.ScoredPoint]:
+) -> list[RetrievalResult]:
     """MCP6 page fairness: chunk and entity points share ONE collection and
     one cosine, and the measured build skew (1405 entities vs 442 chunks —
     76% of the index) let bare name matches crowd every text passage off the
     page: 票價/海科館全票 returned 8 entities, 0 chunks. Each type gets a
     floor of ``top_k // 2`` slots (or all it has — a scarce type never
     blocks the other, the §22 over-block dual); the remaining slots go by
-    score with the id tiebreak (#34: rerun-stable). Final §16 ordering is
+    score with the id tiebreak (#34: rerun-stable). Operates on CITABLE,
+    SoR-validated results — never raw hits (Codex #126: a drift-stale hit
+    in a floor slot would evict a fetched valid one). Final §16 ordering is
     re-imposed downstream by ``ordered_results``."""
     floor = top_k // 2
-    take_chunks = min(floor, len(chunk_hits))
-    take_entities = min(floor, len(entity_hits))
-    page = chunk_hits[:take_chunks] + entity_hits[:take_entities]
+    take_chunks = min(floor, len(chunk_results))
+    take_entities = min(floor, len(entity_results))
+    page = chunk_results[:take_chunks] + entity_results[:take_entities]
     rest = sorted(
-        chunk_hits[take_chunks:] + entity_hits[take_entities:],
-        key=lambda hit: (-hit.score, str(hit.id)),
+        chunk_results[take_chunks:] + entity_results[take_entities:],
+        key=lambda result: (-result.score, result.id),
     )
     return page + rest[: top_k - len(page)]
 
