@@ -19,7 +19,7 @@ import jsonschema
 import pytest
 import sqlalchemy as sa
 
-from core.query.global_reports import global_summary
+from core.query.global_reports import capped_report_id, global_summary
 from core.query.results import McpResponse
 from core.stores import tables
 from core.stores.repo import BuildScopedRepo
@@ -268,7 +268,12 @@ async def test_report_refs_are_capped_with_the_omission_named() -> None:
     assert tuple(r.id for r in result.source_refs) == expected
     capped = [w for w in response.warnings if "capped" in w.message]
     assert len(capped) == 1 and capped[0].code == "TRUNCATED"
-    assert "12 ref(s) omitted across the returned results" in capped[0].message
+    assert "12 ref(s) omitted" in capped[0].message
+    # the warning NAMES its report — the provenance hybrid's fusion filter
+    # parses (builder and parser are siblings, so this pins both directions)
+    assert capped_report_id(capped[0].message) == result.id
+    assert capped_report_id("[global] " + capped[0].message) == result.id
+    assert capped_report_id("some other TRUNCATED message") is None
 
     r2 = await _run([_report(1.0, member_ids=list(members[:8]))], top_k=5)
     assert len(r2.results[0].source_refs) == 8

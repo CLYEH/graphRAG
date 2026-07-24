@@ -96,12 +96,6 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
 
     page = citable[:top_k]
     emitted = _scored([result for result, _ in page])
-    # capped refs are counted over the EMITTED slice only (Codex #123): a
-    # beyond-top_k report's capped members were never returned at all, and
-    # charging them to "the page" would misrepresent complete results as
-    # incomplete (top_k=1 with an 8-ref top report must not warn about the
-    # runner-up's 12)
-    refs_capped = sum(capped for _, capped in page)
     warnings: list[QueryWarning] = []
     if len(citable) > top_k:
         warnings.append(
@@ -115,14 +109,13 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
                 "not grounded in this build's entities (§27.2)",
             )
         )
-    if refs_capped:
-        warnings.append(
-            QueryWarning(
-                "TRUNCATED",
-                f"{REFS_CAP_MESSAGE} — {refs_capped} ref(s) omitted across the "
-                "returned results (§22)",
-            )
-        )
+    # one refs-cap warning PER capped report, over the EMITTED slice only
+    # (Codex #123): a beyond-top_k report's capped members were never returned
+    # at all, and the named id is the provenance hybrid needs to drop the
+    # warning when fusion clips that report off ITS page
+    for result, capped in page:
+        if capped:
+            warnings.append(refs_cap_warning(result.id, capped))
     if emitted:
         # MCP3: v1 global ranking is rating-desc and NEVER consults the query
         # (the docstrings below say so, but an agent cannot read docstrings).
@@ -150,10 +143,38 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
 #: the omitted count so the cap is never mistaken for the full membership.
 REFS_CAP = 8
 
-#: The refs-cap warning's message prefix — public because hybrid_query matches
-#: on it to drop the warning when fusion leaves no report at the cap on the
-#: fused page (a capped report always carries exactly REFS_CAP refs).
-REFS_CAP_MESSAGE = f"community_report source_refs capped at {REFS_CAP} grounded member refs each"
+#: The refs-cap warning's message prefix; the full message names the capped
+#: report's id (see :func:`refs_cap_warning`) so hybrid_query can drop the
+#: warning when fusion clips that exact report off the fused page.
+REFS_CAP_MESSAGE = f"community_report source_refs capped at {REFS_CAP} grounded member refs"
+
+_REFS_CAP_ID_PREFIX = f"{REFS_CAP_MESSAGE} — report "
+
+
+def refs_cap_warning(report_id: str, omitted: int) -> QueryWarning:
+    """The per-report refs-cap TRUNCATED warning, naming its subject.
+
+    One warning per capped report — the id is the PROVENANCE hybrid_query
+    needs: after fusion it keeps the warning only while the named report is
+    still on the page (an aggregate count could not say WHICH report it
+    described, so a clipped capped report left a false claim behind)."""
+    return QueryWarning(
+        "TRUNCATED",
+        f"{_REFS_CAP_ID_PREFIX}{report_id}: {omitted} ref(s) omitted (§22)",
+    )
+
+
+def capped_report_id(message: str) -> str | None:
+    """The report id a refs-cap warning names — None for any other message.
+
+    The parser lives beside the builder so the message shape has ONE owner;
+    accepts hybrid's ``[global] `` origin prefix."""
+    text = message.removeprefix("[global] ")
+    if not text.startswith(_REFS_CAP_ID_PREFIX):
+        return None
+    report_id, sep, _ = text[len(_REFS_CAP_ID_PREFIX) :].partition(":")
+    return report_id if sep else None
+
 
 #: Grounding lookups run in batches of this many ids per query: the IN
 #: predicate binds one parameter per id, and PostgreSQL's extended protocol
