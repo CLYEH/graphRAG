@@ -218,3 +218,50 @@ def test_non_task_branch_skips_the_checkoff_lint(tmp_path: Path) -> None:
     result = _run_check(work, "docs/retro")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "checkoff lint skipped" in result.stdout
+
+
+def test_reformatting_a_settled_entry_is_not_a_smuggled_checkoff(tmp_path: Path) -> None:
+    """H22: the checkoff lint judges STATE, not diff lines.
+
+    The retro's archive step rewrites already-checked entries (moving their
+    as-built out), which a diff-line reading counts as dozens of foreign
+    checkoffs — the migration PR hit exactly that. Nothing else in this file
+    pins the distinction, so a revert to `+- [x]` counting would pass all the
+    other tests while blocking every future retro.
+    """
+    work = _make_repo(tmp_path)
+    settled = TASKS_BASE.replace("- [ ] Y2 second task", "- [x] Y2 second task — long as-built")
+    (work / "TASKS.md").write_text(settled, encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "Y2 done")
+    _git(work, "push", "-q", "origin", "main")
+
+    _branch_commit(
+        work,
+        "task/X1",
+        {
+            "TASKS.md": settled.replace("- [ ] X1 first task", "- [x] X1 first task").replace(
+                "- [x] Y2 second task — long as-built", "- [x] Y2 second task"
+            ),
+        },
+    )
+    result = _run_check(work, "task/X1")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "other than its own item" not in result.stdout
+
+
+def test_an_over_ceiling_completed_entry_fails_the_gate(tmp_path: Path) -> None:
+    """H22 ceiling, and the only test that discriminates the CWD path choice.
+
+    `archive_task.py` resolves TASKS.md from the CWD so the gate judges the
+    repo under test. Anchor it to `__file__` instead and this is the sole test
+    that goes red — every other one keeps passing while the gate silently
+    inspects THIS checkout and can never fail: a green that means nothing.
+    """
+    work = _make_repo(tmp_path)
+    bloated = TASKS_BASE.replace("- [ ] X1 first task", "- [x] X1 first task — " + "z" * 400)
+    _branch_commit(work, "task/X1", {"TASKS.md": bloated})
+    result = _run_check(work, "task/X1")
+    assert result.returncode == 1
+    assert "H22" in result.stdout
+    assert "archive_task.py" in result.stdout

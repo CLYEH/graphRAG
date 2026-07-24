@@ -101,6 +101,12 @@ jobs:
           BASE: ${{ github.base_ref }}
           BRANCH: ${{ github.head_ref }}
         run: bash scripts/governance-check.sh
-      - name: No-op on branch pushes
+      - name: TASKS.md ceiling (push events too — the doc lane has no PR)
         if: github.event_name != 'pull_request'
-        run: echo "push event — governance checks apply to PRs only (keeps this required context green for the doc lane)"
+        # The retro that writes as-built prose touches ONLY *.md, so it rides
+        # the doc fast lane: push to docs/<id>, CI green, fast-forward main —
+        # no PR ever opens. A PR-only ceiling would therefore miss the exact
+        # path that introduces the prose it polices (Codex #121 r5). This is
+        # the H22 ceiling alone — a pure state check on the checkout; the
+        # BASE/BRANCH diff lints stay PR-only where those refs mean something.
+        run: python3 scripts/archive_task.py --check
