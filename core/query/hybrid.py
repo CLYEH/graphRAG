@@ -39,7 +39,7 @@ from typing import Any
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.llms import LLM, ChatMessage, MessageRole
 
-from core.query.global_reports import global_summary
+from core.query.global_reports import capped_report_id, global_summary
 from core.query.graph import GraphQueryParams, graph_query
 from core.query.linking import GraphPlan, plan_graph_query
 from core.query.policy import TextToCypher, TextToSql
@@ -239,6 +239,28 @@ async def hybrid_query(
         [mode_responses[mode].results for mode in _MODE_ORDER if mode in mode_responses],
         policy.top_k,
     )
+    reports = [result for result in fused if result.result_type == "community_report"]
+    if not reports:
+        # MCP3: the global mode's LOW_CONFIDENCE qualifies COMMUNITY REPORTS
+        # (rating-ranked, never query-matched). When fusion clips every report
+        # off the page, the warning would instead indict the surviving
+        # results — which ARE query-matched — so it dies with its subjects.
+        warnings = [
+            w
+            for w in warnings
+            if not (w.code == "LOW_CONFIDENCE" and w.message.startswith("[global]"))
+        ]
+    # Same discipline for the refs-cap TRUNCATED (Codex #123 r3/r4): each cap
+    # warning NAMES its report (provenance lives in the message; the parser is
+    # the builder's sibling in global_reports) — keep it only while that exact
+    # report is on the fused page, so a clipped capped report can never leave
+    # a false "refs omitted" claim behind a surviving complete one.
+    report_ids = {report.id for report in reports}
+    warnings = [
+        w
+        for w in warnings
+        if (cap_id := capped_report_id(w.message)) is None or cap_id in report_ids
+    ]
     if truncated:
         warnings.append(
             QueryWarning("TRUNCATED", f"result truncated to the top_k={policy.top_k} ceiling (§21)")

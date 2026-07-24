@@ -144,7 +144,9 @@ async def test_global_reads_only_the_active_builds_reports(conn: AsyncConnection
         _VALIDATOR.validate(response.to_dict())
         titles = [r.title for r in response.results]
         assert titles == ["fresh high", "fresh low"]  # rating desc, archived NEVER leaks
-        assert response.warnings == ()
+        # MCP3: a results-bearing global page always carries the honesty
+        # warning (rating-ranked, not query-matched) — and nothing else here
+        assert [w.code for w in response.warnings] == ["LOW_CONFIDENCE"]
         for result in response.results:
             assert result.result_type == "community_report"
             assert len(result.source_refs) == 2  # §27.2 member refs, from the live rows

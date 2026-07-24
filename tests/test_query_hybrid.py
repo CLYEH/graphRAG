@@ -21,6 +21,7 @@ import jsonschema
 import pytest
 
 import core.query.hybrid as hybrid_module
+from core.query.global_reports import refs_cap_warning
 from core.query.graph import GraphQueryParams
 from core.query.hybrid import HybridDeps, HybridPolicy, _fuse, hybrid_query
 from core.query.policy import (
@@ -311,6 +312,82 @@ async def test_mode_warnings_are_aggregated_with_their_origin(
     response = await _run(_deps(), _policy())
     truncs = [w for w in response.warnings if w.code == "TRUNCATED"]
     assert any(w.message.startswith("[sql]") for w in truncs)
+
+
+async def test_globals_low_confidence_dies_with_its_reports_in_fusion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #123 r2: the global mode's LOW_CONFIDENCE qualifies COMMUNITY
+    REPORTS (rating-ranked, never query-matched). When fusion clips every
+    report off the page, propagating it anyway tells the agent the surviving,
+    query-matched results are unreliable — the warning must live and die with
+    its subjects."""
+    low_conf = QueryWarning("LOW_CONFIDENCE", "global results are ranked by community rating …")
+    _patch_modes(
+        monkeypatch,
+        semantic=_mode_response("semantic_search", _result(rid="a-hit")),
+        global_=_mode_response(
+            "global_summary",
+            _result(
+                result_type="community_report",
+                rid="z-report",
+                # §27.2/§16: a community_report result must cite entity refs
+                source_refs=(SourceRef(source_type="entity", id=str(uuid.uuid4())),),
+            ),
+            warnings=(low_conf,),
+        ),
+    )
+    # equal RRF (both rank 1) → id ASC tie-break: "a-hit" wins, the report is
+    # clipped by top_k=1 — no community_report on the page, no warning
+    clipped = await _run(_deps(), _policy(top_k=1))
+    assert [r.id for r in clipped.results] == ["a-hit"]
+    assert not any(w.code == "LOW_CONFIDENCE" for w in clipped.warnings)
+
+    # when the report DOES survive fusion, the warning survives with it
+    kept = await _run(_deps(), _policy(top_k=10))
+    assert any(r.result_type == "community_report" for r in kept.results)
+    low = [w for w in kept.warnings if w.code == "LOW_CONFIDENCE"]
+    assert len(low) == 1 and low[0].message.startswith("[global]")
+
+
+async def test_globals_refs_cap_warning_dies_when_the_named_report_is_clipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #123 r4: the cap warning must track PROVENANCE, not a length
+    proxy — a COMPLETE report with exactly REFS_CAP refs surviving fusion
+    while the actually-capped report is clipped would keep a false "refs
+    omitted" claim under any len(source_refs)-based rule. The warning names
+    its report; it lives exactly as long as that report is on the fused
+    page."""
+    cap_warning = refs_cap_warning("z-capped", 12)
+
+    def _entity_refs(count: int) -> tuple[SourceRef, ...]:
+        return tuple(SourceRef(source_type="entity", id=str(uuid.uuid4())) for _ in range(count))
+
+    _patch_modes(
+        monkeypatch,
+        semantic=_mode_response("semantic_search", _result(rid="a-hit")),
+        global_=_mode_response(
+            "global_summary",
+            # b-full is COMPLETE at exactly REFS_CAP members — the length-proxy trap
+            _result(result_type="community_report", rid="b-full", source_refs=_entity_refs(8)),
+            _result(result_type="community_report", rid="z-capped", source_refs=_entity_refs(8)),
+            warnings=(cap_warning,),
+        ),
+    )
+    # top_k=2 keeps "a-hit" + "b-full" (rank-1 tie → id ASC; z-capped at
+    # rank 2 is clipped): the warning's named report is gone, so the warning
+    # goes too — even though an at-cap-length report survived
+    clipped = await _run(_deps(), _policy(top_k=2))
+    assert [r.id for r in clipped.results] == ["a-hit", "b-full"]
+    assert not any("source_refs capped" in w.message for w in clipped.warnings)
+
+    # the named report on the page is what makes the warning true — kept
+    kept = await _run(_deps(), _policy(top_k=10))
+    assert any(r.id == "z-capped" for r in kept.results)
+    capped = [w for w in kept.warnings if "source_refs capped" in w.message]
+    assert len(capped) == 1 and capped[0].message.startswith("[global]")
+    assert "z-capped" in capped[0].message
 
 
 async def test_fusion_merges_duplicates_and_ranks_by_rrf() -> None:

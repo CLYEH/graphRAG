@@ -83,18 +83,19 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
     # citability is judged over EVERY row (not just up to the ceiling): a
     # memberless row past the break would otherwise count as "clipped" and
     # over-fire TRUNCATED — the flag must be exact in both directions (§22)
-    citable: list[RetrievalResult] = []
+    citable: list[tuple[RetrievalResult, int]] = []
     dropped = 0
     ungrounded = 0
     for row in ordered:
-        result, bad_refs = _report_result(row, known)
+        result, bad_refs, capped = _report_result(row, known)
         ungrounded += bad_refs
         if result is None:
             dropped += 1  # no grounded members left — cannot cite (§27.2)
         else:
-            citable.append(result)
+            citable.append((result, capped))
 
-    emitted = _scored(citable[:top_k])
+    page = citable[:top_k]
+    emitted = _scored([result for result, _ in page])
     warnings: list[QueryWarning] = []
     if len(citable) > top_k:
         warnings.append(
@@ -108,7 +109,71 @@ async def global_summary(repo: BuildScopedRepo, query: str, top_k: int) -> McpRe
                 "not grounded in this build's entities (§27.2)",
             )
         )
+    # one refs-cap warning PER capped report, over the EMITTED slice only
+    # (Codex #123): a beyond-top_k report's capped members were never returned
+    # at all, and the named id is the provenance hybrid needs to drop the
+    # warning when fusion clips that report off ITS page
+    for result, capped in page:
+        if capped:
+            warnings.append(refs_cap_warning(result.id, capped))
+    if emitted:
+        # MCP3: v1 global ranking is rating-desc and NEVER consults the query
+        # (the docstrings below say so, but an agent cannot read docstrings).
+        # These results sit in the same scored array as genuinely query-matched
+        # hits, so without this warning an agent treats corpus-overview reports
+        # as evidence FOR its question — measured: hybrid("票價") returned 10
+        # such reports about coral restoration and shipwrecks. LOW_CONFIDENCE
+        # is the frozen code whose meaning fits exactly: the relevance of these
+        # results to THIS query is unestablished.
+        warnings.append(
+            QueryWarning(
+                "LOW_CONFIDENCE",
+                "global results are ranked by community rating and are NOT matched "
+                "against the query — treat them as corpus overview, not as evidence "
+                "for this question (v1 has no global relevance model)",
+            )
+        )
     return _response(repo, query, emitted, tuple(warnings))
+
+
+#: Per-report source_refs ceiling (MCP3). §27.2 requires ≥1 grounded member
+#: ref, not the whole roster — a 58-member community expanded to 58 uuids and
+#: source_refs became 83% of a hybrid payload. Deterministic first-N of the
+#: sorted grounded members; the response carries a TRUNCATED warning naming
+#: the omitted count so the cap is never mistaken for the full membership.
+REFS_CAP = 8
+
+#: The refs-cap warning's message prefix; the full message names the capped
+#: report's id (see :func:`refs_cap_warning`) so hybrid_query can drop the
+#: warning when fusion clips that exact report off the fused page.
+REFS_CAP_MESSAGE = f"community_report source_refs capped at {REFS_CAP} grounded member refs"
+
+_REFS_CAP_ID_PREFIX = f"{REFS_CAP_MESSAGE} — report "
+
+
+def refs_cap_warning(report_id: str, omitted: int) -> QueryWarning:
+    """The per-report refs-cap TRUNCATED warning, naming its subject.
+
+    One warning per capped report — the id is the PROVENANCE hybrid_query
+    needs: after fusion it keeps the warning only while the named report is
+    still on the page (an aggregate count could not say WHICH report it
+    described, so a clipped capped report left a false claim behind)."""
+    return QueryWarning(
+        "TRUNCATED",
+        f"{_REFS_CAP_ID_PREFIX}{report_id}: {omitted} ref(s) omitted (§22)",
+    )
+
+
+def capped_report_id(message: str) -> str | None:
+    """The report id a refs-cap warning names — None for any other message.
+
+    The parser lives beside the builder so the message shape has ONE owner;
+    accepts hybrid's ``[global] `` origin prefix."""
+    text = message.removeprefix("[global] ")
+    if not text.startswith(_REFS_CAP_ID_PREFIX):
+        return None
+    report_id, sep, _ = text[len(_REFS_CAP_ID_PREFIX) :].partition(":")
+    return report_id if sep else None
 
 
 #: Grounding lookups run in batches of this many ids per query: the IN
@@ -135,8 +200,8 @@ async def _known_entity_ids(repo: BuildScopedRepo, claimed: set[Any]) -> set[Any
     return known
 
 
-def _report_result(row: Any, known: set[Any]) -> tuple[RetrievalResult | None, int]:
-    """One SoR report row → ``(result-or-None, ungrounded-ref count)``.
+def _report_result(row: Any, known: set[Any]) -> tuple[RetrievalResult | None, int, int]:
+    """One SoR report row → ``(result-or-None, ungrounded-ref count, capped-ref count)``.
 
     The members ARE the citation (§27.2), and only ids GROUNDED in this
     build's entities may become refs (the array has no FK — a malformed or
@@ -144,25 +209,41 @@ def _report_result(row: Any, known: set[Any]) -> tuple[RetrievalResult | None, i
     A report with zero grounded members drops; one with some survives on the
     grounded subset, with the omissions counted. ``title``/``summary`` are
     nullable display fields — emitted as-is when strings, null otherwise
-    (§16 allows null; no coerced reprs)."""
-    claimed = [m for m in (row.member_entity_ids or []) if m is not None]
+    (§16 allows null; no coerced reprs).
+
+    Refs are CAPPED at ``REFS_CAP`` (MCP3): a large community claims dozens
+    of members (58 measured), and expanding every uuid made source_refs 83%
+    of a hybrid payload — noise an agent pays for on every call. §27.2 needs
+    ≥1 grounded ref, not the roster; the cap keeps the first N in the same
+    deterministic order, and the caller reports the omission (silent
+    truncation would read as the full membership)."""
+    # the array permits repeated uuids — a duplicate is the SAME member, not
+    # another ref: counting repeats minted identical refs, spent the cap on
+    # copies, and crowded real members out of the citation (Codex #123 r2)
+    claimed = {m for m in (row.member_entity_ids or []) if m is not None}
     members = [m for m in claimed if m in known]
     bad_refs = len(claimed) - len(members)
     if not members:
-        return None, bad_refs
+        return None, bad_refs, 0
+    grounded = sorted(members, key=str)
+    capped = max(0, len(grounded) - REFS_CAP)
     refs = tuple(
-        SourceRef(source_type="entity", id=str(entity_id)) for entity_id in sorted(members, key=str)
+        SourceRef(source_type="entity", id=str(entity_id)) for entity_id in grounded[:REFS_CAP]
     )
     title = row.title if isinstance(row.title, str) and row.title.strip() else None
     summary = row.summary if isinstance(row.summary, str) and row.summary.strip() else None
-    return RetrievalResult(
-        result_type="community_report",
-        id=str(row.id),
-        score=0.0,  # placeholder; _scored assigns the positional value
-        source_refs=refs,
-        title=title,
-        text=summary,
-    ), bad_refs
+    return (
+        RetrievalResult(
+            result_type="community_report",
+            id=str(row.id),
+            score=0.0,  # placeholder; _scored assigns the positional value
+            source_refs=refs,
+            title=title,
+            text=summary,
+        ),
+        bad_refs,
+        capped,
+    )
 
 
 def _scored(results: list[RetrievalResult]) -> tuple[RetrievalResult, ...]:

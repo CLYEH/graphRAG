@@ -165,8 +165,8 @@ Keep items small enough to finish in one loop.
 
 ### P0 — 會導致 agent 給出錯誤答案
 - [x] MCP2 warning 分類正確性(review 第 1/4/13 條:seed 未解析警告、輸入錯誤與 store 故障分流、STORE_UNAVAILABLE 具名 store)
-- [ ] MCP3 `global_summary` 的「未經查詢比對」必須可見(review 第 2 條)— `global_summary(query, top_k)` 從不用 `query` 做任何比對(`core/query/global_reports.py:67-72`:抓全部 report 按 `rating desc` 靜態排序),實測三個語意無關的查詢回**完全相同的 id 與順序**;程式碼自承 "carry no relevance model",`score` 是合成位置值 `(total-index)/total`。問題不在 v1 沒有相關性模型,而在這些結果**混在同一個帶分數的 `results` 陣列**裡與真正比對過的結果並排(`hybrid_query("票價")` 20 筆中 10 筆是它們,分數區間重疊),agent 沒有欄位可分辨→會把珊瑚復育/空難/黑潮當成票價的檢索證據。最小修法:結果加欄位或 warning 標明未經相關性比對;根治:給 global 真的相關性模型,或只在查詢確實是「整體/趨勢」型時才參與融合。順帶收 `community_report` 的 `source_refs` 展開量(單篇最多 58 個 entity uuid,佔 payload 83%)。
-- [ ] MCP4 `LOW_CONFIDENCE` 實作或移除(review 第 3 條)— 凍結 enum 裡有一個**從未被任何程式碼發出**的 warning code(`grep -rn LOW_CONFIDENCE` 只命中 contracts/tests/web,零查詢路徑),optional `confidence` 欄位也從未被填。後果:語料答不出來的問題照樣回 20 筆通過 schema 驗證、附完整引用、`warnings` 為空的結果。而且門檻在原理上取不出來——實測「有恐龍化石展嗎」(語料沒有)最高分 0.5494 **贏過**「從台北怎麼去」(語料有)的正確答案 0.4478。有一個宣告了卻不存在的代碼,比沒有更糟:它讓契約看起來覆蓋了實際沒覆蓋的情況。要嘛實作(需定義門檻來源,非單純 cosine)、要嘛移除並在 DESIGN 記錄為刻意不提供——**移除是 `contracts/` 變更,依 DR-002 需 bump `schema_version` 並記 DESIGN §26**(同 MCP7)。
+- [x] MCP3 global_summary 的「未經查詢比對」必須可見(review 第 2 條:LOW_CONFIDENCE 誠實警告 + community_report refs 上限 8)
+- [ ] MCP4 語意/混合路徑的域外信心訊號(review 第 3 條;MCP3 後改寫)— 原任務是「`LOW_CONFIDENCE` 實作或移除」,但 MCP3 已讓 `global_summary` 發出它(語意:global 結果未經查詢比對),**移除選項已死**——代碼已在生產路徑使用。剩下的缺口:**semantic/hybrid 對語料答不出來的問題照樣回 20 筆通過 schema 驗證、附完整引用、無警告的結果**,optional `confidence` 欄位也從未被填。而且門檻在原理上取不出來——實測「有恐龍化石展嗎」(語料沒有)最高分 0.5494 **贏過**「從台北怎麼去」(語料有)的正確答案 0.4478,單純 cosine 門檻不可行。任務:為 semantic/hybrid 定義域外訊號來源(相對分數落差、與 build 詞彙的重疊度、或 LLM 判準)並在低信心時發 `LOW_CONFIDENCE` / 填 `confidence`;若結論是原理上不可行,則在 DESIGN 記錄為刻意不提供並在工具描述誠實聲明。
 
 ### P1 — agent 拿不到可用內容
 - [ ] MCP5 MCP 面補原文取回工具(review 第 6 條)— 八個工具全是查詢或自省,**沒有 `get_chunk`/`get_document`**;REST 早有 `GET /projects/{p}/chunks/{chunk_id}` 與 `/documents/{document_id}`,但沒做成工具。後果:即使 agent 拿到完全合法可解的 chunk UUID(relation 的 evidence ref 就是),在 MCP 面上也**沒有工具能把它換成文字**,引用退化成純裝飾。純新增,不動契約(自省形狀,非 §16——`tool` enum 已凍結,比照 `get_entity`)。
