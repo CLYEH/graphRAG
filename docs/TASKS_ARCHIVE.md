@@ -338,3 +338,7 @@ RunsTable 失敗建置列展開加「失敗診斷」:useBuildSteps/useStepItems 
 ## MCP5
 
 (a) 設計:UUID 驗證先於任何 store 讀取,無效輸入具名 mention-ref 形狀(#124 課:不留死指引);not-found 具名 ACTIVE build;raw 完整不截斷(REST detail 對等);ingested_at 字串化(自省 payload 純 JSON)。(b) 遠端 4 輪:r1 P1 metadata 整包回傳繞過 DR-010 metadata_exposure fail-closed 白名單→改經與 enrichment 同源的 exposure.project(密級欄位 hermetic+live 雙驗證不可見);r2 get_chunk 指引未限定 evidence 形狀(row/document ref 照做會炸)→限定 source_type "chunk",括號用 agent 可見詞彙;r3 wrapper 先 bound() 才驗 id(壞輸入白付 active-build 解析、store 掛掉時錯誤被 STORE_UNAVAILABLE 遮蔽)→抽 pre-binding 拒絕(_NIL_BUILD sentinel、訊息常數單一來源雙發射點),ordering 以真 dispatch 整合測試釘住(nil build 只在跳過 binding 時成立);r4 +1。(c) 測試:單元 5+整合 3(DR-006 archived build 不可見、DR-010 live、ordering pin),probe 各恰紅;check-full 綠。get_entity 同型 bind-then-validate 入 followups。
+
+## MCP6
+
+(a) 設計:_fair_page 名額配在 **SoR 驗證後的 citable results** 上(r1 Codex P2:配在原始 hits 會讓 drift 髒 hit 佔名額再被丟,擠掉已抓回的合法 chunk——恰在 drift 時破功);餘位分數+id tiebreak(#34);typed 檢索使 payload-less/未知型別點 store 端即到不了,drop-branch 測試語意同步(4 drop+2 excluded);fake vectors 鏡射真 repo 型別過濾(否則雙檢索重複計數)。(b) gate-2 兩輪:首輪 PASS 附 ripple nit(hybrid/eval 繼承新行為=MCP8 方向,有意);r1 復審 **FAIL 抓到 false-green 測試**——單 entity 時 raw-slot 頁面不飽和,rest 回填救回 valid chunk,我的 probe 突變又不忠實於 round-0;處方=兩 entity 飽和頁面,reviewer 對真 round-0 復驗紅。(c) 遠端 2 輪(r1 P2→修;r2 +1);整合 279 綠(People Ops title pin 依 MCP6 翻轉並註明)。
