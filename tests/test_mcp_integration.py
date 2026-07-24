@@ -125,10 +125,34 @@ async def _activate_build(project: str, *, entity_name: str) -> uuid.UUID:
             created_at=NOW,
             updated_at=NOW,
         )
+        # MCP7 (v1.1): the mention must RESOLVE (chunk uuid + uri + quote +
+        # offsets) or get_entity omits it — back it with a real doc + chunk
+        mention_hash = f"aa{entity_id.hex[:10]}"
+        document_id = uuid.uuid4()
+        await writer.insert(
+            documents,
+            id=document_id,
+            source_uri="file:///mention.md",
+            raw=f"{entity_name} appears here",
+            content_hash=mention_hash,
+            mime="text/markdown",
+            metadata={},
+            ingested_at=NOW,
+        )
+        await writer.insert(
+            chunks,
+            id=uuid.uuid4(),
+            document_id=document_id,
+            ordinal=0,
+            text=f"{entity_name} appears here",
+            token_count=3,
+            start_offset=0,
+            end_offset=20,
+        )
         await writer.insert_entity_mention(
             entity_id=entity_id,
             source_kind="text",
-            source_ref=f"chunk-{entity_id}",
+            source_ref=f"chunk:{mention_hash}:0",
             surface_form=entity_name,
             confidence=1.0,
         )
@@ -177,7 +201,13 @@ async def test_get_entity_returns_cited_entities_from_the_active_build(
     assert payload["project"] == context.project
     assert len(payload["entities"]) == 1
     entity = payload["entities"][0]
-    assert entity["mentions"][0]["source_type"] == "chunk"  # §27.2's spirit
+    mention = entity["mentions"][0]
+    assert mention["source_type"] == "chunk"  # §27.2's spirit
+    # MCP7: get_entity forwards the RESOLVED shape — chunk UUID id (the
+    # get_chunk key), source_uri, and the quoted surface form
+    assert uuid.UUID(mention["id"])
+    assert mention["source_uri"] == "file:///mention.md"
+    assert mention["metadata"]["quote"] == "Acme"
 
     async with context.bound() as deps:
         empty = await _get_entity(deps.repo, context.project, "Nobody")
@@ -339,5 +369,5 @@ async def test_a_malformed_chunk_id_never_reaches_the_binding(
     if isinstance(unwrapped, dict) and "result" in unwrapped:
         unwrapped = unwrapped["result"]
     assert unwrapped["chunk"] is None
-    assert "not yet resolvable" in unwrapped["error"]
+    assert "STORED form" in unwrapped["error"]  # MCP7: emitted refs carry chunk UUIDs now
     assert unwrapped["build_id"] == _NIL_BUILD  # binding was never opened

@@ -24,6 +24,7 @@ import core.query.hybrid as hybrid_module
 from core.query.global_reports import refs_cap_warning
 from core.query.graph import GraphQueryParams
 from core.query.hybrid import HybridDeps, HybridPolicy, _fuse, hybrid_query
+from core.query.mentions import mention_warnings
 from core.query.policy import (
     CYPHER_ALLOWED_CLAUSES,
     CYPHER_BLOCKED_MIN,
@@ -700,3 +701,50 @@ async def test_a_caller_input_rejection_is_not_reported_as_a_store_outage(
     # (everything is dead) — the same distinction the single-mode tools give
     outage_msgs = [w.message for w in store_400.warnings if w.code == "STORE_UNAVAILABLE"]
     assert any("qdrant unavailable" in m for m in outage_msgs), outage_msgs
+
+
+async def test_mention_loss_warnings_are_refit_to_the_fused_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #127 r4 (the MCP3 provenance arc, applied to mention warnings):
+    a mode computes its cap/drop warnings against its OWN page, but fusion
+    may clip the affected entity — the fused response must not claim a
+    returned entity lost citations when none of the named entities survived.
+    The messages name their entities, so hybrid REBUILDS each warning for
+    the fused page via the builder/parser siblings."""
+    # fixed high uuid: sorts AFTER "a-hit" so the id tie-break clips IT
+    capped_id = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    warnings = mention_warnings({capped_id}, {capped_id: 2}, {capped_id})
+
+    def _entity(rid: str) -> RetrievalResult:
+        # v1.1 entity minimum: a RESOLVED chunk mention ref
+        return _result(
+            result_type="entity",
+            rid=rid,
+            source_refs=(
+                SourceRef(
+                    source_type="chunk",
+                    id=str(uuid.uuid4()),
+                    source_uri="s3://m.md",
+                    metadata={"quote": "q", "start_offset": 0, "end_offset": 1},
+                ),
+            ),
+        )
+
+    _patch_modes(
+        monkeypatch,
+        semantic=_mode_response(
+            "semantic_search", _entity(str(capped_id)), warnings=tuple(warnings)
+        ),
+        graph=_mode_response("graph_query", _result(rid="a-hit")),
+    )
+    # the affected entity SURVIVES fusion → both warnings survive, prefixed
+    kept = await _run(_deps(), _policy(top_k=10))
+    assert any(str(capped_id) in w.message and "capped" in w.message for w in kept.warnings)
+    assert any(str(capped_id) in w.message and "unresolvable" in w.message for w in kept.warnings)
+
+    # the affected entity is CLIPPED (top_k=1, "a-hit" wins the id tie) →
+    # both mention-loss warnings die with it
+    clipped = await _run(_deps(), _policy(top_k=1))
+    assert [r.id for r in clipped.results] == ["a-hit"]
+    assert not any("mention" in w.message for w in clipped.warnings)

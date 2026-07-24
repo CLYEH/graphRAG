@@ -134,7 +134,7 @@ class _FakeSoR:
     def __init__(
         self,
         seeds: dict[str, list[uuid.UUID]] | None = None,
-        mentions: dict[uuid.UUID, list[tuple[str, str]]] | None = None,
+        mentions: dict[uuid.UUID, list[tuple[str, str, str | None]]] | None = None,
         active: set[uuid.UUID] | None = None,
         relations: dict[tuple[uuid.UUID, uuid.UUID, str], tuple[uuid.UUID, list[dict[str, Any]]]]
         | None = None,
@@ -157,8 +157,24 @@ class _FakeSoR:
 
     async def mentions_by_entity(
         self, entity_ids: list[uuid.UUID]
-    ) -> dict[uuid.UUID, list[tuple[str, str]]]:
+    ) -> dict[uuid.UUID, list[tuple[str, str, str | None]]]:
         return {eid: refs for eid, refs in self._mentions.items() if eid in entity_ids}
+
+    async def chunks_by_content_ref(self, refs: Any) -> dict[tuple[str, int], Any]:
+        # every well-formed chunk:{hash}:{ordinal} ref resolves (MCP7): graph
+        # tests pin GRAPH logic; resolution behavior is pinned in the
+        # semantic/mentions suites. Deterministic uuid5 keeps ids stable.
+        return {
+            key: SimpleNamespace(
+                id=uuid.uuid5(uuid.NAMESPACE_URL, f"{key[0]}:{key[1]}"),
+                ordinal=key[1],
+                start_offset=0,
+                end_offset=9,
+                content_hash=key[0],
+                source_uri="s3://g.md",
+            )
+            for key in set(refs)
+        }
 
     async def active_entity_names(self, entity_ids: list[uuid.UUID]) -> dict[uuid.UUID, str]:
         # names mirror ids in the fake — presence is what the tests pin
@@ -297,8 +313,8 @@ async def test_neighbors_returns_cited_entities_nearest_first() -> None:
     sor = _FakeSoR(
         seeds={"acme": [seed]},
         mentions={
-            near: [("text", str(uuid.uuid4()))],
-            far: [("structured", "6:orders:17")],
+            near: [("text", f"chunk:{uuid.uuid4().hex}:0", "q")],
+            far: [("structured", "6:orders:17", None)],
         },
         pairs={(seed, near), (near, far)},  # the SoR agrees the traversal exists
     )
@@ -327,7 +343,7 @@ async def test_a_hit_without_sor_mentions_is_dropped_as_drift() -> None:
     )
     sor = _FakeSoR(
         seeds={"acme": [seed]},
-        mentions={ok: [("text", "c-1")]},
+        mentions={ok: [("text", "chunk:aabbccdd01:1", "q")]},
         pairs={(seed, ghost), (seed, ok)},
     )
     response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
@@ -343,7 +359,11 @@ async def test_a_corrupt_projected_canonical_id_is_dropped_not_crashed() -> None
             {"entity": _node(ok), "distance": 1},
         ]
     )
-    sor = _FakeSoR(seeds={"acme": [seed]}, mentions={ok: [("text", "c-1")]}, pairs={(seed, ok)})
+    sor = _FakeSoR(
+        seeds={"acme": [seed]},
+        mentions={ok: [("text", "chunk:aabbccdd01:1", "q")]},
+        pairs={(seed, ok)},
+    )
     response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
     assert [r.id for r in response.results] == [str(ok)]
     assert _codes(response) == ["PARTIAL_RESULTS"]
@@ -357,7 +377,7 @@ async def test_the_policy_row_cap_truncates_and_flags() -> None:
     graph = _FakeGraph(neighbor_rows=[{"entity": _node(eid), "distance": 1} for eid in ids])
     sor = _FakeSoR(
         seeds={"acme": [seed]},
-        mentions={eid: [("text", f"c-{eid}")] for eid in ids},
+        mentions={eid: [("text", f"chunk:{eid.hex}:0", "q")] for eid in ids},
         pairs={(seed, eid) for eid in ids},
     )
     response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
@@ -381,8 +401,8 @@ async def test_a_neighbor_reached_only_through_a_stale_edge_is_dropped() -> None
     sor = _FakeSoR(
         seeds={"acme": [seed]},
         mentions={
-            via_stale: [("text", "c-stale")],  # active entity, still mentioned…
-            via_live: [("text", "c-live")],
+            via_stale: [("text", "chunk:aaaa50110f:0", "q")],  # active entity, still mentioned…
+            via_live: [("text", "chunk:bbbb111e00:0", "q")],
         },
         pairs={(seed, via_live)},  # …but the SoR edge to it is GONE
     )
@@ -628,7 +648,7 @@ async def test_truncation_survives_sor_drops() -> None:
     graph = _FakeGraph(neighbor_rows=[{"entity": _node(eid), "distance": 1} for eid in ids])
     sor = _FakeSoR(
         seeds={"acme": [seed]},
-        mentions={eid: [("text", f"c-{eid}")] for eid in ids},
+        mentions={eid: [("text", f"chunk:{eid.hex}:0", "q")] for eid in ids},
         pairs={(seed, eid) for eid in ids[1:]},  # the first candidate's edge went stale
     )
     response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
@@ -742,7 +762,10 @@ async def test_subgraph_emits_cited_entities_and_evidence_backed_relations() -> 
     )
     sor = _FakeSoR(
         seeds={"acme": [seed]},
-        mentions={seed: [("text", "c-seed")], other: [("text", "c-other")]},
+        mentions={
+            seed: [("text", "chunk:cccc5eed00:0", "q")],
+            other: [("text", "chunk:dddd014e00:0", "q")],
+        },
         relations={
             (seed, other, "works_at"): (
                 rel_id,
@@ -793,7 +816,7 @@ async def test_subgraph_caps_the_combined_response_at_max_rows() -> None:
     )
     sor = _FakeSoR(
         seeds={"acme": [seed]},
-        mentions={eid: [("text", f"c-{eid}")] for eid in [seed, *others]},
+        mentions={eid: [("text", f"chunk:{eid.hex}:0", "q")] for eid in [seed, *others]},
         relations={
             (seed, others[0], f"t{i}"): (uuid.uuid4(), [_chunk_evidence()]) for i in range(9)
         },
@@ -817,7 +840,7 @@ async def test_subgraph_with_no_edge_budget_skips_the_edge_query_and_flags() -> 
     graph = _FakeGraph(neighbor_rows=[{"entity": _node(o), "distance": 1} for o in others])
     sor = _FakeSoR(
         seeds={"acme": [seed]},
-        mentions={eid: [("text", f"c-{eid}")] for eid in [seed, *others]},
+        mentions={eid: [("text", f"chunk:{eid.hex}:0", "q")] for eid in [seed, *others]},
         pairs={(seed, o) for o in others},
     )
     response = await _run(graph, sor, GraphQueryParams(template="subgraph", entity="acme"))
@@ -834,7 +857,9 @@ async def test_no_budget_at_multi_hop_probes_for_edges_instead_of_asserting() ->
     over-firing is a spurious warning, under-firing is a silent omission."""
     seed = uuid.uuid4()
     others = [uuid.uuid4() for _ in range(_POLICY.max_rows - 1)]
-    mentions = {eid: [("text", f"c-{eid}")] for eid in [seed, *others]}
+    mentions: dict[uuid.UUID, list[tuple[str, str, str | None]]] = {
+        eid: [("text", f"chunk:{eid.hex}:0", "q")] for eid in [seed, *others]
+    }
     rows = [{"entity": _node(o), "distance": 2} for o in others]
     pairs = {(seed, o) for o in others}
 
@@ -875,7 +900,10 @@ async def test_a_relation_whose_evidence_cannot_satisfy_the_contract_is_dropped(
     ]
     sor = _FakeSoR(
         seeds={"acme": [seed]},
-        mentions={seed: [("text", "c-seed")], other: [("text", "c-other")]},
+        mentions={
+            seed: [("text", "chunk:cccc5eed00:0", "q")],
+            other: [("text", "chunk:dddd014e00:0", "q")],
+        },
         relations={(seed, other, "works_at"): (uuid.uuid4(), bad_rows)},
     )
     response = await _run(graph, sor, GraphQueryParams(template="subgraph", entity="acme"))
@@ -992,8 +1020,8 @@ async def test_subgraph_context_emits_sor_backed_nodes_and_citable_edges() -> No
     )
     sor = _SubgraphSoR(
         mentions={
-            seed: [("structured", "t:1")],
-            buddy: [("structured", "t:2")],
+            seed: [("structured", "1:t:1", None)],
+            buddy: [("structured", "1:t:2", None)],
             # silent: no mentions → dropped from the node set (§16)
         },
         relations={(seed, buddy, "WORKS_AT"): (rel, [_chunk_evidence()])},
@@ -1013,3 +1041,161 @@ async def test_subgraph_context_emits_sor_backed_nodes_and_citable_edges() -> No
         "type": "WORKS_AT",
         "confidence": 0.9,
     }
+
+
+async def test_graph_surfaces_mention_cap_and_drop_like_semantic() -> None:
+    """Codex #127: graph silently discarded the resolver's cap/drop signals
+    while semantic warned — a neighbors page could show 8-of-20 mention refs
+    with no TRUNCATED and lose drifted citations with no PARTIAL_RESULTS.
+    Both warnings come from the SAME single-source builder (mention_warnings),
+    so the two surfaces cannot drift."""
+    seed, heavy = uuid.uuid4(), uuid.uuid4()
+    mentions: dict[uuid.UUID, list[tuple[str, str, str | None]]] = {
+        seed: [("text", f"chunk:{seed.hex}:0", "q")],
+        # 10 resolvable mentions → capped at 8; plus one unresolvable → drop
+        heavy: [
+            *(
+                ("text", f"chunk:{uuid.uuid4().hex}:{i}", cast("str | None", "q"))
+                for i in range(10)
+            ),
+            ("text", "not-a-ref", None),
+        ],
+    }
+    graph = _FakeGraph(neighbor_rows=[{"entity": _node(heavy), "distance": 1}])
+    sor = _FakeSoR(seeds={"acme": [seed]}, mentions=mentions, pairs={(seed, heavy)})
+    response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
+    heavy_result = next(r for r in response.results if r.id == str(heavy))
+    assert len(heavy_result.source_refs) == 8  # capped, deterministic prefix
+    codes = [w.code for w in response.warnings]
+    assert "TRUNCATED" in codes  # the cap is named…
+    assert any("get_entity" in w.message for w in response.warnings)  # …with the real escape hatch
+    assert any(
+        "unresolvable mention citation(s) omitted on returned entities" in w.message
+        for w in response.warnings
+    )  # …and the drift loss is surfaced
+
+
+async def test_an_uncitable_page_entity_never_hides_a_fetched_citable_candidate() -> None:
+    """Codex #127 r7 (the MCP6 validate-then-allocate rule, graph edition):
+    slicing to max_rows BEFORE mention resolution let an uncitable entity
+    occupy a page seat while the already-fetched citable probe candidate was
+    never promoted — max_rows citable rows available, fewer returned. The
+    page is now taken from CITABLE candidates."""
+    seed = uuid.uuid4()
+    ids = sorted([uuid.uuid4() for _ in range(_POLICY.max_rows + 1)], key=str)
+    graph = _FakeGraph(neighbor_rows=[{"entity": _node(eid), "distance": 1} for eid in ids])
+    mentions: dict[uuid.UUID, list[tuple[str, str, str | None]]] = {
+        eid: [("text", f"chunk:{eid.hex}:0", "q")] for eid in ids
+    }
+    mentions[ids[0]] = [("text", "not-a-ref", "q")]  # IN-page entity, unresolvable
+    sor = _FakeSoR(
+        seeds={"acme": [seed]},
+        mentions=mentions,
+        pairs={(seed, eid) for eid in ids},  # every edge is valid — only the
+        # mention resolution drops ids[0]
+    )
+    response = await _run(graph, sor, GraphQueryParams(template="neighbors", entity="acme"))
+    # the probe candidate fills the vacated seat — the page stays FULL
+    assert len(response.results) == _POLICY.max_rows
+    assert str(ids[0]) not in [r.id for r in response.results]
+    codes = _codes(response)
+    assert "PARTIAL_RESULTS" in codes  # the drop is surfaced
+    # TRUNCATED still fires — the probe row came back, so the store LIMIT
+    # clipped the fetch and more citable neighbors may exist beyond it (the
+    # fetch-time semantics the sibling truncation test pins)
+    assert "TRUNCATED" in codes
+
+
+async def test_an_evidence_less_edge_never_hides_a_fetched_citable_edge() -> None:
+    """Codex #127 r7's class, EDGE edition (gate-2 sibling sweep): slicing
+    edges to the budget before evidence validation let an uncitable edge
+    occupy a seat while the fetched probe edge was never promoted. Edges are
+    now validated first; the budget takes citable ones."""
+    seed = uuid.uuid4()
+    # max_rows(10) - 9 page entities (seed + 8 neighbors) → edge_budget = 1:
+    # the fetch (budget+1 probe) returns BOTH edges, and round-0 slicing
+    # would keep only the stale one
+    near = [uuid.uuid4() for _ in range(8)]
+    rel_ok, rel_stale = uuid.uuid4(), uuid.uuid4()
+    edge_budget_probe = [
+        # the budget-slot edge has NO evidence (uncitable); the probe edge
+        # (beyond the budget under raw slicing) is fully citable
+        {"src": str(seed), "dst": str(near[0]), "type": "REL_STALE"},
+        {"src": str(near[1]), "dst": str(seed), "type": "REL_OK"},
+    ]
+    graph = _FakeGraph(
+        neighbor_rows=[{"entity": _node(n), "distance": 1} for n in near],
+        edges=edge_budget_probe,
+    )
+    sor = _FakeSoR(
+        seeds={"acme": [seed]},
+        mentions={eid: [("text", f"chunk:{eid.hex}:0", "q")] for eid in [seed, *near]},
+        pairs={(seed, n) for n in near},
+        relations={
+            (near[1], seed, "REL_OK"): (
+                rel_ok,
+                [
+                    {
+                        "evidence_type": "chunk",
+                        "quote": "q",
+                        "source_uri": "s3://e.md",
+                        "start_offset": 0,
+                        "end_offset": 1,
+                        "chunk_id": uuid.uuid4(),
+                        "evidence_ref": "r",
+                    }
+                ],
+            ),
+            # REL_STALE resolves to a relation with NO valid evidence rows
+            (seed, near[0], "REL_STALE"): (rel_stale, []),
+        },
+    )
+    response = await _run(graph, sor, GraphQueryParams(template="subgraph", entity="acme", hops=1))
+    relation_ids = [r.id for r in response.results if r.result_type == "relation"]
+    assert relation_ids == [str(rel_ok)]  # the citable probe edge got the seat
+
+
+async def test_context_edge_budget_takes_citable_edges_first() -> None:
+    """The REST twin of the _subgraph edge fix (Codex #127 r7's class, third
+    sweep site): pre-slicing projected edges to the budget let an
+    evidence-less edge hide the fetched citable probe edge — the context
+    emitted zero edges with one citable available. The budget now caps the
+    CITABLE list."""
+    seed = uuid.uuid4()
+    # 9 page entities (seed + 8 neighbors) → edge_budget = max_rows(10) − 9 = 1
+    near = [uuid.uuid4() for _ in range(8)]
+    rel_ok, rel_stale = uuid.uuid4(), uuid.uuid4()
+    graph = _FakeGraph(
+        neighbor_rows=[{"entity": _node(n), "distance": 1} for n in near],
+        edges=[
+            {"src": str(seed), "dst": str(near[0]), "type": "REL_STALE"},
+            {"src": str(near[1]), "dst": str(seed), "type": "REL_OK"},
+        ],
+    )
+    sor = _SubgraphSoR(
+        seeds={},
+        mentions={eid: [("text", f"chunk:{eid.hex}:0", "q")] for eid in [seed, *near]},
+        pairs={(seed, n) for n in near},
+        relations={
+            (near[1], seed, "REL_OK"): (
+                rel_ok,
+                [
+                    {
+                        "evidence_type": "chunk",
+                        "quote": "q",
+                        "source_uri": "s3://e.md",
+                        "start_offset": 0,
+                        "end_offset": 1,
+                        "chunk_id": uuid.uuid4(),
+                        "evidence_ref": "r",
+                    }
+                ],
+            ),
+            (seed, near[0], "REL_STALE"): (rel_stale, []),
+        },
+        entity_rows=[_sor_entity_row(eid, f"n-{eid}") for eid in [seed, *near]],
+        relation_rows=[_sor_relation_row(rel_ok, near[1], seed)],
+    )
+    context = await _run_subgraph(graph, sor, seed, 1)
+    assert context is not None
+    assert [e["id"] for e in context.edges] == [rel_ok]  # the citable edge got the seat

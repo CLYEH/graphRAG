@@ -49,6 +49,17 @@ def test_split_row_source_ref_roundtrips_and_refuses_corrupt_refs() -> None:
         assert split_row_source_ref(row_source_ref(table, pk)) == (table, pk)
     for corrupt in ["", "people:7", "notanum:people:7", "9:people:7", "6:people", "6"]:
         assert split_row_source_ref(corrupt) is None
+    # Codex #127 r2 class: the length prefix is bounded BEFORE int() — an
+    # unbounded head let a >4300-digit prefix raise past CPython's digit
+    # limit (a crash where the docstring promises the uncitable drop); both
+    # callers (relation evidence + MCP7 mention refs) share this single source
+    assert split_row_source_ref("1234567890:people:7") is None  # 10 digits — over
+    assert split_row_source_ref("9" * 5000 + ":people:7") is None  # never reaches int()
+    # r3 sibling: isdigit() accepts Unicode digits — without the isascii()
+    # guard ٤ (=4) int()s to 4 and this ref SPLITS into ("abcd", "pk"), a
+    # pair the writer never encoded; the input is chosen so the length check
+    # alone cannot save it (the guard is the sole discriminator)
+    assert split_row_source_ref("٤:abcd:pk") is None
 
 
 class _FakeWriter:

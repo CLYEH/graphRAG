@@ -31,7 +31,7 @@ from core.query.policy import CYPHER_ALLOWED_CLAUSES, CYPHER_BLOCKED_MIN, TextTo
 from core.resolve import fingerprints
 from core.stores.graph import BuildScopedGraphProjector, BuildScopedGraphRepo, graph_driver
 from core.stores.repo import BuildScopedRepo, BuildScopedWriter
-from core.stores.tables import builds, entities, relation_evidence, relations
+from core.stores.tables import builds, chunks, documents, entities, relation_evidence, relations
 from tests.conftest import ensure_project
 
 pytestmark = pytest.mark.integration
@@ -105,10 +105,34 @@ async def _entity(
         created_at=NOW,
         updated_at=NOW,
     )
+    # MCP7 (v1.1): the mention must RESOLVE or the entity is uncitable —
+    # back it with a real doc + chunk and the writer's stored ref shape
+    mention_hash = f"aa{entity_id.hex[:10]}"
+    document_id = uuid.uuid4()
+    await writer.insert(
+        documents,
+        id=document_id,
+        source_uri="file:///graph.md",
+        raw=f"{name} appears here",
+        content_hash=mention_hash,
+        mime="text/markdown",
+        metadata={},
+        ingested_at=NOW,
+    )
+    await writer.insert(
+        chunks,
+        id=uuid.uuid4(),
+        document_id=document_id,
+        ordinal=0,
+        text=f"{name} appears here",
+        token_count=3,
+        start_offset=0,
+        end_offset=20,
+    )
     await writer.insert_entity_mention(
         entity_id=entity_id,
         source_kind="text",
-        source_ref=mention_ref or f"chunk-{entity_id}",
+        source_ref=mention_ref or f"chunk:{mention_hash}:0",
         surface_form=name,
         confidence=1.0,
     )

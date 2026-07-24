@@ -495,7 +495,7 @@ async def test_subgraph_end_to_end_over_registry_policy(api: Api) -> None:
         seed = await _make_entity(conn, project, active, "Hall-A")
         await conn.execute(
             entity_mentions.insert().values(
-                entity_id=seed, source_kind="structured", source_ref="halls:1"
+                entity_id=seed, source_kind="structured", source_ref="5:halls:1"
             )
         )
 

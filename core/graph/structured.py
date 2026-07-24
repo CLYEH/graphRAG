@@ -68,7 +68,17 @@ def split_row_source_ref(ref: str) -> tuple[str, str] | None:
     are SoR data but the reader must not crash on a corrupt one — the caller
     treats ``None`` as an uncitable ref and drops it (§22), never a 500."""
     head, sep, rest = ref.partition(":")
-    if not sep or not head.isdigit():
+    # the length prefix is BOUNDED before int() (Codex #127 r2 class, fixed
+    # at the single source for BOTH callers — relation evidence and MCP7
+    # mention refs): isdigit() accepts any length, and int() on a >4300-digit
+    # head raises past CPython's digit limit — a crash where the contract
+    # promises the uncitable drop. A legitimate prefix is len(table), two
+    # digits at most under Postgres's 63-byte identifier limit; 9 mirrors
+    # the chunk-ordinal bound.
+    # isascii() first (Codex #127 r3 sibling): isdigit() accepts Unicode
+    # digits (١), which int() happily converts — a corrupt ref would split
+    # into a (table, pk) the writer never encoded instead of dropping
+    if not sep or not head.isascii() or not head.isdigit() or len(head) > 9:
         return None
     length = int(head)
     if len(rest) < length + 1 or rest[length] != ":":

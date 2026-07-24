@@ -61,6 +61,7 @@ from core.query.global_reports import global_summary as run_global
 from core.query.graph import GraphQueryParams
 from core.query.graph import graph_query as run_graph
 from core.query.hybrid import hybrid_query as run_hybrid
+from core.query.mentions import resolved_mention_refs
 from core.query.metadata_enrich import enrich_response_metadata
 from core.query.results import McpResponse, QueryWarning
 from core.query.semantic import semantic_search as run_semantic
@@ -82,10 +83,6 @@ _NIL_BUILD = "00000000-0000-0000-0000-000000000000"
 #: LOUD — degradation is for store trouble, never for our own bugs.
 _STORE_ERRORS: tuple[type[BaseException], ...] = STORE_CLIENT_ERRORS
 _store_name = store_name
-
-
-#: entity_mentions.source_kind → §16 source_type (the C6a mapping).
-_MENTION_SOURCE_TYPE = {"text": "chunk", "structured": "row"}
 
 
 async def _bounded(
@@ -295,10 +292,13 @@ def build_server(project: str) -> FastMCP:
         two cases (topically-close-but-absent questions outscore answerable
         generic ones). No warning flags an out-of-domain question; judge
         answerability from the returned content, not from the scores:
-        chunk results carry the matched text, but entity results carry only
-        the matched NAME — no tool currently retrieves their underlying
-        content — so a page of bare name matches is NOT evidence the
-        corpus answers the question."""
+        chunk results carry the matched text; entity results carry the
+        matched NAME plus quoted mention citations — a citation with
+        source_type "chunk" has a chunk UUID id (exchange it for full text
+        with get_chunk), one with source_type "row" cites a structured
+        table+pk instead (get_chunk does not accept those). A page of
+        bare name matches is still NOT evidence the corpus answers the
+        question."""
         rt = _rt()
 
         async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
@@ -425,10 +425,10 @@ def build_server(project: str) -> FastMCP:
     @server.tool()
     async def get_chunk(chunk_id: str) -> dict[str, Any]:
         """Exchange a chunk UUID for its TEXT (plus document provenance) —
-        the id of a chunk result or a relation evidence ref. Introspection
-        shape — NOT a §16 response. Entity mention refs
-        (chunk:{content_hash}:{ordinal}) are a different shape and not yet
-        resolvable."""
+        the id of a chunk result, a chunk evidence ref, or an entity chunk
+        mention citation (all carry chunk UUIDs since v1.1). Introspection
+        shape — NOT a §16 response. Row mention/evidence refs cite a
+        structured table+pk and are not accepted here."""
         rt = _rt()
         # parsing needs no store — reject a malformed id BEFORE the binding
         # opens one (Codex #125 r3: a store outage must not mask this error)
@@ -566,7 +566,13 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
             "entities": [],
         }
     entity_ids = await repo.entity_ids_by_name(name)
-    mentions = await repo.mentions_by_entity(entity_ids)
+    # MCP7 (v1.1): mentions arrive RESOLVED — a chunk mention carries the
+    # chunk UUID (get_chunk accepts it directly), source_uri, and the quote
+    # + offsets; a row mention carries table+pk. The shared seam is
+    # core/query/mentions.py; an unresolvable mention is omitted (§22) and
+    # an entity may surface with zero mentions here (introspection shows
+    # the uncited state rather than dropping the entity).
+    refs_by_entity, _, _ = await resolved_mention_refs(repo, entity_ids, cap=None)
     return {
         "project": project,
         "build_id": str(repo.build_id),
@@ -575,9 +581,13 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
             {
                 "id": str(entity_id),
                 "mentions": [
-                    {"source_type": source_type, "id": source_ref}
-                    for kind, source_ref in mentions.get(entity_id, [])
-                    if (source_type := _MENTION_SOURCE_TYPE.get(kind)) is not None
+                    {
+                        "source_type": ref.source_type,
+                        "id": ref.id,
+                        "source_uri": ref.source_uri,
+                        "metadata": ref.metadata,
+                    }
+                    for ref in refs_by_entity.get(entity_id, ())
                 ],
             }
             for entity_id in entity_ids
@@ -589,9 +599,11 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
 #: gap) instead of a bare "invalid" (#124: no dead ends). One constant, two
 #: emitters: the helper (direct callers) and the pre-binding wrapper check.
 _CHUNK_ID_MESSAGE = (
-    "chunk_id must be a chunk UUID (the id of a chunk result or a relation "
-    "evidence ref); entity mention refs (chunk:{content_hash}:{ordinal}) "
-    "are a different shape and not yet resolvable"
+    "chunk_id must be a chunk UUID (the id of a chunk result, a chunk "
+    "evidence ref, or an entity CHUNK mention ref — those carry chunk UUIDs "
+    "since v1.1; row mention/evidence refs cite table+pk and are not chunks); "
+    "a raw chunk:{content_hash}:{ordinal} string is the STORED form and is "
+    "not accepted"
 )
 
 #: get_document's invalid-id message (same two-emitter single source).
@@ -639,15 +651,15 @@ def _invalid_document_payload(project: str, document_id: str) -> dict[str, Any] 
 async def _get_chunk(repo: Any, project: str, chunk_id: str) -> dict[str, Any]:
     """§9 ``get_chunk``: chunk UUID → its text + provenance from the SoR.
 
-    THE citation-to-content path (MCP5): a relation's evidence ref and a
-    chunk result's id both carry a chunk UUID, and before this tool nothing
-    on the MCP surface could exchange one for the text it cites — citations
-    were decoration. Accepts only the UUID form; an entity MENTION ref
-    (``chunk:{content_hash}:{ordinal}``) is a different, currently
-    unresolvable shape (the MCP7 gap), and the error NAMES that instead of
-    a bare "invalid" so an agent holding one learns why it cannot be used.
-    Validation also runs pre-binding in the tool wrapper; it repeats here so
-    DIRECT callers of this helper get the same guarantee.
+    THE citation-to-content path (MCP5): a chunk result's id, a chunk
+    evidence ref, and — since v1.1 (MCP7) — an entity CHUNK mention
+    citation all carry chunk UUIDs this helper resolves; row mention/
+    evidence refs cite a structured table+pk and are not chunks. Accepts
+    only the UUID form: the raw ``chunk:{content_hash}:{ordinal}`` string
+    is the STORED mention format (never emitted since v1.1), and the error
+    NAMES that instead of a bare "invalid" so an agent holding a stale one
+    learns why it cannot be used. Validation also runs pre-binding in the
+    tool wrapper; it repeats here so DIRECT callers get the same guarantee.
     """
     envelope = {"project": project, "build_id": str(repo.build_id), "chunk_id": chunk_id}
     parsed = _parse_uuid(chunk_id)

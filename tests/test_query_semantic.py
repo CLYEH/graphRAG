@@ -51,15 +51,20 @@ class _FakeRepo:
             tables.documents: [],
             tables.entities: [],
         }
-        self.mentions: dict[uuid.UUID, list[tuple[str, str]]] = {}
+        self.mentions: dict[uuid.UUID, list[tuple[str, str, str | None]]] = {}
+        # (content_hash, ordinal) -> chunk row backing a text mention (MCP7)
+        self.content_chunks: dict[tuple[str, int], SimpleNamespace] = {}
 
     async def fetch_all(self, table: Any, *where: Any) -> list[SimpleNamespace]:
         return [SimpleNamespace(**row) for row in self.rows[table]]
 
     async def mentions_by_entity(
         self, entity_ids: list[uuid.UUID]
-    ) -> dict[uuid.UUID, list[tuple[str, str]]]:
+    ) -> dict[uuid.UUID, list[tuple[str, str, str | None]]]:
         return {eid: self.mentions[eid] for eid in entity_ids if eid in self.mentions}
+
+    async def chunks_by_content_ref(self, refs: Any) -> dict[tuple[str, int], SimpleNamespace]:
+        return {key: row for key, row in self.content_chunks.items() if key in set(refs)}
 
 
 class _FakeVectors:
@@ -132,6 +137,30 @@ def _add_chunk(repo: _FakeRepo, chunk_id: uuid.UUID, *, uri: str = "s3://d.md") 
     )
 
 
+def _add_mention(
+    repo: _FakeRepo,
+    entity_id: uuid.UUID,
+    *,
+    content_hash: str = "aabbccdd00",
+    ordinal: int = 0,
+    quote: str = "Acme",
+) -> None:
+    """One RESOLVABLE text mention (MCP7): the triple plus the backing chunk
+    row the two-segment join would find — refs must come out as chunk UUID +
+    uri + quote + offsets or the entity is uncitable under v1.1."""
+    repo.mentions.setdefault(entity_id, []).append(
+        ("text", f"chunk:{content_hash}:{ordinal}", quote)
+    )
+    repo.content_chunks[(content_hash, ordinal)] = SimpleNamespace(
+        id=uuid.uuid4(),
+        ordinal=ordinal,
+        start_offset=0,
+        end_offset=12,
+        content_hash=content_hash,
+        source_uri="s3://d.md",
+    )
+
+
 async def _run(
     repo: _FakeRepo, vectors: _FakeVectors, top_k: int = 10, point_type: str | None = None
 ) -> McpResponse:
@@ -152,7 +181,7 @@ async def test_enriches_chunk_and_entity_hits_into_valid_contract_response() -> 
     chunk_id, entity_id = uuid.uuid4(), uuid.uuid4()
     repo = _FakeRepo()
     _add_chunk(repo, chunk_id, uri="s3://onboarding.md")
-    repo.mentions[entity_id] = [("text", "chunk:h1:0")]
+    _add_mention(repo, entity_id, content_hash="aa11bb22cc", quote="Acme")
     vectors = _FakeVectors([_chunk_hit(chunk_id, score=0.9), _entity_hit(entity_id, score=0.7)])
 
     response = await _run(repo, vectors)
@@ -170,7 +199,15 @@ async def test_enriches_chunk_and_entity_hits_into_valid_contract_response() -> 
     }
     entity = payload["results"][1]
     assert entity["title"] == "Acme"
-    assert entity["source_refs"] == [{"source_type": "chunk", "id": "chunk:h1:0"}]
+    # MCP7 (v1.1): the mention ref is RESOLVED — chunk UUID id (get_chunk
+    # accepts it), source_uri, quote + offsets; never the raw
+    # chunk:{hash}:{ordinal} string no endpoint accepted (the dead citation)
+    (mention_ref,) = entity["source_refs"]
+    assert mention_ref["source_type"] == "chunk"
+    assert uuid.UUID(mention_ref["id"])  # a real chunk UUID, not the raw ref
+    assert mention_ref["source_uri"] == "s3://d.md"
+    assert mention_ref["metadata"]["quote"] == "Acme"
+    assert mention_ref["metadata"]["start_offset"] == 0
     assert payload["warnings"] == []
 
 
@@ -217,8 +254,8 @@ async def test_entity_mention_kind_maps_to_the_citable_source_type() -> None:
     row citation — the source_kind is the only thing that tells them apart."""
     text_ent, row_ent = uuid.uuid4(), uuid.uuid4()
     repo = _FakeRepo()
-    repo.mentions[text_ent] = [("text", "chunk:h:0")]
-    repo.mentions[row_ent] = [("structured", "9:employees:7")]
+    _add_mention(repo, text_ent, quote="TextEnt")
+    repo.mentions[row_ent] = [("structured", "9:employees:7", None)]
     vectors = _FakeVectors([_entity_hit(text_ent, score=0.9), _entity_hit(row_ent, score=0.8)])
     payload = (await _run(repo, vectors)).to_dict()
     _VALIDATOR.validate(payload)
@@ -334,7 +371,7 @@ async def test_corrupt_payload_display_or_id_never_makes_the_response_invalid() 
     entity_id, chunk_id = uuid.uuid4(), uuid.uuid4()
     repo = _FakeRepo()
     _add_chunk(repo, chunk_id)
-    repo.mentions[entity_id] = [("text", "chunk:h:0")]
+    _add_mention(repo, entity_id)
     # entity: numeric canonical_id + object text; chunk: numeric text
     entity_hit = SimpleNamespace(
         id="e",
@@ -393,7 +430,7 @@ async def test_short_queries_still_get_chunks_on_the_page() -> None:
         chunk_hits.append(_chunk_hit(chunk_id, score=0.40 - i * 0.01))
     for i in range(8):
         entity_id = uuid.uuid4()
-        repo.mentions[entity_id] = [("text", f"chunk:h{i}:0")]
+        _add_mention(repo, entity_id, content_hash=f"aab{i:02d}cc00", ordinal=i)
         entity_hits.append(_entity_hit(entity_id, score=0.90 - i * 0.01))
     response = await _run(repo, _FakeVectors(entity_hits + chunk_hits), top_k=6)
     kinds = [r.result_type for r in response.results]
@@ -412,7 +449,7 @@ async def test_point_type_narrows_and_bad_values_degrade_typed() -> None:
     repo = _FakeRepo()
     chunk_id, entity_id = uuid.uuid4(), uuid.uuid4()
     _add_chunk(repo, chunk_id)
-    repo.mentions[entity_id] = [("text", "chunk:h:0")]
+    _add_mention(repo, entity_id)
     vectors = _FakeVectors([_entity_hit(entity_id, score=0.9), _chunk_hit(chunk_id, score=0.4)])
 
     chunks_only = await _run(repo, vectors, point_type="chunk")
@@ -435,7 +472,7 @@ async def test_same_name_entities_become_distinguishable_by_type() -> None:
     repo = _FakeRepo()
     event_id, facility_id, orphan_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     for entity_id in (event_id, facility_id, orphan_id):
-        repo.mentions[entity_id] = [("text", "chunk:h:0")]
+        _add_mention(repo, entity_id)
     repo.rows[tables.entities] = [
         {"id": event_id, "type": "EVENT"},
         {"id": facility_id, "type": "FACILITY"},
@@ -468,8 +505,8 @@ async def test_a_stale_floor_slot_never_evicts_a_fetched_valid_chunk() -> None:
     stale_a, stale_b, valid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     _add_chunk(repo, valid)  # only this chunk has SoR rows — the others drifted
     entity_a, entity_b = uuid.uuid4(), uuid.uuid4()
-    repo.mentions[entity_a] = [("text", "chunk:h:0")]
-    repo.mentions[entity_b] = [("text", "chunk:h:1")]
+    _add_mention(repo, entity_a, ordinal=0)
+    _add_mention(repo, entity_b, ordinal=1)
     hits = [
         _chunk_hit(stale_a, score=0.95),
         _chunk_hit(stale_b, score=0.90),
@@ -483,3 +520,54 @@ async def test_a_stale_floor_slot_never_evicts_a_fetched_valid_chunk() -> None:
     assert any(r.id == str(valid) for r in response.results)
     assert response.warnings[0].code == "PARTIAL_RESULTS"
     assert "2 hit(s)" in response.warnings[0].message  # the drift is surfaced
+
+
+async def test_the_mention_cap_warning_is_page_exact() -> None:
+    """The MCP3 provenance lesson applied to mention caps: a capped entity
+    that fusion/ranking clipped OFF the page never charged its omission to
+    this response — warning anyway would mint a false claim about returned
+    results. Gate: warn only when a capped entity id is among the RETURNED
+    entity results; the escape hatch (get_entity, uncapped) is real (#124)."""
+    from core.query.mentions import MENTION_REFS_CAP
+
+    repo = _FakeRepo()
+    capped_entity, plain_entity = uuid.uuid4(), uuid.uuid4()
+    for i in range(MENTION_REFS_CAP + 2):
+        _add_mention(repo, capped_entity, content_hash=f"aa11bb22c{i:x}", quote="q")
+    _add_mention(repo, plain_entity, content_hash="bb11bb22cc")
+
+    # capped entity ON the page → the warning fires, counting page entities
+    on_page = await _run(repo, _FakeVectors([_entity_hit(capped_entity, score=0.9)]), top_k=2)
+    capped_warnings = [w for w in on_page.warnings if "mention refs capped" in w.message]
+    assert len(capped_warnings) == 1
+    assert str(capped_entity) in capped_warnings[0].message  # NAMES its entity (r4)
+    assert "get_entity" in capped_warnings[0].message  # the REAL escape hatch
+
+    # capped entity clipped OFF the page (top_k=1, plain entity outranks it
+    # by id tie-break? use score) → NO cap warning: nothing returned was capped
+    hits = [_entity_hit(plain_entity, score=0.9), _entity_hit(capped_entity, score=0.2)]
+    off_page = await _run(repo, _FakeVectors(hits), top_k=1)
+    assert [r.id for r in off_page.results] == [str(plain_entity)]
+    assert not any("mention refs capped" in w.message for w in off_page.warnings)
+
+
+async def test_partially_unresolvable_mentions_surface_as_partial_results() -> None:
+    """Codex #127: an entity with one valid + N bad mentions kept its hit, so
+    the hit-level drop counter never noticed the loss — partial provenance
+    was SILENT. The per-entity drop map surfaces it page-exactly: citations
+    lost on RETURNED entities warn PARTIAL_RESULTS; an off-page entity's
+    losses never charge this response."""
+    repo = _FakeRepo()
+    entity_id = uuid.uuid4()
+    _add_mention(repo, entity_id, content_hash="aa11bb22cc", quote="ok")
+    # two unresolvable mentions on the SAME surviving entity
+    repo.mentions[entity_id].append(("text", "chunk:ffffffffff:0", "gone"))
+    repo.mentions[entity_id].append(("text", "not-a-ref", "bad"))
+    response = await _run(repo, _FakeVectors([_entity_hit(entity_id, score=0.9)]))
+    assert len(response.results) == 1  # the hit survives on its valid mention
+    partial = [w for w in response.warnings if w.code == "PARTIAL_RESULTS"]
+    assert len(partial) == 1
+    # the message NAMES the entity with its per-entity count (r4: hybrid
+    # rebuilds these for its fused page via the sibling parser)
+    assert "2 unresolvable mention citation(s) omitted on returned entities" in partial[0].message
+    assert f"{entity_id}=2" in partial[0].message

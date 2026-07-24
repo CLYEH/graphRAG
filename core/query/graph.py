@@ -34,6 +34,7 @@ from typing import Any
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from core.graph.structured import split_row_source_ref
+from core.query.mentions import mention_warnings, resolved_mention_refs
 from core.query.policy import (
     GRAPH_QUERY_TEMPLATES,
     GUARDRAIL_WARNING_CODE,
@@ -51,9 +52,6 @@ from core.stores.graph import BuildScopedGraphRepo
 from core.stores.repo import BuildScopedRepo
 
 _TOOL = "graph_query"
-
-#: entity_mentions.source_kind → §16 source_type (same mapping as C6a).
-_MENTION_SOURCE_TYPE = {"text": "chunk", "structured": "row"}
 
 
 @dataclass(frozen=True)
@@ -150,11 +148,11 @@ async def _neighbors(
     query: str,
 ) -> McpResponse:
     deadline = time.monotonic() + policy.timeout_ms / 1000.0
-    entities, dropped, truncated, timed_out, unresolved = await _neighbor_entities(
+    entities, dropped, truncated, timed_out, unresolved, loss_warnings = await _neighbor_entities(
         graph, repo, policy, params, deadline
     )
     results = _score(entities)
-    warnings = _standard_warnings(policy, truncated, dropped, timed_out)
+    warnings = (*_standard_warnings(policy, truncated, dropped, timed_out), *loss_warnings)
     if unresolved:
         warnings = (*warnings, _unresolved_name_warning(params.entity))
     return _response(graph, query, results, warnings)
@@ -307,7 +305,7 @@ async def _subgraph(
     # the WHOLE subgraph phase — seed traversals AND the edge stage — shares
     # ONE policy deadline (per-stage timeouts would stack, the C6b trap)
     deadline = time.monotonic() + policy.timeout_ms / 1000.0
-    entities, dropped, truncated, timed_out, unresolved = await _neighbor_entities(
+    entities, dropped, truncated, timed_out, unresolved, loss_warnings = await _neighbor_entities(
         graph, repo, policy, params, deadline, include_seeds=True
     )
     # §21: max_rows is the ceiling on the WHOLE response, entities AND
@@ -333,8 +331,12 @@ async def _subgraph(
             # path), not post-drop — a stale edge dropping out must not hide
             # that the ceiling clipped the set
             truncated = True
-            edges = edges[:edge_budget]
-        relations, edge_dropped = await _relation_results(repo, edges)
+        # validate-then-allocate (Codex #127 r7's class, edge edition): an
+        # evidence-less edge in a pre-sliced budget would occupy a seat
+        # while the fetched probe edge was never promoted — resolve every
+        # fetched edge, then take the first edge_budget CITABLE ones
+        all_relations, edge_dropped = await _relation_results(repo, edges)
+        relations = all_relations[:edge_budget]
     elif len(node_ids) >= 2:
         if params.hops == 1:
             # every distance-1 neighbor is directly adjacent to the seed, so
@@ -349,7 +351,10 @@ async def _subgraph(
             )
             truncated = truncated or bool(probe)
     results = _score(entities, relations)
-    warnings = _standard_warnings(policy, truncated, dropped + edge_dropped, timed_out)
+    warnings = (
+        *_standard_warnings(policy, truncated, dropped + edge_dropped, timed_out),
+        *loss_warnings,
+    )
     if unresolved:
         warnings = (*warnings, _unresolved_name_warning(params.entity))
     return _response(graph, query, results, warnings)
@@ -407,7 +412,7 @@ async def subgraph_context(
 
     deadline = time.monotonic() + policy.timeout_ms / 1000.0
     params = GraphQueryParams(template="subgraph", entity=str(seed), hops=hops)
-    entities, _dropped, _truncated, timed_out, _unresolved = await _neighbor_entities(
+    entities, _dropped, _truncated, timed_out, _unresolved, _loss = await _neighbor_entities(
         graph, repo, policy, params, deadline, include_seeds=True, seeds=[seed]
     )
     node_ids = [entity_id for entity_id, _, _, _ in entities]
@@ -440,14 +445,16 @@ async def subgraph_context(
             limit=edge_budget + 1,  # the truncation probe (policy cap only)
             timeout_ms=remaining_ms,
         )
-        projected = projected[:edge_budget]
+        # validate-then-allocate (Codex #127 r7's class — the REST twin of
+        # the _subgraph edge fix): the budget takes CITABLE edges, so an
+        # evidence-less edge cannot hide the fetched citable probe edge
         triples = [t for edge in projected if (t := _edge_triple(edge)) is not None]
         resolved = await repo.relations_with_evidence(triples)
         citable = [
             relation_id
             for triple, (relation_id, evidence_rows) in resolved.items()
             if any(evidence_ref(row) is not None for row in evidence_rows)
-        ]
+        ][:edge_budget]
         if citable:
             node_set = set(node_ids)
             edge_rows = await repo.fetch_all(tables.relations, tables.relations.c.id.in_(citable))
@@ -477,10 +484,21 @@ async def _neighbor_entities(
     *,
     include_seeds: bool = False,
     seeds: Sequence[uuid.UUID] | None = None,
-) -> tuple[list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]], int, bool, bool, bool]:
+) -> tuple[
+    list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]],
+    int,
+    bool,
+    bool,
+    bool,
+    tuple[QueryWarning, ...],
+]:
     """Traverse from every seed, merge, re-verify against the SoR.
 
-    Returns ``(kept, dropped, truncated, timed_out, unresolved)`` where
+    Returns ``(kept, dropped, truncated, timed_out, unresolved,
+    loss_warnings)`` where ``loss_warnings`` are the page-exact mention
+    cap/drop warnings from the shared builder (Codex #127 — both §16 graph
+    templates append them; the REST subgraph-context path has no warnings
+    channel and discards them, documented at its call site) and
     ``unresolved`` means the seed was NAME-seeded and resolved to nothing
     (MCP2: the caller must warn — zero rows from a name that matched no
     active entity is a different answer from an empty neighborhood, and only
@@ -512,7 +530,7 @@ async def _neighbor_entities(
         # with no neighbours, but both are zero rows — without this flag the
         # caller cannot tell them apart, and an agent asked "is A related to
         # B?" confidently answers "no" when it merely mistyped the name
-        return [], 0, False, False, named
+        return [], 0, False, False, named, ()
 
     candidates: set[uuid.UUID] = set()
     dropped = 0
@@ -573,26 +591,34 @@ async def _neighbor_entities(
     dropped += len(candidates - set(best))  # unreachable via the ACTIVE graph → drift
 
     ordered = sorted(best.items(), key=lambda item: (item[1], item[0]))
-    truncated = fetch_clipped or len(ordered) > policy.max_rows
-    ordered = ordered[: policy.max_rows]
 
-    # SoR re-verification (§27.2): an entity result needs ≥1 mention of a
-    # still-active entity; mentions_by_entity filters status='active', so a
-    # drifted (non-active) node resolves to zero mentions and is dropped.
-    mentions = await repo.mentions_by_entity([entity_id for entity_id, _ in ordered])
+    # SoR re-verification BEFORE the page slice (§27.2; Codex #127 r7 — the
+    # MCP6 validate-then-allocate rule): resolving only a pre-sliced page let
+    # an uncitable entity occupy a seat while an already-fetched citable
+    # candidate in the probe position was never promoted — max_rows citable
+    # rows available, fewer returned. Resolve every fetched candidate, then
+    # take the first max_rows CITABLE ones (MCP7 v1.1 — refs carry chunk
+    # uuid + uri + quote + offsets via the shared seam); a drifted node
+    # yields zero refs and is dropped without costing the page a seat.
+    refs_by_entity, mention_drops, capped = await resolved_mention_refs(
+        repo, [entity_id for entity_id, _ in ordered]
+    )
     names = await repo.active_entity_names([entity_id for entity_id, _ in ordered])
-    kept: list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]] = []
+    citable: list[tuple[uuid.UUID, int, tuple[SourceRef, ...], str | None]] = []
     for entity_id, distance in ordered:
-        refs = tuple(
-            SourceRef(source_type=source_type, id=source_ref)
-            for kind, source_ref in mentions.get(entity_id, [])
-            if (source_type := _MENTION_SOURCE_TYPE.get(kind)) is not None
-        )
+        refs = refs_by_entity.get(entity_id, ())
         if refs:
-            kept.append((entity_id, distance, refs, names.get(entity_id)))
+            citable.append((entity_id, distance, refs, names.get(entity_id)))
         else:
             dropped += 1
-    return kept, dropped, truncated, timed_out, False
+    truncated = fetch_clipped or len(citable) > policy.max_rows
+    kept = citable[: policy.max_rows]
+    # page-exact mention-loss warnings (Codex #127: graph was silently
+    # capping/dropping mention refs while semantic warned) — single source
+    loss_warnings = mention_warnings(
+        {entity_id for entity_id, _, _, _ in kept}, mention_drops, capped
+    )
+    return kept, dropped, truncated, timed_out, False, loss_warnings
 
 
 async def _relation_results(

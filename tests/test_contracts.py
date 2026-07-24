@@ -216,8 +216,11 @@ def test_mcp_response_schema_is_valid(mcp_schema: dict[str, Any]) -> None:
 
 
 def test_mcp_schema_version_is_frozen(mcp_schema: dict[str, Any]) -> None:
-    """DR-002: schema_version pins the contract; only a breaking change bumps it."""
-    assert mcp_schema["properties"]["schema_version"]["const"] == "1.0"
+    """DR-002: schema_version pins the contract; only a breaking change bumps it.
+    v1.1 (MCP7, DESIGN §26): the entity-result minimum was TIGHTENED — a chunk
+    mention ref must be resolvable (chunk UUID + source_uri + quote + offsets)
+    instead of the v1.0 bare chunk:{hash}:{ordinal} string no endpoint accepted."""
+    assert mcp_schema["properties"]["schema_version"]["const"] == "1.1"
     assert "schema_version" in mcp_schema["required"]
 
 
@@ -243,6 +246,41 @@ def test_mcp_enums_stay_in_lockstep_with_openapi(
     assert set(defs["QueryMode"]["enum"]) == set(api["QueryMode"]["enum"])
 
 
+def test_a_v10_bare_entity_mention_ref_no_longer_validates() -> None:
+    """The v1.1 tightening's DISCRIMINATOR (a richened fixture would pass a
+    loosened schema unnoticed): the v1.0-legal bare chunk:{hash}:{ordinal}
+    entity ref — the dead citation no endpoint accepted — must now FAIL
+    require_sources. Reverting the entity contains-block turns this green."""
+    schema = json.loads(_MCP_SCHEMA.read_text("utf-8"))
+    validator = jsonschema.Draft202012Validator(
+        schema, format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER
+    )
+
+    response = _valid_mcp_response()
+    entity = next(r for r in response["results"] if r["result_type"] == "entity")
+    entity["source_refs"] = [{"source_type": "chunk", "id": "chunk:aa11bb22cc:0"}]
+    assert list(validator.iter_errors(response)), (
+        "a bare (unresolvable) entity mention ref validated — v1.1 not enforced"
+    )
+
+    # Codex #127: uri/quote/offsets alone are not resolvability — the id
+    # itself must be a chunk UUID (format:uuid, checked with FORMAT_CHECKER,
+    # the build_id precedent) or neither get_chunk nor REST can take it
+    rich_but_dead = _valid_mcp_response()
+    entity = next(r for r in rich_but_dead["results"] if r["result_type"] == "entity")
+    entity["source_refs"] = [
+        {
+            "source_type": "chunk",
+            "id": "chunk:aa11bb22cc:0",
+            "source_uri": "s3://x",
+            "metadata": {"quote": "q", "start_offset": 0, "end_offset": 1},
+        }
+    ]
+    assert list(validator.iter_errors(rich_but_dead)), (
+        "a non-UUID mention id validated despite full uri/quote/offsets"
+    )
+
+
 def _valid_mcp_response() -> dict[str, Any]:
     """A §16-shaped response exercising all six result_types and their §27.2 minimums."""
     n1 = "0a4b1d2e-3f40-4a51-8b62-c73d84e95fa6"
@@ -251,7 +289,7 @@ def _valid_mcp_response() -> dict[str, Any]:
     chunk_id = "3d7e4a5b-6c73-4d84-be95-fa6b07c18d29"
     chunk_uri = "s3://acme/docs/onboarding.md"
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "query": "who owns onboarding?",
         "tool": "hybrid_query",
         "project": "acme",
@@ -280,7 +318,18 @@ def _valid_mcp_response() -> dict[str, Any]:
                 "text": None,
                 "score": 0.88,
                 "confidence": 0.95,
-                "source_refs": [{"source_type": "chunk", "id": chunk_id, "source_uri": chunk_uri}],
+                "source_refs": [
+                    {
+                        "source_type": "chunk",
+                        "id": chunk_id,
+                        "source_uri": chunk_uri,
+                        "metadata": {
+                            "quote": "People Ops",
+                            "start_offset": 1204,
+                            "end_offset": 1490,
+                        },
+                    }
+                ],
             },
             {
                 "result_type": "relation",
