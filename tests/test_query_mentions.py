@@ -59,6 +59,12 @@ def test_the_stored_ref_parses_strictly() -> None:
     assert parse_chunk_mention_ref("chunk:short:0") is None  # non-hex / too short
     assert parse_chunk_mention_ref("chunk-abc123") is None
     assert parse_chunk_mention_ref("chunk:aa11bb22cc:") is None
+    # Codex #127 r2: the ordinal is bounded at 9 digits — an unbounded match
+    # let int() raise past CPython's digit limit and >2^31-1 fail at the PG
+    # INTEGER bind: an error instead of the promised uncitable drop
+    assert parse_chunk_mention_ref("chunk:aa11bb22cc:1234567890") is None
+    assert parse_chunk_mention_ref("chunk:aa11bb22cc:" + "9" * 5000) is None
+    assert parse_chunk_mention_ref("chunk:aa11bb22cc:999999999") == ("aa11bb22cc", 999999999)
     assert parse_chunk_mention_ref("") is None
     assert parse_chunk_mention_ref(cast(Any, None)) is None
 
