@@ -30,9 +30,10 @@ review, DR-002 untouched.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 #: The envelope shape version, stamped server-side into every stored envelope's
 #: ``schema_version`` (DR-010: the envelope is defined in openapi.yaml components;
@@ -300,6 +301,68 @@ def load_metadata_exposure(config: Mapping[str, Any]) -> MetadataExposure:
             )
         fields.append(path)
     return MetadataExposure(fields=tuple(fields))
+
+
+# --- JSONB-storability guards ------------------------------------------------
+# JSON-valid-but-JSONB-unstorable inputs, rejected at the boundary that PARSES
+# client-authored JSON destined for a JSONB column (the uploads metadata field;
+# MCP10 sidecars). Each would otherwise pass every shape/schema check and fail
+# the write later with a low-level Postgres error naming no cause.
+
+
+def reject_non_finite_constant(value: str) -> NoReturn:
+    """``json.loads(parse_constant=…)`` hook: fired only for ``NaN``/``Infinity``/
+    ``-Infinity``. Raising rejects them at parse time instead of letting a
+    non-finite float reach Postgres JSONB and 500/fail the write."""
+    raise ValueError(f"non-finite constant {value!r} is not allowed")
+
+
+def finite_float(value: str) -> float:
+    """``json.loads(parse_float=…)`` hook for every float token. Rejects one that
+    OVERFLOWS to a non-finite float (``1e999`` → ``inf``) — a token parse_constant
+    never sees — so it cannot reach Postgres JSONB. (Huge INTEGERS stay Python
+    int → JSONB-safe.)"""
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite number {value!r} is not allowed")
+    return parsed
+
+
+def _string_storability_reason(text: str) -> str | None:
+    if "\x00" in text:
+        return "contains a NUL character (U+0000)"
+    if any("\ud800" <= ch <= "\udfff" for ch in text):
+        # json.loads materializes an ESCAPED lone surrogate ("\ud800") as a
+        # surrogate code point; paired escapes combine into the astral char at
+        # parse time, so any surrogate REMAINING in a parsed string is unpaired
+        # — and no UTF-8 encoder (Postgres included) can encode it
+        return "contains an unpaired UTF-16 surrogate"
+    return None
+
+
+def unstorable_string_reason(obj: Any) -> str | None:
+    """The first reason a parsed JSON structure cannot be stored in Postgres
+    text/JSONB, or ``None`` if storable: a NUL (U+0000), or an unpaired UTF-16
+    surrogate. Both are legal in a JSON document — the same
+    JSON-valid-but-JSONB-unstorable class as the non-finite guards — and would
+    otherwise fail the write later with a low-level store error naming no
+    cause. Scans object KEYS too: open bags (``context.attributes``,
+    ``governance``) let a bad string hide in a key, which Postgres rejects
+    just as it does a value."""
+    if isinstance(obj, str):
+        return _string_storability_reason(obj)
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if isinstance(key, str) and (reason := _string_storability_reason(key)):
+                return reason
+            if reason := unstorable_string_reason(value):
+                return reason
+        return None
+    if isinstance(obj, list):
+        for value in obj:
+            if reason := unstorable_string_reason(value):
+                return reason
+    return None
 
 
 # --- envelope construction ---------------------------------------------------

@@ -48,6 +48,7 @@ from core.graph.structured import extract_structured
 from core.index.indexing import index_build
 from core.ingest.connectors import DocumentPayload
 from core.ingest.documents import ingest_documents
+from core.metadata.schema import MetadataSchema
 from core.observability.reads import latest_run_graph_items, latest_run_ran_resolve
 from core.observability.spec import ItemOutcome, retry_failed_only
 from core.registry.jobs import build_config_snapshot
@@ -98,15 +99,19 @@ async def _load_sources(conn: AsyncConnection, project: str) -> list[Source]:
             return out
 
 
-def _all_payloads(sources: list[Source]) -> Iterator[DocumentPayload]:
+def _all_payloads(
+    sources: list[Source], metadata_schema: MetadataSchema
+) -> Iterator[DocumentPayload]:
     """Lazily chain every source's connector stream — the connectors yield
     lazily because sources can be large, so this preserves that rather than
     materializing every payload. A source that cannot be resolved (bad
     kind/uri/metadata) raises when reached; the stage's transaction rolls back
     its partial inserts, so a misconfigured source fails the build loud, never a
-    silent partial ingest."""
+    silent partial ingest. ``metadata_schema`` (from the PINNED build config)
+    fences text-source sidecar attributes — the same validation the upload
+    boundary applies at capture (Codex #130)."""
     for source in sources:
-        yield from resolve_source(source)
+        yield from resolve_source(source, metadata_schema=metadata_schema)
 
 
 async def _retry_parent(conn: AsyncConnection, build_id: uuid.UUID) -> uuid.UUID | None:
@@ -123,7 +128,7 @@ async def _retry_parent(conn: AsyncConnection, build_id: uuid.UUID) -> uuid.UUID
     ).scalar_one_or_none()
 
 
-def _ingest_stage() -> StageFn:
+def _ingest_stage(config: BuildConfig) -> StageFn:
     async def ingest(conn: AsyncConnection, project: str, build_id: uuid.UUID) -> StageResult:
         writer = await BuildScopedWriter.for_building_build(conn, project, build_id)
         # RB1-retry (DR-013): a retry child reprocesses the PARENT's corpus,
@@ -138,7 +143,7 @@ def _ingest_stage() -> StageFn:
             docs = await writer.fetch_all(documents)
             return StageResult(outcomes=(), detail={"retry_reused_documents": len(docs)})
         sources = await _load_sources(conn, project)
-        report = await ingest_documents(writer, _all_payloads(sources))
+        report = await ingest_documents(writer, _all_payloads(sources, config.metadata_schema))
         return StageResult(
             outcomes=report.outcomes,
             detail={"sources": len(sources), "documents": len(report.documents)},
@@ -356,7 +361,7 @@ def default_stages(
     Qdrant client and a Neo4j session from :mod:`core.stores` — and hands the
     result to ``run_build``."""
     return Stages(
-        ingest=_ingest_stage(),
+        ingest=_ingest_stage(config),
         clean=_clean_stage(config),
         graph=_graph_stage(config, chat_model),
         resolve=_resolve_stage(config),

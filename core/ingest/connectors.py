@@ -27,6 +27,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.metadata.schema import (
+    MetadataSchema,
+    MetadataValidationError,
+    build_envelope,
+    finite_float,
+    reject_non_finite_constant,
+    unstorable_string_reason,
+)
 from core.stores.tables import STRUCTURED_MIME
 
 #: Free-text suffixes the document connector accepts, mapped to their mime
@@ -54,7 +62,10 @@ def content_hash(raw: str) -> str:
 
 
 def read_text_documents(
-    root: Path, metadata_by_filename: Mapping[str, dict[str, Any]] | None = None
+    root: Path,
+    metadata_by_filename: Mapping[str, dict[str, Any]] | None = None,
+    *,
+    metadata_schema: MetadataSchema | None = None,
 ) -> Iterator[DocumentPayload]:
     """Yield one payload per accepted text file under ``root`` (recursive).
 
@@ -83,6 +94,18 @@ def read_text_documents(
     under the tree is read, each falling back to the connector-derived
     ``{"filename": ...}`` — the original behavior for a non-upload source or a file
     placed on disk directly.
+
+    ``metadata_schema`` fences the SIDECAR path (MCP10 / Codex #130): sidecar
+    ``context.attributes`` are validated against the project ``metadata_schema``
+    — the SAME fence the upload boundary applies at capture — so an undeclared /
+    wrong-typed / missing-required attribute fails the build loud instead of
+    persisting values that typed document filters would silently disagree with.
+    ``None`` folds to the EMPTY schema (fail-closed: every attribute is then
+    undeclared — the schema is load-bearing even when empty), so a caller that
+    forgets to thread the project schema breaks a legitimate sidecar build
+    loudly rather than silently skipping the fence. Files WITHOUT a sidecar
+    never enter the envelope surface, so nothing is validated for them; the
+    managed path's envelopes were validated at upload capture.
     """
     if not root.is_dir():
         raise NotADirectoryError(f"document source root {root} is not a directory")
@@ -130,16 +153,185 @@ def read_text_documents(
                 metadata=metadata_by_filename[name],
             )
         return
+    sidecars = _collect_sidecars(root, metadata_schema)
     for path in sorted(root.rglob("*")):
         suffix = path.suffix.lower()
         if not path.is_file() or suffix not in TEXT_SUFFIXES:
             continue
+        sidecar = sidecars.pop(path, None)
         yield DocumentPayload(
             source_uri=path.resolve().as_uri(),
             raw=path.read_text(encoding="utf-8"),
             mime=TEXT_SUFFIXES[suffix],
-            metadata={"filename": path.name},
+            metadata=(
+                build_envelope(
+                    connector="text-directory",
+                    original_filename=path.name,
+                    context=sidecar.get("context"),
+                    governance=sidecar.get("governance"),
+                )
+                if sidecar is not None
+                else {"filename": path.name}
+            ),
         )
+    if sidecars:
+        # an orphan sidecar means someone's metadata is silently NOT applied
+        # (a typo'd target name) — that is a config error, not a skippable file
+        orphans = sorted(str(p) for p in sidecars)
+        raise ValueError(
+            f"metadata sidecar(s) without a matching document file: {orphans} — "
+            "each <name>.meta.json must sit beside the <name> it describes"
+        )
+
+
+#: MCP10 sidecar convention: a plain-directory source file <name> may carry a
+#: display/provenance envelope in <name>.meta.json beside it — the path that
+#: finally gives citations an end-user-presentable source (the dev-machine
+#: file:// uri identifies the document; context.title / context.attributes
+#: hold what a guide agent may SHOW, e.g. the real public page URL — exposed
+#: to agents only through the projects.config metadata_exposure allowlist,
+#: DR-010). Uploads capture the same envelope through the API instead.
+_SIDECAR_SUFFIX = ".meta.json"
+_SIDECAR_KEYS = {"context", "governance"}
+
+
+def _collect_sidecars(
+    root: Path, metadata_schema: MetadataSchema | None
+) -> dict[Path, dict[str, Any]]:
+    """``{target-file-lexical-path: parsed sidecar}`` for every
+    ``<name>.meta.json`` under ``root``. A corrupt sidecar is a LOUD failure
+    (same rule as an undecodable source file); unknown top-level keys are
+    rejected — ``system``/``schema_version`` are server-stamped namespaces a
+    sidecar must not forge (DR-010 rule 1/4). Sidecar attributes are validated
+    against ``metadata_schema`` (``None`` = the empty schema, fail-closed) —
+    see :func:`read_text_documents`."""
+    schema = metadata_schema if metadata_schema is not None else MetadataSchema(attributes={})
+    collected: dict[Path, dict[str, Any]] = {}
+    for sidecar_path in sorted(root.rglob(f"*{_SIDECAR_SUFFIX}")):
+        if not sidecar_path.is_file():
+            continue
+        try:
+            # the same two hooks as the uploads metadata parser: RFC 8259 JSON
+            # has no non-finite numbers, but json.loads accepts NaN/Infinity
+            # (parse_constant) and a valid token can OVERFLOW to inf (1e999 —
+            # parse_float); either would pass every later shape/schema check
+            # and fail the documents.metadata JSONB insert with a low-level
+            # store error naming no cause (Codex #130 r4)
+            parsed = json.loads(
+                sidecar_path.read_text(encoding="utf-8"),
+                parse_constant=reject_non_finite_constant,
+                parse_float=finite_float,
+            )
+        except ValueError as exc:  # JSONDecodeError/UnicodeDecodeError included
+            raise ValueError(f"metadata sidecar {sidecar_path} is not valid JSON: {exc}") from exc
+        storability = unstorable_string_reason(parsed)
+        if storability is not None:
+            # JSON-valid but JSONB-unstorable (NUL / unpaired surrogate), in a
+            # value OR an object key (the open bags allow both)
+            raise ValueError(
+                f"metadata sidecar {sidecar_path} {storability} in a string "
+                "key or value — PostgreSQL JSONB cannot store it"
+            )
+        if not isinstance(parsed, dict):
+            raise ValueError(f"metadata sidecar {sidecar_path} must be a JSON object")
+        unknown = set(parsed) - _SIDECAR_KEYS
+        if unknown:
+            raise ValueError(
+                f"metadata sidecar {sidecar_path} has unknown key(s) {sorted(unknown)} — "
+                f"allowed: {sorted(_SIDECAR_KEYS)} (system/schema_version are "
+                "server-stamped and cannot be forged from a sidecar)"
+            )
+        for key in _SIDECAR_KEYS:
+            # parity with the upload boundary's _reject_null_subobjects: the
+            # namespaces are optional-but-non-nullable, so an explicit null is
+            # a malformed sidecar, not "absent"
+            if key in parsed and parsed[key] is None:
+                raise ValueError(
+                    f"metadata sidecar {sidecar_path}: {key} must be an object "
+                    "when present, not null"
+                )
+        _validate_sidecar_context(sidecar_path, parsed.get("context"))
+        _validate_sidecar_governance(sidecar_path, parsed.get("governance"))
+        try:
+            schema.validate_context(parsed.get("context") or {})
+        except MetadataValidationError as exc:
+            raise ValueError(
+                f"metadata sidecar {sidecar_path}: {exc} — sidecar attributes are "
+                "validated against the project metadata_schema, the same fence the "
+                "upload boundary applies at capture"
+            ) from exc
+        stem = sidecar_path.name[: -len(_SIDECAR_SUFFIX)]
+        if not stem:
+            raise ValueError(
+                f"metadata sidecar {sidecar_path} names no target file — the "
+                "convention is <name>.meta.json beside <name>"
+            )
+        # Keyed by the LEXICAL in-tree path, never resolve(): the sidecar and
+        # the document loop walk the SAME rglob, so lexical paths match exactly
+        # — while resolving would alias a symlinked document with its referent
+        # (link.txt.meta.json popped while processing a.txt), attaching the
+        # link's provenance to the wrong document (Codex #130 r3). A symlink
+        # named <name> gets its own <name>.meta.json, the directory entry the
+        # operator actually described.
+        collected[sidecar_path.with_name(stem)] = parsed
+    return collected
+
+
+def _validate_sidecar_context(sidecar_path: Path, context: Any) -> None:
+    """The sidecar's ``context`` must be the CLOSED core shape — mirroring
+    the upload boundary's ``extra=\"forbid\"`` model and the frozen
+    ``DocumentMetadataContext`` (``additionalProperties:false``). Without
+    this, ``build_envelope``'s normalization SILENTLY drops any other
+    context key: the single most likely operator mistake —
+    ``context.source_url`` instead of ``context.attributes.source_url`` —
+    would quietly yield an envelope with no presentable provenance, the
+    exact silent failure MCP10 exists to fix (gate-2 blocker)."""
+    if context is None:
+        return
+    if not isinstance(context, dict):
+        raise ValueError(f"metadata sidecar {sidecar_path}: context must be a JSON object")
+    unknown = set(context) - {"title", "document_type", "attributes"}
+    if unknown:
+        raise ValueError(
+            f"metadata sidecar {sidecar_path}: unknown context key(s) {sorted(unknown)} — "
+            "the closed core is title/document_type/attributes; project fields "
+            "(e.g. source_url) belong INSIDE context.attributes"
+        )
+    for field_name in ("title", "document_type"):
+        value = context.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(
+                f"metadata sidecar {sidecar_path}: context.{field_name} must be a "
+                f"string or null, got {type(value).__name__}"
+            )
+    if "attributes" in context and not isinstance(context["attributes"], dict):
+        # explicit null included — parity with the upload boundary, which
+        # rejects present-and-null attributes rather than folding them to {}
+        raise ValueError(
+            f"metadata sidecar {sidecar_path}: context.attributes must be a JSON object"
+        )
+
+
+def _validate_sidecar_governance(sidecar_path: Path, governance: Any) -> None:
+    """The sidecar's ``governance`` mirrors the upload boundary's
+    ``DocumentMetadataGovernance`` shape: an OBJECT whose ``visibility`` /
+    ``classification`` are strings or null, the rest an open bag
+    (``additionalProperties: true`` — extra keys are project data, allowed).
+    Without this, a wrong-typed value (``{"visibility": 42}``) would persist
+    into the envelope despite the frozen contract typing those fields, and a
+    non-object governance would crash later in ``build_envelope``'s ``dict()``
+    with an incidental error naming no cause (Codex #130 r2)."""
+    if governance is None:
+        return
+    if not isinstance(governance, dict):
+        raise ValueError(f"metadata sidecar {sidecar_path}: governance must be a JSON object")
+    for field_name in ("visibility", "classification"):
+        value = governance.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(
+                f"metadata sidecar {sidecar_path}: governance.{field_name} must be a "
+                f"string or null, got {type(value).__name__}"
+            )
 
 
 def read_csv_rows(path: Path, *, table: str, pk_column: str) -> Iterator[DocumentPayload]:

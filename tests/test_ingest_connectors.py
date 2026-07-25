@@ -20,6 +20,7 @@ from core.ingest.connectors import (
     read_text_documents,
     read_xlsx_rows,
 )
+from core.metadata.schema import load_metadata_schema
 
 
 def test_content_hash_tracks_content_only() -> None:
@@ -421,3 +422,270 @@ def test_xlsx_missing_mapped_column_and_empty_sheet_fail_loud(tmp_path: Path) ->
     openpyxl.Workbook().save(empty)
     with pytest.raises(ValueError, match="empty"):
         list(read_xlsx_rows(empty, title_column="標題", body_column="內容"))
+
+
+def test_sidecar_metadata_becomes_a_stamped_envelope(tmp_path: Path) -> None:
+    """MCP10: every citation's source_uri was a dev-machine file:// path — an
+    end-user-facing agent had NOTHING presentable to cite. A plain-directory
+    file may now carry <name>.meta.json beside it: its context (e.g. the
+    real public page URL in attributes) lands in the stored DR-010 envelope,
+    while system/schema_version stay SERVER-stamped (a sidecar cannot forge
+    them). Files without a sidecar keep the old {"filename"} fallback."""
+    import json as jsonlib
+
+    (tmp_path / "faq.txt").write_text("票價資訊", encoding="utf-8")
+    (tmp_path / "faq.txt.meta.json").write_text(
+        jsonlib.dumps(
+            {
+                "context": {
+                    "title": "常見問題:票價",
+                    "attributes": {"source_url": "https://www.nmmst.gov.tw/faq/105"},
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "plain.txt").write_text("no sidecar", encoding="utf-8")
+
+    # the project must DECLARE source_url for a sidecar to carry it — the same
+    # metadata_schema fence the upload boundary applies (DR-010 rule 2)
+    schema = load_metadata_schema(
+        {"metadata_schema": {"attributes": {"source_url": {"type": "string"}}}}
+    )
+    payloads = {
+        p.metadata.get("system", {}).get("original_filename") or p.metadata.get("filename"): p
+        for p in read_text_documents(tmp_path, metadata_schema=schema)
+    }
+    assert set(payloads) == {"faq.txt", "plain.txt"}  # the sidecar itself never ingests
+
+    enveloped = payloads["faq.txt"].metadata
+    assert enveloped["system"] == {"connector": "text-directory", "original_filename": "faq.txt"}
+    assert enveloped["context"]["title"] == "常見問題:票價"
+    assert enveloped["context"]["attributes"]["source_url"] == "https://www.nmmst.gov.tw/faq/105"
+    assert enveloped["schema_version"]  # server-stamped, present
+
+    assert payloads["plain.txt"].metadata == {"filename": "plain.txt"}  # fallback unchanged
+
+
+def test_sidecar_misuse_fails_loudly(tmp_path: Path) -> None:
+    """The sidecar failure modes are LOUD (a silent skip would mean someone's
+    provenance metadata is quietly not applied): corrupt JSON, forged server
+    namespaces, and an orphan sidecar whose target file does not exist (a
+    typo'd name)."""
+    import json as jsonlib
+
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+
+    (tmp_path / "a.txt.meta.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        list(read_text_documents(tmp_path))
+
+    (tmp_path / "a.txt.meta.json").write_text(
+        jsonlib.dumps({"system": {"connector": "forged"}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="server-stamped"):
+        list(read_text_documents(tmp_path))
+
+    (tmp_path / "a.txt.meta.json").unlink()
+    (tmp_path / "typo.txt.meta.json").write_text(jsonlib.dumps({"context": {}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="without a matching document file"):
+        list(read_text_documents(tmp_path))
+
+
+def test_sidecar_context_shape_is_closed(tmp_path: Path) -> None:
+    """build_envelope normalizes context to exactly {title, document_type,
+    attributes} and SILENTLY DROPS anything else — so without a shape check
+    at the sidecar door, the single most likely operator mistake (putting
+    source_url at context top level instead of inside context.attributes)
+    would quietly produce an envelope with NO presentable provenance: the
+    exact silent failure MCP10 exists to fix. The sidecar's context is
+    therefore CLOSED, mirroring the upload boundary's extra="forbid" model
+    and the frozen DocumentMetadataContext (additionalProperties:false)."""
+    import json as jsonlib
+
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    sidecar = tmp_path / "a.txt.meta.json"
+
+    # the flagship mistake: provenance one level too high — must be loud
+    sidecar.write_text(
+        jsonlib.dumps({"context": {"source_url": "https://example.com"}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match=r"unknown context key.*source_url.*INSIDE context"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text(jsonlib.dumps({"context": "a string"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="context must be a JSON object"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text(jsonlib.dumps({"context": {"title": 42}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="context.title must be a string"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text(
+        jsonlib.dumps({"context": {"attributes": ["not", "a", "map"]}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="context.attributes must be a JSON object"):
+        list(read_text_documents(tmp_path))
+
+    # a file literally named ".meta.json" names no target — domain error, not
+    # a bare pathlib crash from with_name("")
+    sidecar.unlink()
+    (tmp_path / ".meta.json").write_text(jsonlib.dumps({"context": {}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="names no target file"):
+        list(read_text_documents(tmp_path))
+
+
+def test_sidecar_rejects_jsonb_unstorable_values(tmp_path: Path) -> None:
+    """JSON-valid but JSONB-unstorable sidecar values must fail AT THE
+    CONNECTOR with the promised actionable error (Codex #130 r4): default
+    json.loads accepts NaN/Infinity, a numeric token can overflow to inf
+    (1e999), and a JSON string/key may carry \\u0000 — each passes every
+    shape/schema check yet fails the documents.metadata JSONB insert later
+    with a low-level store error naming no cause. Same guards as the uploads
+    metadata parser (shared from core.metadata.schema)."""
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    sidecar = tmp_path / "a.txt.meta.json"
+
+    sidecar.write_text('{"governance": {"x": NaN}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="not valid JSON.*non-finite constant"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text('{"governance": {"x": 1e999}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="not valid JSON.*non-finite number"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text('{"governance": {"note": "a\\u0000b"}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="NUL"):
+        list(read_text_documents(tmp_path))
+
+    # a NUL hiding in an object KEY of the open bag, not just a value
+    sidecar.write_text('{"governance": {"a\\u0000b": "v"}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="NUL"):
+        list(read_text_documents(tmp_path))
+
+    # a lone escaped UTF-16 surrogate: json.loads materializes it as a
+    # surrogate code point no UTF-8 encoder (Postgres included) can encode
+    sidecar.write_text('{"governance": {"note": "\\ud800"}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="unpaired UTF-16 surrogate"):
+        list(read_text_documents(tmp_path))
+
+    # a PAIRED surrogate escape is a legal astral char and must NOT be blocked
+    sidecar.write_text('{"governance": {"note": "\\ud83d\\ude00"}}', encoding="utf-8")
+    [payload] = read_text_documents(tmp_path)
+    assert payload.metadata["governance"]["note"] == "\U0001f600"
+
+
+def test_sidecar_targets_are_lexical_not_resolved(tmp_path: Path) -> None:
+    """A sidecar names a DIRECTORY ENTRY, not an inode (Codex #130 r3): with
+    resolve()-keying, `link.txt -> a.txt` plus only `link.txt.meta.json`
+    would let the document loop pop the link's metadata while processing
+    a.txt — the real file receives the LINK's provenance and the link falls
+    back to filename-only, i.e. citations attached to the wrong document.
+    Lexical keying is exact because the sidecar collection and the document
+    loop walk the same rglob."""
+    import json as jsonlib
+
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    try:
+        link.symlink_to(tmp_path / "a.txt")
+    except OSError:  # pragma: no cover - Windows without the symlink privilege
+        pytest.skip("symlink creation not permitted on this platform")
+    (tmp_path / "link.txt.meta.json").write_text(
+        jsonlib.dumps({"context": {"title": "the link's own provenance"}}), encoding="utf-8"
+    )
+
+    by_name = {
+        p.metadata.get("system", {}).get("original_filename") or p.metadata.get("filename"): p
+        for p in read_text_documents(tmp_path)
+    }
+    # the REAL file keeps its fallback — it must never absorb the link's sidecar
+    assert by_name["a.txt"].metadata == {"filename": "a.txt"}
+    assert by_name["link.txt"].metadata["context"]["title"] == "the link's own provenance"
+
+
+def test_sidecar_governance_shape_is_validated(tmp_path: Path) -> None:
+    """The governance namespace is context's sibling and carries the same
+    silent hole without a fence (Codex #130 r2): the frozen
+    DocumentMetadataGovernance contract types visibility/classification as
+    string|null, but build_envelope persists whatever dict it gets — a
+    wrong-typed value would land in the stored envelope, and a non-object
+    governance would crash later in dict() with an error naming no cause.
+    The rest of governance stays an OPEN bag (additionalProperties: true),
+    and explicit-null namespaces are rejected — both exactly the upload
+    boundary's rules."""
+    import json as jsonlib
+
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    sidecar = tmp_path / "a.txt.meta.json"
+
+    sidecar.write_text(jsonlib.dumps({"governance": {"visibility": 42}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="governance.visibility must be a string"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text(jsonlib.dumps({"governance": ["not", "an", "object"]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="governance must be a JSON object"):
+        list(read_text_documents(tmp_path))
+
+    # optional-but-non-nullable, like the upload boundary's context/governance
+    sidecar.write_text(jsonlib.dumps({"governance": None}), encoding="utf-8")
+    with pytest.raises(ValueError, match="governance must be an object when present, not null"):
+        list(read_text_documents(tmp_path))
+    sidecar.write_text(jsonlib.dumps({"context": None}), encoding="utf-8")
+    with pytest.raises(ValueError, match="context must be an object when present, not null"):
+        list(read_text_documents(tmp_path))
+    sidecar.write_text(jsonlib.dumps({"context": {"attributes": None}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="context.attributes must be a JSON object"):
+        list(read_text_documents(tmp_path))
+
+    # a well-typed governance with extra open-bag keys passes and persists
+    sidecar.write_text(
+        jsonlib.dumps({"governance": {"visibility": "public", "retention": "2y"}}),
+        encoding="utf-8",
+    )
+    [payload] = read_text_documents(tmp_path)
+    assert payload.metadata["governance"] == {"visibility": "public", "retention": "2y"}
+
+
+def test_sidecar_attributes_validate_against_the_project_schema(tmp_path: Path) -> None:
+    """Sidecar attributes pass through the SAME metadata_schema fence the
+    upload boundary applies at capture (Codex #130): without it, a sidecar
+    could persist undeclared or wrong-typed values while the build succeeds,
+    and typed document filters would silently disagree with project config.
+    Passing NO schema folds to the EMPTY schema — fail-closed, so a caller
+    that forgets to thread the project schema breaks a legitimate sidecar
+    build loudly instead of silently skipping the fence."""
+    import json as jsonlib
+
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    sidecar = tmp_path / "a.txt.meta.json"
+    sidecar.write_text(
+        jsonlib.dumps({"context": {"attributes": {"source_url": "https://example.com"}}}),
+        encoding="utf-8",
+    )
+
+    # no schema threaded = empty schema: every attribute is undeclared (fail-closed)
+    with pytest.raises(ValueError, match="not declared in the project metadata_schema"):
+        list(read_text_documents(tmp_path))
+
+    declaring = load_metadata_schema(
+        {"metadata_schema": {"attributes": {"source_url": {"type": "string"}}}}
+    )
+    assert [p.raw for p in read_text_documents(tmp_path, metadata_schema=declaring)] == ["x"]
+
+    # wrong-typed value against the declaring schema
+    sidecar.write_text(
+        jsonlib.dumps({"context": {"attributes": {"source_url": 42}}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="must be string"):
+        list(read_text_documents(tmp_path, metadata_schema=declaring))
+
+    # a REQUIRED attribute is enforced on every sidecar (same rule as uploads) —
+    # including one that declares no attributes at all
+    requiring = load_metadata_schema(
+        {"metadata_schema": {"attributes": {"source_url": {"type": "string", "required": True}}}}
+    )
+    sidecar.write_text(jsonlib.dumps({"context": {"title": "t"}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="required attribute 'source_url' is missing"):
+        list(read_text_documents(tmp_path, metadata_schema=requiring))

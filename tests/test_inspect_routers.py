@@ -985,7 +985,7 @@ def test_nul_in_metadata_filter_is_rejected_not_500(
 ) -> None:
     # Codex #120 R2: PostgreSQL JSONB cannot represent U+0000 - a %00 in a
     # client filter would 500 at bind time; rejected for EVERY declared type
-    # before the containment predicate forms (the uploads _contains_nul twin)
+    # before the containment predicate forms (the uploads _unstorable_string_reason twin)
     _filterable_project(monkeypatch)
     r = client.get("/projects/p/documents", params={"filter[topic]": "\x00sea"})
     assert r.status_code == 400

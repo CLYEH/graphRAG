@@ -345,7 +345,8 @@ def test_metadata_with_nul_is_rejected_not_accepted(
     # instead of this file's STATED per-file metadata refusal. It must be rejected AT
     # CAPTURE, recursively (here in an open governance value), and a clean sibling in the
     # same batch stays accepted (per-file, not whole-request). Revert-probe: drop the
-    # _contains_nul guard and bad.txt is accepted, and the NUL rides into the JSONB write.
+    # _unstorable_string_reason guard and bad.txt is accepted, and the NUL rides into the
+    # JSONB write.
     _project(monkeypatch)
     _settings(monkeypatch, tmp_path)
     _capture_source(monkeypatch)
@@ -362,6 +363,35 @@ def test_metadata_with_nul_is_rejected_not_accepted(
     rows = {r["original_filename"]: r for r in resp.json()["data"]["files"]}
     assert rows["bad.txt"]["status"] == "rejected"
     assert "NUL" in rows["bad.txt"]["reason"]
+    assert rows["good.txt"]["status"] == "accepted"  # the clean sibling is unaffected
+
+
+def test_metadata_with_lone_surrogate_is_rejected_not_accepted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # WHY (Codex #130 r5, the NUL guard's sibling): a JSON document may carry an
+    # ESCAPED lone UTF-16 surrogate ("\ud800") that json.loads materializes as a
+    # surrogate code point — valid JSON, but no UTF-8 encoder (Postgres included) can
+    # store it, the same JSON-valid-but-JSONB-unstorable class as NUL. The shared
+    # unstorable_string_reason guard closes both classes at BOTH boundaries (uploads
+    # here, MCP10 sidecars at the connector); this was a pre-existing gap on the
+    # upload path, closed when the guards were consolidated into core.
+    _project(monkeypatch)
+    _settings(monkeypatch, tmp_path)
+    _capture_source(monkeypatch)
+    metadata_json = '{"bad.txt": {"governance": {"note": "\\ud800"}}}'
+    resp = client.post(
+        _URL,
+        files=[
+            ("files", ("bad.txt", b"clean text", "text/plain")),
+            ("files", ("good.txt", b"clean text", "text/plain")),
+        ],
+        data={"metadata": metadata_json},
+    )
+    assert resp.status_code == 201  # per-file reject, not a whole-request failure/500
+    rows = {r["original_filename"]: r for r in resp.json()["data"]["files"]}
+    assert rows["bad.txt"]["status"] == "rejected"
+    assert "surrogate" in rows["bad.txt"]["reason"]
     assert rows["good.txt"]["status"] == "accepted"  # the clean sibling is unaffected
 
 

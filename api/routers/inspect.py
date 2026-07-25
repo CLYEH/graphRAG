@@ -195,7 +195,7 @@ def _typed_metadata_value(raw: str, declared: str, name: str) -> str | float | i
     the containment probe compares numerically either way."""
     # NUL first, for EVERY declared type: PostgreSQL JSONB cannot represent
     # U+0000, so a client-controlled %00 would 500 at bind time — the uploads
-    # metadata path rejects the same class (_contains_nul) before JSONB
+    # metadata path rejects the same class (_unstorable_string_reason) before JSONB
     if "\x00" in raw:
         raise ApiError(
             ErrorCode.VALIDATION_ERROR,
