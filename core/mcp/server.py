@@ -43,9 +43,13 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Final, cast
+from importlib import metadata as importlib_metadata
+from pathlib import Path
+from typing import Annotated, Any, Final, cast
 
+from mcp import types as mcp_types
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -96,6 +100,133 @@ _NO_ACTIVE_BUILD_MESSAGE = (
     "project has no active build — queries bind to builds.status='active' "
     "(DR-001); run a build and activate it, then retry"
 )
+
+#: MCP14 — server self-description. serverInfo.version previously reported
+#: the MCP SDK's version (actively misleading: it identifies neither this
+#: server nor the corpus); it now reports the graphrag package version. The
+#: corpus identity is per-response (§16 build_id), not server metadata.
+try:
+    _SERVER_VERSION = importlib_metadata.version("graphrag")
+except importlib_metadata.PackageNotFoundError:  # editable/dev checkout without dist metadata
+    _SERVER_VERSION = "0.0.0-dev"
+
+_REPO_URL = "https://github.com/CLYEH/graphRAG"
+
+#: the frozen §16 response contract — advertised as the retrieval tools'
+#: outputSchema (MCP14: it existed for every response yet tools/list showed
+#: only additionalProperties:true). Two candidate locations, the
+#: query-policy loader's rule (Codex #134 r1): a source checkout keeps
+#: contracts/ at the repo root; an installed wheel ships a build-time copy
+#: inside the core package (pyproject force-include).
+_MCP_SCHEMA_CANDIDATES = (
+    Path(__file__).resolve().parents[2] / "contracts" / "mcp_response.schema.json",
+    Path(__file__).resolve().parents[1] / "contracts" / "mcp_response.schema.json",
+)
+
+
+def _mcp_response_schema() -> dict[str, Any]:
+    for candidate in _MCP_SCHEMA_CANDIDATES:
+        if candidate.is_file():
+            schema = cast(dict[str, Any], json.loads(candidate.read_text("utf-8")))
+            return cast(dict[str, Any], _strip_schema_descriptions(schema))
+    raise FileNotFoundError(
+        "mcp_response.schema.json not found — looked in: "
+        + ", ".join(str(c) for c in _MCP_SCHEMA_CANDIDATES)
+    )
+
+
+def _strip_schema_descriptions(node: Any, *, in_name_map: bool = False) -> Any:
+    """The ADVERTISED copy of the contract drops every ``description``
+    annotation (Codex #134 r2): the frozen file's descriptions carry DESIGN
+    §-numbers, DR-ids and change-history notes an external agent cannot
+    resolve — exactly the jargon MCP14 scrubbed from tool/param
+    descriptions. Validation keywords are untouched (descriptions are pure
+    annotations), and keys inside name→schema maps (``properties`` etc.)
+    are data, never annotations — a real property NAMED "description" would
+    survive."""
+    if isinstance(node, dict):
+        out: dict[str, Any] = {}
+        for key, value in node.items():
+            if not in_name_map and key == "description" and isinstance(value, str):
+                continue
+            out[key] = _strip_schema_descriptions(
+                value, in_name_map=key in ("properties", "patternProperties", "$defs")
+            )
+        return out
+    if isinstance(node, list):
+        return [_strip_schema_descriptions(item) for item in node]
+    return node
+
+
+#: what an external agent needs to know BEFORE the first call — it cannot
+#: read docs/DESIGN.md, so the instructions carry the operating rules in
+#: plain language (MCP14).
+_SERVER_INSTRUCTIONS = """\
+This server answers questions over ONE project's knowledge base (documents,
+entities, relations, community reports) built by graphRAG.
+
+Tool map:
+- hybrid_query is the default entry: it fans out semantic + graph + sql
+  retrieval and fuses the results. semantic_search / graph_query / sql_query /
+  global_summary run a single mode. explain_retrieval is hybrid_query plus a
+  routing trace (only when the operator enabled expose_debug).
+- get_entity / get_chunk / get_document exchange ids from citations for full
+  content. list_entities / list_chunks / list_reports browse the corpus with
+  cursors — use them to see everything; retrieval responses are capped.
+- list_schema shows the sql-queryable tables.
+
+Reading responses:
+- Retrieval tools return one envelope: results[] (each with source_refs
+  citations), warnings[], and the build_id the answer was read from. Every
+  call binds to the project's single ACTIVE build.
+- warnings[] is how degradation is reported (the call itself succeeds):
+  GUARDRAIL_BLOCKED = the call was refused, nothing was produced;
+  TRUNCATED = results were clipped to a policy ceiling; MODE_SKIPPED /
+  STORE_UNAVAILABLE / PARTIAL_RESULTS = a mode or store dropped out;
+  NO_ACTIVE_BUILD = the project has no active build yet.
+- Introspection tools (get_* / list_*) instead carry error + error_code:
+  INVALID_INPUT (fix your input), NOT_FOUND (the id is not in the active
+  build), QUERY_TIMEOUT (retry later), STORE_UNAVAILABLE (back off),
+  NO_ACTIVE_BUILD (build and activate first). error_code null = success.
+- Scores rank results within a response; they do not measure whether the
+  corpus can answer the question — judge that from the returned content.
+"""
+
+
+def _finalize_server_metadata(server: FastMCP) -> None:
+    """MCP14 — metadata only, no execution-path change.
+
+    (1) serverInfo.version → the graphrag package version (the SDK's own
+    version was actively misleading). (2) prompts/resources handlers are
+    UNREGISTERED: FastMCP declares both capabilities unconditionally while
+    this server registers none — an agent following the declaration wasted
+    two round-trips on empty lists; with the handlers gone the capabilities
+    are no longer advertised (a client calling anyway gets the protocol's
+    method-not-found, which is the truth). (3) the six §16 tools advertise
+    the frozen response contract as their outputSchema — the cached_property
+    slot is pre-filled so ONLY tools/list changes; runtime result conversion
+    still uses fn_metadata (unchanged, proven by the call tests)."""
+    server._mcp_server.version = _SERVER_VERSION  # noqa: SLF001 — the SDK exposes no public setter
+    for request in (
+        mcp_types.ListPromptsRequest,
+        mcp_types.GetPromptRequest,
+        mcp_types.ListResourcesRequest,
+        mcp_types.ReadResourceRequest,
+        mcp_types.ListResourceTemplatesRequest,
+    ):
+        server._mcp_server.request_handlers.pop(request, None)  # noqa: SLF001
+    frozen = _mcp_response_schema()
+    for name in (
+        "semantic_search",
+        "graph_query",
+        "global_summary",
+        "sql_query",
+        "hybrid_query",
+        "explain_retrieval",
+    ):
+        tool = server._tool_manager._tools[name]  # noqa: SLF001
+        tool.__dict__["output_schema"] = frozen
+
 
 #: the store CLIENTS' exception families (§22 STORE_UNAVAILABLE) and their
 #: store names now live in core.stores.errors — hybrid's per-mode guard uses
@@ -416,6 +547,10 @@ def build_server(project: str) -> FastMCP:
         lifespan=lifespan,
         host=http_settings.mcp_http_host,
         port=http_settings.mcp_http_port,
+        # MCP14: the server describes ITSELF — an external agent cannot read
+        # docs/DESIGN.md, so the operating rules ride the initialize response
+        instructions=_SERVER_INSTRUCTIONS,
+        website_url=_REPO_URL,
     )
 
     def _rt() -> _Runtime:
@@ -432,9 +567,28 @@ def build_server(project: str) -> FastMCP:
 
     @server.tool()
     async def semantic_search(
-        query: str, top_k: int | None = None, point_type: str | None = None
+        query: Annotated[str, Field(description="The question or topic, natural language.")],
+        top_k: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "Max results; omitted = the policy ceiling. Over-cap asks are clamped WITH a "
+                    "TRUNCATED warning."
+                )
+            ),
+        ] = None,
+        point_type: Annotated[
+            str | None,
+            Field(
+                description=(
+                    'Restrict results: "chunk" = text passages only, "entity" = name matches only; '
+                    "omitted = both."
+                ),
+                json_schema_extra={"enum": ["chunk", "entity", None]},
+            ),
+        ] = None,
     ) -> dict[str, Any]:
-        """Fuzzy/topical retrieval over document text (§8 semantic).
+        """Fuzzy/topical retrieval over the document text (semantic mode).
 
         Results mix text chunks and entity name matches; each type is
         guaranteed up to half the page, and entity titles carry the ontology
@@ -467,13 +621,42 @@ def build_server(project: str) -> FastMCP:
 
     @server.tool()
     async def graph_query(
-        template: str,
-        entity: str,
-        other_entity: str | None = None,
-        hops: int = 1,
-        query: str = "",
+        template: Annotated[
+            str,
+            Field(
+                description=(
+                    'Traversal shape: "neighbors" (what connects to '
+                    'entity), "path" (route from entity '
+                    'to other_entity), or "subgraph" (the region around entity).'
+                ),
+                json_schema_extra={"enum": ["neighbors", "path", "subgraph"]},
+            ),
+        ],
+        entity: Annotated[
+            str,
+            Field(
+                description="Seed entity, EXACT canonical name (find it with list_entities q=...)."
+            ),
+        ],
+        other_entity: Annotated[
+            str | None,
+            Field(
+                description=(
+                    'Destination entity — required by the "path" template, meaningless elsewhere.'
+                )
+            ),
+        ] = None,
+        hops: Annotated[
+            int,
+            Field(
+                description="Traversal depth; above the policy ceiling is rejected, not clamped."
+            ),
+        ] = 1,
+        query: Annotated[
+            str, Field(description="Optional label echoed in the response envelope.")
+        ] = "",
     ) -> dict[str, Any]:
-        """Entity-relationship retrieval via the §27.6 parameterized templates
+        """Entity-relationship retrieval via parameterized graph templates
         (neighbors / path / subgraph). Relation results cite evidence refs;
         a ref with source_type "chunk" carries a chunk UUID exchangeable for
         its text via get_chunk (row/document evidence refs are other shapes —
@@ -497,8 +680,18 @@ def build_server(project: str) -> FastMCP:
         return await _bounded(rt, "graph_query", label, _run)
 
     @server.tool()
-    async def sql_query(query: str) -> dict[str, Any]:
-        """Precise filters/lookups over structured rows (§8 sql, guarded NL→SQL)."""
+    async def sql_query(
+        query: Annotated[
+            str,
+            Field(
+                description=(
+                    "Natural-language question over the structured tables (see list_schema); "
+                    "translated to guarded read-only SQL."
+                )
+            ),
+        ],
+    ) -> dict[str, Any]:
+        """Precise filters/lookups over structured rows (guarded natural-language→SQL)."""
         rt = _rt()
 
         async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
@@ -509,8 +702,25 @@ def build_server(project: str) -> FastMCP:
         return await _bounded(rt, "sql_query", query, _run)
 
     @server.tool()
-    async def global_summary(query: str, top_k: int | None = None) -> dict[str, Any]:
-        """Corpus-wide community summaries (§8 global)."""
+    async def global_summary(
+        query: Annotated[
+            str,
+            Field(
+                description="Echoed in the envelope; results are rating-ranked, not query-matched."
+            ),
+        ],
+        top_k: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "Max reports; omitted = the policy ceiling. Over-cap asks are clamped WITH a "
+                    "TRUNCATED warning."
+                )
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        """Corpus-wide community summaries — a rating-ranked overview of the
+        whole corpus (use list_reports to page through ALL of them)."""
         rt = _rt()
 
         async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
@@ -521,12 +731,50 @@ def build_server(project: str) -> FastMCP:
 
     @server.tool()
     async def hybrid_query(
-        query: str,
-        top_k: int | None = None,
-        graph_template: str | None = None,
-        graph_entity: str | None = None,
-        graph_other_entity: str | None = None,
-        graph_hops: int | None = None,
+        query: Annotated[str, Field(description="The question, natural language.")],
+        top_k: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "Max fused results; omitted = the policy "
+                    "ceiling. Over-cap asks are clamped WITH a "
+                    "TRUNCATED warning."
+                )
+            ),
+        ] = None,
+        graph_template: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Your explicit graph invocation's traversal shape "
+                    "— must be supplied TOGETHER with "
+                    "graph_entity."
+                ),
+                json_schema_extra={"enum": ["neighbors", "path", "subgraph", None]},
+            ),
+        ] = None,
+        graph_entity: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Your explicit graph invocation's seed entity (exact canonical name) — must be "
+                    "supplied TOGETHER with graph_template."
+                )
+            ),
+        ] = None,
+        graph_other_entity: Annotated[
+            str | None,
+            Field(description='Optional refinement: the "path" template\'s destination entity.'),
+        ] = None,
+        graph_hops: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "Optional refinement: traversal depth (defaults "
+                    "to 1 for a complete invocation)."
+                )
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         """Fan every AVAILABLE mode out over the question and fuse: semantic
         + graph + sql, deterministically (no LLM routing). Community reports
@@ -534,7 +782,7 @@ def build_server(project: str) -> FastMCP:
         query-matched; use global_summary for that. Supply graph_template +
         graph_entity to run YOUR graph invocation; without them the router
         derives a safe plan itself when the question names a build entity
-        (QP1 auto plan — see the routing trace). Supplying ANY graph_*
+        (an automatic plan, visible in the routing trace). Supplying ANY graph_*
         parameter without BOTH graph_template and graph_entity is refused
         loudly (GUARDRAIL_BLOCKED, zero results) — the router never silently
         substitutes its own plan for half of yours. graph_hops defaults to 1
@@ -590,14 +838,16 @@ def build_server(project: str) -> FastMCP:
         return _with_clamp_warning(payload, rt.policy, top_k)
 
     @server.tool()
-    async def get_entity(name: str) -> dict[str, Any]:
-        """Look one entity up by EXACT canonical name (active entities only;
-        the SoR decides what an entity IS) — unsure of the name? Use
-        list_entities(q=...) for substring search first. Introspection
-        shape — NOT a §16 response (the frozen tool enum covers only the
-        five retrieval tools) — but each entity still carries its
-        §27.2-spirit mention citations (uncapped: this is the full-membership
-        surface)."""
+    async def get_entity(
+        name: Annotated[
+            str,
+            Field(description="EXACT canonical entity name (find it with list_entities q=...)."),
+        ],
+    ) -> dict[str, Any]:
+        """Look one entity up by EXACT canonical name — unsure of the name?
+        Use list_entities(q=...) for substring search first. Introspection
+        shape (error/error_code, not the retrieval envelope); each entity
+        carries its full, uncapped mention citations."""
         rt = _rt()
         bound_build: str | None = None
         try:
@@ -613,12 +863,22 @@ def build_server(project: str) -> FastMCP:
             return _introspection_store_error(rt, bound_build, name, exc)
 
     @server.tool()
-    async def get_chunk(chunk_id: str) -> dict[str, Any]:
+    async def get_chunk(
+        chunk_id: Annotated[
+            str,
+            Field(
+                description=(
+                    "Chunk UUID from a chunk result id, a chunk evidence ref, or an entity "
+                    "chunk-mention citation."
+                )
+            ),
+        ],
+    ) -> dict[str, Any]:
         """Exchange a chunk UUID for its TEXT (plus document provenance) —
         the id of a chunk result, a chunk evidence ref, or an entity chunk
-        mention citation (all carry chunk UUIDs since v1.1). Introspection
-        shape — NOT a §16 response. Row mention/evidence refs cite a
-        structured table+pk and are not accepted here."""
+        mention citation. Introspection shape (error/error_code). Row
+        mention/evidence refs cite a structured table+pk and are not
+        accepted here."""
         rt = _rt()
         # parsing needs no store — reject a malformed id BEFORE the binding
         # opens one (Codex #125 r3: a store outage must not mask this error)
@@ -639,10 +899,14 @@ def build_server(project: str) -> FastMCP:
             return _introspection_store_error(rt, bound_build, chunk_id, exc)
 
     @server.tool()
-    async def get_document(document_id: str) -> dict[str, Any]:
+    async def get_document(
+        document_id: Annotated[
+            str, Field(description="Document UUID (e.g. a chunk's document_id).")
+        ],
+    ) -> dict[str, Any]:
         """Exchange a document UUID (a chunk's document_id) for its source
-        provenance and full RAW content. Introspection shape — NOT a §16
-        response."""
+        provenance and full RAW content. Introspection shape
+        (error/error_code)."""
         rt = _rt()
         # same pre-binding rejection as get_chunk (Codex #125 r3)
         rejected = _invalid_document_payload(rt.context.project, document_id)
@@ -665,17 +929,36 @@ def build_server(project: str) -> FastMCP:
 
     @server.tool()
     async def list_entities(
-        q: str | None = None,
-        entity_type: str | None = None,
-        limit: int = 50,
-        cursor: str | None = None,
+        q: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Case-insensitive substring over the canonical name "
+                    "(主館 finds 主題館); falls back to "
+                    "character matching when a short probe finds nothing."
+                )
+            ),
+        ] = None,
+        entity_type: Annotated[
+            str | None, Field(description="Filter by ontology type (as shown in results).")
+        ] = None,
+        limit: Annotated[int, Field(description="Page size, 1..200.")] = 50,
+        cursor: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Continuation cursor from the previous page's next_cursor; restart without one "
+                    "after an activation or filter change."
+                )
+            ),
+        ] = None,
     ) -> dict[str, Any]:
-        """Browse or SEARCH the build's entities, paged (MCP9). q is a
+        """Browse or SEARCH the build's entities, paged. q is a
         case-insensitive substring over the canonical name (主館 finds
         主題館 — use this instead of get_entity when unsure of the exact
         name); entity_type filters the ontology type. Walk next_cursor for
-        the full listing — nothing is unreachable. Introspection shape —
-        NOT a §16 response."""
+        the full listing — nothing is unreachable. Introspection shape
+        (error/error_code)."""
         rt = _rt()
         bound_build: str | None = None
         try:
@@ -693,11 +976,17 @@ def build_server(project: str) -> FastMCP:
             return _introspection_store_error(rt, bound_build, q or "list_entities", exc)
 
     @server.tool()
-    async def list_chunks(limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+    async def list_chunks(
+        limit: Annotated[int, Field(description="Page size, 1..200.")] = 50,
+        cursor: Annotated[
+            str | None,
+            Field(description="Continuation cursor from the previous page's next_cursor."),
+        ] = None,
+    ) -> dict[str, Any]:
         """Browse the build's text chunks, paged, with a named-truncation
         text preview (full text via get_chunk). Walk next_cursor for the
         complete corpus — the retrieval top_k ceiling does not apply here.
-        Introspection shape — NOT a §16 response."""
+        Introspection shape (error/error_code)."""
         rt = _rt()
         bound_build: str | None = None
         try:
@@ -713,11 +1002,17 @@ def build_server(project: str) -> FastMCP:
             return _introspection_store_error(rt, bound_build, "list_chunks", exc)
 
     @server.tool()
-    async def list_reports(limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+    async def list_reports(
+        limit: Annotated[int, Field(description="Page size, 1..200.")] = 50,
+        cursor: Annotated[
+            str | None,
+            Field(description="Continuation cursor from the previous page's next_cursor."),
+        ] = None,
+    ) -> dict[str, Any]:
         """Browse the build's community reports, paged, each with its FULL
-        summary (the global_summary retrieval ceiling hid most of them —
-        this reaches ALL, content included). Introspection shape — NOT a
-        §16 response."""
+        summary (the global_summary retrieval ceiling hides most of them —
+        this reaches ALL, content included). Introspection shape
+        (error/error_code)."""
         rt = _rt()
         bound_build: str | None = None
         try:
@@ -736,15 +1031,21 @@ def build_server(project: str) -> FastMCP:
     async def list_schema() -> dict[str, Any]:
         """The queryable structured surface: each whitelisted sql table with
         the columns it actually has in the ACTIVE build (empty when the sql
-        mode is disabled). Deliberately NOT a §16 response — there is no
-        retrieval result to cite; this is introspection."""
+        mode is disabled). Introspection shape (error/error_code) — there is
+        no retrieval result to cite."""
         return await _list_schema(_rt())
 
     @server.tool()
-    async def explain_retrieval(query: str, top_k: int | None = None) -> dict[str, Any]:
+    async def explain_retrieval(
+        query: Annotated[str, Field(description="The question, natural language.")],
+        top_k: Annotated[
+            int | None,
+            Field(description="Max fused results; omitted = the policy ceiling."),
+        ] = None,
+    ) -> dict[str, Any]:
         """Run the hybrid router and return the response WITH its routing
-        trace — the §16 debug block. Gated by the policy's expose_debug
-        flag (§21): when it is off the call is REFUSED up front
+        trace (the debug block). Gated by the operator's expose_debug
+        policy flag: when it is off the call is REFUSED up front
         (GUARDRAIL_BLOCKED, zero results) — use hybrid_query for results
         without a trace."""
         rt = _rt()
@@ -768,6 +1069,7 @@ def build_server(project: str) -> FastMCP:
         payload = await _bounded(rt, "hybrid_query", query, _run)
         return _with_clamp_warning(payload, rt.policy, top_k)
 
+    _finalize_server_metadata(server)
     return server
 
 
