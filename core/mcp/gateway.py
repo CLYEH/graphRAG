@@ -222,8 +222,16 @@ class McpGateway:
             # the honest termination 404 (its request is over regardless —
             # the r5 reconnect contract). If the SDK already reaped it, the
             # internal DELETE is a harmless no-op.
-            await self._terminate_child_session(app, project, session_id)
-            self._session_seen.pop(session_id, None)
+            # carry the ORIGINAL request's headers (Codex #137 r8): the SDK
+            # transport's DNS-rebinding guard (auto-on for a localhost bind)
+            # 421s a Host-less request, so a bare synthetic DELETE would be
+            # rejected — and only forget the ledger entry once teardown is
+            # CONFIRMED, or a rejected DELETE + an unconditional pop would
+            # let the still-live session escape the bound via the unknown-id
+            # pass-through
+            terminated = await self._terminate_child_session(app, project, headers, session_id)
+            if terminated:
+                self._session_seen.pop(session_id, None)
             await self._send_json(
                 send,
                 404,
@@ -280,28 +288,47 @@ class McpGateway:
             return
         await app(child_scope, receive, send)
 
-    async def _terminate_child_session(self, app: Any, project: str, session_id: bytes) -> None:
+    async def _terminate_child_session(
+        self, app: Any, project: str, orig_headers: list[tuple[bytes, bytes]], session_id: bytes
+    ) -> bool:
         """Issue an internal DELETE into the child so the SDK tears down the
-        over-age session's task + lifespan (Codex #137 r7) — its response is
-        discarded (the CLIENT gets our own termination 404). Best-effort: a
-        teardown failure must not turn an age-ceiling refusal into a 500."""
+        over-age session's task + lifespan (Codex #137 r7). Returns True only
+        when teardown is CONFIRMED — a 2xx (we terminated it) or a 404 (the
+        SDK says it is already gone); a 421 (the transport's DNS-rebinding
+        guard rejecting a Host-less request) or any other status returns
+        False so the caller KEEPS the ledger entry rather than letting a
+        still-live session escape the age bound (Codex #137 r8).
+
+        The ORIGINAL request's headers are carried so Host (and the
+        session-id) satisfy the rebinding guard; body-framing headers are
+        dropped since the DELETE carries no body. Best-effort — a teardown
+        exception returns False (keep the entry), never a 500."""
+        headers = [
+            (k, v)
+            for k, v in orig_headers
+            if k.lower() not in (b"content-length", b"content-type", b"transfer-encoding")
+        ]
         delete_scope = {
             "type": "http",
             "method": "DELETE",
             "path": "/",
             "raw_path": b"/",
             "root_path": f"/mcp/{project}",
-            "headers": [(b"mcp-session-id", session_id)],
+            "headers": headers,
         }
+        status = 0
 
         async def _receive() -> dict[str, Any]:
             return {"type": "http.request", "body": b""}
 
-        async def _discard(_message: dict[str, Any]) -> None:
-            return None
+        async def _capture(message: dict[str, Any]) -> None:
+            nonlocal status
+            if message.get("type") == "http.response.start":
+                status = int(message.get("status", 0))
 
         with contextlib.suppress(Exception):
-            await app(delete_scope, _receive, _discard)
+            await app(delete_scope, _receive, _capture)
+        return (200 <= status < 300) or status == 404
 
     def _compact_sessions(self, now: float) -> None:
         """Forget ids whose sessions the SDK has CERTAINLY reaped

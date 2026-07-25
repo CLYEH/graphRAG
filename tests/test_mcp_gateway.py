@@ -78,9 +78,13 @@ class _ChildApp:
         async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
             self.scopes.append(scope)
             if scope.get("method") == "DELETE":
-                self.deletes.append(
-                    next((v for k, v in scope.get("headers", []) if k == b"mcp-session-id"), None)
-                )
+                hdrs = dict(scope.get("headers", []))
+                self.deletes.append(hdrs.get(b"mcp-session-id"))
+                # like the SDK's rebinding guard: reject a Host-less DELETE
+                status = 200 if b"host" in hdrs else 421
+                await send({"type": "http.response.start", "status": status, "headers": []})
+                await send({"type": "http.response.body", "body": b""})
+                return
             # like the SDK: an initialize response MINTS the session id in
             # its headers (the gateway intercepts it to stamp creation)
             await send(
@@ -560,18 +564,33 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         # ceiling depend on client compliance — gate-2)
         first, last = app._session_seen[b"chatty-1"]  # noqa: SLF001
         app._session_seen[b"chatty-1"] = (first - app._session_max_age_s - 1, last)  # noqa: SLF001
-        status, body = await _request(app, "/mcp/nmmst", headers=sid)
+        sid_host = [(b"mcp-session-id", b"chatty-1"), (b"host", b"127.0.0.1:8300")]
+        status, body = await _request(app, "/mcp/nmmst", headers=sid_host)
         assert status == 404 and b"TERMINATED" in body  # honest wording (r5): not "refresh"
-        # Codex #137 r7: the ceiling actually RELEASES the server session —
-        # an internal DELETE reached the child to tear down its SDK task +
-        # lifespan (not left allocated until the idle timeout)
-        assert b"chatty-1" in harness.children["nmmst"].deletes
-        assert b"chatty-1" not in app._session_seen  # noqa: SLF001 — and the ledger entry dropped
-        # the SAME id re-sent is now unknown → passes through to the child's
-        # own 404 (never re-tracked, no clock restart)
-        status, _ = await _request(app, "/mcp/nmmst", headers=sid)
+        # Codex #137 r7/r8: the ceiling RELEASES the server session — an
+        # internal DELETE reached the child (its SDK task + lifespan torn
+        # down, not left until idle), and it carried the ORIGINAL Host so
+        # the transport's DNS-rebinding guard accepts it (a Host-less DELETE
+        # 421s → the entry would wrongly stay/drop). Confirmed teardown pops.
+        child = harness.children["nmmst"]
+        assert b"chatty-1" in child.deletes
+        assert b"host" in dict(child.scopes[-1]["headers"])  # Host carried into the DELETE
+        assert b"chatty-1" not in app._session_seen  # noqa: SLF001 — confirmed teardown popped it
+        # a re-sent id is now unknown → passes through to the child's own 404
+        status, _ = await _request(app, "/mcp/nmmst", headers=sid_host)
         assert status == 200  # the fake child accepts it; the gateway does not re-track it
         assert b"chatty-1" not in app._session_seen  # noqa: SLF001
+
+        # Codex #137 r8: a DELETE the transport REJECTS (no confirmed
+        # teardown) must KEEP the ledger entry — else the still-live session
+        # escapes the bound via the unknown-id pass-through. Age a session
+        # and send WITHOUT Host so the fake guard 421s the internal DELETE.
+        app._record_session_start(b"rebind-1")  # noqa: SLF001
+        f, la = app._session_seen[b"rebind-1"]  # noqa: SLF001
+        app._session_seen[b"rebind-1"] = (f - app._session_max_age_s - 1, la)  # noqa: SLF001
+        status, _ = await _request(app, "/mcp/nmmst", headers=[(b"mcp-session-id", b"rebind-1")])
+        assert status == 404  # still refused
+        assert b"rebind-1" in app._session_seen  # noqa: SLF001 — KEPT (teardown not confirmed)
 
         # Codex #137 r2 P1: compaction must NOT forget a LIVE (still-touched,
         # not-yet-over-age) session under a dead flood. Establish a young
@@ -613,7 +632,10 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         app._record_session_start(b"short-lived")  # noqa: SLF001
         assert b"short-lived" in app._session_seen  # noqa: SLF001
         status, _ = await _request(
-            app, "/mcp/nmmst", headers=[(b"mcp-session-id", b"short-lived")], method="DELETE"
+            app,
+            "/mcp/nmmst",
+            headers=[(b"mcp-session-id", b"short-lived"), (b"host", b"127.0.0.1:8300")],
+            method="DELETE",
         )
         assert status == 200  # the (fake) child accepted the termination
         assert b"short-lived" not in app._session_seen  # noqa: SLF001 — dropped at once
