@@ -1032,8 +1032,8 @@ def build_server(project: str) -> FastMCP:
     @server.tool()
     async def list_schema() -> dict[str, Any]:
         """The queryable structured surface (each whitelisted sql table
-        with its live columns) PLUS this session's policy ceilings —
-        max_top_k, max_graph_hops, max_latency_ms, query/browse caps,
+        with its live columns) PLUS this session's operative policy
+        ceilings — max_top_k, max_graph_hops, max_latency_ms, query/browse caps,
         whether NL->SQL is enabled (parameterized graph_query is always
         available), expose_debug — so
         limits are discoverable up front instead of by tripping them.
@@ -1085,7 +1085,12 @@ def _policy_disclosure(runtime: _Runtime) -> dict[str, Any]:
     degraded states where an agent most needs to inspect its session before
     retrying — Codex #135 r1) can carry it."""
     return {
-        "default_mode": runtime.policy.default_mode,
+        # default_mode is deliberately NOT disclosed (same rule as the
+        # text_to_cypher toggle): no MCP dispatch path consumes it — the
+        # initialize instructions designate hybrid_query as the default
+        # entry — so disclosing it would hand agents routing guidance that
+        # contradicts the instructions (Codex #135 r4). It returns if MCP
+        # dispatch ever starts honoring it.
         "max_top_k": runtime.policy.max_top_k,
         "max_graph_hops": runtime.policy.max_graph_hops,
         # RECONCILED values throughout (Codex #135 r2): what is disclosed

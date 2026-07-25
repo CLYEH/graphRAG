@@ -694,7 +694,9 @@ async def test_list_schema_discloses_the_session_policy_ceilings() -> None:
     assert degraded["policy"] == payload["policy"]  # same disclosure, store or no store
 
     assert payload["policy"] == {
-        "default_mode": "semantic",
+        # NO default_mode key: nothing on the MCP surface dispatches by it,
+        # and disclosing it contradicts the instructions' hybrid_query
+        # default (Codex #135 r4 — same rule as the cypher toggle)
         "max_top_k": 3,
         "max_graph_hops": 2,
         "max_sql_rows": 40,  # sql_rows(): the enforced, reconciled value
