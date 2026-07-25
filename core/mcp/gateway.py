@@ -112,18 +112,23 @@ class McpGateway:
                 {"error": f"project {project!r} is not in the registry (or not path-addressable)"},
             )
             return
-        # MCP12 preflight — EVERY request, cached mount or not: the child
-        # server reads its policy per SESSION lifespan, and a failure there
-        # surfaces as HTTP 200 + an empty stream (the SDK gives the error no
-        # wire shape), which an agent cannot distinguish from a gateway
-        # crash or a network flap. Validating here turns that into a typed
-        # JSON answer: bad policy → 503 with the actionable PolicyError
-        # text; project deleted after mount → 404 (closing the
-        # "deleted project keeps serving" gap noted at module top); registry
-        # unreachable → 503 within _PREFLIGHT_TIMEOUT_S instead of a 46s
-        # hang. Cost: one policy read per request — the same read the
-        # Console API does per request, accepted for a correct answer.
-        refusal = await self._preflight(project)
+        # MCP12 preflight: the child server reads its policy per SESSION
+        # lifespan, and a failure there surfaces as HTTP 200 + an empty
+        # stream (the SDK gives the error no wire shape), which an agent
+        # cannot distinguish from a gateway crash or a network flap. The
+        # CONFIG validation runs only for session INITIALIZATION (no
+        # mcp-session-id header yet — the request that would hit the broken
+        # lifespan): bad policy → 503 with the actionable PolicyError text;
+        # registry unreachable → 503 within _PREFLIGHT_TIMEOUT_S instead of
+        # a 46s hang. ESTABLISHED sessions keep their lifespan policy
+        # snapshot (DR-012: config edits apply to the NEXT session — Codex
+        # #132 r2), so they get only the cheap existence check (project
+        # DELETED after mount → 404 + eviction; deletion is a lifecycle end,
+        # not a config edit), and during a registry outage they pass through
+        # to their own IN-PROTOCOL typed degradation.
+        headers = scope.get("headers") or []
+        initializing = not any(k.lower() == b"mcp-session-id" for k, _ in headers)
+        refusal = await self._preflight(project, initializing=initializing)
         if refusal is not None:
             status, payload = refusal
             if status == 404:
@@ -182,22 +187,38 @@ class McpGateway:
         }
         await app(child_scope, receive, send)
 
-    async def _preflight(self, project: str) -> tuple[int, dict[str, Any]] | None:
-        """Registry + policy preflight for one request — None means
-        servable; otherwise the (status, payload) refusal to send (MCP12).
+    async def _preflight(
+        self, project: str, *, initializing: bool
+    ) -> tuple[int, dict[str, Any]] | None:
+        """Registry (+ config, when ``initializing``) preflight for one
+        request — None means proceed; otherwise the (status, payload)
+        refusal to send (MCP12).
 
-        Distinguishes the four states the measured empty-stream response
-        collapsed: config error (503 + the actionable PolicyError text),
-        project deleted (404), registry unreachable (503, bounded fast), and
-        healthy (proceed). The not-in-registry case is decided by a direct
-        row lookup in the ERROR path only — never by matching PolicyError
-        message text."""
+        A session-INITIALIZATION request gets the full config validation
+        (it is the one that would hit the broken child lifespan and get the
+        measured empty-stream non-answer): config error → 503 + the
+        actionable text, deleted → 404, registry unreachable → 503 bounded
+        fast. An ESTABLISHED session request gets only the existence check
+        (DR-012: its policy snapshot from lifespan start stays authoritative
+        — a config edit mid-session must not 503 a healthy session), and a
+        registry outage lets it PROCEED to its own in-protocol typed
+        degradation rather than an out-of-protocol JSON error. The
+        not-in-registry case is decided by a direct row lookup — never by
+        matching PolicyError message text."""
         from core.registry import get_project
 
         assert self._engine is not None, "gateway lifespan not started"
+        not_found = (
+            404,
+            {"error": f"project {project!r} is not in the registry (or not path-addressable)"},
+        )
         try:
             with anyio.fail_after(_PREFLIGHT_TIMEOUT_S):
                 async with self._engine.connect() as conn:
+                    if not initializing:
+                        if await get_project(conn, project) is None:
+                            return not_found
+                        return None
                     try:
                         await load_runtime_config_from_registry(conn, project)
                         return None
@@ -206,20 +227,21 @@ class McpGateway:
                     # (the composed loader rightly refuses it)
                     except (PolicyError, MetadataConfigError) as exc:
                         if await get_project(conn, project) is None:
-                            return 404, {
-                                "error": f"project {project!r} is not in the registry "
-                                "(or not path-addressable)"
-                            }
+                            return not_found
                         return 503, {
                             "error": f"project {project!r} is not servable — "
                             f"configuration error: {exc}"
                         }
         except TimeoutError:
+            if not initializing:
+                return None  # the established session degrades in-protocol
             return 503, {
                 "error": "registry unreachable (timed out) — the gateway could not "
                 "read the project's query policy; check Postgres"
             }
         except STORE_CLIENT_ERRORS as exc:
+            if not initializing:
+                return None  # the established session degrades in-protocol
             return 503, {
                 "error": f"registry unreachable ({type(exc).__name__}) — the gateway "
                 "could not read the project's query policy; check Postgres"

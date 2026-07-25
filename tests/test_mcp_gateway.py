@@ -84,7 +84,12 @@ class _Harness:
         return SimpleNamespace(name=name, config=config)
 
 
-async def _request(app: Any, path: str, raw_path: bytes | None = None) -> tuple[int, bytes]:
+async def _request(
+    app: Any,
+    path: str,
+    raw_path: bytes | None = None,
+    headers: list[tuple[bytes, bytes]] | None = None,
+) -> tuple[int, bytes]:
     messages: list[dict[str, Any]] = []
 
     async def send(message: dict[str, Any]) -> None:
@@ -98,7 +103,7 @@ async def _request(app: Any, path: str, raw_path: bytes | None = None) -> tuple[
         "path": path,
         "raw_path": raw_path if raw_path is not None else path.encode("utf-8"),
         "method": "POST",
-        "headers": [],
+        "headers": headers or [],
     }
     await app(scope, receive, send)
     status = next(m["status"] for m in messages if m["type"] == "http.response.start")
@@ -252,6 +257,20 @@ async def test_preflight_answers_typed_for_every_unservable_state(harness: _Harn
         assert b"no query_policy block" in body  # the operator-actionable cause
         assert "misconfigured" not in harness.children  # never mounted
 
+        # (1b) DR-012 snapshot: an ESTABLISHED session (mcp-session-id
+        # header) is NOT config-revalidated — a config broken MID-session
+        # must not 503 a healthy session whose lifespan policy snapshot is
+        # authoritative (Codex #132 r2); only the NEXT session sees the fix
+        session_headers = [(b"mcp-session-id", b"abc123")]
+        status, _ = await _request(app, "/mcp/nmmst")  # mount while valid
+        assert status == 200
+        harness.configs["nmmst"] = {}  # broken AFTER the session started
+        status, body = await _request(app, "/mcp/nmmst", headers=session_headers)
+        assert status == 200, body  # the established session keeps serving
+        status, _ = await _request(app, "/mcp/nmmst")  # a NEW session is refused
+        assert status == 503
+        del harness.configs["nmmst"]  # back to valid for the cases below
+
         # (2) deleted AFTER mount: the cached mount stops serving (the
         # module-top "deleted project keeps serving" gap, closed) AND the
         # child lifespan closes PROMPTLY — not at gateway shutdown (Codex
@@ -271,6 +290,14 @@ async def test_preflight_answers_typed_for_every_unservable_state(harness: _Harn
         status, _ = await _request(app, "/mcp/nmmst")
         assert status == 200
         assert harness.children["nmmst"] is not evicted
+
+        # deletion is a LIFECYCLE end, not a config edit: an established
+        # session's request also answers 404 (the DR-012 snapshot shields
+        # config edits only — a deleted project stops serving everyone)
+        harness.registry.discard("nmmst")
+        status, _ = await _request(app, "/mcp/nmmst", headers=[(b"mcp-session-id", b"abc123")])
+        assert status == 404
+        harness.registry.add("nmmst")
 
         # (3) a mount failure answers typed, never a raw 500 traceback
         harness.registry.add("brokenmount")
@@ -350,4 +377,59 @@ async def test_preflight_registry_outage_fails_fast_and_typed(
         assert time.monotonic() - before < 5.0  # bounded, not the 46s hang
         assert status == 503
         assert b"registry unreachable" in body and b"ConnectionRefusedError" in body
+        finish.set()
+
+
+async def test_established_sessions_pass_through_a_registry_outage(
+    monkeypatch: pytest.MonkeyPatch, harness: _Harness
+) -> None:
+    """MCP12 r2 companion pin: during a registry outage an ESTABLISHED
+    session (already mounted, mcp-session-id header) must PROCEED to its
+    child and degrade IN-protocol (the tools' typed STORE_UNAVAILABLE) —
+    an out-of-protocol gateway 503 here is exactly what Codex #132 r2
+    flagged; a regression to unconditional preflight reintroduces it
+    silently."""
+    app = build_gateway()
+
+    started = anyio.Event()
+    finish = anyio.Event()
+
+    async def lifespan_receive() -> dict[str, Any]:
+        if not started.is_set():
+            return {"type": "lifespan.startup"}
+        await finish.wait()
+        return {"type": "lifespan.shutdown"}
+
+    async def lifespan_send(message: dict[str, Any]) -> None:
+        if message["type"] == "lifespan.startup.complete":
+            started.set()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(app, {"type": "lifespan"}, lifespan_receive, lifespan_send)
+        await started.wait()
+
+        # mount while the registry is healthy, session establishes
+        status, _ = await _request(app, "/mcp/nmmst")
+        assert status == 200
+
+        # registry dies AFTER the mount
+        class _DeadConnect:
+            async def __aenter__(self) -> object:
+                raise ConnectionRefusedError("[Errno 111] Connection refused")
+
+            async def __aexit__(self, *exc: object) -> None:
+                return None
+
+        monkeypatch.setattr(
+            app, "_engine", SimpleNamespace(dispose=_async_noop, connect=_DeadConnect)
+        )
+
+        # the established session still reaches its child, in-protocol
+        status, body = await _request(app, "/mcp/nmmst", headers=[(b"mcp-session-id", b"abc123")])
+        assert status == 200 and body == b"ok:nmmst"
+
+        # a NEW session (no header) is still refused fast and typed
+        status, body = await _request(app, "/mcp/nmmst")
+        assert status == 503 and b"registry unreachable" in body
+
         finish.set()
