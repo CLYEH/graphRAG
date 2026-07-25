@@ -32,6 +32,7 @@ class _ChildApp:
         self.lifespan_entered = False
         self.lifespan_closed = False
         self.shared_closed = False
+        self.deletes: list[Any] = []  # DELETE session-ids the child received (r7 teardown)
         self.closed_event = anyio.Event()
         # the session-manager pre-seed (MCP17) constructs a REAL manager
         # against these — the fake carries what the constructor reads
@@ -76,6 +77,10 @@ class _ChildApp:
     def streamable_http_app(self) -> Any:
         async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
             self.scopes.append(scope)
+            if scope.get("method") == "DELETE":
+                self.deletes.append(
+                    next((v for k, v in scope.get("headers", []) if k == b"mcp-session-id"), None)
+                )
             # like the SDK: an initialize response MINTS the session id in
             # its headers (the gateway intercepts it to stamp creation)
             await send(
@@ -557,22 +562,31 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         app._session_seen[b"chatty-1"] = (first - app._session_max_age_s - 1, last)  # noqa: SLF001
         status, body = await _request(app, "/mcp/nmmst", headers=sid)
         assert status == 404 and b"TERMINATED" in body  # honest wording (r5): not "refresh"
+        # Codex #137 r7: the ceiling actually RELEASES the server session —
+        # an internal DELETE reached the child to tear down its SDK task +
+        # lifespan (not left allocated until the idle timeout)
+        assert b"chatty-1" in harness.children["nmmst"].deletes
+        assert b"chatty-1" not in app._session_seen  # noqa: SLF001 — and the ledger entry dropped
+        # the SAME id re-sent is now unknown → passes through to the child's
+        # own 404 (never re-tracked, no clock restart)
         status, _ = await _request(app, "/mcp/nmmst", headers=sid)
-        assert status == 404  # same id re-sent: refused by construction
+        assert status == 200  # the fake child accepts it; the gateway does not re-track it
+        assert b"chatty-1" not in app._session_seen  # noqa: SLF001
 
-        # Codex #137 r2 P1: compaction must NOT forget a refused-but-active
-        # id. Flood the ledger past the compaction threshold with entries
-        # whose sessions the SDK has certainly reaped (last touch beyond
-        # idle_timeout+margin) — the chatty tombstone, still being touched,
-        # survives and stays refused; the dead entries are forgotten.
+        # Codex #137 r2 P1: compaction must NOT forget a LIVE (still-touched,
+        # not-yet-over-age) session under a dead flood. Establish a young
+        # tracked session, flood the ledger with certainly-reaped entries,
+        # touch the young one — it survives, the dead flood is forgotten.
         import time as _t
 
+        app._record_session_start(b"young-1")  # noqa: SLF001
+        young = [(b"mcp-session-id", b"young-1")]
         stale = _t.monotonic() - app._session_idle_timeout_s - 120  # noqa: SLF001
         for i in range(4100):
             app._session_seen[f"dead-{i}".encode()] = (stale, stale)  # noqa: SLF001
-        status, _ = await _request(app, "/mcp/nmmst", headers=sid)  # triggers compaction
-        assert status == 404  # STILL refused — the tombstone survived
-        assert b"chatty-1" in app._session_seen  # noqa: SLF001
+        status, _ = await _request(app, "/mcp/nmmst", headers=young)  # touch → compaction
+        assert status == 200  # young session still serves
+        assert b"young-1" in app._session_seen  # noqa: SLF001 — live entry survived
         assert len(app._session_seen) < 100  # the dead flood was forgotten  # noqa: SLF001
 
         # Codex #137 r2 P2: the clock starts at CREATION — the id minted in

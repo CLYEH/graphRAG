@@ -157,22 +157,11 @@ class McpGateway:
         headers = scope.get("headers") or []
         session_id = next((v for k, v in headers if k.lower() == b"mcp-session-id"), None)
         initializing = session_id is None
-        if session_id is not None:
-            expired = self._touch_session_age(session_id)
-            if expired:
-                await self._send_json(
-                    send,
-                    404,
-                    {
-                        "error": "session TERMINATED — it exceeded the maximum age "
-                        f"({int(self._session_max_age_s)}s). Open a NEW transport and "
-                        "re-initialize to continue with the project's CURRENT policy "
-                        "(the same 404-then-reconnect contract as the SDK's idle "
-                        "reaper — a client that keeps the old session id on a fresh "
-                        "transport stays terminated)."
-                    },
-                )
-                return
+        # over-age is decided BEFORE preflight/mount, but the actual
+        # server-side teardown (Codex #137 r7) happens AFTER the child is
+        # mounted below — an internal DELETE releases the SDK session's task
+        # + lifespan instead of leaving them allocated until the idle timeout
+        terminate_by_age = session_id is not None and self._touch_session_age(session_id)
         refusal = await self._preflight(project, initializing=initializing)
         if refusal is not None:
             status, payload = refusal
@@ -223,6 +212,31 @@ class McpGateway:
                 {"error": f"project {project!r} is not in the registry (or not path-addressable)"},
             )
             return
+        if terminate_by_age and session_id is not None:
+            # Codex #137 r7: actually RELEASE the server-side session at the
+            # ceiling — a bare 404 here would leave the SDK's session task +
+            # lifespan allocated until its idle timeout (another ~30 min),
+            # so N simultaneously-aging sessions overlap avoidably. An
+            # internal DELETE into the child triggers the SDK's own session
+            # teardown; then we drop our ledger entry and answer the client
+            # the honest termination 404 (its request is over regardless —
+            # the r5 reconnect contract). If the SDK already reaped it, the
+            # internal DELETE is a harmless no-op.
+            await self._terminate_child_session(app, project, session_id)
+            self._session_seen.pop(session_id, None)
+            await self._send_json(
+                send,
+                404,
+                {
+                    "error": "session TERMINATED — it exceeded the maximum age "
+                    f"({int(self._session_max_age_s)}s). Open a NEW transport and "
+                    "re-initialize to continue with the project's CURRENT policy "
+                    "(the same 404-then-reconnect contract as the SDK's idle "
+                    "reaper — a client that keeps the old session id on a fresh "
+                    "transport stays terminated)."
+                },
+            )
+            return
         # the mounted app sees itself at root — root_path keeps URL
         # reconstruction (and the SDK's own endpoint echoes) correct
         child_scope = {
@@ -265,6 +279,29 @@ class McpGateway:
             await app(child_scope, receive, send_terminating)
             return
         await app(child_scope, receive, send)
+
+    async def _terminate_child_session(self, app: Any, project: str, session_id: bytes) -> None:
+        """Issue an internal DELETE into the child so the SDK tears down the
+        over-age session's task + lifespan (Codex #137 r7) — its response is
+        discarded (the CLIENT gets our own termination 404). Best-effort: a
+        teardown failure must not turn an age-ceiling refusal into a 500."""
+        delete_scope = {
+            "type": "http",
+            "method": "DELETE",
+            "path": "/",
+            "raw_path": b"/",
+            "root_path": f"/mcp/{project}",
+            "headers": [(b"mcp-session-id", session_id)],
+        }
+
+        async def _receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": b""}
+
+        async def _discard(_message: dict[str, Any]) -> None:
+            return None
+
+        with contextlib.suppress(Exception):
+            await app(delete_scope, _receive, _discard)
 
     def _compact_sessions(self, now: float) -> None:
         """Forget ids whose sessions the SDK has CERTAINLY reaped
