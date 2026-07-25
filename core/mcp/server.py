@@ -1087,11 +1087,15 @@ def _policy_disclosure(runtime: _Runtime) -> dict[str, Any]:
         "default_mode": runtime.policy.default_mode,
         "max_top_k": runtime.policy.max_top_k,
         "max_graph_hops": runtime.policy.max_graph_hops,
-        # the RECONCILED sql cap (min of the top-level and mode-local
-        # ceilings) — disclosing raw max_sql_rows would overstate when a
-        # project lowers text_to_sql.max_rows (gate-2 nit)
+        # RECONCILED values throughout (Codex #135 r2): what is disclosed
+        # must be what is ENFORCED — raw top-level fields overstate whenever
+        # a project lowers a mode-local ceiling (rows) or a mode-local
+        # timeout sits under max_latency_ms
         "max_sql_rows": runtime.policy.sql_rows(),
+        "max_graph_rows": runtime.policy.cypher_policy().max_rows,
         "max_latency_ms": runtime.policy.max_latency_ms,
+        "sql_timeout_ms": runtime.policy.sql_policy().timeout_ms,
+        "graph_timeout_ms": runtime.policy.cypher_policy().timeout_ms,
         "expose_debug": runtime.policy.expose_debug,
         "sql_enabled": runtime.policy.text_to_sql.enabled,
         "cypher_enabled": runtime.policy.text_to_cypher.enabled,

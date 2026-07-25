@@ -665,6 +665,11 @@ async def test_list_schema_discloses_the_session_policy_ceilings() -> None:
         expose_debug=True,
         text_to_sql=SimpleNamespace(enabled=False),
         sql_rows=lambda: 40,  # the RECONCILED cap (min of top-level and mode-local)
+        # mode-local reconciled ceilings (Codex #135 r2): rows below top_k,
+        # timeouts below max_latency_ms — the divergences that would be
+        # overstated by raw top-level fields
+        sql_policy=lambda: SimpleNamespace(timeout_ms=800),
+        cypher_policy=lambda: SimpleNamespace(max_rows=7, timeout_ms=700),
         text_to_cypher=SimpleNamespace(enabled=False),
     )
     runtime = _Runtime(context=_Ctx(), policy=policy)  # type: ignore[arg-type]
@@ -693,6 +698,9 @@ async def test_list_schema_discloses_the_session_policy_ceilings() -> None:
         "max_top_k": 3,
         "max_graph_hops": 2,
         "max_sql_rows": 40,  # sql_rows(): the enforced, reconciled value
+        "max_graph_rows": 7,  # cypher_policy().max_rows — likewise reconciled
+        "sql_timeout_ms": 800,
+        "graph_timeout_ms": 700,
         "max_latency_ms": 9000,
         "expose_debug": True,
         "sql_enabled": False,
@@ -801,6 +809,7 @@ async def test_list_schema_maps_db_deadline_and_failures_typed() -> None:
             expose_debug=False,
             text_to_cypher=SimpleNamespace(enabled=False),
             sql_rows=lambda: 50,
+            cypher_policy=lambda: SimpleNamespace(max_rows=50, timeout_ms=500),
         )
         return _Runtime(context=_Ctx(), policy=policy)  # type: ignore[arg-type]
 
