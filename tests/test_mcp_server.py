@@ -53,6 +53,65 @@ async def test_the_server_exposes_exactly_the_frozen_tool_set() -> None:
     assert {tool.name for tool in tools} == _FROZEN_TOOLS
 
 
+async def test_tool_surface_metadata_is_complete() -> None:
+    """MCP14 (measured tools/list): 19 parameters had NO description, the
+    closed template vocabularies were bare strings without enum (an agent
+    learned the legal values only from the rejection message), outputSchema
+    was additionalProperties:true while the frozen response contract sat
+    unattached, descriptions cited §-numbers an external agent cannot
+    resolve, serverInfo.version reported the MCP SDK's version, and
+    prompts/resources capabilities were declared with nothing behind them
+    (two wasted round-trips for a spec-following agent). All metadata — the
+    execution path is untouched (the http/integration suites prove calls
+    still flow)."""
+    import json
+
+    from core.mcp.server import _SERVER_VERSION
+
+    server = build_server("demo")
+    tools = await server.list_tools()
+
+    for tool in tools:
+        assert tool.description, f"{tool.name} has no description"
+        assert "§" not in tool.description, f"{tool.name} cites §-numbers agents cannot resolve"
+        for pname, prop in tool.inputSchema.get("properties", {}).items():
+            assert prop.get("description"), f"{tool.name}.{pname} has no description"
+            assert "§" not in prop["description"], f"{tool.name}.{pname} cites §-numbers"
+
+    by_name = {tool.name: tool for tool in tools}
+    closed = ["neighbors", "path", "subgraph"]
+    assert by_name["graph_query"].inputSchema["properties"]["template"]["enum"] == closed
+    assert by_name["hybrid_query"].inputSchema["properties"]["graph_template"]["enum"] == closed
+    assert by_name["semantic_search"].inputSchema["properties"]["point_type"]["enum"] == [
+        "chunk",
+        "entity",
+    ]
+
+    # the six envelope-returning tools advertise the FROZEN contract
+    frozen = json.loads((REPO_ROOT / "contracts" / "mcp_response.schema.json").read_text("utf-8"))
+    for name in (
+        "semantic_search",
+        "graph_query",
+        "global_summary",
+        "sql_query",
+        "hybrid_query",
+        "explain_retrieval",
+    ):
+        assert by_name[name].outputSchema == frozen, f"{name} outputSchema not the contract"
+
+    # the server describes ITSELF: our version (not the SDK's), operating
+    # instructions, a website, and NO empty prompts/resources capabilities
+    assert server._mcp_server.version == _SERVER_VERSION  # noqa: SLF001
+    assert server.instructions and "hybrid_query" in server.instructions
+    from mcp.server.lowlevel.server import NotificationOptions
+
+    caps = server._mcp_server.get_capabilities(  # noqa: SLF001
+        notification_options=NotificationOptions(), experimental_capabilities={}
+    )
+    assert caps.prompts is None and caps.resources is None
+    assert caps.tools is not None  # the real capability stays declared
+
+
 def test_a_partial_graph_invocation_is_refused_not_silently_replanned() -> None:
     """MCP11: hybrid_query's docstring promises "run YOUR graph invocation",
     but a caller supplying only HALF of it (template without entity, or any
