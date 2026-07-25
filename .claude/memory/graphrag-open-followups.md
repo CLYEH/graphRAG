@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: d673e708-e836-4b8a-8fc7-cb33527c5fc3
-  modified: 2026-07-25T21:34:02.268Z
+  modified: 2026-07-25T22:41:07.472Z
 ---
 
 散落在已刪除記憶檔裡仍然「活著」的 follow-ups,集中一處(狀態以 TASKS.md/
@@ -118,3 +118,4 @@ GitHub 為準;立案或了結後從本檔劃掉):
 - **MCP session 透明 policy 刷新 transport(2026-07-25, MCP17 #137 r5)**:gateway 的 max-age 逾齡以 404 終止 session,與 SDK idle reaper 同契約——pinned MCP Python client 收 404 不自動重連(保留舊 id、後續全 404),故長跑 agent 的 policy 撤銷需客戶端主動開新 transport。真正透明的「session 到齡自動重連並帶新 policy」需自訂 transport 或 SDK 支援,屬產品層決策(§23 auth round 一併考量)。現況:idle+max-age 皆終止式,DESIGN §9 已誠實記載。
 - **gateway routing 的 rebinding 確認洩漏(2026-07-25, MCP17 #137 r11 gate-2)**：未認證 /mcp routing 的 404(not-in-registry)vs child-421(rebinding 拒)狀態差,可讓 DNS-rebinding 頁「確認猜中的專案名」——比已修的 /health 枚舉弱,但屬未認證 §23 routing 固有,唯 gateway 層自帶 rebinding 驗證可閉。留待 §23 auth round 與 gateway 認證一併處理。
 - **hybrid 模態併發執行(2026-07-26, MCP18 owner 定案 defer)**:hybrid 現以循序 `for mode in selected:` 跑各模態(端到端實測 3,078ms≈各模態耗時和),模態彼此獨立本可併發——但 semantic/graph/sql 共用單一 asyncpg 連線,同連線併發協程會炸(asyncpg 單連線不可並發),故真併發需 per-mode PG 連線隔離(各自 build-scoped、DR-006 再驗、清理)+改寫釘住循序假設的 §21 deadline/§22 degradation/mode-order 測試(`tests/test_query_hybrid.py` 的 `test_the_whole_call_shares_one_wall_clock_deadline`、`test_auto_planned_graph_runs_at_its_mode_order_position`)。MCP18 owner 定案先落地 (b) embedding 快取、(a) 併發改列 follow-up 待重估(風險 vs 收益)。附:QP1 auto-plan(`distinct_active_entity_names` DB 往返 ~766ms)於模態前循序跑,可與不需 graph_params 的 semantic/sql 併發。核心 `core/query/hybrid.py:185` 循序迴圈;house style 並發用 asyncio(core)/anyio task group(gateway)。
+- **query embedding 快取的 gateway 級預算(2026-07-26, MCP18 #138 Codex r1 P1 defer)**:MCP18 (b) 的 embedding LRU 每 query-embedder 實例一份(`embedding_cache_size` 預設 128),`McpGateway._apps` 保留每個已掛載專案的 server+cache 至刪除,故多專案 gateway 的 aggregate=N×size×~100KB/vec(text-embedding-3-large 3072 floats)、無 gateway 級上限。本回合採 Codex 首帖(調小預設+operator 調降旋鈕)已解即時耗盡風險;Codex 次帖「跨 server 共享 byte/entry 預算」會動到 per-instance 隔離模型,與上條併發同屬 gateway-resource follow-up,待 owner 重估時一併設計(shared LRU/global accountant vs 保持 per-instance)。各 cache 已各自 LRU 有界,aggregate 隨 operator 佈建的專案數而非流量成長。
