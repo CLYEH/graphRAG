@@ -72,6 +72,14 @@ _SCOPE_COLUMNS: dict[sa.Table, tuple[str, ...]] = {
 }
 
 
+def escape_like(value: str) -> str:
+    """Escape LIKE/ILIKE metacharacters so a literal ``%``/``_``/``\\`` in a
+    search value is a character, not a wildcard (shared by the REST search
+    and the MCP browse tools — one implementation, no drift). Backslash
+    first so the escapes we add are not themselves re-escaped."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class NotBuildScopedError(TypeError):
     """Raised when a table must not be silently build-scoped.
 
@@ -651,6 +659,70 @@ class BuildScopedRepo:
         )
         rows = (await self._execute(query)).fetchall()
         return {row.id: row.canonical_name for row in rows}
+
+    async def page_entities(
+        self,
+        limit: int,
+        after_id: uuid.UUID | None = None,
+        q: str | None = None,
+        entity_type: str | None = None,
+        fuzzy: bool = False,
+    ) -> list[Any]:
+        """One keyset page of ACTIVE entities, id-ascending (MCP9 browse).
+
+        ``q`` is a case-insensitive substring over canonical_name (the same
+        semantics as the REST ``/entities?q=`` search — 主館 finds 主題館,
+        closing the exact-match dead end that zeroed near-miss names);
+        ``entity_type`` filters the ontology type. Fetches ``limit`` rows —
+        the CALLER passes limit+1 as its own has-more probe. Escapes LIKE
+        metacharacters in ``q`` so a literal ``%``/``_`` in a name is a
+        character, not a wildcard."""
+        entities = tables.entities
+        conditions = [
+            entities.c.project == self.project,
+            entities.c.build_id == self.build_id,
+            entities.c.status == "active",
+        ]
+        if after_id is not None:
+            conditions.append(entities.c.id > after_id)
+        if q:
+            escaped = escape_like(q)
+            if fuzzy:
+                # character-AND (MCP9): 主館 is NOT a substring of 主題館 —
+                # each query character must appear somewhere in the name;
+                # the CJK-friendly fallback when substring finds nothing
+                conditions.extend(
+                    entities.c.canonical_name.ilike(f"%{ch}%", escape="\\")
+                    for ch in q
+                    if ch not in ("%", "_", "\\")
+                )
+            else:
+                conditions.append(entities.c.canonical_name.ilike(f"%{escaped}%", escape="\\"))
+        if entity_type:
+            conditions.append(entities.c.type == entity_type)
+        query = (
+            sa.select(entities.c.id, entities.c.canonical_name, entities.c.type)
+            .where(*conditions)
+            .order_by(entities.c.id)
+            .limit(limit)
+        )
+        return list((await self._execute(query)).fetchall())
+
+    async def page_rows(
+        self,
+        table: sa.Table,
+        columns: Sequence[sa.Column[Any]],
+        limit: int,
+        after_id: uuid.UUID | None = None,
+    ) -> list[Any]:
+        """One keyset page of a build-scoped table, id-ascending (MCP9 browse
+        for chunks/community_reports). The scope injection is the usual
+        ``_select`` path; the CALLER passes limit+1 as its has-more probe."""
+        query = self._select(table).with_only_columns(*columns)
+        if after_id is not None:
+            query = query.where(table.c.id > after_id)
+        query = query.order_by(table.c.id).limit(limit)
+        return list((await self._execute(query)).fetchall())
 
     async def entity_ids_by_name(self, name: str) -> list[uuid.UUID]:
         """Active entity ids whose canonical_name matches ``name`` (SoR seed

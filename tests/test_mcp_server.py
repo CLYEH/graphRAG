@@ -1,5 +1,5 @@
 """Why: the MCP server is the §9 facade — its TOOL VOCABULARY is frozen by
-DESIGN (the ten names), an invalid policy must kill the server at BUILD
+DESIGN (the thirteen names), an invalid policy must kill the server at BUILD
 time (a guardrail misconfiguration must never serve queries half-armed), and
 the demo project's shipped config must actually load. The tools' internals
 are the C6 mode functions with their own suites; wiring is proven live in the
@@ -34,6 +34,9 @@ _FROZEN_TOOLS = {
     "get_entity",
     "get_chunk",
     "get_document",
+    "list_entities",
+    "list_chunks",
+    "list_reports",
     "list_schema",
     "explain_retrieval",
 }
@@ -555,3 +558,143 @@ async def test_get_document_emits_raw_whole_and_projects_metadata_fail_closed() 
 
     missing = await _get_document(_IntrospectionRepo(), "demo", str(uuid.uuid4()), _NO_EXPOSURE)
     assert missing["document"] is None and "ACTIVE build" in missing["error"]
+
+
+class _BrowseRepo:
+    """Fake repo for the MCP9 browse helpers: canned id-ordered rows; honors
+    after_id/limit like the real keyset page, and records the q it saw."""
+
+    def __init__(self, rows: list[SimpleNamespace]) -> None:
+        self.build_id = uuid.uuid4()
+        self.rows = sorted(rows, key=lambda r: str(r.id))
+        self.seen_q: list[str | None] = []
+
+    async def page_entities(
+        self,
+        limit: int,
+        after_id: Any = None,
+        q: Any = None,
+        entity_type: Any = None,
+        fuzzy: bool = False,
+    ) -> list[SimpleNamespace]:
+        self.seen_q.append(q)
+        rows = self.rows
+        if q and fuzzy:
+            rows = [r for r in rows if all(ch in r.canonical_name for ch in q)]
+        elif q:
+            rows = [r for r in rows if q.lower() in r.canonical_name.lower()]
+        if entity_type:
+            rows = [r for r in rows if r.type == entity_type]
+        if after_id is not None:
+            rows = [r for r in rows if str(r.id) > str(after_id)]
+        return rows[:limit]
+
+    async def page_rows(
+        self, table: Any, columns: Any, limit: int, after_id: Any = None
+    ) -> list[SimpleNamespace]:
+        rows = self.rows
+        if after_id is not None:
+            rows = [r for r in rows if str(r.id) > str(after_id)]
+        return rows[:limit]
+
+
+def _entity_row(name: str, etype: str = "FACILITY") -> SimpleNamespace:
+    return SimpleNamespace(id=uuid.uuid4(), canonical_name=name, type=etype)
+
+
+async def test_list_entities_pages_exhaustively_and_searches_substring() -> None:
+    """MCP9's reason to exist: the max_top_k=20 retrieval ceiling made most
+    of the corpus PERMANENTLY invisible ("list every option" was
+    unanswerable in principle), and get_entity's exact-match zeroed
+    near-miss names (主館 vs 主題館). Browsing walks the cursor to
+    exhaustion, and q is substring — the near-miss now resolves."""
+    from core.mcp.server import _list_entities
+
+    rows = [_entity_row(f"廳-{i:02d}") for i in range(5)] + [_entity_row("主題館")]
+    repo = _BrowseRepo(rows)
+
+    # exhaustive walk at page size 2 → every entity reachable
+    seen: list[str] = []
+    cursor: str | None = None
+    for _ in range(10):
+        page = await _list_entities(repo, "demo", 2, cursor, None, None)
+        assert page["error"] is None
+        seen.extend(e["name"] for e in page["entities"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert sorted(seen) == sorted(r.canonical_name for r in rows)  # ALL of them
+
+    # substring first; when it finds NOTHING the character-AND fallback
+    # kicks in and the response NAMES the looser mode — the visitor's 主館
+    # (not a substring of 主題館) now resolves instead of zeroing
+    found = await _list_entities(repo, "demo", 50, None, "題館", None)
+    assert [e["name"] for e in found["entities"]] == ["主題館"]
+    assert found["match"] == "substring"
+    fuzzy = await _list_entities(repo, "demo", 50, None, "主館", None)
+    assert [e["name"] for e in fuzzy["entities"]] == ["主題館"]
+    assert fuzzy["match"] == "characters"  # precision drop is SAID
+
+
+async def test_browse_cursors_refuse_foreign_scopes() -> None:
+    """Class 31: a cursor pins its FULL result-set identity — replayed after
+    an activation (different build) or with different filters it must be
+    REFUSED with the cause named, never silently re-anchored onto a mixed
+    result set; a garbage cursor is a typed error, not a crash."""
+    from core.mcp.server import _list_entities
+
+    repo = _BrowseRepo([_entity_row(f"e{i}") for i in range(4)])
+    first = await _list_entities(repo, "demo", 2, None, None, None)
+    cursor = first["next_cursor"]
+    assert cursor is not None
+
+    # same scope → continues
+    ok = await _list_entities(repo, "demo", 2, cursor, None, None)
+    assert ok["error"] is None and ok["entities"]
+
+    # different q filter → refused, cause named
+    refiltered = await _list_entities(repo, "demo", 2, cursor, "e", None)
+    assert refiltered["entities"] == [] and "different listing scope" in refiltered["error"]
+
+    # different entity_type filter → refused (the type axis is part of the
+    # fingerprint — dropping it would silently page type-B's set from
+    # type-A's anchor, the exact class-31 skip/dupe failure)
+    retyped = await _list_entities(repo, "demo", 2, cursor, None, "EVENT")
+    assert retyped["entities"] == [] and "different listing scope" in retyped["error"]
+
+    # a cursor from ANOTHER TOOL → refused (tool name is in the fingerprint)
+    from core.mcp.server import _list_chunks
+
+    cross_tool = await _list_chunks(repo, "demo", 2, cursor)
+    assert cross_tool["chunks"] == [] and "different listing scope" in cross_tool["error"]
+
+    # different build (activation happened) → refused, cause named
+    repo.build_id = uuid.uuid4()
+    rebuilt = await _list_entities(repo, "demo", 2, cursor, None, None)
+    assert rebuilt["entities"] == [] and "different build" in rebuilt["error"]
+
+    # garbage → typed error
+    garbage = await _list_entities(repo, "demo", 2, "not-a-cursor", None, None)
+    assert "not a graphRAG browse cursor" in garbage["error"]
+
+
+async def test_browse_limit_is_bounded_and_chunk_previews_name_truncation() -> None:
+    """The browse limit is validated (typed error, no store read shape) and
+    list_chunks previews carry a NAMED truncation flag — a silent cut would
+    read as the full text (§22); get_chunk is the full-text path."""
+    from core.mcp.server import _list_chunks, _list_entities
+
+    repo = _BrowseRepo([])
+    over = await _list_entities(repo, "demo", 999, None, None, None)
+    assert "limit must be an integer in 1..200" in over["error"]
+    bad = await _list_entities(repo, "demo", True, None, None, None)
+    assert bad["error"] is not None  # bool is not a page size
+
+    long_chunk = SimpleNamespace(
+        id=uuid.uuid4(), document_id=uuid.uuid4(), ordinal=0, text="長" * 300
+    )
+    short_chunk = SimpleNamespace(id=uuid.uuid4(), document_id=uuid.uuid4(), ordinal=1, text="短")
+    chunks = await _list_chunks(_BrowseRepo([long_chunk, short_chunk]), "demo", 50, None)
+    by_ordinal = {c["ordinal"]: c for c in chunks["chunks"]}
+    assert len(by_ordinal[0]["text_preview"]) == 200 and by_ordinal[0]["text_truncated"]
+    assert by_ordinal[1]["text_preview"] == "短" and not by_ordinal[1]["text_truncated"]

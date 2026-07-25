@@ -53,6 +53,9 @@ _TOOLS = {
     "get_entity",
     "get_chunk",
     "get_document",
+    "list_entities",
+    "list_chunks",
+    "list_reports",
     "list_schema",
     "explain_retrieval",
 }
