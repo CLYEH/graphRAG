@@ -27,7 +27,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from core.metadata.schema import MetadataSchema, MetadataValidationError, build_envelope
+from core.metadata.schema import (
+    MetadataSchema,
+    MetadataValidationError,
+    build_envelope,
+    contains_nul,
+    finite_float,
+    reject_non_finite_constant,
+)
 from core.stores.tables import STRUCTURED_MIME
 
 #: Free-text suffixes the document connector accepts, mapped to their mime
@@ -204,9 +211,26 @@ def _collect_sidecars(
         if not sidecar_path.is_file():
             continue
         try:
-            parsed = json.loads(sidecar_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # the same two hooks as the uploads metadata parser: RFC 8259 JSON
+            # has no non-finite numbers, but json.loads accepts NaN/Infinity
+            # (parse_constant) and a valid token can OVERFLOW to inf (1e999 —
+            # parse_float); either would pass every later shape/schema check
+            # and fail the documents.metadata JSONB insert with a low-level
+            # store error naming no cause (Codex #130 r4)
+            parsed = json.loads(
+                sidecar_path.read_text(encoding="utf-8"),
+                parse_constant=reject_non_finite_constant,
+                parse_float=finite_float,
+            )
+        except ValueError as exc:  # JSONDecodeError/UnicodeDecodeError included
             raise ValueError(f"metadata sidecar {sidecar_path} is not valid JSON: {exc}") from exc
+        if contains_nul(parsed):
+            # JSON-valid but JSONB-unstorable: Postgres cannot hold U+0000 in
+            # text/JSONB, in a value OR an object key (the open bags allow both)
+            raise ValueError(
+                f"metadata sidecar {sidecar_path} contains a NUL (U+0000) in a string "
+                "key or value — PostgreSQL JSONB cannot store it"
+            )
         if not isinstance(parsed, dict):
             raise ValueError(f"metadata sidecar {sidecar_path} must be a JSON object")
         unknown = set(parsed) - _SIDECAR_KEYS

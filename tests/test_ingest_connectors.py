@@ -536,6 +536,35 @@ def test_sidecar_context_shape_is_closed(tmp_path: Path) -> None:
         list(read_text_documents(tmp_path))
 
 
+def test_sidecar_rejects_jsonb_unstorable_values(tmp_path: Path) -> None:
+    """JSON-valid but JSONB-unstorable sidecar values must fail AT THE
+    CONNECTOR with the promised actionable error (Codex #130 r4): default
+    json.loads accepts NaN/Infinity, a numeric token can overflow to inf
+    (1e999), and a JSON string/key may carry \\u0000 — each passes every
+    shape/schema check yet fails the documents.metadata JSONB insert later
+    with a low-level store error naming no cause. Same guards as the uploads
+    metadata parser (shared from core.metadata.schema)."""
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    sidecar = tmp_path / "a.txt.meta.json"
+
+    sidecar.write_text('{"governance": {"x": NaN}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="not valid JSON.*non-finite constant"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text('{"governance": {"x": 1e999}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="not valid JSON.*non-finite number"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text('{"governance": {"note": "a\\u0000b"}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="NUL"):
+        list(read_text_documents(tmp_path))
+
+    # a NUL hiding in an object KEY of the open bag, not just a value
+    sidecar.write_text('{"governance": {"a\\u0000b": "v"}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="NUL"):
+        list(read_text_documents(tmp_path))
+
+
 def test_sidecar_targets_are_lexical_not_resolved(tmp_path: Path) -> None:
     """A sidecar names a DIRECTORY ENTRY, not an inode (Codex #130 r3): with
     resolve()-keying, `link.txt -> a.txt` plus only `link.txt.meta.json`

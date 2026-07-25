@@ -30,9 +30,10 @@ review, DR-002 untouched.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 #: The envelope shape version, stamped server-side into every stored envelope's
 #: ``schema_version`` (DR-010: the envelope is defined in openapi.yaml components;
@@ -300,6 +301,47 @@ def load_metadata_exposure(config: Mapping[str, Any]) -> MetadataExposure:
             )
         fields.append(path)
     return MetadataExposure(fields=tuple(fields))
+
+
+# --- JSONB-storability guards ------------------------------------------------
+# JSON-valid-but-JSONB-unstorable inputs, rejected at the boundary that PARSES
+# client-authored JSON destined for a JSONB column (the uploads metadata field;
+# MCP10 sidecars). Each would otherwise pass every shape/schema check and fail
+# the write later with a low-level Postgres error naming no cause.
+
+
+def reject_non_finite_constant(value: str) -> NoReturn:
+    """``json.loads(parse_constant=…)`` hook: fired only for ``NaN``/``Infinity``/
+    ``-Infinity``. Raising rejects them at parse time instead of letting a
+    non-finite float reach Postgres JSONB and 500/fail the write."""
+    raise ValueError(f"non-finite constant {value!r} is not allowed")
+
+
+def finite_float(value: str) -> float:
+    """``json.loads(parse_float=…)`` hook for every float token. Rejects one that
+    OVERFLOWS to a non-finite float (``1e999`` → ``inf``) — a token parse_constant
+    never sees — so it cannot reach Postgres JSONB. (Huge INTEGERS stay Python
+    int → JSONB-safe.)"""
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite number {value!r} is not allowed")
+    return parsed
+
+
+def contains_nul(obj: Any) -> bool:
+    """True if any string key or value nested in a parsed structure holds a NUL
+    (U+0000). A JSON string may legally carry ``\\u0000``, but Postgres
+    text/JSONB cannot store it — the same JSON-valid-but-JSONB-unstorable class
+    as the non-finite guards. Scans KEYS too: open bags (``context.attributes``,
+    ``governance``) let a NUL hide in an object key, which Postgres rejects just
+    as it does a value."""
+    if isinstance(obj, str):
+        return "\x00" in obj
+    if isinstance(obj, dict):
+        return any((isinstance(k, str) and "\x00" in k) or contains_nul(v) for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(contains_nul(v) for v in obj)
+    return False
 
 
 # --- envelope construction ---------------------------------------------------

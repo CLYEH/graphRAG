@@ -22,10 +22,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import uuid
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -43,7 +42,19 @@ from core.builds.sources import SourceResolutionError, ensure_resolvable_file_ur
 from core.config import get_settings
 from core.ingest.connectors import TEXT_SUFFIXES
 from core.metadata import MetadataValidationError, build_envelope, load_metadata_schema
-from core.metadata.schema import MetadataConfigError, MetadataSchema
+from core.metadata.schema import (
+    MetadataConfigError,
+    MetadataSchema,
+)
+from core.metadata.schema import (
+    contains_nul as _contains_nul,
+)
+from core.metadata.schema import (
+    finite_float as _finite_float,
+)
+from core.metadata.schema import (
+    reject_non_finite_constant as _reject_non_finite_constant,
+)
 from core.paths import safe_project_subdir
 from core.registry import ProjectNotFoundError, get_project, upsert_managed_source
 
@@ -298,37 +309,9 @@ def _corpus_dir(settings: Any, project: str) -> Path:
     return root
 
 
-def _reject_non_finite_constant(value: str) -> NoReturn:
-    """``json.loads(parse_constant=…)`` hook: fired only for ``NaN``/``Infinity``/
-    ``-Infinity``. Raising here rejects them at parse time (the caller maps it to a
-    400) instead of letting a non-finite float reach Postgres JSONB and 500."""
-    raise ValueError(f"non-finite constant {value!r} is not allowed")
-
-
-def _finite_float(value: str) -> float:
-    """``json.loads(parse_float=…)`` hook for every float token. Rejects one that
-    OVERFLOWS to a non-finite float (``1e999`` → ``inf``) — a token parse_constant
-    never sees — so it cannot pass a ``number`` attribute and 500 in Postgres JSONB."""
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise ValueError(f"non-finite number {value!r} is not allowed")
-    return parsed
-
-
-def _contains_nul(obj: Any) -> bool:
-    """True if any string key or value nested in a parsed-metadata structure holds a
-    NUL (U+0000). A JSON string may legally carry ``\\u0000``, but Postgres text/JSONB
-    cannot store it — the same JSON-valid-but-JSONB-unstorable class as the non-finite
-    guards above — so such a value would 500 the ``upsert_managed_source`` write. Scans
-    keys too: the open ``context.attributes`` / ``governance`` bags let a client NUL hide
-    in an object KEY, which Postgres rejects just as it does a value."""
-    if isinstance(obj, str):
-        return "\x00" in obj
-    if isinstance(obj, dict):
-        return any((isinstance(k, str) and "\x00" in k) or _contains_nul(v) for k, v in obj.items())
-    if isinstance(obj, list):
-        return any(_contains_nul(v) for v in obj)
-    return False
+# The JSONB-storability guards (_reject_non_finite_constant / _finite_float /
+# _contains_nul) live in core.metadata.schema — shared with the MCP10 sidecar
+# boundary, which closes the same JSON-valid-but-JSONB-unstorable classes.
 
 
 async def _canonical_upload_fingerprint(
