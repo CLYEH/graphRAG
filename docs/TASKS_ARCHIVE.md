@@ -378,3 +378,7 @@ RunsTable 失敗建置列展開加「失敗診斷」:useBuildSteps/useStepItems 
 ## MCP15
 
 (a) list_schema 併入 session 實際 policy 區塊(不新增工具,§9 詞彙凍結;lifespan 載入即所揭露=所執行,DR-012 一致);guardrail 內部(黑名單/子塊細節)刻意不揭露。(b) gate-2 四輪 PASS 鏈:r1 nit sql_rows() 對帳值;r2 nit 全分支釘 policy;r3/r4 採納後確認。(c) 遠端 4 輪全 P2 must-fix,一條規則逐步顯影:r1 policy 區塊要騎全部錯誤分支(degraded 態正是 agent 檢視 session 的時刻;_policy_disclosure 無 store 純函數);r2 每個上限都要是 reconciled enforced 值(max_graph_rows/sql+graph timeout_ms=既有 §21 reconciler);r3 非 operative 旗標整欄移除(text_to_cypher.enabled 轄的自由 NL→Cypher 路徑無任何 MCP 面曝光,任何值都誤導)+ max_response_bytes:null 顯式揭露無上限;r4 default_mode 同規則移除(無 dispatch 消費者、與 instructions 的 hybrid 預設矛盾);r5 +1。期間 Codex 一度停擺 ~1h(三 poke 無 👀),PushNotification 通知 owner 後恢復。(d) 教訓:揭露面三律——騎全分支、只列 operative、值必 reconciled;「寧缺勿列」:no-consumer 欄位任何值都是錯的。
+
+## MCP16
+
+(a) 併發瓶頸實測定位:爬升 5→60 併發中位延遲 5.3s→40.0s、吞吐固定 0.8 session/s、PG 峰值 7 連線=序列化;AsyncQdrantClient 建構子同步阻塞 1,302ms 逐 session 執行。修=每 server 一份共享 bundle(首建走 to_thread、asyncio.Lock lazy 建;後續 session 僅policy 讀,實測 1587ms→196ms);policy 逐 session 用拋棄式 engine 先讀(#93 R5 保留、失敗不毒共享);關閉權移 owner(gateway host/run_server)經 _graphrag_close_shared。(b) gate-2 兩輪:r1 FAIL blocker=host finally 的 await closer() 未圍——單專案 close 例外會讓 anyio cancel 整個 task group,拆掉 gateway 的專案隔離(lifecycle #50 class);修=contextlib.suppress(CancelledError 照傳播)+aclose 逐 client 獨立 suppress+fragile/steady 級聯圍堵測試;stdio 跨 loop close 同 suppress(nit)。(c) Codex 首輪 +1(期間短暫無反應,重 poke 即回)。(d) 教訓:共享資源化改造=關閉權必須顯式移交 owner,且 owner 的 finally await 是cancel-cascade 高風險點(anyio task group 語意)——含住例外、放行取消。
