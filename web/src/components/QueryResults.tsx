@@ -16,6 +16,9 @@ const WARN_TONE: Record<WarningCode, string> = {
   LOW_CONFIDENCE: "warn",
   GUARDRAIL_BLOCKED: "bad",
   TRUNCATED: "warn",
+  // v1.4 (DR-015): the DR-001 lifecycle refusal — nothing was produced, so
+  // it renders with the refusal tone, same as GUARDRAIL_BLOCKED
+  NO_ACTIVE_BUILD: "bad",
 };
 
 // The deadline can fire during binding, leaving no build bound — the envelope

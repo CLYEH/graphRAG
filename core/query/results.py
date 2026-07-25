@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 #: Bumped only on a breaking change (DR-002); mirrors the schema ``const``.
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 
 
 @dataclass(frozen=True)

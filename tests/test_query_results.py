@@ -101,7 +101,7 @@ def test_serialized_response_validates_against_the_frozen_schema() -> None:
     # the envelope names the build it read (DR-001) and semantic has no router
     assert payload["build_id"] == _BUILD
     assert payload["graph_context"] is None and payload["debug"] is None
-    assert payload["schema_version"] == "1.1"  # v1.1: MCP7 entity-ref tightening (DESIGN §26)
+    assert payload["schema_version"] == "1.2"  # v1.2: MCP12 NO_ACTIVE_BUILD warning (DESIGN §26)
 
 
 def test_require_sources_is_enforced_at_construction() -> None:

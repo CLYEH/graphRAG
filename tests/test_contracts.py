@@ -57,6 +57,9 @@ _FROZEN_WARNING_CODES = frozenset(
         "LOW_CONFIDENCE",
         "GUARDRAIL_BLOCKED",
         "TRUNCATED",
+        # v1.2 (MCP12, DR-015, additive): the DR-001 lifecycle refusal —
+        # REST's 409 said as a typed MCP warning instead of a raw isError
+        "NO_ACTIVE_BUILD",
     }
 )
 
@@ -219,8 +222,10 @@ def test_mcp_schema_version_is_frozen(mcp_schema: dict[str, Any]) -> None:
     """DR-002: schema_version pins the contract; only a breaking change bumps it.
     v1.1 (MCP7, DESIGN §26): the entity-result minimum was TIGHTENED — a chunk
     mention ref must be resolvable (chunk UUID + source_uri + quote + offsets)
-    instead of the v1.0 bare chunk:{hash}:{ordinal} string no endpoint accepted."""
-    assert mcp_schema["properties"]["schema_version"]["const"] == "1.1"
+    instead of the v1.0 bare chunk:{hash}:{ordinal} string no endpoint accepted.
+    v1.2 (MCP12, DR-015): WarningCode gains NO_ACTIVE_BUILD — an old-schema
+    consumer would reject the new code, so the addition is version-gated."""
+    assert mcp_schema["properties"]["schema_version"]["const"] == "1.2"
     assert "schema_version" in mcp_schema["required"]
 
 
@@ -289,7 +294,7 @@ def _valid_mcp_response() -> dict[str, Any]:
     chunk_id = "3d7e4a5b-6c73-4d84-be95-fa6b07c18d29"
     chunk_uri = "s3://acme/docs/onboarding.md"
     return {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "query": "who owns onboarding?",
         "tool": "hybrid_query",
         "project": "acme",
@@ -629,8 +634,10 @@ def test_contract_is_versioned(spec: dict[str, Any]) -> None:
     (GOV2/GOV3), build retry lineage + step/item drill-down (RB1), server-side
     search + page totals (SS1b), and the MCP connection-info endpoint (DR-012
     rider).
+    1.3 → 1.4 (2026-07-25, DESIGN §26 DR-015): WarningCode gains
+    NO_ACTIVE_BUILD (additive, lockstep with mcp_response v1.2).
     """
-    assert spec["info"]["version"] == "1.3"
+    assert spec["info"]["version"] == "1.4"
 
 
 def test_frozen_endpoint_surface(spec: dict[str, Any]) -> None:

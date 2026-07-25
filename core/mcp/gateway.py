@@ -39,13 +39,24 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
+from core.mcp.policy import PolicyError, load_runtime_config_from_registry
 from core.mcp.server import build_server
+from core.metadata.schema import MetadataConfigError
+from core.stores.errors import STORE_CLIENT_ERRORS
 
 #: matched against the RAW (undecoded) path: a percent-encoded slash
 #: (%2F) must stay INSIDE its segment — matching the decoded path would let
 #: /mcp/a%2Fb smuggle itself into project `a` + child path /b and serve the
 #: WRONG project's server (Codex #93 R3)
 _MCP_PATH_RAW = re.compile(rb"^/mcp/([^/]+)(/.*)?$")
+
+#: MCP12: ceiling on the per-request registry preflight. Measured defect: a
+#: session lifespan failure (bad policy, Postgres down) surfaced as HTTP 200
+#: + session id + a ZERO-BYTE stream — the PolicyError's actionable text
+#: never reached the wire, and with Postgres down the hang ran 46s (past
+#: every §21 budget). The preflight bounds that path: policy problems answer
+#: 503 WITH the actionable message, a dead registry answers 503 fast.
+_PREFLIGHT_TIMEOUT_S = 5.0
 
 
 def _json_response(status: int, payload: dict[str, Any]) -> tuple[int, bytes]:
@@ -67,7 +78,12 @@ class McpGateway:
         # raises `RuntimeError: Attempted to exit cancel scope in a different
         # task` (gate-2 reproduced it); one task per child owns both ends.
         self._tasks: TaskGroup | None = None
-        self._stop = anyio.Event()
+        # one stop event PER child (Codex #132 r1): eviction of a deleted
+        # project must close THAT child's lifespan promptly — a single
+        # gateway-wide event kept evicted hosts (and their session managers)
+        # alive until full shutdown, accumulating orphans across
+        # delete/recreate cycles. Shutdown sets every remaining event.
+        self._child_stops: dict[str, anyio.Event] = {}
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
@@ -86,14 +102,75 @@ class McpGateway:
         # into the name here and is rejected below, never re-split as a path
         project = unquote(match.group(1).decode("utf-8", "replace"))
         rest = unquote((match.group(2) or b"/").decode("utf-8", "replace"))
-        if "/" in project:
+        if "/" in project or project in (".", ".."):
+            # non-addressable names answer 404 BEFORE any registry read —
+            # the same rule _app_for enforces (kept there as defense in
+            # depth); the preflight below must not spend a DB read on them
             await self._send_json(
                 send,
                 404,
                 {"error": f"project {project!r} is not in the registry (or not path-addressable)"},
             )
             return
-        app = await self._app_for(project)
+        # MCP12 preflight: the child server reads its policy per SESSION
+        # lifespan, and a failure there surfaces as HTTP 200 + an empty
+        # stream (the SDK gives the error no wire shape), which an agent
+        # cannot distinguish from a gateway crash or a network flap. The
+        # CONFIG validation runs only for session INITIALIZATION (no
+        # mcp-session-id header yet — the request that would hit the broken
+        # lifespan): bad policy → 503 with the actionable PolicyError text;
+        # registry unreachable → 503 within _PREFLIGHT_TIMEOUT_S instead of
+        # a 46s hang. ESTABLISHED sessions keep their lifespan policy
+        # snapshot (DR-012: config edits apply to the NEXT session — Codex
+        # #132 r2), so they get only the cheap existence check (project
+        # DELETED after mount → 404 + eviction; deletion is a lifecycle end,
+        # not a config edit), and during a registry outage they pass through
+        # to their own IN-PROTOCOL typed degradation.
+        headers = scope.get("headers") or []
+        initializing = not any(k.lower() == b"mcp-session-id" for k, _ in headers)
+        refusal = await self._preflight(project, initializing=initializing)
+        if refusal is not None:
+            status, payload = refusal
+            if status == 404:
+                # the SoR no longer has the project — stop serving the
+                # cached mount AND close its child lifespan promptly (the
+                # per-child stop; a gateway-wide event would keep the
+                # orphaned session manager alive until full shutdown)
+                async with self._lock:
+                    self._apps.pop(project, None)
+                    child_stop = self._child_stops.pop(project, None)
+                if child_stop is not None:
+                    child_stop.set()
+            await self._send_json(send, status, payload)
+            return
+        try:
+            # the mount phase re-reads the registry (_project_exists) and
+            # enters the child lifespan — BOTH under the same fast deadline
+            # as the preflight (Codex #132 r1: Postgres stalling BETWEEN the
+            # two reads would otherwise hang this request on the driver's
+            # own much longer timeout, past the promised fast 503)
+            with anyio.fail_after(_PREFLIGHT_TIMEOUT_S):
+                app = await self._app_for(project)
+        except TimeoutError:
+            await self._send_json(
+                send,
+                503,
+                {
+                    "error": f"project {project!r} mount timed out — the registry "
+                    "or the session manager stalled; retry shortly"
+                },
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — a mount failure must answer typed, not a raw 500
+            await self._send_json(
+                send,
+                503,
+                {
+                    "error": f"project {project!r} failed to mount "
+                    f"({type(exc).__name__}) — see the gateway log"
+                },
+            )
+            return
         if app is None:
             await self._send_json(
                 send,
@@ -109,6 +186,66 @@ class McpGateway:
             "root_path": scope.get("root_path", "") + f"/mcp/{project}",
         }
         await app(child_scope, receive, send)
+
+    async def _preflight(
+        self, project: str, *, initializing: bool
+    ) -> tuple[int, dict[str, Any]] | None:
+        """Registry (+ config, when ``initializing``) preflight for one
+        request — None means proceed; otherwise the (status, payload)
+        refusal to send (MCP12).
+
+        A session-INITIALIZATION request gets the full config validation
+        (it is the one that would hit the broken child lifespan and get the
+        measured empty-stream non-answer): config error → 503 + the
+        actionable text, deleted → 404, registry unreachable → 503 bounded
+        fast. An ESTABLISHED session request gets only the existence check
+        (DR-012: its policy snapshot from lifespan start stays authoritative
+        — a config edit mid-session must not 503 a healthy session), and a
+        registry outage lets it PROCEED to its own in-protocol typed
+        degradation rather than an out-of-protocol JSON error. The
+        not-in-registry case is decided by a direct row lookup — never by
+        matching PolicyError message text."""
+        from core.registry import get_project
+
+        assert self._engine is not None, "gateway lifespan not started"
+        not_found = (
+            404,
+            {"error": f"project {project!r} is not in the registry (or not path-addressable)"},
+        )
+        try:
+            with anyio.fail_after(_PREFLIGHT_TIMEOUT_S):
+                async with self._engine.connect() as conn:
+                    if not initializing:
+                        if await get_project(conn, project) is None:
+                            return not_found
+                        return None
+                    try:
+                        await load_runtime_config_from_registry(conn, project)
+                        return None
+                    # MetadataConfigError: a malformed metadata_exposure is
+                    # the same "config not servable" answer as a bad policy
+                    # (the composed loader rightly refuses it)
+                    except (PolicyError, MetadataConfigError) as exc:
+                        if await get_project(conn, project) is None:
+                            return not_found
+                        return 503, {
+                            "error": f"project {project!r} is not servable — "
+                            f"configuration error: {exc}"
+                        }
+        except TimeoutError:
+            if not initializing:
+                return None  # the established session degrades in-protocol
+            return 503, {
+                "error": "registry unreachable (timed out) — the gateway could not "
+                "read the project's query policy; check Postgres"
+            }
+        except STORE_CLIENT_ERRORS as exc:
+            if not initializing:
+                return None  # the established session degrades in-protocol
+            return 503, {
+                "error": f"registry unreachable ({type(exc).__name__}) — the gateway "
+                "could not read the project's query policy; check Postgres"
+            }
 
     async def _lifespan(self, receive: Any, send: Any) -> None:
         message = await receive()
@@ -134,8 +271,10 @@ class McpGateway:
                 assert message["type"] == "lifespan.shutdown"
                 # release every host task — each exits its child lifespan in
                 # the SAME task that entered it; the task-group exit below
-                # waits for all of them to finish closing
-                self._stop.set()
+                # waits for all of them to finish closing (evicted children
+                # already had their own event set)
+                for child_stop in list(self._child_stops.values()):
+                    child_stop.set()
         finally:
             self._tasks = None
             if self._engine is not None:
@@ -157,6 +296,7 @@ class McpGateway:
             server.settings.streamable_http_path = "/"
             app = server.streamable_http_app()
             assert self._tasks is not None, "gateway lifespan not started"
+            child_stop = anyio.Event()
 
             async def host(*, task_status: TaskStatus[None]) -> None:
                 # ONE task owns the child lifespan end to end (see __init__):
@@ -164,10 +304,11 @@ class McpGateway:
                 # child startup propagates to the mount request loud
                 async with app.router.lifespan_context(app):
                     task_status.started()
-                    await self._stop.wait()
+                    await child_stop.wait()
 
             await self._tasks.start(host)
             self._apps[project] = app
+            self._child_stops[project] = child_stop
             return app
 
     async def _project_exists(self, project: str) -> bool:
