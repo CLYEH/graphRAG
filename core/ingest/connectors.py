@@ -31,9 +31,9 @@ from core.metadata.schema import (
     MetadataSchema,
     MetadataValidationError,
     build_envelope,
-    contains_nul,
     finite_float,
     reject_non_finite_constant,
+    unstorable_string_reason,
 )
 from core.stores.tables import STRUCTURED_MIME
 
@@ -224,11 +224,12 @@ def _collect_sidecars(
             )
         except ValueError as exc:  # JSONDecodeError/UnicodeDecodeError included
             raise ValueError(f"metadata sidecar {sidecar_path} is not valid JSON: {exc}") from exc
-        if contains_nul(parsed):
-            # JSON-valid but JSONB-unstorable: Postgres cannot hold U+0000 in
-            # text/JSONB, in a value OR an object key (the open bags allow both)
+        storability = unstorable_string_reason(parsed)
+        if storability is not None:
+            # JSON-valid but JSONB-unstorable (NUL / unpaired surrogate), in a
+            # value OR an object key (the open bags allow both)
             raise ValueError(
-                f"metadata sidecar {sidecar_path} contains a NUL (U+0000) in a string "
+                f"metadata sidecar {sidecar_path} {storability} in a string "
                 "key or value — PostgreSQL JSONB cannot store it"
             )
         if not isinstance(parsed, dict):

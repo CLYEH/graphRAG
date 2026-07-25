@@ -564,6 +564,17 @@ def test_sidecar_rejects_jsonb_unstorable_values(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="NUL"):
         list(read_text_documents(tmp_path))
 
+    # a lone escaped UTF-16 surrogate: json.loads materializes it as a
+    # surrogate code point no UTF-8 encoder (Postgres included) can encode
+    sidecar.write_text('{"governance": {"note": "\\ud800"}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="unpaired UTF-16 surrogate"):
+        list(read_text_documents(tmp_path))
+
+    # a PAIRED surrogate escape is a legal astral char and must NOT be blocked
+    sidecar.write_text('{"governance": {"note": "\\ud83d\\ude00"}}', encoding="utf-8")
+    [payload] = read_text_documents(tmp_path)
+    assert payload.metadata["governance"]["note"] == "\U0001f600"
+
 
 def test_sidecar_targets_are_lexical_not_resolved(tmp_path: Path) -> None:
     """A sidecar names a DIRECTORY ENTRY, not an inode (Codex #130 r3): with

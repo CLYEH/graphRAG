@@ -47,13 +47,13 @@ from core.metadata.schema import (
     MetadataSchema,
 )
 from core.metadata.schema import (
-    contains_nul as _contains_nul,
-)
-from core.metadata.schema import (
     finite_float as _finite_float,
 )
 from core.metadata.schema import (
     reject_non_finite_constant as _reject_non_finite_constant,
+)
+from core.metadata.schema import (
+    unstorable_string_reason as _unstorable_string_reason,
 )
 from core.paths import safe_project_subdir
 from core.registry import ProjectNotFoundError, get_project, upsert_managed_source
@@ -145,20 +145,23 @@ async def upload_documents_endpoint(
             ErrorCode.VALIDATION_ERROR,
             "every file part must carry a filename (it is the manifest's correlation key)",
         )
-    # A NUL in a filename is the SAME U+0000→JSONB-500 class the metadata guard closes, on
-    # a second string feeding the same write: the submitted filename is echoed verbatim into
-    # the stored envelope's server-owned system.original_filename, and Postgres text/JSONB
-    # cannot hold U+0000 — so an accepted NUL filename 500s the upsert_managed_source write.
-    # Reject it as a whole-request 400 here (a filename with a NUL is not a valid name on any
-    # filesystem, and it is the correlation key), grouped with the empty/duplicate filename
-    # guards so it also covers a file that carries no per-file metadata (the per-file
-    # _contains_nul guard only scans a file's supplied context/governance).
-    if any("\x00" in name for name in submitted_names):
-        raise ApiError(
-            ErrorCode.VALIDATION_ERROR,
-            "a submitted filename contains a NUL character (U+0000), which is not a valid "
-            "filename and cannot be stored",
-        )
+    # An unstorable string in a filename (NUL / unpaired surrogate) is the SAME
+    # JSONB-unstorable class the metadata guard closes, on a second string feeding the
+    # same write: the submitted filename is echoed verbatim into the stored envelope's
+    # server-owned system.original_filename, and Postgres text/JSONB cannot hold it —
+    # so an accepted bad filename 500s the upsert_managed_source write. Reject it as a
+    # whole-request 400 here (such a filename is not a valid name on any filesystem,
+    # and it is the correlation key), grouped with the empty/duplicate filename guards
+    # so it also covers a file that carries no per-file metadata (the per-file
+    # _unstorable_string_reason guard only scans a file's supplied context/governance).
+    for name in submitted_names:
+        name_reason = _unstorable_string_reason(name)
+        if name_reason is not None:
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                f"a submitted filename {name_reason}, which is not a valid "
+                "filename and cannot be stored",
+            )
     duplicates = sorted({n for n in submitted_names if submitted_names.count(n) > 1})
     if duplicates:
         raise ApiError(
@@ -310,8 +313,8 @@ def _corpus_dir(settings: Any, project: str) -> Path:
 
 
 # The JSONB-storability guards (_reject_non_finite_constant / _finite_float /
-# _contains_nul) live in core.metadata.schema — shared with the MCP10 sidecar
-# boundary, which closes the same JSON-valid-but-JSONB-unstorable classes.
+# _unstorable_string_reason) live in core.metadata.schema — shared with the MCP10
+# sidecar boundary, which closes the same JSON-valid-but-JSONB-unstorable classes.
 
 
 async def _canonical_upload_fingerprint(
@@ -475,17 +478,19 @@ def _validate_file(
             parsed = DocumentMetadataInput.model_validate(entry)
         except ValidationError as exc:
             return f"metadata is invalid: {_first_pydantic_error(exc)}", None
-        if _contains_nul(parsed.model_dump()):
-            # A JSON string may hold U+0000, but Postgres text/JSONB cannot store it, so
-            # upsert_managed_source would 500 the WHOLE upload rather than this file's
-            # stated metadata refusal. Reject at capture (same class as the non-finite
-            # guards in _parse_metadata_field), before the accept path reaches the DB.
-            # Per-file here (a file's own metadata is its own concern), unlike the
-            # non-finite guard (a parse-time hook that can't attribute the token to a
-            # file → whole-request 400) and the NUL-filename guard (a structural
-            # correlation-key check → whole-request 400): granularity follows where the
-            # bad string lives, not the shared JSONB-unstorable class.
-            return "metadata contains a NUL character (U+0000), which cannot be stored", None
+        metadata_reason = _unstorable_string_reason(parsed.model_dump())
+        if metadata_reason is not None:
+            # A JSON string may hold U+0000 or an unpaired surrogate, but Postgres
+            # text/JSONB cannot store either, so upsert_managed_source would 500 the
+            # WHOLE upload rather than this file's stated metadata refusal. Reject at
+            # capture (same class as the non-finite guards in _parse_metadata_field),
+            # before the accept path reaches the DB. Per-file here (a file's own
+            # metadata is its own concern), unlike the non-finite guard (a parse-time
+            # hook that can't attribute the token to a file → whole-request 400) and
+            # the filename guard (a structural correlation-key check → whole-request
+            # 400): granularity follows where the bad string lives, not the shared
+            # JSONB-unstorable class.
+            return f"metadata {metadata_reason}, which cannot be stored", None
         if parsed.context is not None:
             context_to_check = parsed.context.model_dump()
     # validate the context against the project schema ALWAYS — with an empty

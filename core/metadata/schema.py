@@ -328,20 +328,41 @@ def finite_float(value: str) -> float:
     return parsed
 
 
-def contains_nul(obj: Any) -> bool:
-    """True if any string key or value nested in a parsed structure holds a NUL
-    (U+0000). A JSON string may legally carry ``\\u0000``, but Postgres
-    text/JSONB cannot store it — the same JSON-valid-but-JSONB-unstorable class
-    as the non-finite guards. Scans KEYS too: open bags (``context.attributes``,
-    ``governance``) let a NUL hide in an object key, which Postgres rejects just
-    as it does a value."""
+def _string_storability_reason(text: str) -> str | None:
+    if "\x00" in text:
+        return "contains a NUL character (U+0000)"
+    if any("\ud800" <= ch <= "\udfff" for ch in text):
+        # json.loads materializes an ESCAPED lone surrogate ("\ud800") as a
+        # surrogate code point; paired escapes combine into the astral char at
+        # parse time, so any surrogate REMAINING in a parsed string is unpaired
+        # — and no UTF-8 encoder (Postgres included) can encode it
+        return "contains an unpaired UTF-16 surrogate"
+    return None
+
+
+def unstorable_string_reason(obj: Any) -> str | None:
+    """The first reason a parsed JSON structure cannot be stored in Postgres
+    text/JSONB, or ``None`` if storable: a NUL (U+0000), or an unpaired UTF-16
+    surrogate. Both are legal in a JSON document — the same
+    JSON-valid-but-JSONB-unstorable class as the non-finite guards — and would
+    otherwise fail the write later with a low-level store error naming no
+    cause. Scans object KEYS too: open bags (``context.attributes``,
+    ``governance``) let a bad string hide in a key, which Postgres rejects
+    just as it does a value."""
     if isinstance(obj, str):
-        return "\x00" in obj
+        return _string_storability_reason(obj)
     if isinstance(obj, dict):
-        return any((isinstance(k, str) and "\x00" in k) or contains_nul(v) for k, v in obj.items())
+        for key, value in obj.items():
+            if isinstance(key, str) and (reason := _string_storability_reason(key)):
+                return reason
+            if reason := unstorable_string_reason(value):
+                return reason
+        return None
     if isinstance(obj, list):
-        return any(contains_nul(v) for v in obj)
-    return False
+        for value in obj:
+            if reason := unstorable_string_reason(value):
+                return reason
+    return None
 
 
 # --- envelope construction ---------------------------------------------------
