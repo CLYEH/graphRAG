@@ -623,6 +623,18 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
             app._session_seen[f"reaped-{i}".encode()] = (stale, stale)  # noqa: SLF001
         app._record_session_start(b"fresh-init")  # noqa: SLF001 — insert compacts
         assert len(app._session_seen) < 100  # the dead flood was forgotten  # noqa: SLF001
+
+        # Codex #137 r9: a LARGE LIVE set (nothing to reap) must NOT rebuild
+        # the dict on every request — the high-water mark rises to 2x the
+        # post-compaction size, so compaction does not re-run until the
+        # ledger grows again. Fill with live (recent) entries past the mark
+        # and confirm the mark advanced beyond the current size.
+        live = _t.monotonic()
+        for i in range(5000):
+            app._session_seen[f"live-{i}".encode()] = (live, live)  # noqa: SLF001
+        app._compact_sessions(live)  # noqa: SLF001 — one compaction over live entries
+        assert app._compact_at >= 2 * len(app._session_seen) - 1  # noqa: SLF001 — mark raised
+        assert app._compact_at > len(app._session_seen)  # noqa: SLF001 — no immediate re-trigger
         assert b"fresh-init" in app._session_seen  # ...the fresh one survives  # noqa: SLF001
 
         # Codex #137 r6: an explicit MCP session termination (DELETE) drops

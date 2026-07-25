@@ -103,6 +103,15 @@ class McpGateway:
         self._session_seen: dict[bytes, tuple[float, float]] = {}
         self._session_max_age_s = 7200.0
         self._session_idle_timeout_s = 1800.0
+        # compaction high-water mark (Codex #137 r9): a plain len>4096 check
+        # rebuilds the whole dict on EVERY request once the live set stays
+        # above 4096 (compaction keeps live entries, so it removes nothing
+        # and the count never drops) — O(n²) under high concurrency. Instead
+        # compact only past this mark and RAISE it to 2× the post-compaction
+        # size, so between compactions the ledger must grow substantially:
+        # amortized O(1) per request, and a genuinely-large live set never
+        # rebuilds until it doubles.
+        self._compact_at = 4096
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
@@ -340,13 +349,18 @@ class McpGateway:
         unknown-id pass-through to the child's own 404. Runs from BOTH
         insertion and touch (Codex #137 r5 P1: one-shot init clients never
         touch, so insert-time compaction is what bounds a gateway that only
-        ever sees initializations)."""
-        if len(self._session_seen) <= 4096:
+        ever sees initializations). The high-water mark (Codex #137 r9)
+        makes this amortized O(1): it rebuilds the dict only past
+        ``_compact_at`` and then RAISES the mark to 2× the post-compaction
+        size, so a large live set (nothing to reap) does not rebuild on
+        every request — it waits until the ledger grows again."""
+        if len(self._session_seen) <= self._compact_at:
             return
         horizon = now - (self._session_idle_timeout_s + 60.0)
         self._session_seen = {
             sid: (f, s) for sid, (f, s) in self._session_seen.items() if s > horizon
         }
+        self._compact_at = max(4096, 2 * len(self._session_seen))
 
     def _record_session_start(self, session_id: bytes) -> None:
         """Stamp a session's creation (Codex #137 r2 P2): the id is captured
