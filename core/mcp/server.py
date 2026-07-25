@@ -126,6 +126,15 @@ def _top_k_clamp_warning(policy: QueryPolicy, requested: int | None) -> dict[str
     }
 
 
+def _echoable(query: str) -> str:
+    """The §16 envelope echo of a caller's query: a WITHIN-cap query is
+    returned whole (clients correlate, log, and retry from the envelope —
+    Codex #133 r2), while a genuinely oversized one is truncated to 200
+    chars so no refusal path can ever amplify a large input (Codex #133 r1)
+    — the backstop for the tools' cap-first ordering."""
+    return query if len(query) <= _QUERY_CHARS_CAP else query[:200]
+
+
 def _oversized_query_payload(project: str, tool: str, query: str) -> dict[str, Any] | None:
     """The shared §21 query-length refusal, or None when within the cap
     (MCP12; extracted for MCP13 — every path that would ECHO the query must
@@ -1188,11 +1197,11 @@ def _incomplete_graph_invocation_payload(
         return None
     missing = [name for name in ("graph_template", "graph_entity") if name not in supplied]
     return McpResponse(
-        # echo truncated (the _oversized_query_payload convention): the tool
-        # runs the cap first, but this refusal must never be able to reflect
-        # a large input whole even if an ordering regression reopens the
-        # bypass (Codex #133 r1 class — defense in depth)
-        query=query[:200],
+        # a WITHIN-cap query is echoed whole (clients correlate/log/retry
+        # from the §16 envelope — Codex #133 r2); only a genuinely oversized
+        # input is truncated, the defense-in-depth backstop should the
+        # tool's cap-first ordering ever regress (Codex #133 r1 class)
+        query=_echoable(query),
         tool="hybrid_query",
         project=project,
         build_id=_NIL_BUILD,
@@ -1223,10 +1232,9 @@ def _debug_disabled_payload(project: str, query: str) -> dict[str, Any]:
     pipeline. Nil build — nothing was ever resolved (pre-binding
     convention)."""
     return McpResponse(
-        # truncated echo — same regression-proofing as the incomplete-
-        # invocation refusal (the tool runs the cap first; this holds even
-        # if that ordering ever regresses)
-        query=query[:200],
+        # within-cap echoed whole, oversized truncated — same rule as the
+        # incomplete-invocation refusal (Codex #133 r2)
+        query=_echoable(query),
         tool="hybrid_query",
         project=project,
         build_id=_NIL_BUILD,

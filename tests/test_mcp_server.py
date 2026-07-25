@@ -495,6 +495,21 @@ def test_explain_retrieval_refusal_is_a_real_refusal() -> None:
     # symmetric hardening: the debug refusal truncates its echo too
     assert len(_debug_disabled_payload("demo", "x" * 4001)["query"]) == 200
 
+    # Codex #133 r2 dual: a WITHIN-cap query is echoed WHOLE — clients
+    # correlate/log/retry from the §16 envelope, and truncating a legal
+    # 201..4000-char query would silently corrupt that correlation
+    legal = "y" * 300
+    within = _partial(
+        "demo",
+        legal,
+        graph_template=None,
+        graph_entity="區域探索廳",
+        graph_other_entity=None,
+        graph_hops=None,
+    )
+    assert within is not None and within["query"] == legal
+    assert _debug_disabled_payload("demo", legal)["query"] == legal
+
 
 async def test_introspection_errors_carry_typed_codes() -> None:
     """MCP13 (c): the introspection tools' free-text error field squashed
