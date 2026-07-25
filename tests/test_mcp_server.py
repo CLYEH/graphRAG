@@ -450,18 +450,50 @@ def test_explain_retrieval_refusal_is_a_real_refusal() -> None:
 
     import jsonschema
 
-    from core.mcp.server import _debug_disabled_payload
+    from core.mcp.server import _debug_disabled_payload, _oversized_query_payload
 
     payload = _debug_disabled_payload("demo", "票價")
-    jsonschema.Draft202012Validator(
+    validator = jsonschema.Draft202012Validator(
         json.loads((REPO_ROOT / "contracts" / "mcp_response.schema.json").read_text("utf-8")),
         format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER,
-    ).validate(payload)
+    )
+    validator.validate(payload)
     assert payload["results"] == []  # NOTHING was produced — the code's one meaning
     assert payload["build_id"] == "00000000-0000-0000-0000-000000000000"  # never ran
     [warning] = payload["warnings"]
     assert warning["code"] == "GUARDRAIL_BLOCKED"
     assert "refused" in warning["message"] and "hybrid_query" in warning["message"]
+
+    # Codex #133 r1: the debug refusal echoes the query, and the tool's
+    # early return bypasses _bounded's cap — so the SHARED cap helper must
+    # run first, truncating the echo (no whole-input reflection/amplification)
+    oversized = _oversized_query_payload("demo", "hybrid_query", "x" * 4001)
+    assert oversized is not None
+    validator.validate(oversized)
+    assert len(oversized["query"]) == 200  # echo truncated, never reflected whole
+    assert "4000-char cap" in oversized["warnings"][0]["message"]
+    assert _oversized_query_payload("demo", "hybrid_query", "x" * 4000) is None  # dual
+
+    # gate-2 sweep: hybrid_query's MCP11 incomplete-invocation refusal is the
+    # SAME pre-_bounded early-return class — the tool runs the cap first,
+    # AND (defense in depth) the refusal itself truncates its echo, so no
+    # ordering regression can ever reflect a large input whole.
+    from core.mcp.server import _incomplete_graph_invocation_payload as _partial
+
+    reflected = _partial(
+        "demo",
+        "x" * 4001,
+        graph_template=None,
+        graph_entity="區域探索廳",
+        graph_other_entity=None,
+        graph_hops=None,
+    )
+    assert reflected is not None
+    validator.validate(reflected)
+    assert len(reflected["query"]) == 200  # never reflected whole, even helper-direct
+
+    # symmetric hardening: the debug refusal truncates its echo too
+    assert len(_debug_disabled_payload("demo", "x" * 4001)["query"]) == 200
 
 
 async def test_introspection_errors_carry_typed_codes() -> None:

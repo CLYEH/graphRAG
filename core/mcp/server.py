@@ -126,6 +126,31 @@ def _top_k_clamp_warning(policy: QueryPolicy, requested: int | None) -> dict[str
     }
 
 
+def _oversized_query_payload(project: str, tool: str, query: str) -> dict[str, Any] | None:
+    """The shared §21 query-length refusal, or None when within the cap
+    (MCP12; extracted for MCP13 — every path that would ECHO the query must
+    run this FIRST, including tool-level early returns that bypass
+    ``_bounded``, or an oversized input is reflected whole: response
+    amplification and a cap the surface no longer shares — Codex #133 r1).
+    The echo is truncated to 200 chars for the same reason."""
+    if len(query) <= _QUERY_CHARS_CAP:
+        return None
+    return McpResponse(
+        query=query[:200],
+        tool=tool,
+        project=project,
+        build_id=_NIL_BUILD,
+        results=(),
+        warnings=(
+            QueryWarning(
+                "GUARDRAIL_BLOCKED",
+                f"query length {len(query)} exceeds the {_QUERY_CHARS_CAP}-char cap "
+                "— shorten the query (§21); rejected, not clamped",
+            ),
+        ),
+    ).to_dict()
+
+
 def _with_clamp_warning(
     payload: dict[str, Any], policy: QueryPolicy, requested: int | None
 ) -> dict[str, Any]:
@@ -163,21 +188,9 @@ async def _bounded(
     # length check needs no store — refuse an oversized query BEFORE the
     # binding opens one (MCP12: the query rides into the model provider's
     # token limits; a §21 refusal here is actionable, a provider error not)
-    if len(query) > _QUERY_CHARS_CAP:
-        return McpResponse(
-            query=query[:200],
-            tool=tool,
-            project=runtime.context.project,
-            build_id=_NIL_BUILD,
-            results=(),
-            warnings=(
-                QueryWarning(
-                    "GUARDRAIL_BLOCKED",
-                    f"query length {len(query)} exceeds the {_QUERY_CHARS_CAP}-char cap "
-                    "— shorten the query (§21); rejected, not clamped",
-                ),
-            ),
-        ).to_dict()
+    oversized = _oversized_query_payload(runtime.context.project, tool, query)
+    if oversized is not None:
+        return oversized
     deadline = time.monotonic() + runtime.policy.max_latency_ms / 1000.0
     try:
         async with asyncio.timeout(runtime.policy.max_latency_ms / 1000.0):
@@ -526,6 +539,13 @@ def build_server(project: str) -> FastMCP:
         text questions, semantic_search alone is often faster and returns
         more readable passages."""
         rt = _rt()
+        # cap FIRST (the explain_retrieval ordering, Codex #133 r1 class):
+        # the incomplete-invocation refusal below is a pre-_bounded early
+        # return that echoes the query — unchecked, an oversized query with
+        # a half graph invocation would be reflected whole
+        oversized = _oversized_query_payload(rt.context.project, "hybrid_query", query)
+        if oversized is not None:
+            return oversized
         refused = _incomplete_graph_invocation_payload(
             rt.context.project,
             query,
@@ -719,6 +739,12 @@ def build_server(project: str) -> FastMCP:
         (GUARDRAIL_BLOCKED, zero results) — use hybrid_query for results
         without a trace."""
         rt = _rt()
+        # the shared query cap runs FIRST (Codex #133 r1): this early return
+        # bypasses _bounded, and _debug_disabled_payload echoes the query —
+        # an unchecked oversized input would be reflected whole
+        oversized = _oversized_query_payload(rt.context.project, "hybrid_query", query)
+        if oversized is not None:
+            return oversized
         if not rt.policy.expose_debug:
             return _debug_disabled_payload(rt.context.project, query)
 
@@ -1162,7 +1188,11 @@ def _incomplete_graph_invocation_payload(
         return None
     missing = [name for name in ("graph_template", "graph_entity") if name not in supplied]
     return McpResponse(
-        query=query,
+        # echo truncated (the _oversized_query_payload convention): the tool
+        # runs the cap first, but this refusal must never be able to reflect
+        # a large input whole even if an ordering regression reopens the
+        # bypass (Codex #133 r1 class — defense in depth)
+        query=query[:200],
         tool="hybrid_query",
         project=project,
         build_id=_NIL_BUILD,
@@ -1193,7 +1223,10 @@ def _debug_disabled_payload(project: str, query: str) -> dict[str, Any]:
     pipeline. Nil build — nothing was ever resolved (pre-binding
     convention)."""
     return McpResponse(
-        query=query,
+        # truncated echo — same regression-proofing as the incomplete-
+        # invocation refusal (the tool runs the cap first; this holds even
+        # if that ordering ever regresses)
+        query=query[:200],
         tool="hybrid_query",
         project=project,
         build_id=_NIL_BUILD,
