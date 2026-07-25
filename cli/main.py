@@ -91,8 +91,9 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "uvicorn worker processes (MCP17). Streamable-HTTP sessions are process-sticky: "
-            "workers>1 needs a session-affinity load balancer in front"
+            "uvicorn worker processes (MCP17). Must be 1: sessions are process-local and "
+            "uvicorn workers share one socket — scale with multiple one-worker instances "
+            "on distinct ports behind a session-affinity LB"
         ),
     )
 
@@ -289,15 +290,22 @@ def _serve_mcp(args: argparse.Namespace) -> int:
         )
     workers = getattr(args, "workers", 1)
     if workers > 1:
-        # MCP17: sessions are process-sticky (streamable-HTTP state lives in
-        # the worker that created it) — without session-affinity in front, a
-        # follow-up request landing on another worker loses its session
+        # MCP17 (Codex #137 r1): uvicorn workers SHARE one listening socket,
+        # so no external load balancer can pick the worker a connection
+        # lands on — and streamable-HTTP session state lives only in the
+        # worker that created it, so a follow-up request accepted by another
+        # worker gets "Session not found". workers>1 on one socket is
+        # structurally broken for stateful sessions: REFUSED, with the
+        # working recipe named.
         print(
-            f"warning: workers={workers} — streamable-HTTP sessions are "
-            "process-sticky; put a session-affinity load balancer in front, "
-            "or keep workers=1.",
+            f"REFUSED: workers={workers} cannot provide session stickiness — "
+            "uvicorn workers share one socket, and streamable-HTTP sessions "
+            "are process-local. Scale by running multiple one-worker "
+            "gateway instances on distinct ports behind a session-affinity "
+            "load balancer instead.",
             file=sys.stderr,
         )
+        return 1
     # the IMPORT-STRING + factory form (MCP17): an already-instantiated app
     # object made uvicorn's `workers` unusable — each worker process must
     # import and build its own gateway

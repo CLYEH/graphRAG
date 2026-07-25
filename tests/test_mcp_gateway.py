@@ -489,6 +489,52 @@ async def test_established_sessions_pass_through_a_registry_outage(
         finish.set()
 
 
+async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) -> None:
+    """MCP17 (Codex #137 r1): the SDK idle timeout RESETS on every request,
+    so a chatty session's DR-012 policy snapshot never expires — a policy
+    tightening could stay invisible forever. The gateway enforces an
+    ABSOLUTE ceiling: past it the session's requests answer 404 and the
+    client re-initializes, picking up the CURRENT policy."""
+    app = build_gateway()
+    started = anyio.Event()
+    finish = anyio.Event()
+
+    async def lifespan_receive() -> dict[str, Any]:
+        if not started.is_set():
+            return {"type": "lifespan.startup"}
+        await finish.wait()
+        return {"type": "lifespan.shutdown"}
+
+    async def lifespan_send(message: dict[str, Any]) -> None:
+        if message["type"] == "lifespan.startup.complete":
+            started.set()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(app, {"type": "lifespan"}, lifespan_receive, lifespan_send)
+        await started.wait()
+
+        sid = [(b"mcp-session-id", b"chatty-1")]
+        status, _ = await _request(app, "/mcp/nmmst", headers=sid)
+        assert status == 200  # young session serves
+
+        # backdate first-seen past the ceiling: the NEXT request must 404
+        # with the actionable re-initialize message — and the ledger entry
+        # is KEPT, so a client that ignores the 404 and re-sends the SAME
+        # id stays refused (popping would restart its clock, making the
+        # ceiling depend on client compliance — gate-2)
+        app._session_first_seen[b"chatty-1"] -= app._session_max_age_s + 1  # noqa: SLF001
+        status, body = await _request(app, "/mcp/nmmst", headers=sid)
+        assert status == 404 and b"re-initialize" in body
+        status, _ = await _request(app, "/mcp/nmmst", headers=sid)
+        assert status == 404  # same id re-sent: refused by construction
+
+        # a NEW session (no header) is untouched by the ceiling
+        status, _ = await _request(app, "/mcp/nmmst")
+        assert status == 200
+
+        finish.set()
+
+
 def test_create_app_is_a_uvicorn_factory() -> None:
     """MCP17: `uvicorn.run(app_instance)` made `workers` unusable (each
     worker process must IMPORT the app) — the gateway was structurally

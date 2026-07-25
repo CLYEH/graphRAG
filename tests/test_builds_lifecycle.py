@@ -146,6 +146,36 @@ def test_serve_mcp_warns_separately_for_an_unusable_public_host(
     assert "(wildcard bind)" not in err  # the mislabel this test exists to forbid
 
 
+def test_serve_mcp_refuses_multiple_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """MCP17 (Codex #137 r1): uvicorn workers SHARE one listening socket, so
+    no load balancer can pick the worker a connection lands on — and
+    streamable-HTTP session state is process-local, so a follow-up request
+    on another worker gets "Session not found". workers>1 on one socket is
+    structurally broken: REFUSED with the working recipe (multiple
+    one-worker instances on distinct ports behind an affinity LB), and
+    uvicorn is never started."""
+    import argparse
+
+    monkeypatch.setattr(
+        "cli.main.get_settings",
+        lambda: SimpleNamespace(
+            mcp_http_host="127.0.0.1", mcp_http_port=8300, mcp_public_host=None
+        ),
+    )
+    ran: list[Any] = []
+    monkeypatch.setattr(
+        "uvicorn.run",
+        lambda *a, **k: ran.append(a),
+    )
+    assert _serve_mcp(argparse.Namespace(host=None, port=None, workers=2)) == 1
+    assert ran == []  # uvicorn never started
+    err = capsys.readouterr().err
+    assert "REFUSED" in err and "distinct ports" in err
+
+
 @pytest.mark.parametrize(
     ("host", "port", "warns"),
     [

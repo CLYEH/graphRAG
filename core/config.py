@@ -100,6 +100,14 @@ class Settings(BaseSettings):
     # long a stale policy snapshot can survive.
     mcp_session_idle_timeout_s: int = Field(default=1800, gt=0)
 
+    # MCP17 (Codex #137 r1): the idle timeout alone does NOT bound a CHATTY
+    # session's policy snapshot — every request resets the idle deadline, so
+    # a frequently-used session could keep disabled sql/debug access or
+    # obsolete limits forever after a policy change. This is the ABSOLUTE
+    # ceiling: past it the gateway answers 404 and the client re-initializes
+    # (a fresh session = a fresh DR-012 policy snapshot).
+    mcp_session_max_age_s: int = Field(default=7200, gt=0)
+
     # The host an EXTERNAL agent should dial, when that differs from the bind
     # interface above. A bind is an interface, not an address: `0.0.0.0` / `::`
     # mean "every interface" and are meaningless to a client — advertising them

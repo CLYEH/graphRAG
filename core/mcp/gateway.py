@@ -31,6 +31,7 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import time
 from typing import Any
 from urllib.parse import unquote
 
@@ -86,6 +87,14 @@ class McpGateway:
         # alive until full shutdown, accumulating orphans across
         # delete/recreate cycles. Shutdown sets every remaining event.
         self._child_stops: dict[str, anyio.Event] = {}
+        # MCP17 (Codex #137 r1): ABSOLUTE session age. The SDK's idle timeout
+        # resets on every request, so a chatty session's DR-012 policy
+        # snapshot would never expire — this gateway-side ledger records when
+        # a session id was FIRST seen (>= its true start, so the bound errs
+        # tight) and answers 404 past the ceiling; the client re-initializes
+        # and the fresh lifespan reads the CURRENT policy.
+        self._session_first_seen: dict[bytes, float] = {}
+        self._session_max_age_s = 7200.0
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
@@ -138,7 +147,21 @@ class McpGateway:
         # not a config edit), and during a registry outage they pass through
         # to their own IN-PROTOCOL typed degradation.
         headers = scope.get("headers") or []
-        initializing = not any(k.lower() == b"mcp-session-id" for k, _ in headers)
+        session_id = next((v for k, v in headers if k.lower() == b"mcp-session-id"), None)
+        initializing = session_id is None
+        if session_id is not None:
+            expired = self._touch_session_age(session_id)
+            if expired:
+                await self._send_json(
+                    send,
+                    404,
+                    {
+                        "error": "session exceeded the maximum age "
+                        f"({int(self._session_max_age_s)}s) — re-initialize to get a "
+                        "fresh session (and the project's CURRENT policy)"
+                    },
+                )
+                return
         refusal = await self._preflight(project, initializing=initializing)
         if refusal is not None:
             status, payload = refusal
@@ -197,6 +220,30 @@ class McpGateway:
             "root_path": scope.get("root_path", "") + f"/mcp/{project}",
         }
         await app(child_scope, receive, send)
+
+    def _touch_session_age(self, session_id: bytes) -> bool:
+        """Record/inspect a session id's age — True when past the absolute
+        ceiling (MCP17: the idle timeout resets per request, so ONLY an
+        absolute bound caps a chatty session's stale policy snapshot).
+        First-seen approximates session start from the gateway's view (>=
+        the true start — the bound errs tight, never loose). Expired and
+        stale entries are purged so the ledger cannot grow unboundedly."""
+        now = time.monotonic()
+        first = self._session_first_seen.setdefault(session_id, now)
+        if now - first > self._session_max_age_s:
+            # the entry is KEPT (gate-2 nit): popping would let a client
+            # that ignores the 404 restart the clock by re-sending the same
+            # id — kept, the expired id stays refused by construction; the
+            # opportunistic purge below bounds the ledger instead
+            return True
+        # opportunistic purge: drop entries already past the ceiling (their
+        # sessions are dead or will be refused on next touch anyway)
+        if len(self._session_first_seen) > 4096:
+            cutoff = now - self._session_max_age_s
+            self._session_first_seen = {
+                sid: t for sid, t in self._session_first_seen.items() if t > cutoff
+            }
+        return False
 
     async def _preflight(
         self, project: str, *, initializing: bool
@@ -263,6 +310,7 @@ class McpGateway:
         assert message["type"] == "lifespan.startup"
         try:
             settings = get_settings()
+            self._session_max_age_s = float(settings.mcp_session_max_age_s)
             self._engine = create_async_engine(
                 settings.postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
                 poolclass=NullPool,
