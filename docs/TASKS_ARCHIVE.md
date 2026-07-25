@@ -358,3 +358,7 @@ RunsTable 失敗建置列展開加「失敗診斷」:useBuildSteps/useStepItems 
 ## MCP10
 
 (a) gate-2 一輪 FAIL:sidecar context 未驗形——build_envelope 靜默丟未知 context key,最常見失誤(source_url 放錯層)無聲產出無出處 envelope,正是任務要修的沉默失效→context 收 closed core。(b) 遠端 5 輪全 P2 must-fix,同一 fence-parity class 連環:r1 attributes 未過 project metadata_schema(upload 有驗、sidecar 繞過)→BuildConfig 增 metadata_schema 沿 pinned config 穿線至 connector,None 摺疊空 schema fail-closed;r2 governance 兄弟洞(dict() 整包落庫)→鏡射 upload 模型 + 顯式 null parity;r3 resolve() keying 讓 symlink 的 sidecar 被 referent 搶走→改 lexical keying(同一 rglob 走訪,sidecar 命名目錄項非 inode);r4 JSONB 不可存值(NaN/1e999/NUL)→三 guard 上移 core 共用(escape_like 前例),uploads aliased import 零改呼叫點;r5 lone surrogate(gate-2 r4 已預告)→contains_nul 泛化 unstorable_string_reason,一處收口雙邊生效(連 upload 既存缺口)。(c) 教訓:fenced surface 的新入口要在開工時就把「同 class 的每個 namespace/每種不可存值」sibling-sweep 掃完,五輪其實是同一張 fence 檢查表。
+
+## MCP11
+
+(a) 任務寫於 MCP8 之前——開工重量測發現前半缺陷(LLM selector 丟棄顯式 graph 參數)已被 MCP8 決定性 fan-out 結構性修除(nmmst 實測顯式 invocation 執行、graph 未 skip),scope 收殮為半套參數缺陷,避免重複實作。(b) 半套 graph_*(缺 template+entity 完整對)原本靜默丟棄且 QP1 補自己的 plan 照跑;修法=_incomplete_graph_invocation_payload 於 binding 前 GUARDRAIL_BLOCKED 拒絕(nil build 前例 _invalid_chunk_payload;訊息點名已給/缺少/「did NOT run」+兩條補救路);graph_hops 預設 int=1→None 使單給可偵測,完整時摺回 1 行為不變;path 模板的 other_entity 要求仍由下游 _validate_params 把關(不重複)。(c) 一輪過:gate-2 PASS(16 種參數組合窮舉驗證無誤分類)、Codex 首輪 +1;refusal 封包在測試中過凍結 mcp_response.schema 驗證。
