@@ -173,7 +173,9 @@ Tool map:
 - get_entity / get_chunk / get_document exchange ids from citations for full
   content. list_entities / list_chunks / list_reports browse the corpus with
   cursors — use them to see everything; retrieval responses are capped.
-- list_schema shows the sql-queryable tables.
+- list_schema shows the sql-queryable tables AND this session's policy
+  ceilings (max_top_k, max_graph_hops, max_latency_ms, query/browse caps,
+  enabled modes) — check it before probing limits by trial and error.
 
 Reading responses:
 - Retrieval tools return one envelope: results[] (each with source_refs
@@ -1029,10 +1031,12 @@ def build_server(project: str) -> FastMCP:
 
     @server.tool()
     async def list_schema() -> dict[str, Any]:
-        """The queryable structured surface: each whitelisted sql table with
-        the columns it actually has in the ACTIVE build (empty when the sql
-        mode is disabled). Introspection shape (error/error_code) — there is
-        no retrieval result to cite."""
+        """The queryable structured surface (each whitelisted sql table
+        with its live columns) PLUS this session's policy ceilings —
+        max_top_k, max_graph_hops, max_latency_ms, query/browse caps, which
+        modes are enabled, expose_debug — so limits are discoverable up
+        front instead of by tripping them. Introspection shape
+        (error/error_code)."""
         return await _list_schema(_rt())
 
     @server.tool()
@@ -1105,6 +1109,28 @@ async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
                     "build_id": bound_build,
                     "sql_enabled": runtime.policy.text_to_sql.enabled,
                     "tables": tables,
+                    # MCP15: every ceiling an agent could previously learn
+                    # only by tripping it (or reverse-engineering warnings)
+                    # — and per-project policy divergence was INVISIBLE
+                    # (measured: a policy edit changed behavior with no
+                    # discoverable surface reflecting it). This block is the
+                    # session's ACTUAL policy, read at lifespan start.
+                    "policy": {
+                        "default_mode": runtime.policy.default_mode,
+                        "max_top_k": runtime.policy.max_top_k,
+                        "max_graph_hops": runtime.policy.max_graph_hops,
+                        # the RECONCILED sql cap (min of the top-level and mode-local
+                        # ceilings) — disclosing raw max_sql_rows would overstate
+                        # when a project lowers text_to_sql.max_rows (gate-2 nit)
+                        "max_sql_rows": runtime.policy.sql_rows(),
+                        "max_latency_ms": runtime.policy.max_latency_ms,
+                        "expose_debug": runtime.policy.expose_debug,
+                        "sql_enabled": runtime.policy.text_to_sql.enabled,
+                        "cypher_enabled": runtime.policy.text_to_cypher.enabled,
+                        "query_chars_cap": _QUERY_CHARS_CAP,
+                        "browse_limit_cap": BROWSE_LIMIT_CAP,
+                        "browse_q_cap": BROWSE_Q_CAP,
+                    },
                     "error": None,
                     "error_code": None,
                 }

@@ -632,6 +632,59 @@ async def test_introspection_errors_carry_typed_codes() -> None:
     assert missing["error_code"] == "NOT_FOUND"
 
 
+async def test_list_schema_discloses_the_session_policy_ceilings() -> None:
+    """MCP15: of the ten operative limits only the SQL whitelist was
+    discoverable up front — max_top_k/max_graph_hops/max_latency_ms/
+    expose_debug/enabled modes/query caps could be learned only by tripping
+    them, and PER-PROJECT policy divergence was invisible (measured: an
+    operator's max_top_k=3 edit changed behavior with no discoverable
+    surface reflecting it). list_schema now discloses the session's ACTUAL
+    policy — the divergent values below are deliberately non-default."""
+    import uuid
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from core.mcp.server import _list_schema, _Runtime
+
+    build_id = uuid.uuid4()
+    deps = SimpleNamespace(repo=SimpleNamespace(project="museum", build_id=build_id))
+
+    class _Ctx:
+        project = "museum"
+
+        @asynccontextmanager
+        async def bound(self):  # type: ignore[no-untyped-def]
+            yield deps
+
+    policy = SimpleNamespace(
+        default_mode="semantic",
+        max_top_k=3,  # the measured divergent edit
+        max_graph_hops=2,
+        max_sql_rows=50,
+        max_latency_ms=9000,
+        expose_debug=True,
+        text_to_sql=SimpleNamespace(enabled=False),
+        sql_rows=lambda: 40,  # the RECONCILED cap (min of top-level and mode-local)
+        text_to_cypher=SimpleNamespace(enabled=False),
+    )
+    runtime = _Runtime(context=_Ctx(), policy=policy)  # type: ignore[arg-type]
+    payload = await _list_schema(runtime)
+    assert payload["error"] is None and payload["error_code"] is None
+    assert payload["policy"] == {
+        "default_mode": "semantic",
+        "max_top_k": 3,
+        "max_graph_hops": 2,
+        "max_sql_rows": 40,  # sql_rows(): the enforced, reconciled value
+        "max_latency_ms": 9000,
+        "expose_debug": True,
+        "sql_enabled": False,
+        "cypher_enabled": False,
+        "query_chars_cap": 4000,
+        "browse_limit_cap": 200,
+        "browse_q_cap": 64,
+    }
+
+
 def test_the_introspection_no_active_build_shape_is_explicit() -> None:
     """MCP12: the introspection tools' DR-001 refusal is the same explicit
     error-field shape as their timeout/store degradations — previously the
