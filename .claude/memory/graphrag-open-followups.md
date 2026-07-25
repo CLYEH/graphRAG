@@ -115,3 +115,4 @@ GitHub 為準;立案或了結後從本檔劃掉):
   諮詢),純命名/註解過期。順手時機:下一個動 hybrid 整合測試的任務改名為 `_FakeLLM`
   並修 docstring。
 - **inspect.py 讀面 metadata filter 仍 NUL-only(2026-07-25, MCP10 #130 gate-2 nit)**:寫面 guard 已泛化為 unstorable_string_reason 含 surrogate,讀面未跟。gate-2 判 adequate:lone surrogate 幾乎不可能經 URL query decode 存活(不像 %00),讀面非寫入邊界。純 cross-reference parity 的一行 tightening,下次動 inspect.py filter 時順手收。
+- **MCP session 透明 policy 刷新 transport(2026-07-25, MCP17 #137 r5)**:gateway 的 max-age 逾齡以 404 終止 session,與 SDK idle reaper 同契約——pinned MCP Python client 收 404 不自動重連(保留舊 id、後續全 404),故長跑 agent 的 policy 撤銷需客戶端主動開新 transport。真正透明的「session 到齡自動重連並帶新 policy」需自訂 transport 或 SDK 支援,屬產品層決策(§23 auth round 一併考量)。現況:idle+max-age 皆終止式,DESIGN §9 已誠實記載。

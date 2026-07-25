@@ -164,9 +164,12 @@ class McpGateway:
                     send,
                     404,
                     {
-                        "error": "session exceeded the maximum age "
-                        f"({int(self._session_max_age_s)}s) — re-initialize to get a "
-                        "fresh session (and the project's CURRENT policy)"
+                        "error": "session TERMINATED — it exceeded the maximum age "
+                        f"({int(self._session_max_age_s)}s). Open a NEW transport and "
+                        "re-initialize to continue with the project's CURRENT policy "
+                        "(the same 404-then-reconnect contract as the SDK's idle "
+                        "reaper — a client that keeps the old session id on a fresh "
+                        "transport stays terminated)."
                     },
                 )
                 return
@@ -243,13 +246,33 @@ class McpGateway:
             return
         await app(child_scope, receive, send)
 
+    def _compact_sessions(self, now: float) -> None:
+        """Forget ids whose sessions the SDK has CERTAINLY reaped
+        (idle_timeout + margin since their LAST activity) once the ledger is
+        large. A live session keeps refreshing its last-seen — even while
+        being refused past the ceiling — so its tombstone survives and the
+        age bound holds by construction; only genuinely-dead ids are
+        dropped, and a request under a dropped (reaped) id then takes the
+        unknown-id pass-through to the child's own 404. Runs from BOTH
+        insertion and touch (Codex #137 r5 P1: one-shot init clients never
+        touch, so insert-time compaction is what bounds a gateway that only
+        ever sees initializations)."""
+        if len(self._session_seen) <= 4096:
+            return
+        horizon = now - (self._session_idle_timeout_s + 60.0)
+        self._session_seen = {
+            sid: (f, s) for sid, (f, s) in self._session_seen.items() if s > horizon
+        }
+
     def _record_session_start(self, session_id: bytes) -> None:
         """Stamp a session's creation (Codex #137 r2 P2): the id is captured
         from the INITIALIZE response, so the absolute clock starts at
         creation — not at the first follow-up request, which a client could
-        delay to stretch the documented ceiling."""
+        delay to stretch the documented ceiling. Compacts on insert so a
+        gateway that only ever sees initializations stays bounded (r5 P1)."""
         now = time.monotonic()
         self._session_seen.setdefault(session_id, (now, now))
+        self._compact_sessions(now)
 
     def _touch_session_age(self, session_id: bytes) -> bool:
         """Inspect a KNOWN session id's age — True when past the absolute
@@ -262,9 +285,7 @@ class McpGateway:
         unauthenticated flood of unique ids grow the ledger without bound;
         an unknown id now passes through untracked to the SDK, which
         answers its own 404). A known entry is KEPT on expiry (an ignored
-        404 must not restart the clock), and compaction forgets an id only
-        after idle_timeout+margin since its LAST activity — once the SDK
-        has necessarily reaped it, so no live session slips its clock."""
+        404 must not restart the clock)."""
         now = time.monotonic()
         seen = self._session_seen.get(session_id)
         if seen is None:
@@ -273,17 +294,7 @@ class McpGateway:
             return False
         first, _last = seen
         self._session_seen[session_id] = (first, now)
-        if len(self._session_seen) > 4096:
-            # compaction runs BEFORE the expiry return (a refused-chatty
-            # touch must still compact): forget only ids whose sessions the
-            # SDK has certainly reaped (idle_timeout + margin since last
-            # touch) — a live session keeps touching its entry, even while
-            # being refused, so its tombstone survives and the ceiling
-            # holds by construction
-            horizon = now - (self._session_idle_timeout_s + 60.0)
-            self._session_seen = {
-                sid: (f, s) for sid, (f, s) in self._session_seen.items() if s > horizon
-            }
+        self._compact_sessions(now)  # before the expiry return: a refused touch must still compact
         return now - first > self._session_max_age_s
 
     async def _preflight(

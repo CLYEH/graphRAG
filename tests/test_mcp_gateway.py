@@ -555,7 +555,7 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         first, last = app._session_seen[b"chatty-1"]  # noqa: SLF001
         app._session_seen[b"chatty-1"] = (first - app._session_max_age_s - 1, last)  # noqa: SLF001
         status, body = await _request(app, "/mcp/nmmst", headers=sid)
-        assert status == 404 and b"re-initialize" in body
+        assert status == 404 and b"TERMINATED" in body  # honest wording (r5): not "refresh"
         status, _ = await _request(app, "/mcp/nmmst", headers=sid)
         assert status == 404  # same id re-sent: refused by construction
 
@@ -579,6 +579,17 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         status, _ = await _request(app, "/mcp/nmmst")  # initializing (no header)
         assert status == 200
         assert b"minted-nmmst" in app._session_seen  # noqa: SLF001
+
+        # Codex #137 r5 P1: a gateway that ONLY ever sees initializations
+        # (one-shot clients that never follow up) must still stay bounded —
+        # _record_session_start compacts on insert. Flood with reaped
+        # (idle-past-horizon) entries, then one more initialize must trim.
+        stale = _t.monotonic() - app._session_idle_timeout_s - 120  # noqa: SLF001
+        for i in range(4100):
+            app._session_seen[f"reaped-{i}".encode()] = (stale, stale)  # noqa: SLF001
+        app._record_session_start(b"fresh-init")  # noqa: SLF001 — insert compacts
+        assert len(app._session_seen) < 100  # the dead flood was forgotten  # noqa: SLF001
+        assert b"fresh-init" in app._session_seen  # ...the fresh one survives  # noqa: SLF001
 
         finish.set()
 
