@@ -114,8 +114,25 @@ _REPO_URL = "https://github.com/CLYEH/graphRAG"
 
 #: the frozen §16 response contract — advertised as the retrieval tools'
 #: outputSchema (MCP14: it existed for every response yet tools/list showed
-#: only additionalProperties:true).
-_MCP_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "contracts" / "mcp_response.schema.json"
+#: only additionalProperties:true). Two candidate locations, the
+#: query-policy loader's rule (Codex #134 r1): a source checkout keeps
+#: contracts/ at the repo root; an installed wheel ships a build-time copy
+#: inside the core package (pyproject force-include).
+_MCP_SCHEMA_CANDIDATES = (
+    Path(__file__).resolve().parents[2] / "contracts" / "mcp_response.schema.json",
+    Path(__file__).resolve().parents[1] / "contracts" / "mcp_response.schema.json",
+)
+
+
+def _mcp_response_schema() -> dict[str, Any]:
+    for candidate in _MCP_SCHEMA_CANDIDATES:
+        if candidate.is_file():
+            return cast(dict[str, Any], json.loads(candidate.read_text("utf-8")))
+    raise FileNotFoundError(
+        "mcp_response.schema.json not found — looked in: "
+        + ", ".join(str(c) for c in _MCP_SCHEMA_CANDIDATES)
+    )
+
 
 #: what an external agent needs to know BEFORE the first call — it cannot
 #: read docs/DESIGN.md, so the instructions carry the operating rules in
@@ -174,7 +191,7 @@ def _finalize_server_metadata(server: FastMCP) -> None:
         mcp_types.ListResourceTemplatesRequest,
     ):
         server._mcp_server.request_handlers.pop(request, None)  # noqa: SLF001
-    frozen = json.loads(_MCP_SCHEMA_PATH.read_text("utf-8"))
+    frozen = _mcp_response_schema()
     for name in (
         "semantic_search",
         "graph_query",
@@ -543,7 +560,7 @@ def build_server(project: str) -> FastMCP:
                     'Restrict results: "chunk" = text passages only, "entity" = name matches only; '
                     "omitted = both."
                 ),
-                json_schema_extra={"enum": ["chunk", "entity"]},
+                json_schema_extra={"enum": ["chunk", "entity", None]},
             ),
         ] = None,
     ) -> dict[str, Any]:
@@ -709,7 +726,7 @@ def build_server(project: str) -> FastMCP:
                     "— must be supplied TOGETHER with "
                     "graph_entity."
                 ),
-                json_schema_extra={"enum": ["neighbors", "path", "subgraph"]},
+                json_schema_extra={"enum": ["neighbors", "path", "subgraph", None]},
             ),
         ] = None,
         graph_entity: Annotated[

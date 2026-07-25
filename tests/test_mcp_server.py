@@ -80,11 +80,19 @@ async def test_tool_surface_metadata_is_complete() -> None:
 
     by_name = {tool.name: tool for tool in tools}
     closed = ["neighbors", "path", "subgraph"]
+    # required param: the closed set alone; NULLABLE params include null in
+    # the enum — pydantic emits anyOf[string,null] AND the enum applies to
+    # both branches, so an explicit null must not fail the advertised schema
+    # (Codex #134 r1)
     assert by_name["graph_query"].inputSchema["properties"]["template"]["enum"] == closed
-    assert by_name["hybrid_query"].inputSchema["properties"]["graph_template"]["enum"] == closed
+    assert by_name["hybrid_query"].inputSchema["properties"]["graph_template"]["enum"] == [
+        *closed,
+        None,
+    ]
     assert by_name["semantic_search"].inputSchema["properties"]["point_type"]["enum"] == [
         "chunk",
         "entity",
+        None,
     ]
 
     # the six envelope-returning tools advertise the FROZEN contract
