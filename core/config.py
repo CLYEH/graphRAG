@@ -149,11 +149,15 @@ class Settings(BaseSettings):
     # its embedder in a bounded LRU (query_embedding_model): a repeated question
     # — a museum guide sees the same few (ticket price, hours, directions) — is
     # served from cache and skips the API call. This is the LRU size PER query-
-    # embedder instance (one per project server / API app — so a multi-project
-    # gateway's aggregate ceiling is N×this); 0 disables it. Ingestion embedders
-    # are NOT cached — each chunk/entity text is distinct, so caching them only
-    # burns memory.
-    embedding_cache_size: int = Field(default=512, ge=0)
+    # embedder instance (one per project server / API app). It is NOT a
+    # gateway-wide budget: McpGateway keeps every mounted project's server (and
+    # its cache) until the project is deleted, so a gateway serving N warmed
+    # projects holds N caches — and each `text-embedding-3-large` vector is
+    # ~100KB (3,072 Python floats), so the aggregate is ~N × size × 100KB.
+    # Default 128 keeps that ~12.5MB per warmed project; a MANY-project host
+    # should tune it DOWN (or 0 to disable). Ingestion embedders are NOT cached
+    # — each chunk/entity text is distinct, so caching them only burns memory.
+    embedding_cache_size: int = Field(default=128, ge=0)
     # .env keeps the conventional unprefixed name (see .env.example); the
     # GRAPHRAG_-prefixed alias also works. Read here so no other module ever
     # touches os.environ for it (CLAUDE.md guardrail).
