@@ -93,8 +93,16 @@ class McpGateway:
         # a session id was FIRST seen (>= its true start, so the bound errs
         # tight) and answers 404 past the ceiling; the client re-initializes
         # and the fresh lifespan reads the CURRENT policy.
-        self._session_first_seen: dict[bytes, float] = {}
+        # sid -> (first_seen, last_seen). first_seen drives the ceiling;
+        # last_seen drives SAFE compaction (Codex #137 r2 P1: an entry may
+        # be forgotten only once the SDK has necessarily reaped the session
+        # - idle_timeout past its last activity - because a forgotten id
+        # that the child still serves would restart its clock and resume
+        # the stale snapshot; a forgotten DEAD id is harmless, the child
+        # answers "session not found" itself).
+        self._session_seen: dict[bytes, tuple[float, float]] = {}
         self._session_max_age_s = 7200.0
+        self._session_idle_timeout_s = 1800.0
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
@@ -219,31 +227,54 @@ class McpGateway:
             "path": rest,
             "root_path": scope.get("root_path", "") + f"/mcp/{project}",
         }
+        if initializing:
+            # Codex #137 r2 P2: the absolute clock starts at CREATION — the
+            # id is minted in the initialize RESPONSE headers, so intercept
+            # them (a clock started at first follow-up could be delayed
+            # almost a full idle_timeout, stretching the ceiling)
+            async def send_capturing(message: dict[str, Any]) -> None:
+                if message.get("type") == "http.response.start":
+                    for key, value in message.get("headers", []):
+                        if key.lower() == b"mcp-session-id":
+                            self._record_session_start(bytes(value))
+                await send(message)
+
+            await app(child_scope, receive, send_capturing)
+            return
         await app(child_scope, receive, send)
+
+    def _record_session_start(self, session_id: bytes) -> None:
+        """Stamp a session's creation (Codex #137 r2 P2): the id is captured
+        from the INITIALIZE response, so the absolute clock starts at
+        creation — not at the first follow-up request, which a client could
+        delay to stretch the documented ceiling."""
+        now = time.monotonic()
+        self._session_seen.setdefault(session_id, (now, now))
 
     def _touch_session_age(self, session_id: bytes) -> bool:
         """Record/inspect a session id's age — True when past the absolute
         ceiling (MCP17: the idle timeout resets per request, so ONLY an
         absolute bound caps a chatty session's stale policy snapshot).
-        First-seen approximates session start from the gateway's view (>=
-        the true start — the bound errs tight, never loose). Expired and
-        stale entries are purged so the ledger cannot grow unboundedly."""
+        Entries are KEPT on expiry (an ignored 404 must not restart the
+        clock), and compaction forgets an id only after idle_timeout has
+        passed since its LAST activity — i.e. only once the SDK itself has
+        necessarily reaped the session, so no live session can ever slip
+        its clock (Codex #137 r2 P1)."""
         now = time.monotonic()
-        first = self._session_first_seen.setdefault(session_id, now)
-        if now - first > self._session_max_age_s:
-            # the entry is KEPT (gate-2 nit): popping would let a client
-            # that ignores the 404 restart the clock by re-sending the same
-            # id — kept, the expired id stays refused by construction; the
-            # opportunistic purge below bounds the ledger instead
-            return True
-        # opportunistic purge: drop entries already past the ceiling (their
-        # sessions are dead or will be refused on next touch anyway)
-        if len(self._session_first_seen) > 4096:
-            cutoff = now - self._session_max_age_s
-            self._session_first_seen = {
-                sid: t for sid, t in self._session_first_seen.items() if t > cutoff
+        first, _last = self._session_seen.get(session_id, (now, now))
+        self._session_seen[session_id] = (first, now)
+        if len(self._session_seen) > 4096:
+            # compaction runs BEFORE the expiry return (a refused-chatty
+            # touch must still compact): forget only ids whose sessions the
+            # SDK has certainly reaped (idle_timeout + margin since last
+            # touch) — a live session keeps touching its entry, even while
+            # being refused, so its tombstone survives and the ceiling
+            # holds by construction
+            horizon = now - (self._session_idle_timeout_s + 60.0)
+            self._session_seen = {
+                sid: (f, seen) for sid, (f, seen) in self._session_seen.items() if seen > horizon
             }
-        return False
+        return now - first > self._session_max_age_s
 
     async def _preflight(
         self, project: str, *, initializing: bool
@@ -311,6 +342,7 @@ class McpGateway:
         try:
             settings = get_settings()
             self._session_max_age_s = float(settings.mcp_session_max_age_s)
+            self._session_idle_timeout_s = float(settings.mcp_session_idle_timeout_s)
             self._engine = create_async_engine(
                 settings.postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
                 poolclass=NullPool,

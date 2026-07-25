@@ -76,7 +76,15 @@ class _ChildApp:
     def streamable_http_app(self) -> Any:
         async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
             self.scopes.append(scope)
-            await send({"type": "http.response.start", "status": 200, "headers": []})
+            # like the SDK: an initialize response MINTS the session id in
+            # its headers (the gateway intercepts it to stamp creation)
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"mcp-session-id", f"minted-{self.project}".encode())],
+                }
+            )
             await send({"type": "http.response.body", "body": b"ok:" + self.project.encode()})
 
         app.router = self.router  # type: ignore[attr-defined]
@@ -522,15 +530,33 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         # is KEPT, so a client that ignores the 404 and re-sends the SAME
         # id stays refused (popping would restart its clock, making the
         # ceiling depend on client compliance — gate-2)
-        app._session_first_seen[b"chatty-1"] -= app._session_max_age_s + 1  # noqa: SLF001
+        first, last = app._session_seen[b"chatty-1"]  # noqa: SLF001
+        app._session_seen[b"chatty-1"] = (first - app._session_max_age_s - 1, last)  # noqa: SLF001
         status, body = await _request(app, "/mcp/nmmst", headers=sid)
         assert status == 404 and b"re-initialize" in body
         status, _ = await _request(app, "/mcp/nmmst", headers=sid)
         assert status == 404  # same id re-sent: refused by construction
 
-        # a NEW session (no header) is untouched by the ceiling
-        status, _ = await _request(app, "/mcp/nmmst")
+        # Codex #137 r2 P1: compaction must NOT forget a refused-but-active
+        # id. Flood the ledger past the compaction threshold with entries
+        # whose sessions the SDK has certainly reaped (last touch beyond
+        # idle_timeout+margin) — the chatty tombstone, still being touched,
+        # survives and stays refused; the dead entries are forgotten.
+        import time as _t
+
+        stale = _t.monotonic() - app._session_idle_timeout_s - 120  # noqa: SLF001
+        for i in range(4100):
+            app._session_seen[f"dead-{i}".encode()] = (stale, stale)  # noqa: SLF001
+        status, _ = await _request(app, "/mcp/nmmst", headers=sid)  # triggers compaction
+        assert status == 404  # STILL refused — the tombstone survived
+        assert b"chatty-1" in app._session_seen  # noqa: SLF001
+        assert len(app._session_seen) < 100  # the dead flood was forgotten  # noqa: SLF001
+
+        # Codex #137 r2 P2: the clock starts at CREATION — the id minted in
+        # the initialize RESPONSE is stamped immediately, not on first use
+        status, _ = await _request(app, "/mcp/nmmst")  # initializing (no header)
         assert status == 200
+        assert b"minted-nmmst" in app._session_seen  # noqa: SLF001
 
         finish.set()
 
