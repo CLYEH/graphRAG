@@ -1077,6 +1077,30 @@ def build_server(project: str) -> FastMCP:
     return server
 
 
+def _policy_disclosure(runtime: _Runtime) -> dict[str, Any]:
+    """The session's ACTUAL policy, disclosed (MCP15). Built from the
+    lifespan-loaded object alone — NO store is touched, so every list_schema
+    branch (including no-active-build / timeout / store-error, exactly the
+    degraded states where an agent most needs to inspect its session before
+    retrying — Codex #135 r1) can carry it."""
+    return {
+        "default_mode": runtime.policy.default_mode,
+        "max_top_k": runtime.policy.max_top_k,
+        "max_graph_hops": runtime.policy.max_graph_hops,
+        # the RECONCILED sql cap (min of the top-level and mode-local
+        # ceilings) — disclosing raw max_sql_rows would overstate when a
+        # project lowers text_to_sql.max_rows (gate-2 nit)
+        "max_sql_rows": runtime.policy.sql_rows(),
+        "max_latency_ms": runtime.policy.max_latency_ms,
+        "expose_debug": runtime.policy.expose_debug,
+        "sql_enabled": runtime.policy.text_to_sql.enabled,
+        "cypher_enabled": runtime.policy.text_to_cypher.enabled,
+        "query_chars_cap": _QUERY_CHARS_CAP,
+        "browse_limit_cap": BROWSE_LIMIT_CAP,
+        "browse_q_cap": BROWSE_Q_CAP,
+    }
+
+
 async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
     """§9 ``list_schema``: the whitelisted sql tables with their live columns
     (introspection shape). The wall clock covers binding + discovery; the
@@ -1115,37 +1139,39 @@ async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
                     # (measured: a policy edit changed behavior with no
                     # discoverable surface reflecting it). This block is the
                     # session's ACTUAL policy, read at lifespan start.
-                    "policy": {
-                        "default_mode": runtime.policy.default_mode,
-                        "max_top_k": runtime.policy.max_top_k,
-                        "max_graph_hops": runtime.policy.max_graph_hops,
-                        # the RECONCILED sql cap (min of the top-level and mode-local
-                        # ceilings) — disclosing raw max_sql_rows would overstate
-                        # when a project lowers text_to_sql.max_rows (gate-2 nit)
-                        "max_sql_rows": runtime.policy.sql_rows(),
-                        "max_latency_ms": runtime.policy.max_latency_ms,
-                        "expose_debug": runtime.policy.expose_debug,
-                        "sql_enabled": runtime.policy.text_to_sql.enabled,
-                        "cypher_enabled": runtime.policy.text_to_cypher.enabled,
-                        "query_chars_cap": _QUERY_CHARS_CAP,
-                        "browse_limit_cap": BROWSE_LIMIT_CAP,
-                        "browse_q_cap": BROWSE_Q_CAP,
-                    },
+                    "policy": _policy_disclosure(runtime),
                     "error": None,
                     "error_code": None,
                 }
     except NoActiveBuildError:
-        return _introspection_no_active_build(runtime, "list_schema")
+        # the policy rides EVERY branch (it needs no store): the degraded
+        # states are exactly when an agent inspects its session (Codex #135)
+        return {
+            **_introspection_no_active_build(runtime, "list_schema"),
+            "policy": _policy_disclosure(runtime),
+        }
     except TimeoutError:
-        return _introspection_timeout(runtime, bound_build, "list_schema")
+        return {
+            **_introspection_timeout(runtime, bound_build, "list_schema"),
+            "policy": _policy_disclosure(runtime),
+        }
     except DBAPIError as exc:
         if _is_statement_timeout(exc):
-            return _introspection_timeout(runtime, bound_build, "list_schema")
-        return _introspection_store_error(runtime, bound_build, "list_schema", exc)
+            return {
+                **_introspection_timeout(runtime, bound_build, "list_schema"),
+                "policy": _policy_disclosure(runtime),
+            }
+        return {
+            **_introspection_store_error(runtime, bound_build, "list_schema", exc),
+            "policy": _policy_disclosure(runtime),
+        }
     except _STORE_ERRORS as exc:
         # binding touches the other stores' clients too (qdrant/neo4j) — the
         # same §22 line as _bounded
-        return _introspection_store_error(runtime, bound_build, "list_schema", exc)
+        return {
+            **_introspection_store_error(runtime, bound_build, "list_schema", exc),
+            "policy": _policy_disclosure(runtime),
+        }
 
 
 async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:

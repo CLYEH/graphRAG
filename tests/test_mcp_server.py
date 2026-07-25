@@ -670,6 +670,24 @@ async def test_list_schema_discloses_the_session_policy_ceilings() -> None:
     runtime = _Runtime(context=_Ctx(), policy=policy)  # type: ignore[arg-type]
     payload = await _list_schema(runtime)
     assert payload["error"] is None and payload["error_code"] is None
+
+    # Codex #135 r1: the policy needs NO store, so it rides the DEGRADED
+    # branches too — no-active-build/timeout/store-error are exactly the
+    # states where an agent inspects its session before retrying
+    from core.stores.repo import NoActiveBuildError
+
+    class _NoBuildCtx:
+        project = "museum"
+
+        @asynccontextmanager
+        async def bound(self):  # type: ignore[no-untyped-def]
+            raise NoActiveBuildError("museum")
+            yield deps
+
+    degraded = await _list_schema(_Runtime(context=_NoBuildCtx(), policy=policy))  # type: ignore[arg-type]
+    assert degraded["error_code"] == "NO_ACTIVE_BUILD"
+    assert degraded["policy"] == payload["policy"]  # same disclosure, store or no store
+
     assert payload["policy"] == {
         "default_mode": "semantic",
         "max_top_k": 3,
@@ -774,17 +792,28 @@ async def test_list_schema_maps_db_deadline_and_failures_typed() -> None:
             max_latency_ms=1000,
             text_to_sql=SimpleNamespace(enabled=True, allowed_tables=("orders",)),
             sql_policy=lambda: SimpleNamespace(timeout_ms=500),
+            # MCP15: the disclosure block rides every branch, so the fake
+            # carries the disclosed fields too
+            default_mode="hybrid",
+            max_top_k=20,
+            max_graph_hops=3,
+            max_sql_rows=50,
+            expose_debug=False,
+            text_to_cypher=SimpleNamespace(enabled=False),
+            sql_rows=lambda: 50,
         )
         return _Runtime(context=_Ctx(), policy=policy)  # type: ignore[arg-type]
 
     timed_out = await _list_schema(_runtime(DBAPIError("q", None, _PgTimeout())))
     assert "deadline" in timed_out["error"]  # 57014 IS the §21 deadline
+    assert timed_out["policy"]["max_top_k"] == 20  # MCP15: disclosure rides this branch too
 
     failed = await _list_schema(_runtime(DBAPIError("q", None, _PgOther())))
     # MCP2: the store is NAMED — "store unavailable" left the agent unable to
     # tell "route around Qdrant" from "everything is dead" (postgres down)
     assert failed["error"] == "postgres unavailable (DBAPIError) — §22"
     assert failed["build_id"] == "b-1"
+    assert failed["policy"]["max_top_k"] == 20  # MCP15: ...and this one
 
     with pytest.raises(ValueError, match="in-code bug"):
         await _list_schema(_runtime(ValueError("in-code bug")))
