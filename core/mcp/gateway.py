@@ -407,7 +407,14 @@ class McpGateway:
                 json_response=server.settings.json_response,
                 stateless=server.settings.stateless_http,
                 security_settings=server.settings.transport_security,
-                session_idle_timeout=float(get_settings().mcp_session_idle_timeout_s),
+                # the SAME lifetime the compaction horizon uses (Codex #137
+                # r4): reading get_settings() fresh here would let a runtime
+                # env change give a later-mounted manager a LONGER reap
+                # timeout than _session_idle_timeout_s (captured at lifespan
+                # start), so compaction could forget an id the SDK still
+                # holds live — its next request then takes the unknown-id
+                # pass-through and permanently escapes the age ceiling
+                session_idle_timeout=self._session_idle_timeout_s,
             )
             app = server.streamable_http_app()
             assert self._tasks is not None, "gateway lifespan not started"

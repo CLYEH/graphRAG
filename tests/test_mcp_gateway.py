@@ -214,6 +214,13 @@ async def test_routing_registry_and_isolation(harness: _Harness) -> None:
         status, body = await _request(app, "/health")
         assert status == 200 and b'"mounted_projects": []' in body
 
+        # Codex #137 r4: the pre-seeded manager's reap timeout MUST equal the
+        # gateway's captured _session_idle_timeout_s (the same value the
+        # compaction horizon uses) — reading get_settings() fresh at mount
+        # would let a runtime env change split reaping from compaction. Set
+        # a DISTINCT captured value before the mount to discriminate.
+        app._session_idle_timeout_s = 999.0  # noqa: SLF001
+
         # known project → routed; child sees root-relative path + prefix root_path
         status, body = await _request(app, "/mcp/nmmst")
         assert status == 200 and body == b"ok:nmmst"
@@ -224,7 +231,8 @@ async def test_routing_registry_and_isolation(harness: _Harness) -> None:
         # until client DELETE or gateway restart — a stale DR-012 policy
         # snapshot could survive forever)
         assert child._session_manager is not None  # noqa: SLF001
-        assert child._session_manager.session_idle_timeout == 1800.0  # noqa: SLF001
+        # ...and it is the GATEWAY's captured value, not a fresh settings read
+        assert child._session_manager.session_idle_timeout == 999.0  # noqa: SLF001
         status, body = await _request(app, "/health")
         assert status == 200 and b"nmmst" in body  # mounts enumerated
         assert child.scopes[0]["path"] == "/"
