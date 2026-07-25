@@ -87,6 +87,13 @@ class McpGateway:
         # alive until full shutdown, accumulating orphans across
         # delete/recreate cycles. Shutdown sets every remaining event.
         self._child_stops: dict[str, anyio.Event] = {}
+        # the pre-seeded SDK session manager per project (Codex #137 r12):
+        # an explicit-DELETE termination does NOT remove the transport from
+        # the manager's own _server_instances/_session_owners maps (only the
+        # idle path pops them), so after a confirmed max-age teardown the
+        # gateway must evict the id from the manager registry too — else one
+        # SDK entry leaks per rollover until project eviction / shutdown
+        self._session_managers: dict[str, Any] = {}
         # MCP17 (Codex #137 r1): ABSOLUTE session age. The SDK's idle timeout
         # resets on every request, so a chatty session's DR-012 policy
         # snapshot would never expire — this gateway-side ledger records when
@@ -190,6 +197,7 @@ class McpGateway:
                 # orphaned session manager alive until full shutdown)
                 async with self._lock:
                     self._apps.pop(project, None)
+                    self._session_managers.pop(project, None)
                     child_stop = self._child_stops.pop(project, None)
                 if child_stop is not None:
                     child_stop.set()
@@ -250,6 +258,7 @@ class McpGateway:
             terminated = await self._terminate_child_session(app, project, headers, session_id)
             if terminated:
                 self._session_seen.pop(session_id, None)
+                self._evict_from_manager(project, session_id)
             await self._send_json(
                 send,
                 404,
@@ -347,6 +356,23 @@ class McpGateway:
         with contextlib.suppress(Exception):
             await app(delete_scope, _receive, _capture)
         return (200 <= status < 300) or status == 404
+
+    def _evict_from_manager(self, project: str, session_id: bytes) -> None:
+        """Remove a confirmed-terminated id from the SDK manager's own
+        registries (Codex #137 r12): the pinned SDK does NOT pop an
+        explicitly-DELETEd transport from ``_server_instances`` /
+        ``_session_owners`` (only the idle path does), so without this each
+        max-age rollover leaks one SDK entry until project eviction. Keyed
+        by the session-id STRING (the SDK's key type). Defensive: unknown
+        attributes / a renamed SDK field are no-ops, never a crash — a
+        tripwire test pins the current attribute names so an SDK upgrade
+        surfaces red rather than silently leaking again."""
+        manager = self._session_managers.get(project)
+        sid = session_id.decode("utf-8", "replace")
+        for attr in ("_server_instances", "_session_owners"):
+            registry = getattr(manager, attr, None)
+            if isinstance(registry, dict):
+                registry.pop(sid, None)
 
     def _compact_sessions(self, now: float) -> None:
         """Forget ids whose sessions the SDK has CERTAINLY reaped
@@ -570,6 +596,7 @@ class McpGateway:
             await self._tasks.start(host)
             self._apps[project] = app
             self._child_stops[project] = child_stop
+            self._session_managers[project] = server._session_manager  # noqa: SLF001
             return app
 
     async def _project_exists(self, project: str) -> bool:

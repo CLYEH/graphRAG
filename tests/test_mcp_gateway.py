@@ -579,6 +579,14 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         assert b"chatty-1" in child.deletes
         assert b"host" in dict(child.scopes[-1]["headers"])  # Host carried into the DELETE
         assert b"chatty-1" not in app._session_seen  # noqa: SLF001 — confirmed teardown popped it
+        # Codex #137 r12: the SDK manager's OWN registries are evicted too —
+        # the pinned SDK never pops an explicitly-DELETEd transport, so
+        # without this each rollover leaks one _server_instances entry. The
+        # attribute-name tripwire (a real manager was pre-seeded in _app_for)
+        # fails red on an SDK rename rather than silently leaking again.
+        mgr = app._session_managers["nmmst"]  # noqa: SLF001
+        assert isinstance(mgr._server_instances, dict)  # noqa: SLF001 — SDK attr present
+        assert isinstance(mgr._session_owners, dict)  # noqa: SLF001
         # a re-sent id is now unknown → passes through to the child's own 404
         status, _ = await _request(app, "/mcp/nmmst", headers=sid_host)
         assert status == 200  # the fake child accepts it; the gateway does not re-track it
@@ -670,6 +678,43 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         assert status == 200  # the (fake) child accepted the termination
         assert b"short-lived" not in app._session_seen  # noqa: SLF001 — dropped at once
 
+        finish.set()
+
+
+async def test_confirmed_teardown_evicts_the_sdk_manager_registries(harness: _Harness) -> None:
+    """Codex #137 r12: the pinned SDK's StreamableHTTPSessionManager does
+    NOT remove an explicitly-DELETEd transport from its own
+    _server_instances/_session_owners maps (only the idle path pops them),
+    so a confirmed max-age teardown must evict the id from the manager too —
+    else a busy long-running gateway leaks one SDK entry per rollover."""
+    app = build_gateway()
+    started = anyio.Event()
+    finish = anyio.Event()
+
+    async def lifespan_receive() -> dict[str, Any]:
+        if not started.is_set():
+            return {"type": "lifespan.startup"}
+        await finish.wait()
+        return {"type": "lifespan.shutdown"}
+
+    async def lifespan_send(message: dict[str, Any]) -> None:
+        if message["type"] == "lifespan.startup.complete":
+            started.set()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(app, {"type": "lifespan"}, lifespan_receive, lifespan_send)
+        await started.wait()
+        await _request(app, "/mcp/nmmst")  # mount → pre-seed the manager
+        mgr = app._session_managers["nmmst"]  # noqa: SLF001
+        mgr._server_instances["s-1"] = object()  # noqa: SLF001 — SDK-tracked transport
+        mgr._session_owners["s-1"] = object()  # noqa: SLF001 — and its owner metadata
+
+        app._evict_from_manager("nmmst", b"s-1")  # noqa: SLF001 — confirmed-teardown eviction
+        assert "s-1" not in mgr._server_instances  # noqa: SLF001
+        assert "s-1" not in mgr._session_owners  # noqa: SLF001
+        # unknown project / id is a no-op, never a crash
+        app._evict_from_manager("nmmst", b"never")  # noqa: SLF001
+        app._evict_from_manager("ghost", b"s-1")  # noqa: SLF001
         finish.set()
 
 
