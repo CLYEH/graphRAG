@@ -18,6 +18,7 @@ construction (nothing writes on this connection).
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -79,7 +80,12 @@ class ProjectContext:
             )
 
     async def aclose(self) -> None:
-        """Release the long-lived engines (server shutdown)."""
-        await self.qdrant.close()
-        await self.neo4j.close()
-        await self.engine.dispose()
+        """Release the long-lived engines (server shutdown).
+
+        Best-effort and INDEPENDENT per client (MCP16 gate-2): one store
+        being unhealthy at close time must not skip the others' release nor
+        propagate — shutdown cleanup failure is loggable noise, never a
+        cascade. Cancellation still propagates (except Exception)."""
+        for close in (self.qdrant.close, self.neo4j.close, self.engine.dispose):
+            with contextlib.suppress(Exception):  # best-effort shutdown release
+                await close()

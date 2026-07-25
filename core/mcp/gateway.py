@@ -28,6 +28,7 @@ Mechanics:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from typing import Any
@@ -302,9 +303,23 @@ class McpGateway:
                 # ONE task owns the child lifespan end to end (see __init__):
                 # started() only fires after a successful enter, so a failing
                 # child startup propagates to the mount request loud
-                async with app.router.lifespan_context(app):
-                    task_status.started()
-                    await child_stop.wait()
+                try:
+                    async with app.router.lifespan_context(app):
+                        task_status.started()
+                        await child_stop.wait()
+                finally:
+                    # MCP16: sessions share one client bundle and no longer
+                    # close it — the host (this child's owner) closes it once
+                    # the child app is done (eviction or gateway shutdown).
+                    # CONTAINED (gate-2 blocker): an exception escaping this
+                    # finally would make anyio cancel the task group — one
+                    # project's close error tearing down EVERY project's
+                    # host, the exact isolation the gateway exists to
+                    # provide. Cancellation still propagates.
+                    closer = getattr(server, "_graphrag_close_shared", None)
+                    if closer is not None:
+                        with contextlib.suppress(Exception):  # never a cascade
+                            await closer()
 
             await self._tasks.start(host)
             self._apps[project] = app
