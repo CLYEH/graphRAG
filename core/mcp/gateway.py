@@ -252,16 +252,26 @@ class McpGateway:
         self._session_seen.setdefault(session_id, (now, now))
 
     def _touch_session_age(self, session_id: bytes) -> bool:
-        """Record/inspect a session id's age — True when past the absolute
+        """Inspect a KNOWN session id's age — True when past the absolute
         ceiling (MCP17: the idle timeout resets per request, so ONLY an
         absolute bound caps a chatty session's stale policy snapshot).
-        Entries are KEPT on expiry (an ignored 404 must not restart the
-        clock), and compaction forgets an id only after idle_timeout has
-        passed since its LAST activity — i.e. only once the SDK itself has
-        necessarily reaped the session, so no live session can ever slip
-        its clock (Codex #137 r2 P1)."""
+
+        Only ids CAPTURED from a successful initialize response are tracked
+        (:meth:`_record_session_start`) — an UNKNOWN id is NOT inserted here
+        (Codex #137 r3 P1: setdefault-ing every client-supplied id let an
+        unauthenticated flood of unique ids grow the ledger without bound;
+        an unknown id now passes through untracked to the SDK, which
+        answers its own 404). A known entry is KEPT on expiry (an ignored
+        404 must not restart the clock), and compaction forgets an id only
+        after idle_timeout+margin since its LAST activity — once the SDK
+        has necessarily reaped it, so no live session slips its clock."""
         now = time.monotonic()
-        first, _last = self._session_seen.get(session_id, (now, now))
+        seen = self._session_seen.get(session_id)
+        if seen is None:
+            # untracked (never initialized through this gateway, or already
+            # reaped): pass through — the child owns the session-not-found
+            return False
+        first, _last = seen
         self._session_seen[session_id] = (first, now)
         if len(self._session_seen) > 4096:
             # compaction runs BEFORE the expiry return (a refused-chatty
@@ -272,7 +282,7 @@ class McpGateway:
             # holds by construction
             horizon = now - (self._session_idle_timeout_s + 60.0)
             self._session_seen = {
-                sid: (f, seen) for sid, (f, seen) in self._session_seen.items() if seen > horizon
+                sid: (f, s) for sid, (f, s) in self._session_seen.items() if s > horizon
             }
         return now - first > self._session_max_age_s
 

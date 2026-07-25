@@ -521,9 +521,23 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         tg.start_soon(app, {"type": "lifespan"}, lifespan_receive, lifespan_send)
         await started.wait()
 
+        # only ids CAPTURED from a successful initialize are tracked
+        # (Codex #137 r3 P1: an unknown id must NOT be inserted, or an
+        # unauthenticated flood of unique ids grows the ledger unbounded) —
+        # simulate the initialize capture, then use the id
+        app._record_session_start(b"chatty-1")  # noqa: SLF001
         sid = [(b"mcp-session-id", b"chatty-1")]
         status, _ = await _request(app, "/mcp/nmmst", headers=sid)
         assert status == 200  # young session serves
+
+        # an UNKNOWN id (never initialized here) is NOT tracked — it passes
+        # through to the child (which owns session-not-found), and the
+        # ledger does not grow from attacker-supplied ids
+        before = len(app._session_seen)  # noqa: SLF001
+        status, _ = await _request(app, "/mcp/nmmst", headers=[(b"mcp-session-id", b"forged-xyz")])
+        assert status == 200  # passed through to the (fake) child
+        assert b"forged-xyz" not in app._session_seen  # noqa: SLF001
+        assert len(app._session_seen) == before  # untracked, no growth  # noqa: SLF001
 
         # backdate first-seen past the ceiling: the NEXT request must 404
         # with the actionable re-initialize message — and the ledger entry
