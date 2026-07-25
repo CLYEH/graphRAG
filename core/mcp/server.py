@@ -106,6 +106,42 @@ _STORE_ERRORS: tuple[type[BaseException], ...] = STORE_CLIENT_ERRORS
 _store_name = store_name
 
 
+def _top_k_clamp_warning(policy: QueryPolicy, requested: int | None) -> dict[str, str] | None:
+    """MCP13 (a): ``policy.top_k`` reconciles an over-cap ask via ``min()`` —
+    SILENTLY. An agent asking 9999 and receiving ``max_top_k`` results with
+    empty warnings cannot distinguish "the corpus only has this many" from
+    "you were clamped" — exactly the judgment (rephrase? paginate with the
+    list_* tools?) the warning exists to inform; the OTHER end of the same
+    parameter (a negative top_k) already refuses loudly. Emitted at the tool
+    layer because the clamp happens here, not in the mode functions."""
+    if requested is None or requested <= policy.max_top_k:
+        return None
+    return {
+        "code": "TRUNCATED",
+        "message": (
+            f"top_k={requested} exceeds the policy ceiling {policy.max_top_k} — "
+            f"clamped to {policy.max_top_k} (§21 max_top_k); use the list_* tools "
+            "to page beyond the retrieval ceiling"
+        ),
+    }
+
+
+def _with_clamp_warning(
+    payload: dict[str, Any], policy: QueryPolicy, requested: int | None
+) -> dict[str, Any]:
+    """Append the top_k clamp warning to a §16 payload when it applies.
+
+    A nil-build payload is a pre-binding refusal (oversized query, no active
+    build) or a binding stall — the retrieval never ran, so no clamp ever
+    happened and claiming one would overstate the response."""
+    if payload["build_id"] == _NIL_BUILD:
+        return payload
+    clamp = _top_k_clamp_warning(policy, requested)
+    if clamp is not None:
+        payload["warnings"] = [*payload["warnings"], clamp]
+    return payload
+
+
 async def _bounded(
     runtime: _Runtime,
     tool: str,
@@ -257,6 +293,7 @@ def _introspection_store_error(
         "build_id": build_id or _NIL_BUILD,
         "subject": subject,
         "error": f"{_store_name(exc)} unavailable ({type(exc).__name__}) — §22",
+        "error_code": "STORE_UNAVAILABLE",
     }
 
 
@@ -270,6 +307,7 @@ def _introspection_no_active_build(runtime: _Runtime, subject: str) -> dict[str,
         "build_id": _NIL_BUILD,
         "subject": subject,
         "error": _NO_ACTIVE_BUILD_MESSAGE,
+        "error_code": "NO_ACTIVE_BUILD",
     }
 
 
@@ -284,6 +322,7 @@ def _introspection_timeout(runtime: _Runtime, build_id: str | None, subject: str
         "build_id": build_id or _NIL_BUILD,
         "subject": subject,
         "error": f"query exceeded the {runtime.policy.max_latency_ms}ms deadline{detail} (§21)",
+        "error_code": "QUERY_TIMEOUT",
     }
 
 
@@ -401,7 +440,8 @@ def build_server(project: str) -> FastMCP:
                 deps.repo, deps.vectors, deps.embedder, query, rt.policy.top_k(top_k), point_type
             )
 
-        return await _bounded(rt, "semantic_search", query, _run)
+        payload = await _bounded(rt, "semantic_search", query, _run)
+        return _with_clamp_warning(payload, rt.policy, top_k)
 
     @server.tool()
     async def graph_query(
@@ -454,7 +494,8 @@ def build_server(project: str) -> FastMCP:
         async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
             return await run_global(deps.repo, query, rt.policy.top_k(top_k))
 
-        return await _bounded(rt, "global_summary", query, _run)
+        payload = await _bounded(rt, "global_summary", query, _run)
+        return _with_clamp_warning(payload, rt.policy, top_k)
 
     @server.tool()
     async def hybrid_query(
@@ -516,7 +557,8 @@ def build_server(project: str) -> FastMCP:
                 params,
             )
 
-        return await _bounded(rt, "hybrid_query", query, _run)
+        payload = await _bounded(rt, "hybrid_query", query, _run)
+        return _with_clamp_warning(payload, rt.policy, top_k)
 
     @server.tool()
     async def get_entity(name: str) -> dict[str, Any]:
@@ -672,10 +714,13 @@ def build_server(project: str) -> FastMCP:
     @server.tool()
     async def explain_retrieval(query: str, top_k: int | None = None) -> dict[str, Any]:
         """Run the hybrid router and return the response WITH its routing
-        trace — the §16 debug block. Gated by the same policy flag as every
-        debug emission (§21): when expose_debug is off, the query still runs
-        but the trace stays null and a typed warning says why."""
+        trace — the §16 debug block. Gated by the policy's expose_debug
+        flag (§21): when it is off the call is REFUSED up front
+        (GUARDRAIL_BLOCKED, zero results) — use hybrid_query for results
+        without a trace."""
         rt = _rt()
+        if not rt.policy.expose_debug:
+            return _debug_disabled_payload(rt.context.project, query)
 
         async def _run(deps: Any, remaining_ms: int) -> McpResponse:
             return await run_hybrid(
@@ -686,15 +731,7 @@ def build_server(project: str) -> FastMCP:
             )
 
         payload = await _bounded(rt, "hybrid_query", query, _run)
-        if not rt.policy.expose_debug:
-            payload["warnings"] = [
-                *payload["warnings"],
-                {
-                    "code": "GUARDRAIL_BLOCKED",
-                    "message": "expose_debug is disabled by policy — no trace emitted (§21)",
-                },
-            ]
-        return payload
+        return _with_clamp_warning(payload, rt.policy, top_k)
 
     return server
 
@@ -731,6 +768,8 @@ async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
                     "build_id": bound_build,
                     "sql_enabled": runtime.policy.text_to_sql.enabled,
                     "tables": tables,
+                    "error": None,
+                    "error_code": None,
                 }
     except NoActiveBuildError:
         return _introspection_no_active_build(runtime, "list_schema")
@@ -757,6 +796,7 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
             "build_id": str(repo.build_id),
             "name": name if isinstance(name, str) else repr(name),
             "error": "name must be a non-blank string",
+            "error_code": "INVALID_INPUT",
             "entities": [],
         }
     entity_ids = await repo.entity_ids_by_name(name)
@@ -771,6 +811,8 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
         "project": project,
         "build_id": str(repo.build_id),
         "name": name,
+        "error": None,
+        "error_code": None,
         "entities": [
             {
                 "id": str(entity_id),
@@ -883,7 +925,13 @@ async def _list_entities(
     envelope = {"project": project, "build_id": build_id}
     bad = _bad_limit(limit) or _bad_q(q)
     if bad is not None:
-        return {**envelope, "entities": [], "next_cursor": None, "error": bad}
+        return {
+            **envelope,
+            "entities": [],
+            "next_cursor": None,
+            "error": bad,
+            "error_code": "INVALID_INPUT",
+        }
     # the match mode is STICKY across pages via the cursor scope (class 31):
     # substring first; when a fresh search finds nothing, fall back to
     # character-AND (主館 is not a substring of 主題館 — but 主 and 館 both
@@ -900,7 +948,13 @@ async def _list_entities(
         scope = chr_scope if match == "characters" else sub_scope
         after_id, cursor_error = _parse_browse_cursor(cursor, build_id, scope)
         if cursor_error is not None:
-            return {**envelope, "entities": [], "next_cursor": None, "error": cursor_error}
+            return {
+                **envelope,
+                "entities": [],
+                "next_cursor": None,
+                "error": cursor_error,
+                "error_code": "INVALID_INPUT",
+            }
         rows = await repo.page_entities(
             limit + 1, after_id, q, entity_type, fuzzy=(match == "characters")
         )
@@ -924,6 +978,7 @@ async def _list_entities(
         "match": match if q else None,
         "next_cursor": next_cursor,
         "error": None,
+        "error_code": None,
     }
 
 
@@ -938,14 +993,26 @@ async def _list_chunks(repo: Any, project: str, limit: int, cursor: str | None) 
     envelope = {"project": project, "build_id": build_id}
     bad = _bad_limit(limit)
     if bad is not None:
-        return {**envelope, "chunks": [], "next_cursor": None, "error": bad}
+        return {
+            **envelope,
+            "chunks": [],
+            "next_cursor": None,
+            "error": bad,
+            "error_code": "INVALID_INPUT",
+        }
     after_id: uuid.UUID | None = None
     if cursor is not None:
         after_id, cursor_error = _parse_browse_cursor(
             cursor, build_id, _browse_scope("list_chunks")
         )
         if cursor_error is not None:
-            return {**envelope, "chunks": [], "next_cursor": None, "error": cursor_error}
+            return {
+                **envelope,
+                "chunks": [],
+                "next_cursor": None,
+                "error": cursor_error,
+                "error_code": "INVALID_INPUT",
+            }
     columns = (
         tables.chunks.c.id,
         tables.chunks.c.document_id,
@@ -973,6 +1040,7 @@ async def _list_chunks(repo: Any, project: str, limit: int, cursor: str | None) 
         ],
         "next_cursor": next_cursor,
         "error": None,
+        "error_code": None,
     }
 
 
@@ -983,14 +1051,26 @@ async def _list_reports(repo: Any, project: str, limit: int, cursor: str | None)
     envelope = {"project": project, "build_id": build_id}
     bad = _bad_limit(limit)
     if bad is not None:
-        return {**envelope, "reports": [], "next_cursor": None, "error": bad}
+        return {
+            **envelope,
+            "reports": [],
+            "next_cursor": None,
+            "error": bad,
+            "error_code": "INVALID_INPUT",
+        }
     after_id: uuid.UUID | None = None
     if cursor is not None:
         after_id, cursor_error = _parse_browse_cursor(
             cursor, build_id, _browse_scope("list_reports")
         )
         if cursor_error is not None:
-            return {**envelope, "reports": [], "next_cursor": None, "error": cursor_error}
+            return {
+                **envelope,
+                "reports": [],
+                "next_cursor": None,
+                "error": cursor_error,
+                "error_code": "INVALID_INPUT",
+            }
     columns = (
         tables.community_reports.c.id,
         tables.community_reports.c.title,
@@ -1021,6 +1101,7 @@ async def _list_reports(repo: Any, project: str, limit: int, cursor: str | None)
         ],
         "next_cursor": next_cursor,
         "error": None,
+        "error_code": None,
     }
 
 
@@ -1101,6 +1182,34 @@ def _incomplete_graph_invocation_payload(
     ).to_dict()
 
 
+def _debug_disabled_payload(project: str, query: str) -> dict[str, Any]:
+    """MCP13 (b): GUARDRAIL_BLOCKED means "refused, nothing produced"
+    EVERYWHERE else (hops=99 / unknown template → n=0), but explain_retrieval
+    used to run the FULL pipeline (measured 5.4s + real LLM spend), return a
+    SUCCESSFUL page, and stamp it GUARDRAIL_BLOCKED — an agent applying the
+    uniform rule would discard a good answer, and one applying the local
+    reading forks the code's meaning. The flag is known at lifespan, so the
+    call is refused BEFORE binding: one code, one meaning, no wasted
+    pipeline. Nil build — nothing was ever resolved (pre-binding
+    convention)."""
+    return McpResponse(
+        query=query,
+        tool="hybrid_query",
+        project=project,
+        build_id=_NIL_BUILD,
+        results=(),
+        warnings=(
+            QueryWarning(
+                "GUARDRAIL_BLOCKED",
+                "expose_debug is disabled by policy — explain_retrieval refused "
+                "before running the query (nothing was produced; §21). Use "
+                "hybrid_query for results without a trace, or ask the operator "
+                "to enable expose_debug",
+            ),
+        ),
+    ).to_dict()
+
+
 def _invalid_chunk_payload(project: str, chunk_id: str) -> dict[str, Any] | None:
     """Typed rejection for a malformed chunk_id BEFORE store binding, or None
     when the id parses (Codex #125 r3): parsing needs no store, so a bad id
@@ -1116,6 +1225,7 @@ def _invalid_chunk_payload(project: str, chunk_id: str) -> dict[str, Any] | None
         "chunk_id": chunk_id,
         "chunk": None,
         "error": _CHUNK_ID_MESSAGE,
+        "error_code": "INVALID_INPUT",
     }
 
 
@@ -1129,6 +1239,7 @@ def _invalid_document_payload(project: str, document_id: str) -> dict[str, Any] 
         "document_id": document_id,
         "document": None,
         "error": _DOCUMENT_ID_MESSAGE,
+        "error_code": "INVALID_INPUT",
     }
 
 
@@ -1148,10 +1259,20 @@ async def _get_chunk(repo: Any, project: str, chunk_id: str) -> dict[str, Any]:
     envelope = {"project": project, "build_id": str(repo.build_id), "chunk_id": chunk_id}
     parsed = _parse_uuid(chunk_id)
     if parsed is None:
-        return {**envelope, "chunk": None, "error": _CHUNK_ID_MESSAGE}
+        return {
+            **envelope,
+            "chunk": None,
+            "error": _CHUNK_ID_MESSAGE,
+            "error_code": "INVALID_INPUT",
+        }
     rows = await repo.fetch_all(tables.chunks, tables.chunks.c.id == parsed)
     if not rows:
-        return {**envelope, "chunk": None, "error": "no chunk with this id in the ACTIVE build"}
+        return {
+            **envelope,
+            "chunk": None,
+            "error": "no chunk with this id in the ACTIVE build",
+            "error_code": "NOT_FOUND",
+        }
     row = rows[0]
     return {
         **envelope,
@@ -1165,6 +1286,7 @@ async def _get_chunk(repo: Any, project: str, chunk_id: str) -> dict[str, Any]:
             "token_count": row.token_count,
         },
         "error": None,
+        "error_code": None,
     }
 
 
@@ -1186,13 +1308,19 @@ async def _get_document(
     envelope = {"project": project, "build_id": str(repo.build_id), "document_id": document_id}
     parsed = _parse_uuid(document_id)
     if parsed is None:
-        return {**envelope, "document": None, "error": _DOCUMENT_ID_MESSAGE}
+        return {
+            **envelope,
+            "document": None,
+            "error": _DOCUMENT_ID_MESSAGE,
+            "error_code": "INVALID_INPUT",
+        }
     rows = await repo.fetch_all(tables.documents, tables.documents.c.id == parsed)
     if not rows:
         return {
             **envelope,
             "document": None,
             "error": "no document with this id in the ACTIVE build",
+            "error_code": "NOT_FOUND",
         }
     row = rows[0]
     return {
@@ -1208,6 +1336,7 @@ async def _get_document(
             "raw": row.raw,
         },
         "error": None,
+        "error_code": None,
     }
 
 
