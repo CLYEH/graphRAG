@@ -23,6 +23,8 @@ construction point, keyed through :mod:`core.config`, never ``os.environ``.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from llama_index.core.embeddings import BaseEmbedding
 from llama_index.core.llms import LLM
 
@@ -86,3 +88,80 @@ def embedding_model() -> BaseEmbedding:
         api_key=settings.openai_api_key,
     )
     return embedder
+
+
+class _InMemoryEmbeddingCache:
+    """Bounded in-memory LRU for QUERY embeddings (MCP18 query-latency).
+
+    Plugged into a LlamaIndex ``BaseEmbedding`` through its built-in
+    ``embeddings_cache`` hook: :meth:`BaseEmbedding.aget_text_embedding`
+    consults this BEFORE the ~1s OpenAI round-trip, so a repeated question (a
+    museum guide sees the same few) is served from memory and never hits the
+    API. Riding the framework's own hook keeps its dispatcher/callback
+    instrumentation intact — no method is overridden.
+
+    A text embedding is a pure function of (model, text): the model is fixed
+    per embedder instance, so keying by ``text`` alone is sufficient, and the
+    result is BUILD-independent, so one cache per query-embedder INSTANCE is
+    correct across builds (DR-006 does not apply — nothing cached here is
+    build-scoped; the embedder outlives any single build). It is NOT process-
+    global: each project's server holds its own (MCP16 shared bundle) and the
+    API app holds one, so a multi-project gateway's aggregate ceiling is
+    N × capacity. A single asyncio loop per server drives every consult, so the
+    plain dict ops need no lock. The sync ``get``/``put`` mirror the async pair
+    so the framework's (query-path-unused) sync surface can never AttributeError
+    on a half-implemented cache.
+
+    Pin note (load-bearing): the cache is attached by post-construction
+    assignment to the ``embeddings_cache`` field (see :func:`_with_query_cache`),
+    which bypasses the framework's ``BaseKVStore`` validator on that field. This
+    relies on the pinned LlamaIndex — a bump that enables ``validate_assignment``
+    or calls other ``BaseKVStore`` methods on the hook would break it; the
+    real-machinery test in ``test_llm_factory`` pins the behavior so such a bump
+    surfaces red rather than silently bypassing the cache.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._store: OrderedDict[tuple[str, str], dict[str, list[float]]] = OrderedDict()
+
+    def get(self, key: str, collection: str) -> dict[str, list[float]] | None:
+        hit = self._store.get((collection, key))
+        if hit is not None:
+            self._store.move_to_end((collection, key))
+        return hit
+
+    def put(self, key: str, val: dict[str, list[float]], collection: str) -> None:
+        self._store[(collection, key)] = val
+        self._store.move_to_end((collection, key))
+        while len(self._store) > self._capacity:
+            self._store.popitem(last=False)
+
+    async def aget(self, key: str, collection: str) -> dict[str, list[float]] | None:
+        return self.get(key, collection)
+
+    async def aput(self, key: str, val: dict[str, list[float]], collection: str) -> None:
+        self.put(key, val, collection)
+
+
+def _with_query_cache(embedder: BaseEmbedding, cache_size: int) -> BaseEmbedding:
+    """Attach the MCP18 query-embedding LRU to ``embedder`` when enabled.
+
+    Pure and key-free (constructs no provider), so it is unit-testable against
+    a fake embedder. ``cache_size <= 0`` leaves the embedder uncached — the
+    contract the ingestion path relies on by NOT calling this."""
+    if cache_size > 0:
+        embedder.embeddings_cache = _InMemoryEmbeddingCache(cache_size)
+    return embedder
+
+
+def query_embedding_model() -> BaseEmbedding:
+    """Build the embedding model for the QUERY path, wrapped in the MCP18
+    bounded LRU (:func:`_with_query_cache`).
+
+    Ingestion keeps the plain :func:`embedding_model` — its chunk/entity texts
+    are distinct, so caching them only burns memory; only queries repeat (and
+    each pays the ~1s round-trip otherwise). Same single construction point and
+    key precondition as :func:`embedding_model`."""
+    settings = get_settings()
+    return _with_query_cache(embedding_model(), settings.embedding_cache_size)

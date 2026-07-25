@@ -230,7 +230,7 @@ async def test_a_registered_tool_calls_through_on_live_stores(
 
     monkeypatch.setattr(server_module, "chat_model", lambda: cast(LLM, _FakeLLM()))
     monkeypatch.setattr(
-        server_module, "embedding_model", lambda: cast(BaseEmbedding, _FakeEmbedder())
+        server_module, "query_embedding_model", lambda: cast(BaseEmbedding, _FakeEmbedder())
     )
     await _activate_build(context.project, entity_name="Acme")
     server = build_server(context.project)
@@ -358,7 +358,7 @@ async def test_a_malformed_chunk_id_never_reaches_the_binding(
 
     monkeypatch.setattr(server_module, "chat_model", lambda: cast(LLM, _FakeLLM()))
     monkeypatch.setattr(
-        server_module, "embedding_model", lambda: cast(BaseEmbedding, _FakeEmbedder())
+        server_module, "query_embedding_model", lambda: cast(BaseEmbedding, _FakeEmbedder())
     )
     await _activate_build(context.project, entity_name="Acme")
     server = build_server(context.project)

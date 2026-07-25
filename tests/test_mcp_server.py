@@ -272,7 +272,7 @@ async def test_bad_policy_error_is_not_masked_by_client_construction(
     monkeypatch.setattr(server_module, "create_async_engine", lambda *a, **k: _Engine())
     monkeypatch.setattr(server_module, "vector_client", _would_mask)
     monkeypatch.setattr(server_module, "graph_driver", _would_mask)
-    monkeypatch.setattr(server_module, "embedding_model", _would_mask)
+    monkeypatch.setattr(server_module, "query_embedding_model", _would_mask)
     monkeypatch.setattr(server_module, "chat_model", _would_mask)
     monkeypatch.setattr(server_module, "_load_runtime_config", _bad_policy)
 

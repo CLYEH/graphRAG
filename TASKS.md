@@ -188,7 +188,7 @@ Keep items small enough to finish in one loop.
 ### P4 — 效能與併發(若要讓多個 agent 同時使用)
 - [x] MCP16 事件迴圈解阻塞:store/model client 改每 server 一份共享(首 session 於 asyncio.to_thread 建構——Qdrant 建構子實測 1,302ms 迴圈停滯不再凍住併發;後續 session 僅讀 policy,實測 1587ms→196ms),session 不再各建各關(累積問題一併除);policy 仍逐 session(DR-012)且先於 client(#93 R5);關閉權在 owner(gateway host 驅逐/關機、run_server 結束)經 _graphrag_close_shared。
 - [x] MCP17 gateway 水平擴充與 session 生命週期:serve-mcp 改 factory(`create_app`);`--workers>1` REFUSED(需 affinity LB,process-sticky+共用 socket);idle 注入 1800s + 絕對年齡上限 7200s(鍵 `(project,session_id)`)封頂過期 policy 快照,過齡誠實 404 reconnect+server 端釋放;/health 回非敏感 `{"status":"ok"}`;刪專案撤銷沿 MCP12 preflight。
-- [ ] MCP18 查詢路徑延遲(review 第 25 條)— 逐層量測:Qdrant 純向量搜尋 **16ms**、`global` 模態(純 Postgres)**141ms**、OpenAI embedding **1,019ms**、OpenAI selector **1,525ms**、`semantic` 端到端 1,156ms、`hybrid` 端到端 **3,078ms**。**向量搜尋佔不到延遲的 1%,3 秒裡約 2.5 秒是兩次 OpenAI 往返**。三項修法:(a)hybrid 的模態改**併發執行**(現為循序 `for mode in selected:`,各模態彼此獨立);(b)**embedding 快取/去重**——往返約 1 秒佔 `semantic` 延遲 88%,導覽場景問題高度重複(票價/開放時間/交通)命中率會很高;(c)重估 LLM selector(見 MCP8——它花 1.5 秒且讓結果更差)。附帶實測:帶 graph 參數反而**快 766ms**,因為跳過 QP1 自動規劃——即 MCP11 那條被靜默忽略的路徑還讓呼叫方付了一次沒用到的規劃成本。
+- [x] MCP18 查詢延遲(review 第 25 條)— (b) 跨請求 embedding 快取:query embedder 包 bounded LRU(每實例一份,非 gateway 級預算;`embedding_cache_size` 預設 128,多專案主機應調降;0 停用),重複問題(導覽:票價/開放時間/交通)命中即跳過 ~1s OpenAI 往返(佔 semantic ~88%);ingestion 不快取。(c) selector 已由 MCP8 移除。(a) 模態併發需 per-mode PG 連線隔離,owner 定案改列 follow-up。
 
 ---
 

@@ -74,7 +74,7 @@ async def test_global_query_end_to_end_over_the_shared_seam(
 ) -> None:
     # the shared ProjectContext constructs every client; global calls none of
     # the models, but construction must not demand a key (#37 factory fakes)
-    monkeypatch.setattr("api.deps.embedding_model", lambda: object())
+    monkeypatch.setattr("api.deps.query_embedding_model", lambda: object())
     monkeypatch.setattr("api.deps.chat_model", lambda: object())
 
     engine = _engine()
@@ -159,7 +159,7 @@ async def test_graph_and_hybrid_end_to_end_over_the_shared_seam(
     guardrail parity over live Neo4j (hop ceiling → 200 + GUARDRAIL_BLOCKED,
     never a REST-only 400; the projection is empty for this build — the
     C6c/BA3c precedent)."""
-    monkeypatch.setattr("api.deps.embedding_model", lambda: object())
+    monkeypatch.setattr("api.deps.query_embedding_model", lambda: object())
     monkeypatch.setattr("api.deps.chat_model", lambda: object())
 
     engine = _engine()
