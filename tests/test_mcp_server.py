@@ -403,6 +403,159 @@ async def test_bounded_maps_every_expected_failure_family_typed() -> None:
         await _raising(ZeroDivisionError())
 
 
+def test_top_k_clamp_is_said_not_silent() -> None:
+    """MCP13 (a): policy.top_k reconciles an over-cap ask via min() —
+    silently. An agent asking 9999 and getting max_top_k results with EMPTY
+    warnings cannot distinguish "the corpus only has this many" from "you
+    were clamped" — the exact judgment (rephrase? page with list_*?) the
+    warning informs; the OTHER end of the same parameter (negative top_k)
+    already refuses loudly. The clamp must be SAID (TRUNCATED), and only
+    when it actually happened (the over-block dual)."""
+    from types import SimpleNamespace
+
+    from core.mcp.server import _top_k_clamp_warning, _with_clamp_warning
+
+    policy = SimpleNamespace(max_top_k=20)
+    clamp = _top_k_clamp_warning(policy, 9999)  # type: ignore[arg-type]
+    assert clamp is not None
+    assert clamp["code"] == "TRUNCATED"
+    assert "9999" in clamp["message"] and "20" in clamp["message"]  # both numbers named
+
+    # no ask / at-cap / under-cap: NOT clamped — no warning (over-block dual)
+    for requested in (None, 20, 5):
+        assert _top_k_clamp_warning(policy, requested) is None  # type: ignore[arg-type]
+
+    payload = {"build_id": "b-1", "warnings": [{"code": "MODE_SKIPPED", "message": "x"}]}
+    out = _with_clamp_warning(payload, policy, 9999)  # type: ignore[arg-type]
+    assert [w["code"] for w in out["warnings"]] == ["MODE_SKIPPED", "TRUNCATED"]
+
+    # a nil-build payload is a pre-binding refusal / binding stall — the
+    # retrieval never RAN, so claiming a clamp would overstate the response
+    refused = {
+        "build_id": "00000000-0000-0000-0000-000000000000",
+        "warnings": [{"code": "GUARDRAIL_BLOCKED", "message": "refused"}],
+    }
+    out = _with_clamp_warning(refused, policy, 9999)  # type: ignore[arg-type]
+    assert [w["code"] for w in out["warnings"]] == ["GUARDRAIL_BLOCKED"]
+
+
+def test_explain_retrieval_refusal_is_a_real_refusal() -> None:
+    """MCP13 (b): GUARDRAIL_BLOCKED means "refused, nothing produced"
+    everywhere else — but explain_retrieval used to run the FULL pipeline
+    (5.4s + real LLM spend), return a successful page, and stamp it
+    GUARDRAIL_BLOCKED: an agent applying the uniform rule discards a good
+    answer. The refusal shape must be a true refusal: zero results, nil
+    build (nothing ran), one code one meaning — and contract-valid."""
+    import json
+
+    import jsonschema
+
+    from core.mcp.server import _debug_disabled_payload, _oversized_query_payload
+
+    payload = _debug_disabled_payload("demo", "票價")
+    validator = jsonschema.Draft202012Validator(
+        json.loads((REPO_ROOT / "contracts" / "mcp_response.schema.json").read_text("utf-8")),
+        format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER,
+    )
+    validator.validate(payload)
+    assert payload["results"] == []  # NOTHING was produced — the code's one meaning
+    assert payload["build_id"] == "00000000-0000-0000-0000-000000000000"  # never ran
+    [warning] = payload["warnings"]
+    assert warning["code"] == "GUARDRAIL_BLOCKED"
+    assert "refused" in warning["message"] and "hybrid_query" in warning["message"]
+
+    # Codex #133 r1: the debug refusal echoes the query, and the tool's
+    # early return bypasses _bounded's cap — so the SHARED cap helper must
+    # run first, truncating the echo (no whole-input reflection/amplification)
+    oversized = _oversized_query_payload("demo", "hybrid_query", "x" * 4001)
+    assert oversized is not None
+    validator.validate(oversized)
+    assert len(oversized["query"]) == 200  # echo truncated, never reflected whole
+    assert "4000-char cap" in oversized["warnings"][0]["message"]
+    assert _oversized_query_payload("demo", "hybrid_query", "x" * 4000) is None  # dual
+
+    # gate-2 sweep: hybrid_query's MCP11 incomplete-invocation refusal is the
+    # SAME pre-_bounded early-return class — the tool runs the cap first,
+    # AND (defense in depth) the refusal itself truncates its echo, so no
+    # ordering regression can ever reflect a large input whole.
+    from core.mcp.server import _incomplete_graph_invocation_payload as _partial
+
+    reflected = _partial(
+        "demo",
+        "x" * 4001,
+        graph_template=None,
+        graph_entity="區域探索廳",
+        graph_other_entity=None,
+        graph_hops=None,
+    )
+    assert reflected is not None
+    validator.validate(reflected)
+    assert len(reflected["query"]) == 200  # never reflected whole, even helper-direct
+
+    # symmetric hardening: the debug refusal truncates its echo too
+    assert len(_debug_disabled_payload("demo", "x" * 4001)["query"]) == 200
+
+    # Codex #133 r2 dual: a WITHIN-cap query is echoed WHOLE — clients
+    # correlate/log/retry from the §16 envelope, and truncating a legal
+    # 201..4000-char query would silently corrupt that correlation
+    legal = "y" * 300
+    within = _partial(
+        "demo",
+        legal,
+        graph_template=None,
+        graph_entity="區域探索廳",
+        graph_other_entity=None,
+        graph_hops=None,
+    )
+    assert within is not None and within["query"] == legal
+    assert _debug_disabled_payload("demo", legal)["query"] == legal
+
+
+async def test_introspection_errors_carry_typed_codes() -> None:
+    """MCP13 (c): the introspection tools' free-text error field squashed
+    input-error / timeout / store-outage into one untyped string — three
+    states whose correct agent reactions differ completely (fix the input /
+    retry later / back off). Every error shape now carries a typed
+    error_code sibling; successes carry None."""
+    import uuid
+    from types import SimpleNamespace
+
+    from core.mcp.server import (
+        _get_chunk,
+        _introspection_no_active_build,
+        _introspection_store_error,
+        _introspection_timeout,
+        _invalid_document_payload,
+        _list_entities,
+        _Runtime,
+    )
+
+    runtime = _Runtime(
+        context=SimpleNamespace(project="p"),  # type: ignore[arg-type]
+        policy=SimpleNamespace(max_latency_ms=1000),  # type: ignore[arg-type]
+    )
+    assert _introspection_timeout(runtime, None, "s")["error_code"] == "QUERY_TIMEOUT"
+    assert (
+        _introspection_store_error(runtime, None, "s", ConnectionRefusedError())["error_code"]
+        == "STORE_UNAVAILABLE"
+    )
+    assert _introspection_no_active_build(runtime, "s")["error_code"] == "NO_ACTIVE_BUILD"
+    invalid = _invalid_document_payload("p", "not-a-uuid")
+    assert invalid is not None and invalid["error_code"] == "INVALID_INPUT"
+
+    # browse input refusal (pre-store) and NOT_FOUND both typed
+    repo = SimpleNamespace(build_id=uuid.uuid4())
+    page = await _list_entities(repo, "p", 0, None, None, None)  # limit 0 = invalid
+    assert page["error_code"] == "INVALID_INPUT"
+
+    async def _fetch_all(table: Any, where: Any) -> list[Any]:
+        return []
+
+    repo_empty = SimpleNamespace(build_id=uuid.uuid4(), fetch_all=_fetch_all)
+    missing = await _get_chunk(repo_empty, "p", str(uuid.uuid4()))
+    assert missing["error_code"] == "NOT_FOUND"
+
+
 def test_the_introspection_no_active_build_shape_is_explicit() -> None:
     """MCP12: the introspection tools' DR-001 refusal is the same explicit
     error-field shape as their timeout/store degradations — previously the
@@ -441,6 +594,7 @@ def test_the_introspection_timeout_shape_is_explicit() -> None:
         "build_id": str(build_id),
         "subject": "list_schema",
         "error": "query exceeded the 1000ms deadline (§21)",
+        "error_code": "QUERY_TIMEOUT",  # MCP13 (c): typed, not a free-text-only squash
     }
     # the deadline can fire DURING scope binding — no build was resolved,
     # and the nil-uuid sentinel + message detail say so honestly

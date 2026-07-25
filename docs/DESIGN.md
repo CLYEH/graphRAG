@@ -289,7 +289,7 @@ graphRAG/
 
 ### 27.2 契約凍結（enum 級；contracts/ 交付物）
 - **error code enum**（additive-only）：`PROJECT_NOT_FOUND, BUILD_NOT_FOUND, BUILD_NOT_READY, NO_ACTIVE_BUILD, VALIDATION_ERROR, JOB_NOT_FOUND, JOB_CONFLICT, IDEMPOTENCY_CONFLICT, QUERY_UNSAFE, QUERY_TIMEOUT, STORE_UNAVAILABLE, RATE_LIMITED, INTERNAL`。
-- **warning code enum**：`STORE_UNAVAILABLE, MODE_SKIPPED, PARTIAL_RESULTS, LOW_CONFIDENCE, GUARDRAIL_BLOCKED, TRUNCATED`。
+- **warning code enum**：`STORE_UNAVAILABLE, MODE_SKIPPED, PARTIAL_RESULTS, LOW_CONFIDENCE, GUARDRAIL_BLOCKED, TRUNCATED, NO_ACTIVE_BUILD`(末項 v1.2/DR-015)。**語意一致性(MCP13)**:任何 clamp(top_k 超限收斂到 max_top_k)必發 `TRUNCATED` 明示,靜默 clamp 禁止;`GUARDRAIL_BLOCKED` 單義=「呼叫被拒、零產出」(explain_retrieval 於 expose_debug 關閉時事前拒絕,不再跑完管線後標記);introspection 形(非 §16)的 `error` 一律配 typed `error_code`(`INVALID_INPUT|NOT_FOUND|QUERY_TIMEOUT|STORE_UNAVAILABLE|NO_ACTIVE_BUILD`,成功=null)。
 - **SSE event**：`event: job.update|job.done|job.failed`；`data: {job_id, status, step, progress(0..1), message, ts}`。
 - **Idempotency**：`idempotency_keys(key pk, project, endpoint, request_hash, response jsonb, status, created_at, expires_at)`；TTL 🔧 24h；同 key+同 request_hash → 回存檔回應；同 key+不同 request_hash → `409 IDEMPOTENCY_CONFLICT`。
 - **source_refs 最低要求**（`require_sources` 強制，依 result_type）：chunk→≥1 chunk ref（source_uri+offsets）；entity→≥1 **可解** mention（v1.1/MCP7:chunk mention=chunk UUID id+source_uri+quote+chunk offsets,與 relation chunk evidence 同形;row mention=table+pk）；relation→≥1 relation_evidence；path→每條 edge 皆有 ref；row→table+pk；community_report→member entity refs。
