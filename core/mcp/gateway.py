@@ -244,6 +244,26 @@ class McpGateway:
 
             await app(child_scope, receive, send_capturing)
             return
+        if scope.get("method") == "DELETE" and session_id is not None:
+            # Codex #137 r6: an explicit MCP session termination (DELETE)
+            # releases the session in the SDK immediately — drop the ledger
+            # entry on a successful (2xx) response instead of waiting the
+            # full idle_timeout+margin, so a high-churn client that creates
+            # and DELETEs many short-lived sessions cannot grow the ledger
+            # within the reap window. A dead id later re-sent takes the
+            # unknown-id pass-through (the child's own 404); a NON-2xx
+            # DELETE (already gone / rejected) keeps the entry, harmless.
+            captured = session_id
+
+            async def send_terminating(message: dict[str, Any]) -> None:
+                if message.get("type") == "http.response.start" and (
+                    200 <= int(message.get("status", 0)) < 300
+                ):
+                    self._session_seen.pop(captured, None)
+                await send(message)
+
+            await app(child_scope, receive, send_terminating)
+            return
         await app(child_scope, receive, send)
 
     def _compact_sessions(self, now: float) -> None:

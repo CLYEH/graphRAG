@@ -118,6 +118,7 @@ async def _request(
     path: str,
     raw_path: bytes | None = None,
     headers: list[tuple[bytes, bytes]] | None = None,
+    method: str = "POST",
 ) -> tuple[int, bytes]:
     messages: list[dict[str, Any]] = []
 
@@ -131,7 +132,7 @@ async def _request(
         "type": "http",
         "path": path,
         "raw_path": raw_path if raw_path is not None else path.encode("utf-8"),
-        "method": "POST",
+        "method": method,
         "headers": headers or [],
     }
     await app(scope, receive, send)
@@ -590,6 +591,18 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         app._record_session_start(b"fresh-init")  # noqa: SLF001 — insert compacts
         assert len(app._session_seen) < 100  # the dead flood was forgotten  # noqa: SLF001
         assert b"fresh-init" in app._session_seen  # ...the fresh one survives  # noqa: SLF001
+
+        # Codex #137 r6: an explicit MCP session termination (DELETE) drops
+        # the ledger entry IMMEDIATELY on a 2xx — a high-churn client that
+        # creates+DELETEs many short-lived sessions cannot grow the ledger
+        # within the idle reap window
+        app._record_session_start(b"short-lived")  # noqa: SLF001
+        assert b"short-lived" in app._session_seen  # noqa: SLF001
+        status, _ = await _request(
+            app, "/mcp/nmmst", headers=[(b"mcp-session-id", b"short-lived")], method="DELETE"
+        )
+        assert status == 200  # the (fake) child accepted the termination
+        assert b"short-lived" not in app._session_seen  # noqa: SLF001 — dropped at once
 
         finish.set()
 
