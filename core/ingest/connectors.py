@@ -151,7 +151,7 @@ def read_text_documents(
         suffix = path.suffix.lower()
         if not path.is_file() or suffix not in TEXT_SUFFIXES:
             continue
-        sidecar = sidecars.pop(path.resolve(), None)
+        sidecar = sidecars.pop(path, None)
         yield DocumentPayload(
             source_uri=path.resolve().as_uri(),
             raw=path.read_text(encoding="utf-8"),
@@ -191,7 +191,7 @@ _SIDECAR_KEYS = {"context", "governance"}
 def _collect_sidecars(
     root: Path, metadata_schema: MetadataSchema | None
 ) -> dict[Path, dict[str, Any]]:
-    """``{target-file-resolved-path: parsed sidecar}`` for every
+    """``{target-file-lexical-path: parsed sidecar}`` for every
     ``<name>.meta.json`` under ``root``. A corrupt sidecar is a LOUD failure
     (same rule as an undecodable source file); unknown top-level keys are
     rejected — ``system``/``schema_version`` are server-stamped namespaces a
@@ -241,8 +241,14 @@ def _collect_sidecars(
                 f"metadata sidecar {sidecar_path} names no target file — the "
                 "convention is <name>.meta.json beside <name>"
             )
-        target = sidecar_path.with_name(stem)
-        collected[target.resolve()] = parsed
+        # Keyed by the LEXICAL in-tree path, never resolve(): the sidecar and
+        # the document loop walk the SAME rglob, so lexical paths match exactly
+        # — while resolving would alias a symlinked document with its referent
+        # (link.txt.meta.json popped while processing a.txt), attaching the
+        # link's provenance to the wrong document (Codex #130 r3). A symlink
+        # named <name> gets its own <name>.meta.json, the directory entry the
+        # operator actually described.
+        collected[sidecar_path.with_name(stem)] = parsed
     return collected
 
 

@@ -536,6 +536,35 @@ def test_sidecar_context_shape_is_closed(tmp_path: Path) -> None:
         list(read_text_documents(tmp_path))
 
 
+def test_sidecar_targets_are_lexical_not_resolved(tmp_path: Path) -> None:
+    """A sidecar names a DIRECTORY ENTRY, not an inode (Codex #130 r3): with
+    resolve()-keying, `link.txt -> a.txt` plus only `link.txt.meta.json`
+    would let the document loop pop the link's metadata while processing
+    a.txt — the real file receives the LINK's provenance and the link falls
+    back to filename-only, i.e. citations attached to the wrong document.
+    Lexical keying is exact because the sidecar collection and the document
+    loop walk the same rglob."""
+    import json as jsonlib
+
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    try:
+        link.symlink_to(tmp_path / "a.txt")
+    except OSError:  # pragma: no cover - Windows without the symlink privilege
+        pytest.skip("symlink creation not permitted on this platform")
+    (tmp_path / "link.txt.meta.json").write_text(
+        jsonlib.dumps({"context": {"title": "the link's own provenance"}}), encoding="utf-8"
+    )
+
+    by_name = {
+        p.metadata.get("system", {}).get("original_filename") or p.metadata.get("filename"): p
+        for p in read_text_documents(tmp_path)
+    }
+    # the REAL file keeps its fallback — it must never absorb the link's sidecar
+    assert by_name["a.txt"].metadata == {"filename": "a.txt"}
+    assert by_name["link.txt"].metadata["context"]["title"] == "the link's own provenance"
+
+
 def test_sidecar_governance_shape_is_validated(tmp_path: Path) -> None:
     """The governance namespace is context's sibling and carries the same
     silent hole without a fence (Codex #130 r2): the frozen
