@@ -39,6 +39,7 @@ from core.ingest.connectors import (
     read_text_documents,
     read_xlsx_rows,
 )
+from core.metadata.schema import MetadataSchema
 from core.registry.store import MANAGED_FILES_KEY, Source
 
 #: Source kinds this task wires to a C2 connector. The ``sources`` table/API
@@ -372,16 +373,26 @@ def _xlsx_extra_columns(source: Source) -> tuple[str, ...]:
     return tuple(item.strip() for item in value)
 
 
-def resolve_source(source: Source) -> Iterator[DocumentPayload]:
+def resolve_source(
+    source: Source, *, metadata_schema: MetadataSchema | None = None
+) -> Iterator[DocumentPayload]:
     """The §5-step-1 payload stream for one source, dispatched by ``kind``.
 
     Raises :class:`SourceResolutionError` eagerly for an unsupported/missing kind,
     a non-``file://`` uri, or missing structured metadata. The connector's own
     lazy failures (a missing directory, a CSV header without the pk column) still
     surface loud when the ingest stage iterates the stream.
+
+    ``metadata_schema`` is the project's pinned attribute schema, threaded to the
+    text connector's SIDECAR fence (``None`` folds to the empty schema there —
+    fail-closed; see :func:`~core.ingest.connectors.read_text_documents`). The
+    ingest stage passes ``BuildConfig.metadata_schema`` so sidecar validation
+    runs against the config PINNED to the build, not live project state.
     """
     if source.kind == "text":
-        return read_text_documents(_local_path(source), _files_metadata(source))
+        return read_text_documents(
+            _local_path(source), _files_metadata(source), metadata_schema=metadata_schema
+        )
     if source.kind == "structured":
         return read_csv_rows(
             _local_path(source),

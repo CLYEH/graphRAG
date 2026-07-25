@@ -22,6 +22,7 @@ from core.builds import stages as stages_mod
 from core.builds.config import load_build_config
 from core.builds.stages import OntologyRequiredError, default_stages
 from core.graph.structured import GraphExtractReport
+from core.metadata.schema import MetadataSchema
 from core.observability.spec import ItemOutcome
 from core.registry.store import Source
 from core.resolve.resolution import ResolveReport
@@ -259,7 +260,12 @@ async def test_ingest_pages_sources_and_flatmaps_payloads(
         return ([src], None) if after is None else ([], None)
 
     monkeypatch.setattr(stages_mod, "list_sources", _list_sources)
-    monkeypatch.setattr(stages_mod, "resolve_source", lambda s: iter([SimpleNamespace(raw="doc")]))
+
+    def _resolve(s: Any, *, metadata_schema: Any) -> Any:
+        seen["metadata_schema"] = metadata_schema
+        return iter([SimpleNamespace(raw="doc")])
+
+    monkeypatch.setattr(stages_mod, "resolve_source", _resolve)
 
     stages = _stages({})
     result = await stages.ingest(SimpleNamespace(), "p", _BUILD_ID)
@@ -267,6 +273,11 @@ async def test_ingest_pages_sources_and_flatmaps_payloads(
     # ingest_documents received the flattened payloads; report mapped through.
     assert list(spy["ingest"].args[1]) == [SimpleNamespace(raw="doc")]
     assert result.detail == {"sources": 1, "documents": 1}
+    # Codex #130: the PINNED config's metadata_schema is threaded to
+    # resolve_source — the sidecar fence runs against the build's config, and
+    # dropping the thread would silently fold every build to the empty schema
+    # (rejecting legitimate declared sidecar attributes).
+    assert seen["metadata_schema"] == MetadataSchema(attributes={})
     # SRC2: the build must load ONLY enabled sources — a disabled source is
     # excluded from future builds (regression guard: dropping the flag would
     # silently re-ingest disabled corpus).

@@ -66,6 +66,7 @@ from typing import Any
 from core.clean.chunking import DEFAULT_MAX_CHARS, DEFAULT_OVERLAP
 from core.graph.ontology import EntityRule, RelationRule, StructuredMapping, TextOntology
 from core.graph.proposals import PROPOSAL_POLICIES
+from core.metadata.schema import MetadataConfigError, MetadataSchema, load_metadata_schema
 from core.resolve.resolution import ResolutionConfig
 
 #: Hold LLM-proposed types for review unless the config opts into auto-adoption.
@@ -96,6 +97,7 @@ class BuildConfig:
     resolution: ResolutionConfig
     chunk_max_chars: int
     chunk_overlap: int
+    metadata_schema: MetadataSchema
 
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
@@ -312,6 +314,13 @@ def load_build_config(raw: Mapping[str, Any]) -> BuildConfig:
     raw = _mapping(raw, "config")
     ontology, proposal_policy = _load_ontology(raw)
     chunk_max_chars, chunk_overlap = _load_chunking(raw)
+    # Re-wrapped so the worker preflight's single BuildConfigError catch
+    # terminalizes a malformed metadata_schema instead of retrying it forever
+    # (MetadataConfigError is a sibling ValueError, not a BuildConfigError).
+    try:
+        metadata_schema = load_metadata_schema(raw)
+    except MetadataConfigError as exc:
+        raise BuildConfigError(f"metadata_schema: {exc}") from exc
     return BuildConfig(
         ontology=ontology,
         ontology_proposal_policy=proposal_policy,
@@ -319,4 +328,5 @@ def load_build_config(raw: Mapping[str, Any]) -> BuildConfig:
         resolution=_load_resolution(raw),
         chunk_max_chars=chunk_max_chars,
         chunk_overlap=chunk_overlap,
+        metadata_schema=metadata_schema,
     )

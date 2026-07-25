@@ -181,6 +181,7 @@ async def test_sidecar_envelope_survives_to_the_document_row(
     import json as jsonlib
 
     from core.ingest.connectors import read_text_documents
+    from core.metadata.schema import load_metadata_schema
 
     (tmp_path / "faq.txt").write_text("full fare 200", encoding="utf-8")
     (tmp_path / "faq.txt.meta.json").write_text(
@@ -194,13 +195,20 @@ async def test_sidecar_envelope_survives_to_the_document_row(
         ),
         encoding="utf-8",
     )
+    # the sidecar fence: source_url must be DECLARED in the project
+    # metadata_schema, exactly as an upload would require (Codex #130)
+    schema = load_metadata_schema(
+        {"metadata_schema": {"attributes": {"source_url": {"type": "string"}}}}
+    )
     engine = _engine()
     project = f"itest-{uuid.uuid4().hex[:10]}"
     try:
         async with engine.connect() as conn:
             trans = await conn.begin()
             writer = await _building_writer(conn, project)
-            report = await ingest_documents(writer, list(read_text_documents(tmp_path)))
+            report = await ingest_documents(
+                writer, list(read_text_documents(tmp_path, metadata_schema=schema))
+            )
             assert [o.status for o in report.outcomes] == ["ingested"]
             row = (await writer.fetch_all(documents))[0]
             assert row.metadata["system"] == {

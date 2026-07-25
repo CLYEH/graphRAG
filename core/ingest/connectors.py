@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from core.metadata.schema import build_envelope
+from core.metadata.schema import MetadataSchema, MetadataValidationError, build_envelope
 from core.stores.tables import STRUCTURED_MIME
 
 #: Free-text suffixes the document connector accepts, mapped to their mime
@@ -55,7 +55,10 @@ def content_hash(raw: str) -> str:
 
 
 def read_text_documents(
-    root: Path, metadata_by_filename: Mapping[str, dict[str, Any]] | None = None
+    root: Path,
+    metadata_by_filename: Mapping[str, dict[str, Any]] | None = None,
+    *,
+    metadata_schema: MetadataSchema | None = None,
 ) -> Iterator[DocumentPayload]:
     """Yield one payload per accepted text file under ``root`` (recursive).
 
@@ -84,6 +87,18 @@ def read_text_documents(
     under the tree is read, each falling back to the connector-derived
     ``{"filename": ...}`` — the original behavior for a non-upload source or a file
     placed on disk directly.
+
+    ``metadata_schema`` fences the SIDECAR path (MCP10 / Codex #130): sidecar
+    ``context.attributes`` are validated against the project ``metadata_schema``
+    — the SAME fence the upload boundary applies at capture — so an undeclared /
+    wrong-typed / missing-required attribute fails the build loud instead of
+    persisting values that typed document filters would silently disagree with.
+    ``None`` folds to the EMPTY schema (fail-closed: every attribute is then
+    undeclared — the schema is load-bearing even when empty), so a caller that
+    forgets to thread the project schema breaks a legitimate sidecar build
+    loudly rather than silently skipping the fence. Files WITHOUT a sidecar
+    never enter the envelope surface, so nothing is validated for them; the
+    managed path's envelopes were validated at upload capture.
     """
     if not root.is_dir():
         raise NotADirectoryError(f"document source root {root} is not a directory")
@@ -131,7 +146,7 @@ def read_text_documents(
                 metadata=metadata_by_filename[name],
             )
         return
-    sidecars = _collect_sidecars(root)
+    sidecars = _collect_sidecars(root, metadata_schema)
     for path in sorted(root.rglob("*")):
         suffix = path.suffix.lower()
         if not path.is_file() or suffix not in TEXT_SUFFIXES:
@@ -173,12 +188,17 @@ _SIDECAR_SUFFIX = ".meta.json"
 _SIDECAR_KEYS = {"context", "governance"}
 
 
-def _collect_sidecars(root: Path) -> dict[Path, dict[str, Any]]:
+def _collect_sidecars(
+    root: Path, metadata_schema: MetadataSchema | None
+) -> dict[Path, dict[str, Any]]:
     """``{target-file-resolved-path: parsed sidecar}`` for every
     ``<name>.meta.json`` under ``root``. A corrupt sidecar is a LOUD failure
     (same rule as an undecodable source file); unknown top-level keys are
     rejected — ``system``/``schema_version`` are server-stamped namespaces a
-    sidecar must not forge (DR-010 rule 1/4)."""
+    sidecar must not forge (DR-010 rule 1/4). Sidecar attributes are validated
+    against ``metadata_schema`` (``None`` = the empty schema, fail-closed) —
+    see :func:`read_text_documents`."""
+    schema = metadata_schema if metadata_schema is not None else MetadataSchema(attributes={})
     collected: dict[Path, dict[str, Any]] = {}
     for sidecar_path in sorted(root.rglob(f"*{_SIDECAR_SUFFIX}")):
         if not sidecar_path.is_file():
@@ -197,6 +217,14 @@ def _collect_sidecars(root: Path) -> dict[Path, dict[str, Any]]:
                 "server-stamped and cannot be forged from a sidecar)"
             )
         _validate_sidecar_context(sidecar_path, parsed.get("context"))
+        try:
+            schema.validate_context(parsed.get("context") or {})
+        except MetadataValidationError as exc:
+            raise ValueError(
+                f"metadata sidecar {sidecar_path}: {exc} — sidecar attributes are "
+                "validated against the project metadata_schema, the same fence the "
+                "upload boundary applies at capture"
+            ) from exc
         stem = sidecar_path.name[: -len(_SIDECAR_SUFFIX)]
         if not stem:
             raise ValueError(

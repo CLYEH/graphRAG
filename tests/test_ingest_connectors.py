@@ -20,6 +20,7 @@ from core.ingest.connectors import (
     read_text_documents,
     read_xlsx_rows,
 )
+from core.metadata.schema import load_metadata_schema
 
 
 def test_content_hash_tracks_content_only() -> None:
@@ -447,9 +448,14 @@ def test_sidecar_metadata_becomes_a_stamped_envelope(tmp_path: Path) -> None:
     )
     (tmp_path / "plain.txt").write_text("no sidecar", encoding="utf-8")
 
+    # the project must DECLARE source_url for a sidecar to carry it — the same
+    # metadata_schema fence the upload boundary applies (DR-010 rule 2)
+    schema = load_metadata_schema(
+        {"metadata_schema": {"attributes": {"source_url": {"type": "string"}}}}
+    )
     payloads = {
         p.metadata.get("system", {}).get("original_filename") or p.metadata.get("filename"): p
-        for p in read_text_documents(tmp_path)
+        for p in read_text_documents(tmp_path, metadata_schema=schema)
     }
     assert set(payloads) == {"faq.txt", "plain.txt"}  # the sidecar itself never ingests
 
@@ -528,3 +534,46 @@ def test_sidecar_context_shape_is_closed(tmp_path: Path) -> None:
     (tmp_path / ".meta.json").write_text(jsonlib.dumps({"context": {}}), encoding="utf-8")
     with pytest.raises(ValueError, match="names no target file"):
         list(read_text_documents(tmp_path))
+
+
+def test_sidecar_attributes_validate_against_the_project_schema(tmp_path: Path) -> None:
+    """Sidecar attributes pass through the SAME metadata_schema fence the
+    upload boundary applies at capture (Codex #130): without it, a sidecar
+    could persist undeclared or wrong-typed values while the build succeeds,
+    and typed document filters would silently disagree with project config.
+    Passing NO schema folds to the EMPTY schema — fail-closed, so a caller
+    that forgets to thread the project schema breaks a legitimate sidecar
+    build loudly instead of silently skipping the fence."""
+    import json as jsonlib
+
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    sidecar = tmp_path / "a.txt.meta.json"
+    sidecar.write_text(
+        jsonlib.dumps({"context": {"attributes": {"source_url": "https://example.com"}}}),
+        encoding="utf-8",
+    )
+
+    # no schema threaded = empty schema: every attribute is undeclared (fail-closed)
+    with pytest.raises(ValueError, match="not declared in the project metadata_schema"):
+        list(read_text_documents(tmp_path))
+
+    declaring = load_metadata_schema(
+        {"metadata_schema": {"attributes": {"source_url": {"type": "string"}}}}
+    )
+    assert [p.raw for p in read_text_documents(tmp_path, metadata_schema=declaring)] == ["x"]
+
+    # wrong-typed value against the declaring schema
+    sidecar.write_text(
+        jsonlib.dumps({"context": {"attributes": {"source_url": 42}}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="must be string"):
+        list(read_text_documents(tmp_path, metadata_schema=declaring))
+
+    # a REQUIRED attribute is enforced on every sidecar (same rule as uploads) —
+    # including one that declares no attributes at all
+    requiring = load_metadata_schema(
+        {"metadata_schema": {"attributes": {"source_url": {"type": "string", "required": True}}}}
+    )
+    sidecar.write_text(jsonlib.dumps({"context": {"title": "t"}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="required attribute 'source_url' is missing"):
+        list(read_text_documents(tmp_path, metadata_schema=requiring))
