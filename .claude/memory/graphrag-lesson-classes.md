@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: d673e708-e836-4b8a-8fc7-cb33527c5fc3
-  modified: 2026-07-24T08:13:59.934Z
+  modified: 2026-07-25T17:15:04.771Z
 ---
 
 # 使用方式(step 8 / prep 協定)
@@ -78,7 +78,7 @@ Deny-guard 的面有 sibling 建構子 × 巢狀深度——全枚舉;每條 den
 Per-segment cap≠request 級不變量——枚舉生命週期每段,交接剩餘預算;圍籬面的旁路入口要帶同強度能力證明(ActiveBinding/InitVar-sealed,#37)。**「驗證先於 store」要在最外層成立**(#125 r3):helper 內驗證了,但 wrapper 先開 binding(active-build 解析)才進 helper——壞輸入白付 store 成本、store 掛掉時可行動錯誤被 STORE_UNAVAILABLE 遮蔽;修=pre-binding 拒絕(nil sentinel)+ 真 dispatch ordering pin(nil build 只在跳過 binding 時成立)。**配額/名額類機制要在驗證後的集合上運作**(#126:floor 名額配在原始 hits 上,drift 髒 hit 佔名額再被 drop,擠掉已抓回的合法 chunk——保證恰在 drift 時破功;修=先全量驗證再配置;#127 r7 同 class 三站連環:neighbors 頁、subgraph edges、REST context edges——**一站被抓就全倉 grep 同型配置點一次掃完**,gate-2 sibling sweep 連抓兩站證明 waved sibling 必回鍋)。
 
 **Class 12 — 框架生命週期 × 自有 SoR/liveness**(何時比對:任何 framework dispatch/retry/timeout/streaming 任務)[pattern:lease/reaper 原語已抽出]
-先讀框架原始碼列「出口清單」再蓋上去;liveness 自己擁有(DB lease+reaper),框架 timeout 只當鬆後盾;恢復通道自身是生命週期(per-generation 決定性 id、key 保留、索引掃描);config 快照 pin 在 **job 建立**(INSERT 內 scalar subquery),不是首次 dispatch(佇列延遲窗,#51);yield-dep 活到 response 完成——streaming 抱著 txn 一路(#54);best-effort 背景工作(heartbeat/cleanup)例外經 finally 的 await 遮蔽主結果——除 cancellation 外全部收容(#50);啟用新模式/transport→重審既有碼的模式相依假設(per-session lifespan 覆寫 module slot,#58);框架錯誤路徑窮舉(handler 優先序、隱藏序列化失敗、side-channel headers,#41);anyio cancel scope 綁 task——host-task-per-child(同 task 進出 lifespan);startup.complete=綠燈語意(資源就緒才送,#93)。
+先讀框架原始碼列「出口清單」再蓋上去;liveness 自己擁有(DB lease+reaper),框架 timeout 只當鬆後盾;恢復通道自身是生命週期(per-generation 決定性 id、key 保留、索引掃描);config 快照 pin 在 **job 建立**(INSERT 內 scalar subquery),不是首次 dispatch(佇列延遲窗,#51);yield-dep 活到 response 完成——streaming 抱著 txn 一路(#54);best-effort 背景工作(heartbeat/cleanup)例外經 finally 的 await 遮蔽主結果——除 cancellation 外全部收容(#50);啟用新模式/transport→重審既有碼的模式相依假設(per-session lifespan 覆寫 module slot,#58);框架錯誤路徑窮舉(handler 優先序、隱藏序列化失敗、side-channel headers,#41);anyio cancel scope 綁 task——host-task-per-child(同 task 進出 lifespan);startup.complete=綠燈語意(資源就緒才送,#93);per-request 重置的 idle timeout 唯**絕對年齡界**能封頂 session 過期快照;生命週期帳本以**完整 scope** 為鍵(project+session_id,部分 scope 會跨 scope 串話)、confirm-before-pop 不認他 scope 的 not-found、框架顯式終止路徑要 evict 其自身 registry(max-age 與 client-DELETE 兩路徑皆是)、無界帳本 insert+touch 雙觸發 compaction+攤還 high-water mark+time-trigger 回落、繞過框架安全檢查(rebinding guard)的 gateway 級回應零敏感(#137)。
 
 **Class 13 — eager dependency acquisition**(何時比對:DI provider、資源工廠)[pattern:must-not-acquire 測試]
 DI 解析先於 handler 邏輯——provider 解析期零 I/O;資源只在需要它的分支內取;以 raising-provider + must-not-acquire 測試 pin。
