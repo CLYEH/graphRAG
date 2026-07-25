@@ -370,7 +370,7 @@ def build_server(project: str) -> FastMCP:
         graph_template: str | None = None,
         graph_entity: str | None = None,
         graph_other_entity: str | None = None,
-        graph_hops: int = 1,
+        graph_hops: int | None = None,
     ) -> dict[str, Any]:
         """Fan every AVAILABLE mode out over the question and fuse: semantic
         + graph + sql, deterministically (no LLM routing). Community reports
@@ -378,7 +378,11 @@ def build_server(project: str) -> FastMCP:
         query-matched; use global_summary for that. Supply graph_template +
         graph_entity to run YOUR graph invocation; without them the router
         derives a safe plan itself when the question names a build entity
-        (QP1 auto plan — see the routing trace).
+        (QP1 auto plan — see the routing trace). Supplying ANY graph_*
+        parameter without BOTH graph_template and graph_entity is refused
+        loudly (GUARDRAIL_BLOCKED, zero results) — the router never silently
+        substitutes its own plan for half of yours. graph_hops defaults to 1
+        when your invocation omits it.
 
         `score` is rank-fusion (RRF) ordering, not confidence; each result's
         `confidence` carries its origin mode's RAW score (cosine for
@@ -388,13 +392,23 @@ def build_server(project: str) -> FastMCP:
         text questions, semantic_search alone is often faster and returns
         more readable passages."""
         rt = _rt()
+        refused = _incomplete_graph_invocation_payload(
+            rt.context.project,
+            query,
+            graph_template=graph_template,
+            graph_entity=graph_entity,
+            graph_other_entity=graph_other_entity,
+            graph_hops=graph_hops,
+        )
+        if refused is not None:
+            return refused
         params: GraphQueryParams | None = None
         if graph_template is not None and graph_entity is not None:
             params = GraphQueryParams(
                 template=graph_template,
                 entity=graph_entity,
                 other_entity=graph_other_entity,
-                hops=graph_hops,
+                hops=graph_hops if graph_hops is not None else 1,
             )
 
         async def _run(deps: Any, remaining_ms: int) -> McpResponse:
@@ -923,6 +937,61 @@ def _parse_uuid(raw: str) -> uuid.UUID | None:
         return uuid.UUID(raw)
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def _incomplete_graph_invocation_payload(
+    project: str,
+    query: str,
+    *,
+    graph_template: str | None,
+    graph_entity: str | None,
+    graph_other_entity: str | None,
+    graph_hops: int | None,
+) -> dict[str, Any] | None:
+    """MCP11: a caller-supplied graph invocation is TEMPLATE + ENTITY; any
+    ``graph_*`` argument without that complete pair used to be dropped
+    SILENTLY — worse, the QP1 auto plan would then run the router's OWN
+    template/seed and the agent believed THEIRS ran. The tool docstring
+    promises "run YOUR graph invocation", so a partial one is a client
+    error refused LOUDLY before binding (parsing needs no store — the same
+    pre-binding convention as :func:`_invalid_chunk_payload`; nil build,
+    nothing spent): the router must never trust its own guess over the
+    caller's explicit instruction. Returns None when the invocation is
+    COMPLETE (template + entity, with other_entity/hops as optional
+    refinements) or ABSENT (no graph_* argument at all — QP1 may plan
+    freely)."""
+    supplied = [
+        name
+        for name, value in (
+            ("graph_template", graph_template),
+            ("graph_entity", graph_entity),
+            ("graph_other_entity", graph_other_entity),
+            ("graph_hops", graph_hops),
+        )
+        if value is not None
+    ]
+    if not supplied or (graph_template is not None and graph_entity is not None):
+        return None
+    missing = [name for name in ("graph_template", "graph_entity") if name not in supplied]
+    return McpResponse(
+        query=query,
+        tool="hybrid_query",
+        project=project,
+        build_id=_NIL_BUILD,
+        results=(),
+        warnings=(
+            QueryWarning(
+                "GUARDRAIL_BLOCKED",
+                f"incomplete graph invocation — {supplied} supplied without {missing}: "
+                "a caller-supplied graph invocation needs BOTH graph_template AND "
+                "graph_entity (graph_other_entity / graph_hops are optional "
+                "refinements). Refused instead of silently running the router's own "
+                "auto plan — your graph invocation did NOT run; supply the missing "
+                "parameter(s) and retry, or omit every graph_* parameter to let the "
+                "router plan",
+            ),
+        ),
+    ).to_dict()
 
 
 def _invalid_chunk_payload(project: str, chunk_id: str) -> dict[str, Any] | None:
