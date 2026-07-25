@@ -374,3 +374,7 @@ RunsTable 失敗建置列展開加「失敗診斷」:useBuildSteps/useStepItems 
 ## MCP14
 
 (a) 全 metadata 補完:全參數 Field description(測試機械強制、§-free 雙面掃);封閉詞彙 enum 走 json_schema_extra 廣告面(Literal 會把非法值退化成 raw transport error,砸掉 MCP12/13 typed 拒絕——gate-2 驗證 runtime 拒絕前提);六信封工具 outputSchema 以 cached_property 槽預填凍結契約(runtime fn_metadata 不動);server 自述 instructions/website_url/graphrag 套件版本;空 prompts/resources handler 反註冊取消宣告;SDK 三觸點各配 tripwire。(b) gate-2 兩輪 PASS(nit:參數描述 § 檢查採納)。(c) 遠端 3 輪:r1 P1 wheel 部署路徑(repo-root only→FileNotFoundError)→鏡射 policy.py 雙候選 loader;r1 P2 nullable enum 頂層約束 anyOf 兩分支、顯式 null 被拒→nullable 參數 enum 含 null;r2 P2 凍結 schema 自帶 §/DR 描述整包外洩→_strip_schema_descriptions 廣告副本去 annotation(name→schema 映射視為資料雙保險,drop-not-rewrite 免影子文件);r3 +1。(d) 教訓:去行話要掃「每一個對外廣告面」——掛上新工件(凍結 schema)等於重新進口剛清掉的行話;打包路徑解析先找同倉既有 pattern(policy.py 雙候選)。
+
+## MCP15
+
+(a) list_schema 併入 session 實際 policy 區塊(不新增工具,§9 詞彙凍結;lifespan 載入即所揭露=所執行,DR-012 一致);guardrail 內部(黑名單/子塊細節)刻意不揭露。(b) gate-2 四輪 PASS 鏈:r1 nit sql_rows() 對帳值;r2 nit 全分支釘 policy;r3/r4 採納後確認。(c) 遠端 4 輪全 P2 must-fix,一條規則逐步顯影:r1 policy 區塊要騎全部錯誤分支(degraded 態正是 agent 檢視 session 的時刻;_policy_disclosure 無 store 純函數);r2 每個上限都要是 reconciled enforced 值(max_graph_rows/sql+graph timeout_ms=既有 §21 reconciler);r3 非 operative 旗標整欄移除(text_to_cypher.enabled 轄的自由 NL→Cypher 路徑無任何 MCP 面曝光,任何值都誤導)+ max_response_bytes:null 顯式揭露無上限;r4 default_mode 同規則移除(無 dispatch 消費者、與 instructions 的 hybrid 預設矛盾);r5 +1。期間 Codex 一度停擺 ~1h(三 poke 無 👀),PushNotification 通知 owner 後恢復。(d) 教訓:揭露面三律——騎全分支、只列 operative、值必 reconciled;「寧缺勿列」:no-consumer 欄位任何值都是錯的。

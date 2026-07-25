@@ -183,7 +183,7 @@ Keep items small enough to finish in one loop.
 
 ### P3 — 可發現性(成本最低、回報直接)
 - [x] MCP14 工具面 metadata 補完:全參數 Field description;封閉詞彙上 enum(template/graph_template/point_type);六個信封工具 outputSchema 接上凍結契約(僅廣告面,runtime 轉換不動);描述去 §/內部代號;server 自述(instructions/website_url/版本改報 graphrag 套件版,非 SDK 版);空的 prompts/resources 能力取消宣告(handler 反註冊)。全 metadata,執行路徑零變更。
-- [x] MCP15 限制事前可發現:list_schema 回應併入 session 實際 policy 區塊(default_mode/max_top_k/max_graph_hops/max_sql_rows/max_latency_ms/expose_debug/sql+cypher enabled/query 4000/browse 200/q 64)——逐專案 policy 分歧從此可見(lifespan 讀入的即所揭露的);server instructions 指路。純新增,不動工具詞彙。
+- [x] MCP15 限制事前可發現:list_schema 回應併入 session 實際 policy 區塊——max_top_k/max_graph_hops/對帳後 max_sql_rows+max_graph_rows/max_latency_ms/sql+graph timeout_ms/expose_debug/sql_enabled/max_response_bytes(顯式 null=無上限)/query 4000/browse 200/q 64,騎全部分支;非 operative 欄位(default_mode、cypher 開關)寧缺勿列。純新增,不動工具詞彙。
 
 ### P4 — 效能與併發(若要讓多個 agent 同時使用)
 - [ ] MCP16 事件迴圈解阻塞(review 第 26/27 條;**併發的單一最大瓶頸**)— 併發爬升實測(每 session:initialize + `get_entity`,純 Postgres):5→15→30→60 併發的中位延遲 5.3s→13.8s→20.9s→**40.0s**,總牆鐘 76s,**零失敗但吞吐量固定在約 0.8 session/秒**——線性劣化=序列化。**PG 連線峰值始終是 7,資料庫不是瓶頸**。根因:`vector_client()`(`core/stores/vectors.py:59-61`)的 `AsyncQdrantClient(url=...)` 建構子**做同步阻塞 I/O**,而它在每個 session 的 lifespan 被呼叫一次(`core/mcp/server.py:251`)——實測建構期間**事件迴圈最長停滯 1,302ms**,在單執行緒迴圈裡會凍住所有其他併發連線。修法:client 建構移出 per-session lifespan(gateway 建置時建一次共用),或至少包進 `asyncio.to_thread`。順帶:每個 session 現在各建一套 engine(`NullPool`)+Qdrant+Neo4j+兩個 OpenAI client,搭配「session 永不過期、`_apps` 從不淘汰」會隨連線數單調累積。
