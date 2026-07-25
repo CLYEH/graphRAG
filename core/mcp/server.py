@@ -127,11 +127,35 @@ _MCP_SCHEMA_CANDIDATES = (
 def _mcp_response_schema() -> dict[str, Any]:
     for candidate in _MCP_SCHEMA_CANDIDATES:
         if candidate.is_file():
-            return cast(dict[str, Any], json.loads(candidate.read_text("utf-8")))
+            schema = cast(dict[str, Any], json.loads(candidate.read_text("utf-8")))
+            return cast(dict[str, Any], _strip_schema_descriptions(schema))
     raise FileNotFoundError(
         "mcp_response.schema.json not found — looked in: "
         + ", ".join(str(c) for c in _MCP_SCHEMA_CANDIDATES)
     )
+
+
+def _strip_schema_descriptions(node: Any, *, in_name_map: bool = False) -> Any:
+    """The ADVERTISED copy of the contract drops every ``description``
+    annotation (Codex #134 r2): the frozen file's descriptions carry DESIGN
+    §-numbers, DR-ids and change-history notes an external agent cannot
+    resolve — exactly the jargon MCP14 scrubbed from tool/param
+    descriptions. Validation keywords are untouched (descriptions are pure
+    annotations), and keys inside name→schema maps (``properties`` etc.)
+    are data, never annotations — a real property NAMED "description" would
+    survive."""
+    if isinstance(node, dict):
+        out: dict[str, Any] = {}
+        for key, value in node.items():
+            if not in_name_map and key == "description" and isinstance(value, str):
+                continue
+            out[key] = _strip_schema_descriptions(
+                value, in_name_map=key in ("properties", "patternProperties", "$defs")
+            )
+        return out
+    if isinstance(node, list):
+        return [_strip_schema_descriptions(item) for item in node]
+    return node
 
 
 #: what an external agent needs to know BEFORE the first call — it cannot

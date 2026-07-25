@@ -95,8 +95,17 @@ async def test_tool_surface_metadata_is_complete() -> None:
         None,
     ]
 
-    # the six envelope-returning tools advertise the FROZEN contract
+    # the six envelope-returning tools advertise the FROZEN contract —
+    # minus its description annotations, which carry §/DR/change-history
+    # jargon an external agent cannot resolve (Codex #134 r2); the
+    # validation keywords must survive intact
+    from core.mcp.server import _strip_schema_descriptions
+
     frozen = json.loads((REPO_ROOT / "contracts" / "mcp_response.schema.json").read_text("utf-8"))
+    sanitized = _strip_schema_descriptions(frozen)
+    assert "§" not in json.dumps(sanitized) and "DR-0" not in json.dumps(sanitized)
+    assert sanitized["properties"]["schema_version"]["const"] == "1.2"  # keywords intact
+    assert sanitized["required"] == frozen["required"]
     for name in (
         "semantic_search",
         "graph_query",
@@ -105,7 +114,7 @@ async def test_tool_surface_metadata_is_complete() -> None:
         "hybrid_query",
         "explain_retrieval",
     ):
-        assert by_name[name].outputSchema == frozen, f"{name} outputSchema not the contract"
+        assert by_name[name].outputSchema == sanitized, f"{name} outputSchema not the contract"
 
     # the server describes ITSELF: our version (not the SDK's), operating
     # instructions, a website, and NO empty prompts/resources capabilities
