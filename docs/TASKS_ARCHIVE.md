@@ -350,3 +350,7 @@ RunsTable 失敗建置列展開加「失敗診斷」:useBuildSteps/useStepItems 
 ## MCP8
 
 (a) selector 移除=C3b fallback 升格唯一行為,auto-plan 結構性必跑(_MODE_ORDER 位置);deps.llm 僅 sql/NLSQL 用。(b) global 恆置 gated,每呼叫 MODE_SKIPPED 指 global_summary;[global] fusion filters(MCP3 r2-r4 機制)因不可達移除,mention refit 保留。(c) confidence=首模態原始分數 clamp 0..1(§16 score 排序約束故 RRF 值不動);DESIGN §22 MCP4 句依 S7 同步(provenance 非可答性)。(d) 測試:selector 時代 12+ 測試依 test-lifecycle 反轉合併(llm.calls==0 判別);global 融合/報告 pin 反轉;confidence probe 恰紅;整合兩檔 pin 反轉。(e) 遠端 2 輪:r1 P2=eval models_needed 仍假設 selector(keyless hybrid eval 誤炸)→needs_llm=text_to_sql.enabled 綁 hybrid/sql,pin 反轉;r2 +1。gate-2 一輪清掉 5 個被點名的 selector 殘留 nit(retro 時另發現整合測試 fixture `_SelectorLLM` 一處殘黨,入 followups 帳)。(f) 實測:report 0 格、4c/4e、conf=真 cosine、3,078→1,384ms。
+
+## MCP9
+
+(a) 游標=sha256 canonical-JSON 指紋(class 31,gate-2 nit 採納取代 raw concat——separator-injection 邊緣消滅),四軸拒絕測試(build/q/entity_type/跨工具);sticky match 由指紋比對恢復,未知 tag 拒絕不猜。(b) gate-2 一輪 FAIL 兩 blocker:headline 行為零 live 覆蓋(fake 用 Python 重實作配對語意,無法驗證真 SQL)→ live 整合兩支(題館 substring/主館 字元-AND/100% 字面逸出/type facet/雙表窮盡遊走/DR-006 舊 build+舊游標拒絕);entity_type 游標軸未測→補。(c) 遠端 3 輪:r1 P1 list_reports 漏 summary(無 get_report=內容仍不可達,#124 死路類在自己修法裡)→完整 summary 隨頁;r1 P2 fuzzy 跳過 wildcard 字元(%% 配全部)→逐字元 escape_like;r2 P2 q 無上界(逐字元謂詞爆炸)→BROWSE_Q_CAP=64+FUZZY_Q_CAP=16;r3 +1。(d) escape_like 上移 core 供 REST/MCP 共用。
