@@ -39,13 +39,24 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
+from core.mcp.policy import PolicyError, load_runtime_config_from_registry
 from core.mcp.server import build_server
+from core.metadata.schema import MetadataConfigError
+from core.stores.errors import STORE_CLIENT_ERRORS
 
 #: matched against the RAW (undecoded) path: a percent-encoded slash
 #: (%2F) must stay INSIDE its segment — matching the decoded path would let
 #: /mcp/a%2Fb smuggle itself into project `a` + child path /b and serve the
 #: WRONG project's server (Codex #93 R3)
 _MCP_PATH_RAW = re.compile(rb"^/mcp/([^/]+)(/.*)?$")
+
+#: MCP12: ceiling on the per-request registry preflight. Measured defect: a
+#: session lifespan failure (bad policy, Postgres down) surfaced as HTTP 200
+#: + session id + a ZERO-BYTE stream — the PolicyError's actionable text
+#: never reached the wire, and with Postgres down the hang ran 46s (past
+#: every §21 budget). The preflight bounds that path: policy problems answer
+#: 503 WITH the actionable message, a dead registry answers 503 fast.
+_PREFLIGHT_TIMEOUT_S = 5.0
 
 
 def _json_response(status: int, payload: dict[str, Any]) -> tuple[int, bytes]:
@@ -86,14 +97,49 @@ class McpGateway:
         # into the name here and is rejected below, never re-split as a path
         project = unquote(match.group(1).decode("utf-8", "replace"))
         rest = unquote((match.group(2) or b"/").decode("utf-8", "replace"))
-        if "/" in project:
+        if "/" in project or project in (".", ".."):
+            # non-addressable names answer 404 BEFORE any registry read —
+            # the same rule _app_for enforces (kept there as defense in
+            # depth); the preflight below must not spend a DB read on them
             await self._send_json(
                 send,
                 404,
                 {"error": f"project {project!r} is not in the registry (or not path-addressable)"},
             )
             return
-        app = await self._app_for(project)
+        # MCP12 preflight — EVERY request, cached mount or not: the child
+        # server reads its policy per SESSION lifespan, and a failure there
+        # surfaces as HTTP 200 + an empty stream (the SDK gives the error no
+        # wire shape), which an agent cannot distinguish from a gateway
+        # crash or a network flap. Validating here turns that into a typed
+        # JSON answer: bad policy → 503 with the actionable PolicyError
+        # text; project deleted after mount → 404 (closing the
+        # "deleted project keeps serving" gap noted at module top); registry
+        # unreachable → 503 within _PREFLIGHT_TIMEOUT_S instead of a 46s
+        # hang. Cost: one policy read per request — the same read the
+        # Console API does per request, accepted for a correct answer.
+        refusal = await self._preflight(project)
+        if refusal is not None:
+            status, payload = refusal
+            if status == 404:
+                # the SoR no longer has the project — stop serving the
+                # cached mount (its host task idles until shutdown)
+                async with self._lock:
+                    self._apps.pop(project, None)
+            await self._send_json(send, status, payload)
+            return
+        try:
+            app = await self._app_for(project)
+        except Exception as exc:  # noqa: BLE001 — a mount failure must answer typed, not a raw 500
+            await self._send_json(
+                send,
+                503,
+                {
+                    "error": f"project {project!r} failed to mount "
+                    f"({type(exc).__name__}) — see the gateway log"
+                },
+            )
+            return
         if app is None:
             await self._send_json(
                 send,
@@ -109,6 +155,49 @@ class McpGateway:
             "root_path": scope.get("root_path", "") + f"/mcp/{project}",
         }
         await app(child_scope, receive, send)
+
+    async def _preflight(self, project: str) -> tuple[int, dict[str, Any]] | None:
+        """Registry + policy preflight for one request — None means
+        servable; otherwise the (status, payload) refusal to send (MCP12).
+
+        Distinguishes the four states the measured empty-stream response
+        collapsed: config error (503 + the actionable PolicyError text),
+        project deleted (404), registry unreachable (503, bounded fast), and
+        healthy (proceed). The not-in-registry case is decided by a direct
+        row lookup in the ERROR path only — never by matching PolicyError
+        message text."""
+        from core.registry import get_project
+
+        assert self._engine is not None, "gateway lifespan not started"
+        try:
+            with anyio.fail_after(_PREFLIGHT_TIMEOUT_S):
+                async with self._engine.connect() as conn:
+                    try:
+                        await load_runtime_config_from_registry(conn, project)
+                        return None
+                    # MetadataConfigError: a malformed metadata_exposure is
+                    # the same "config not servable" answer as a bad policy
+                    # (the composed loader rightly refuses it)
+                    except (PolicyError, MetadataConfigError) as exc:
+                        if await get_project(conn, project) is None:
+                            return 404, {
+                                "error": f"project {project!r} is not in the registry "
+                                "(or not path-addressable)"
+                            }
+                        return 503, {
+                            "error": f"project {project!r} is not servable — "
+                            f"configuration error: {exc}"
+                        }
+        except TimeoutError:
+            return 503, {
+                "error": "registry unreachable (timed out) — the gateway could not "
+                "read the project's query policy; check Postgres"
+            }
+        except STORE_CLIENT_ERRORS as exc:
+            return 503, {
+                "error": f"registry unreachable ({type(exc).__name__}) — the gateway "
+                "could not read the project's query policy; check Postgres"
+            }
 
     async def _lifespan(self, receive: Any, send: Any) -> None:
         message = await receive()

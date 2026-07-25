@@ -1702,6 +1702,11 @@ components:
         - LOW_CONFIDENCE
         - GUARDRAIL_BLOCKED
         - TRUNCATED
+        # v1.2 of mcp_response (DR-015, additive): the DR-001 lifecycle
+        # refusal — REST answers 409 NO_ACTIVE_BUILD (ErrorCode above); the
+        # MCP envelope says the same condition as a typed warning instead of
+        # letting the LookupError escape as a raw transport error.
+        - NO_ACTIVE_BUILD
 
     Warning:
       type: object

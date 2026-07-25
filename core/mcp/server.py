@@ -51,6 +51,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
+from core.llm.errors import LLM_CLIENT_ERRORS
 from core.llm.factory import chat_model, embedding_model
 from core.mcp.context import ProjectContext
 from core.mcp.policy import (
@@ -71,12 +72,30 @@ from core.query.sql import sql_query as run_sql
 from core.stores import tables
 from core.stores.errors import STORE_CLIENT_ERRORS, store_name
 from core.stores.graph import graph_driver
+from core.stores.repo import NoActiveBuildError
 from core.stores.vectors import vector_client
 
 #: §16 build_id is format:uuid — when the deadline fires DURING scope
 #: binding no build was ever resolved; the nil uuid is the honest,
 #: format-legal sentinel (the warning message says which case happened).
 _NIL_BUILD = "00000000-0000-0000-0000-000000000000"
+
+#: MCP12: hard cap on the query string every retrieval tool accepts. The
+#: query is embedded / paraphrased through the model provider on the hot
+#: path — without a cap an arbitrarily long input rides straight into
+#: provider token limits and surfaces as a provider error (or cost). A §21
+#: guardrail refusal at the door is actionable; a relayed provider error is
+#: not. Generous for real questions (browse q caps are 64; this is 4000).
+_QUERY_CHARS_CAP = 4000
+
+#: MCP12: the DR-001 refusal every binding surface emits when the project
+#: has no active build — REST maps the same condition to a 409; the MCP
+#: envelope says it with a typed warning (NO_ACTIVE_BUILD, contract v1.2)
+#: instead of letting the LookupError escape as a raw isError string.
+_NO_ACTIVE_BUILD_MESSAGE = (
+    "project has no active build — queries bind to builds.status='active' "
+    "(DR-001); run a build and activate it, then retry"
+)
 
 #: the store CLIENTS' exception families (§22 STORE_UNAVAILABLE) and their
 #: store names now live in core.stores.errors — hybrid's per-mode guard uses
@@ -105,6 +124,24 @@ async def _bounded(
     cancellation (finally runs), and the per-call connection closes with the
     context manager either way."""
     bound_build: str | None = None
+    # length check needs no store — refuse an oversized query BEFORE the
+    # binding opens one (MCP12: the query rides into the model provider's
+    # token limits; a §21 refusal here is actionable, a provider error not)
+    if len(query) > _QUERY_CHARS_CAP:
+        return McpResponse(
+            query=query[:200],
+            tool=tool,
+            project=runtime.context.project,
+            build_id=_NIL_BUILD,
+            results=(),
+            warnings=(
+                QueryWarning(
+                    "GUARDRAIL_BLOCKED",
+                    f"query length {len(query)} exceeds the {_QUERY_CHARS_CAP}-char cap "
+                    "— shorten the query (§21); rejected, not clamped",
+                ),
+            ),
+        ).to_dict()
     deadline = time.monotonic() + runtime.policy.max_latency_ms / 1000.0
     try:
         async with asyncio.timeout(runtime.policy.max_latency_ms / 1000.0):
@@ -141,6 +178,19 @@ async def _bounded(
                 ),
             ),
         ).to_dict()
+    except NoActiveBuildError:
+        # DR-001 lifecycle state, not store trouble: REST answers 409, the
+        # MCP envelope answers with the typed NO_ACTIVE_BUILD warning
+        # (contract v1.2) — previously this LookupError escaped as a raw
+        # isError string (MCP12)
+        return McpResponse(
+            query=query,
+            tool=tool,
+            project=runtime.context.project,
+            build_id=_NIL_BUILD,
+            results=(),
+            warnings=(QueryWarning("NO_ACTIVE_BUILD", _NO_ACTIVE_BUILD_MESSAGE),),
+        ).to_dict()
     except _STORE_ERRORS as exc:
         # a store outage during binding or the mode run degrades typed
         # (§22 STORE_UNAVAILABLE), never an MCP transport error; hybrid maps
@@ -158,6 +208,36 @@ async def _bounded(
                     "to an empty typed response (§22)",
                 ),
             ),
+        ).to_dict()
+    except LLM_CLIENT_ERRORS as exc:
+        # the model provider sits on the hot path (embedding / NL→SQL /
+        # hybrid routing) — a single 429 must degrade TYPED, never a raw
+        # isError; the message names only the exception CLASS (upstream
+        # error text — provider identity, model token ceilings — is never
+        # relayed to an untrusted caller). Hybrid classifies per-mode with
+        # the same input-vs-infrastructure rule (MCP2); this is the
+        # single-mode equivalent (MCP12).
+        status = getattr(exc, "status_code", None)
+        if not isinstance(exc, STORE_CLIENT_ERRORS) and status in (400, 422):
+            warning = QueryWarning(
+                "GUARDRAIL_BLOCKED",
+                f"the model provider rejected the request input "
+                f"({type(exc).__name__}, HTTP {status}) — the request as issued "
+                "cannot be served; retrying unchanged will fail again (§22)",
+            )
+        else:
+            warning = QueryWarning(
+                "STORE_UNAVAILABLE",
+                f"model provider unavailable ({type(exc).__name__}) — degraded "
+                "to an empty typed response; retry later (§22)",
+            )
+        return McpResponse(
+            query=query,
+            tool=tool,
+            project=runtime.context.project,
+            build_id=bound_build or _NIL_BUILD,
+            results=(),
+            warnings=(warning,),
         ).to_dict()
 
 
@@ -177,6 +257,19 @@ def _introspection_store_error(
         "build_id": build_id or _NIL_BUILD,
         "subject": subject,
         "error": f"{_store_name(exc)} unavailable ({type(exc).__name__}) — §22",
+    }
+
+
+def _introspection_no_active_build(runtime: _Runtime, subject: str) -> dict[str, Any]:
+    """The introspection tools' DR-001 refusal shape — the same typed
+    ``error`` field as the timeout/store shapes (MCP12: the NoActiveBuildError
+    LookupError previously escaped every introspection tool as a raw isError
+    string). Nil build: no build was ever resolved, by definition."""
+    return {
+        "project": runtime.context.project,
+        "build_id": _NIL_BUILD,
+        "subject": subject,
+        "error": _NO_ACTIVE_BUILD_MESSAGE,
     }
 
 
@@ -441,6 +534,8 @@ def build_server(project: str) -> FastMCP:
                 async with rt.context.bound() as deps:
                     bound_build = str(deps.repo.build_id)
                     return await _get_entity(deps.repo, rt.context.project, name)
+        except NoActiveBuildError:
+            return _introspection_no_active_build(rt, name)
         except TimeoutError:
             return _introspection_timeout(rt, bound_build, name)
         except _STORE_ERRORS as exc:
@@ -465,6 +560,8 @@ def build_server(project: str) -> FastMCP:
                 async with rt.context.bound() as deps:
                     bound_build = str(deps.repo.build_id)
                     return await _get_chunk(deps.repo, rt.context.project, chunk_id)
+        except NoActiveBuildError:
+            return _introspection_no_active_build(rt, chunk_id)
         except TimeoutError:
             return _introspection_timeout(rt, bound_build, chunk_id)
         except _STORE_ERRORS as exc:
@@ -488,6 +585,8 @@ def build_server(project: str) -> FastMCP:
                     return await _get_document(
                         deps.repo, rt.context.project, document_id, rt.exposure
                     )
+        except NoActiveBuildError:
+            return _introspection_no_active_build(rt, document_id)
         except TimeoutError:
             return _introspection_timeout(rt, bound_build, document_id)
         except _STORE_ERRORS as exc:
@@ -515,6 +614,8 @@ def build_server(project: str) -> FastMCP:
                     return await _list_entities(
                         deps.repo, rt.context.project, limit, cursor, q, entity_type
                     )
+        except NoActiveBuildError:
+            return _introspection_no_active_build(rt, q or "list_entities")
         except TimeoutError:
             return _introspection_timeout(rt, bound_build, q or "list_entities")
         except _STORE_ERRORS as exc:
@@ -533,6 +634,8 @@ def build_server(project: str) -> FastMCP:
                 async with rt.context.bound() as deps:
                     bound_build = str(deps.repo.build_id)
                     return await _list_chunks(deps.repo, rt.context.project, limit, cursor)
+        except NoActiveBuildError:
+            return _introspection_no_active_build(rt, "list_chunks")
         except TimeoutError:
             return _introspection_timeout(rt, bound_build, "list_chunks")
         except _STORE_ERRORS as exc:
@@ -551,6 +654,8 @@ def build_server(project: str) -> FastMCP:
                 async with rt.context.bound() as deps:
                     bound_build = str(deps.repo.build_id)
                     return await _list_reports(deps.repo, rt.context.project, limit, cursor)
+        except NoActiveBuildError:
+            return _introspection_no_active_build(rt, "list_reports")
         except TimeoutError:
             return _introspection_timeout(rt, bound_build, "list_reports")
         except _STORE_ERRORS as exc:
@@ -627,6 +732,8 @@ async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
                     "sql_enabled": runtime.policy.text_to_sql.enabled,
                     "tables": tables,
                 }
+    except NoActiveBuildError:
+        return _introspection_no_active_build(runtime, "list_schema")
     except TimeoutError:
         return _introspection_timeout(runtime, bound_build, "list_schema")
     except DBAPIError as exc:

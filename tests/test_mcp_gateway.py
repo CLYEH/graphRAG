@@ -20,6 +20,7 @@ import pytest
 
 import core.mcp.gateway as gateway_module
 from core.mcp.gateway import build_gateway
+from tests.conftest import DEMO_QUERY_POLICY
 
 
 class _ChildApp:
@@ -64,6 +65,9 @@ class _Harness:
         self.registry = registry
         self.children: dict[str, _ChildApp] = {}
         self.build_calls: list[str] = []
+        # per-project config override — default: a VALID policy, so the
+        # MCP12 per-request preflight passes and routing behaves as before
+        self.configs: dict[str, dict[str, Any]] = {}
 
     def fake_build_server(self, project: str) -> _ChildApp:
         self.build_calls.append(project)
@@ -72,7 +76,10 @@ class _Harness:
         return child
 
     async def fake_get_project(self, conn: object, name: str) -> object | None:
-        return SimpleNamespace(name=name) if name in self.registry else None
+        if name not in self.registry:
+            return None
+        config = self.configs.get(name, {"query_policy": DEMO_QUERY_POLICY})
+        return SimpleNamespace(name=name, config=config)
 
 
 async def _request(app: Any, path: str, raw_path: bytes | None = None) -> tuple[int, bytes]:
@@ -204,3 +211,110 @@ async def test_routing_registry_and_isolation(harness: _Harness) -> None:
     assert harness.children["nmmst"].lifespan_closed
     assert harness.children["fresh"].lifespan_closed
     assert events[-1]["type"] == "lifespan.shutdown.complete"
+
+
+async def test_preflight_answers_typed_for_every_unservable_state(harness: _Harness) -> None:
+    """MCP12: a session-lifespan failure used to surface as HTTP 200 + a
+    ZERO-BYTE stream — the PolicyError's actionable text never reached the
+    wire, an agent could not tell config-error from deleted from gateway
+    crash from network flap (and with Postgres down the hang ran 46s, past
+    every §21 budget). The per-request preflight splits those states into
+    typed JSON answers: bad policy → 503 WITH the actionable message; a
+    project DELETED after mount → 404 and the cached mount stops serving;
+    registry unreachable → 503 fast; a mount failure → 503 naming the class,
+    never a raw 500 traceback."""
+    app = build_gateway()
+
+    started = anyio.Event()
+    finish = anyio.Event()
+
+    async def lifespan_receive() -> dict[str, Any]:
+        if not started.is_set():
+            return {"type": "lifespan.startup"}
+        await finish.wait()
+        return {"type": "lifespan.shutdown"}
+
+    async def lifespan_send(message: dict[str, Any]) -> None:
+        if message["type"] == "lifespan.startup.complete":
+            started.set()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(app, {"type": "lifespan"}, lifespan_receive, lifespan_send)
+        await started.wait()
+
+        # (1) config error: the actionable PolicyError text reaches the wire
+        harness.registry.add("misconfigured")
+        harness.configs["misconfigured"] = {}  # no query_policy block
+        status, body = await _request(app, "/mcp/misconfigured")
+        assert status == 503
+        assert b"no query_policy block" in body  # the operator-actionable cause
+        assert "misconfigured" not in harness.children  # never mounted
+
+        # (2) deleted AFTER mount: the cached mount stops serving (the
+        # module-top "deleted project keeps serving" gap, closed)
+        status, _ = await _request(app, "/mcp/nmmst")
+        assert status == 200 and "nmmst" in harness.children
+        harness.registry.discard("nmmst")
+        status, body = await _request(app, "/mcp/nmmst")
+        assert status == 404, body
+
+        # (3) a mount failure answers typed, never a raw 500 traceback
+        harness.registry.add("brokenmount")
+
+        def _boom(project: str) -> Any:
+            raise RuntimeError("SDK exploded")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(gateway_module, "build_server", _boom)
+            status, body = await _request(app, "/mcp/brokenmount")
+        assert status == 503
+        assert b"RuntimeError" in body and b"Traceback" not in body
+
+        finish.set()
+
+
+async def test_preflight_registry_outage_fails_fast_and_typed(
+    monkeypatch: pytest.MonkeyPatch, harness: _Harness
+) -> None:
+    """MCP12: with Postgres down the old path hung 46s and then produced the
+    empty-stream non-answer. The preflight turns it into a bounded, typed
+    503 naming the outage — measured here as the raw builtin
+    ConnectionRefusedError a dead Postgres actually raises at connect."""
+    import time
+
+    class _DeadConnect:
+        async def __aenter__(self) -> object:
+            raise ConnectionRefusedError("[Errno 111] Connection refused")
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        gateway_module,
+        "create_async_engine",
+        lambda *a, **k: SimpleNamespace(dispose=_async_noop, connect=_DeadConnect),
+    )
+    app = build_gateway()
+
+    started = anyio.Event()
+    finish = anyio.Event()
+
+    async def lifespan_receive() -> dict[str, Any]:
+        if not started.is_set():
+            return {"type": "lifespan.startup"}
+        await finish.wait()
+        return {"type": "lifespan.shutdown"}
+
+    async def lifespan_send(message: dict[str, Any]) -> None:
+        if message["type"] == "lifespan.startup.complete":
+            started.set()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(app, {"type": "lifespan"}, lifespan_receive, lifespan_send)
+        await started.wait()
+        before = time.monotonic()
+        status, body = await _request(app, "/mcp/nmmst")
+        assert time.monotonic() - before < 5.0  # bounded, not the 46s hang
+        assert status == 503
+        assert b"registry unreachable" in body and b"ConnectionRefusedError" in body
+        finish.set()

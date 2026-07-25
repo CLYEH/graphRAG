@@ -290,6 +290,137 @@ async def test_bounded_tools_degrade_typed_at_the_wall_clock_deadline() -> None:
     assert "during scope binding" in payload["warnings"][0]["message"]
 
 
+async def test_bounded_maps_every_expected_failure_family_typed() -> None:
+    """MCP12 (§22): failure families that previously ESCAPED every retrieval
+    tool as a raw MCP isError string (a Python exception repr an agent's
+    JSON.parse chokes on) must each answer with a typed, contract-valid
+    envelope. Measured escapes: a dead Postgres surfaces the builtin
+    ConnectionRefusedError (not DBAPIError — "unexpected connection_lost()
+    call" class); NoActiveBuildError is a LookupError; the model provider's
+    OpenAIError family sits on the embedding/NL→SQL hot path where a single
+    429 killed every tool — and its raw message (provider identity, token
+    ceilings) must never be relayed to an untrusted caller. An oversized
+    query is refused BEFORE binding (it would ride into provider token
+    limits — a §21 refusal is actionable, a provider error is not)."""
+    import json
+    import uuid
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    import jsonschema
+    import openai
+
+    from core.mcp.server import _bounded, _Runtime
+    from core.query.results import McpResponse
+    from core.stores.repo import NoActiveBuildError
+
+    validator = jsonschema.Draft202012Validator(
+        json.loads((REPO_ROOT / "contracts" / "mcp_response.schema.json").read_text("utf-8")),
+        format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER,
+    )
+    build_id = uuid.uuid4()
+    deps = SimpleNamespace(repo=SimpleNamespace(project="p", build_id=build_id))
+
+    class _Ctx:
+        project = "p"
+
+        @asynccontextmanager
+        async def bound(self):  # type: ignore[no-untyped-def]
+            yield deps
+
+    policy = SimpleNamespace(max_latency_ms=1000)
+    runtime = _Runtime(context=_Ctx(), policy=policy)  # type: ignore[arg-type]
+
+    async def _raising(exc: BaseException) -> Any:
+        async def runner(_deps: Any, _remaining_ms: int) -> McpResponse:
+            raise exc
+
+        return await _bounded(runtime, "semantic_search", "q", runner)
+
+    # a dead Postgres at connect: raw builtin ConnectionRefusedError
+    payload = await _raising(ConnectionRefusedError("[Errno 111] refused"))
+    validator.validate(payload)
+    [warning] = payload["warnings"]
+    assert warning["code"] == "STORE_UNAVAILABLE"
+    assert "postgres" in warning["message"]
+
+    # provider outage (429/network): typed degradation naming ONLY the class
+    secret = "Rate limit reached for gpt-x in org-abc on tokens per min"
+    payload = await _raising(openai.OpenAIError(secret))
+    validator.validate(payload)
+    [warning] = payload["warnings"]
+    assert warning["code"] == "STORE_UNAVAILABLE"
+    assert "model provider" in warning["message"]
+    assert secret not in warning["message"]  # upstream text stays server-side
+
+    # provider input-rejection (400/422): the caller's input, not an outage
+    class _InputRejected(openai.OpenAIError):
+        status_code = 400
+
+    payload = await _raising(_InputRejected("bad request"))
+    validator.validate(payload)
+    assert payload["warnings"][0]["code"] == "GUARDRAIL_BLOCKED"
+
+    # DR-001 lifecycle: no active build → the v1.2 typed warning, nil build
+    class _NoBuildCtx:
+        project = "p"
+
+        @asynccontextmanager
+        async def bound(self):  # type: ignore[no-untyped-def]
+            raise NoActiveBuildError("p")
+            yield deps
+
+    no_build = _Runtime(context=_NoBuildCtx(), policy=policy)  # type: ignore[arg-type]
+
+    async def _unreachable(_deps: Any, _remaining_ms: int) -> McpResponse:
+        raise AssertionError("unreachable")
+
+    payload = await _bounded(no_build, "semantic_search", "q", _unreachable)
+    validator.validate(payload)
+    [warning] = payload["warnings"]
+    assert warning["code"] == "NO_ACTIVE_BUILD"
+    assert "activate" in warning["message"]  # actionable, not a LookupError repr
+    assert payload["build_id"] == "00000000-0000-0000-0000-000000000000"
+
+    # oversized query: refused BEFORE the binding ever opens a store
+    class _MustNotBind:
+        project = "p"
+
+        @asynccontextmanager
+        async def bound(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("binding must not open for an over-cap query")
+            yield deps
+
+    capped = _Runtime(context=_MustNotBind(), policy=policy)  # type: ignore[arg-type]
+    payload = await _bounded(capped, "semantic_search", "x" * 4001, _unreachable)
+    validator.validate(payload)
+    [warning] = payload["warnings"]
+    assert warning["code"] == "GUARDRAIL_BLOCKED"
+    assert "4000-char cap" in warning["message"]
+
+    # in-code bugs still propagate LOUD — §22 degrades dependencies, not bugs
+    with pytest.raises(ZeroDivisionError):
+        await _raising(ZeroDivisionError())
+
+
+def test_the_introspection_no_active_build_shape_is_explicit() -> None:
+    """MCP12: the introspection tools' DR-001 refusal is the same explicit
+    error-field shape as their timeout/store degradations — previously the
+    NoActiveBuildError LookupError escaped them as a raw isError string."""
+    from types import SimpleNamespace
+
+    from core.mcp.server import _introspection_no_active_build, _Runtime
+
+    runtime = _Runtime(
+        context=SimpleNamespace(project="p"),  # type: ignore[arg-type]
+        policy=SimpleNamespace(max_latency_ms=1000),  # type: ignore[arg-type]
+    )
+    payload = _introspection_no_active_build(runtime, "list_chunks")
+    assert payload["build_id"] == "00000000-0000-0000-0000-000000000000"
+    assert payload["subject"] == "list_chunks"
+    assert "activate" in payload["error"]  # actionable (DR-001), not a repr
+
+
 def test_the_introspection_timeout_shape_is_explicit() -> None:
     """The introspection tools are not §16 responses, so their §22 deadline
     degradation is an explicit error field — project/build_id/subject/error,

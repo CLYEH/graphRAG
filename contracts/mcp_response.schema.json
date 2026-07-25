@@ -15,7 +15,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "1.1",
+      "const": "1.2",
       "description": "Bumped only on breaking changes (DR-002)."
     },
     "query": {
@@ -692,7 +692,8 @@
         "PARTIAL_RESULTS",
         "LOW_CONFIDENCE",
         "GUARDRAIL_BLOCKED",
-        "TRUNCATED"
+        "TRUNCATED",
+        "NO_ACTIVE_BUILD"
       ]
     },
     "Warning": {
