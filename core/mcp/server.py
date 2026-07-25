@@ -723,6 +723,21 @@ def _parse_browse_cursor(
     return parsed, None
 
 
+#: Search-string ceiling (Codex #129 r2): q is agent-controlled and the
+#: character-AND fallback builds ONE ILIKE predicate per character — an
+#: unbounded q would compile an enormous statement. 64 covers any real
+#: name probe; the fuzzy fallback additionally engages only for short
+#: (name-ish) queries.
+BROWSE_Q_CAP = 64
+FUZZY_Q_CAP = 16
+
+
+def _bad_q(q: str | None) -> str | None:
+    if q is not None and len(q) > BROWSE_Q_CAP:
+        return f"q must be at most {BROWSE_Q_CAP} characters, got {len(q)}"
+    return None
+
+
 def _bad_limit(limit: Any) -> str | None:
     if type(limit) is not int or limit < 1 or limit > BROWSE_LIMIT_CAP:
         return f"limit must be an integer in 1..{BROWSE_LIMIT_CAP}, got {limit!r}"
@@ -745,7 +760,7 @@ async def _list_entities(
     scope-pinned (build + filters, class 31)."""
     build_id = str(repo.build_id)
     envelope = {"project": project, "build_id": build_id}
-    bad = _bad_limit(limit)
+    bad = _bad_limit(limit) or _bad_q(q)
     if bad is not None:
         return {**envelope, "entities": [], "next_cursor": None, "error": bad}
     # the match mode is STICKY across pages via the cursor scope (class 31):
@@ -770,7 +785,9 @@ async def _list_entities(
         )
     else:
         rows = await repo.page_entities(limit + 1, None, q, entity_type)
-        if not rows and q and len(q) >= 2:
+        if not rows and q and 2 <= len(q) <= FUZZY_Q_CAP:
+            # the per-character fallback engages only for short (name-ish)
+            # probes — each character costs one ILIKE predicate
             match = "characters"
             rows = await repo.page_entities(limit + 1, None, q, entity_type, fuzzy=True)
     scope = _entity_scope(match, q, entity_type)

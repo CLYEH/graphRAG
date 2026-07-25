@@ -690,6 +690,15 @@ async def test_browse_limit_is_bounded_and_chunk_previews_name_truncation() -> N
     bad = await _list_entities(repo, "demo", True, None, None, None)
     assert bad["error"] is not None  # bool is not a page size
 
+    # Codex #129 r2: q is agent-controlled and fuzzy costs one predicate per
+    # character — an unbounded q must be refused typed, and the fallback only
+    # engages for short name-ish probes (a 17+-char zero-hit stays substring)
+    long_q = await _list_entities(repo, "demo", 50, None, "長" * 65, None)
+    assert "at most 64 characters" in long_q["error"]
+    no_fuzzy = await _list_entities(repo, "demo", 50, None, "無" * 17, None)
+    assert no_fuzzy["error"] is None and no_fuzzy["match"] == "substring"
+    assert no_fuzzy["entities"] == []  # honest empty, not a predicate storm
+
     long_chunk = SimpleNamespace(
         id=uuid.uuid4(), document_id=uuid.uuid4(), ordinal=0, text="長" * 300
     )
