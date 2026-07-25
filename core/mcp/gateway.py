@@ -78,7 +78,12 @@ class McpGateway:
         # raises `RuntimeError: Attempted to exit cancel scope in a different
         # task` (gate-2 reproduced it); one task per child owns both ends.
         self._tasks: TaskGroup | None = None
-        self._stop = anyio.Event()
+        # one stop event PER child (Codex #132 r1): eviction of a deleted
+        # project must close THAT child's lifespan promptly — a single
+        # gateway-wide event kept evicted hosts (and their session managers)
+        # alive until full shutdown, accumulating orphans across
+        # delete/recreate cycles. Shutdown sets every remaining event.
+        self._child_stops: dict[str, anyio.Event] = {}
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
@@ -123,13 +128,34 @@ class McpGateway:
             status, payload = refusal
             if status == 404:
                 # the SoR no longer has the project — stop serving the
-                # cached mount (its host task idles until shutdown)
+                # cached mount AND close its child lifespan promptly (the
+                # per-child stop; a gateway-wide event would keep the
+                # orphaned session manager alive until full shutdown)
                 async with self._lock:
                     self._apps.pop(project, None)
+                    child_stop = self._child_stops.pop(project, None)
+                if child_stop is not None:
+                    child_stop.set()
             await self._send_json(send, status, payload)
             return
         try:
-            app = await self._app_for(project)
+            # the mount phase re-reads the registry (_project_exists) and
+            # enters the child lifespan — BOTH under the same fast deadline
+            # as the preflight (Codex #132 r1: Postgres stalling BETWEEN the
+            # two reads would otherwise hang this request on the driver's
+            # own much longer timeout, past the promised fast 503)
+            with anyio.fail_after(_PREFLIGHT_TIMEOUT_S):
+                app = await self._app_for(project)
+        except TimeoutError:
+            await self._send_json(
+                send,
+                503,
+                {
+                    "error": f"project {project!r} mount timed out — the registry "
+                    "or the session manager stalled; retry shortly"
+                },
+            )
+            return
         except Exception as exc:  # noqa: BLE001 — a mount failure must answer typed, not a raw 500
             await self._send_json(
                 send,
@@ -223,8 +249,10 @@ class McpGateway:
                 assert message["type"] == "lifespan.shutdown"
                 # release every host task — each exits its child lifespan in
                 # the SAME task that entered it; the task-group exit below
-                # waits for all of them to finish closing
-                self._stop.set()
+                # waits for all of them to finish closing (evicted children
+                # already had their own event set)
+                for child_stop in list(self._child_stops.values()):
+                    child_stop.set()
         finally:
             self._tasks = None
             if self._engine is not None:
@@ -246,6 +274,7 @@ class McpGateway:
             server.settings.streamable_http_path = "/"
             app = server.streamable_http_app()
             assert self._tasks is not None, "gateway lifespan not started"
+            child_stop = anyio.Event()
 
             async def host(*, task_status: TaskStatus[None]) -> None:
                 # ONE task owns the child lifespan end to end (see __init__):
@@ -253,10 +282,11 @@ class McpGateway:
                 # child startup propagates to the mount request loud
                 async with app.router.lifespan_context(app):
                     task_status.started()
-                    await self._stop.wait()
+                    await child_stop.wait()
 
             await self._tasks.start(host)
             self._apps[project] = app
+            self._child_stops[project] = child_stop
             return app
 
     async def _project_exists(self, project: str) -> bool:

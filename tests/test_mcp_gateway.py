@@ -31,6 +31,7 @@ class _ChildApp:
         self.scopes: list[dict[str, Any]] = []
         self.lifespan_entered = False
         self.lifespan_closed = False
+        self.closed_event = anyio.Event()
         self.settings = SimpleNamespace(streamable_http_path="/mcp")
         self.router = SimpleNamespace(lifespan_context=self._lifespan)
 
@@ -47,6 +48,7 @@ class _ChildApp:
                 child.lifespan_entered = True
                 yield
             child.lifespan_closed = True
+            child.closed_event.set()
 
         return ctx()
 
@@ -251,12 +253,24 @@ async def test_preflight_answers_typed_for_every_unservable_state(harness: _Harn
         assert "misconfigured" not in harness.children  # never mounted
 
         # (2) deleted AFTER mount: the cached mount stops serving (the
-        # module-top "deleted project keeps serving" gap, closed)
+        # module-top "deleted project keeps serving" gap, closed) AND the
+        # child lifespan closes PROMPTLY — not at gateway shutdown (Codex
+        # #132 r1: a gateway-wide stop event accumulated orphaned session
+        # managers across delete/recreate cycles)
         status, _ = await _request(app, "/mcp/nmmst")
         assert status == 200 and "nmmst" in harness.children
         harness.registry.discard("nmmst")
         status, body = await _request(app, "/mcp/nmmst")
         assert status == 404, body
+        evicted = harness.children["nmmst"]
+        with anyio.fail_after(2):
+            await evicted.closed_event.wait()
+        assert evicted.lifespan_closed
+        # ...and a RECREATED project mounts a FRESH child, not the orphan
+        harness.registry.add("nmmst")
+        status, _ = await _request(app, "/mcp/nmmst")
+        assert status == 200
+        assert harness.children["nmmst"] is not evicted
 
         # (3) a mount failure answers typed, never a raw 500 traceback
         harness.registry.add("brokenmount")
@@ -269,6 +283,25 @@ async def test_preflight_answers_typed_for_every_unservable_state(harness: _Harn
             status, body = await _request(app, "/mcp/brokenmount")
         assert status == 503
         assert b"RuntimeError" in body and b"Traceback" not in body
+
+        # (4) the MOUNT phase is deadline-bounded too (Codex #132 r1):
+        # Postgres stalling BETWEEN preflight and _project_exists must not
+        # hang the request on the driver's own longer timeout
+        harness.registry.add("stallmount")
+
+        async def _stalling_exists(project: str) -> bool:
+            await anyio.sleep(30)
+            return True  # pragma: no cover — the deadline cuts first
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(app, "_project_exists", _stalling_exists)
+            import time as _time
+
+            before = _time.monotonic()
+            status, body = await _request(app, "/mcp/stallmount")
+            assert _time.monotonic() - before < 10
+        assert status == 503
+        assert b"mount timed out" in body
 
         finish.set()
 
