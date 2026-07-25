@@ -16,7 +16,12 @@ from typing import Any
 import pytest
 
 from core.mcp.policy import PolicyError
-from core.mcp.server import _get_chunk, _get_document, build_server
+from core.mcp.server import (
+    _get_chunk,
+    _get_document,
+    _incomplete_graph_invocation_payload,
+    build_server,
+)
 from core.metadata.schema import MetadataExposure
 
 #: DR-010's default: no metadata_exposure block → empty allowlist → nothing leaks
@@ -46,6 +51,71 @@ async def test_the_server_exposes_exactly_the_frozen_tool_set() -> None:
     server = build_server("demo")
     tools = await server.list_tools()
     assert {tool.name for tool in tools} == _FROZEN_TOOLS
+
+
+def test_a_partial_graph_invocation_is_refused_not_silently_replanned() -> None:
+    """MCP11: hybrid_query's docstring promises "run YOUR graph invocation",
+    but a caller supplying only HALF of it (template without entity, or any
+    optional refinement alone) used to be dropped silently — and the QP1
+    auto plan would then run the router's OWN template/seed, so the agent
+    believed THEIR invocation ran (measured: 票價 with explicit params → 0
+    relations three times, no warning). The router must never trust its own
+    guess over the caller's explicit instruction: every incomplete
+    combination is a loud pre-binding GUARDRAIL_BLOCKED refusal with zero
+    results that names what was supplied, what is missing, and that the
+    caller's invocation did NOT run."""
+    partial_cases: list[dict[str, Any]] = [
+        {"graph_template": "neighbors"},
+        {"graph_entity": "區域探索廳"},
+        {"graph_other_entity": "潮境智能海洋館"},
+        {"graph_hops": 2},
+        {"graph_entity": "區域探索廳", "graph_hops": 2},
+        {"graph_template": "path", "graph_other_entity": "潮境智能海洋館"},
+    ]
+    defaults: dict[str, Any] = {
+        "graph_template": None,
+        "graph_entity": None,
+        "graph_other_entity": None,
+        "graph_hops": None,
+    }
+    import json
+
+    import jsonschema
+
+    validator = jsonschema.Draft202012Validator(
+        json.loads((REPO_ROOT / "contracts" / "mcp_response.schema.json").read_text("utf-8")),
+        format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER,
+    )
+    for case in partial_cases:
+        payload = _incomplete_graph_invocation_payload("demo", "票價", **{**defaults, **case})
+        assert payload is not None, f"{case} must be refused"
+        validator.validate(payload)  # the refusal is a contract-valid §16 envelope
+        assert payload["results"] == []  # refused = nothing produced (n=0)
+        assert payload["build_id"] == "00000000-0000-0000-0000-000000000000"  # pre-binding
+        [warning] = payload["warnings"]
+        assert warning["code"] == "GUARDRAIL_BLOCKED"
+        for name in case:
+            assert name in warning["message"]  # names what WAS supplied
+        assert "did NOT run" in warning["message"]  # kills the "mine ran" belief
+        missing = {"graph_template", "graph_entity"} - set(case)
+        for name in missing:
+            assert name in warning["message"]  # names what to add
+
+    # COMPLETE invocations and a fully-absent one pass through (None = run):
+    # template+entity is the contract pair; refinements may ride along; no
+    # graph_* at all leaves QP1 free to plan.
+    complete_cases: list[dict[str, Any]] = [
+        {},
+        {"graph_template": "neighbors", "graph_entity": "區域探索廳"},
+        {
+            "graph_template": "path",
+            "graph_entity": "區域探索廳",
+            "graph_other_entity": "潮境智能海洋館",
+            "graph_hops": 2,
+        },
+    ]
+    for case in complete_cases:
+        assert _incomplete_graph_invocation_payload("demo", "票價", **{**defaults, **case}) is None
 
 
 async def test_registry_policy_failures_are_typed_and_loud(
