@@ -634,8 +634,10 @@ def test_contract_is_versioned(spec: dict[str, Any]) -> None:
     (GOV2/GOV3), build retry lineage + step/item drill-down (RB1), server-side
     search + page totals (SS1b), and the MCP connection-info endpoint (DR-012
     rider).
+    1.3 → 1.4 (2026-07-25, DESIGN §26 DR-015): WarningCode gains
+    NO_ACTIVE_BUILD (additive, lockstep with mcp_response v1.2).
     """
-    assert spec["info"]["version"] == "1.3"
+    assert spec["info"]["version"] == "1.4"
 
 
 def test_frozen_endpoint_surface(spec: dict[str, Any]) -> None:

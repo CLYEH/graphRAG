@@ -1163,7 +1163,8 @@ export interface components {
       | "PARTIAL_RESULTS"
       | "LOW_CONFIDENCE"
       | "GUARDRAIL_BLOCKED"
-      | "TRUNCATED";
+      | "TRUNCATED"
+      | "NO_ACTIVE_BUILD";
     Warning: {
       code: components["schemas"]["WarningCode"];
       message: string;
