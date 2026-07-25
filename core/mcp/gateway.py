@@ -127,14 +127,16 @@ class McpGateway:
         if scope["type"] != "http":
             raise RuntimeError(f"unsupported ASGI scope type {scope['type']!r}")
         raw_path = scope.get("raw_path") or scope["path"].encode("utf-8")
-        # MCP17: a minimal ops surface — /health answers 200 with the
-        # mounted projects (previously /, /mcp and /health all 404'd, so an
-        # operator could not even tell the gateway was alive or what it had
-        # mounted). Read-only; sessions stay SDK-internal.
+        # MCP17: a minimal liveness surface — /health answers 200 (previously
+        # /, /mcp and /health all 404'd, so an operator could not tell the
+        # gateway was even alive). Deliberately NON-SENSITIVE (Codex #137
+        # r11): this gateway-level response bypasses the SDK transport's
+        # DNS-rebinding validation, so a rebinding page could read whatever
+        # it returns — the mounted-PROJECT-NAMES enumeration is therefore
+        # NOT exposed here (that is an authenticated admin concern for the
+        # §23 auth round); only a bare liveness result leaks nothing.
         if scope["path"] == "/health":
-            await self._send_json(
-                send, 200, {"status": "ok", "mounted_projects": sorted(self._apps)}
-            )
+            await self._send_json(send, 200, {"status": "ok"})
             return
         match = _MCP_PATH_RAW.match(raw_path)
         if match is None:

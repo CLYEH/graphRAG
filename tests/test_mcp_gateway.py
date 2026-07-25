@@ -219,10 +219,12 @@ async def test_routing_registry_and_isolation(harness: _Harness) -> None:
         # outside /mcp → 404 (except /health, asserted above — MCP17)
         assert (await _request(app, "/other"))[0] == 404
 
-        # /health: a minimal ops surface (MCP17 — previously every non-/mcp
-        # path 404'd, so liveness/mounts were unobservable)
+        # /health: a minimal LIVENESS surface (MCP17 — previously every
+        # non-/mcp path 404'd). NON-SENSITIVE (Codex #137 r11): it bypasses
+        # the SDK's DNS-rebinding check, so it must not leak mount names.
         status, body = await _request(app, "/health")
-        assert status == 200 and b'"mounted_projects": []' in body
+        assert status == 200 and b'"status": "ok"' in body
+        assert b"mounted_projects" not in body  # no project-name enumeration
 
         # Codex #137 r4: the pre-seeded manager's reap timeout MUST equal the
         # gateway's captured _session_idle_timeout_s (the same value the
@@ -244,7 +246,8 @@ async def test_routing_registry_and_isolation(harness: _Harness) -> None:
         # ...and it is the GATEWAY's captured value, not a fresh settings read
         assert child._session_manager.session_idle_timeout == 999.0  # noqa: SLF001
         status, body = await _request(app, "/health")
-        assert status == 200 and b"nmmst" in body  # mounts enumerated
+        assert status == 200 and b'"status": "ok"' in body  # liveness only, no mount leak
+        assert b"nmmst" not in body
         assert child.scopes[0]["path"] == "/"
         assert child.scopes[0]["root_path"] == "/mcp/nmmst"
         # the child's own streamable path was re-rooted so the gateway prefix
