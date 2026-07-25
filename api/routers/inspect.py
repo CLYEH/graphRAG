@@ -56,7 +56,7 @@ from core.query.graph import subgraph_context
 from core.registry import ProjectNotFoundError, get_project
 from core.stores import tables
 from core.stores.graph import BuildScopedGraphRepo
-from core.stores.repo import ActiveBinding, BuildScopedRepo, NoActiveBuildError
+from core.stores.repo import ActiveBinding, BuildScopedRepo, NoActiveBuildError, escape_like
 from core.stores.repo import resolve_active_binding as _resolve_active_binding
 
 router = APIRouter(tags=["inspect"])
@@ -94,15 +94,6 @@ REVIEW_STATUS: tuple[str, ...] = ("unreviewed", "approved", "rejected")
 #: no relation_evidence row exists (the gauge's NOT EXISTS). Anything else 400s.
 CONFIDENCE_FACETS: tuple[str, ...] = ("low",)
 EVIDENCE_FACETS: tuple[str, ...] = ("missing",)
-
-
-def _escape_like(value: str) -> str:
-    """Escape a user search term for a LIKE/ILIKE pattern (SS1b). ``%``/``_``
-    are SQL wildcards and ``\\`` the default escape char — without escaping,
-    a literal ``%`` a user typed would match anything (a surprising superset)
-    and ``\\`` could form an escape sequence. Backslash first so the escapes we
-    add are not themselves re-escaped."""
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 #: COALESCE floor for the NULLABLE timestamp sorts (SS1b): NULL rows order as
@@ -330,7 +321,7 @@ async def list_documents_endpoint(
         filters.append(docs.c.status == status)
         applied["status"] = status
     if q is not None:
-        filters.append(docs.c.source_uri.ilike(f"%{_escape_like(q)}%", escape="\\"))
+        filters.append(docs.c.source_uri.ilike(f"%{escape_like(q)}%", escape="\\"))
     for attr_name, declared in sorted(fattrs.items()):
         # allow_blank: a declared-string attribute validly STORES ""/blank
         # (ingest only checks isinstance str), so the facet must reach those
@@ -475,7 +466,7 @@ async def list_entities_endpoint(
     if review_status is not None:
         filters.append(ents.c.review_status == review_status)
     if q is not None:
-        filters.append(ents.c.canonical_name.ilike(f"%{_escape_like(q)}%", escape="\\"))
+        filters.append(ents.c.canonical_name.ilike(f"%{escape_like(q)}%", escape="\\"))
     total = await repo.fetch_count(ents, *filters)
     where = [*filters]
     order_by, mint_cursor = _sorted_page(

@@ -33,7 +33,7 @@ from core.metadata.schema import MetadataExposure
 from core.resolve import fingerprints
 from core.stores.graph import graph_driver
 from core.stores.repo import BuildScopedWriter
-from core.stores.tables import builds, chunks, documents, entities
+from core.stores.tables import builds, chunks, community_reports, documents, entities
 from core.stores.tables import projects as projects_table
 from core.stores.vectors import vector_client
 from tests.conftest import DEMO_QUERY_POLICY, ensure_project
@@ -88,6 +88,7 @@ async def context(migrated: None) -> AsyncIterator[ProjectContext]:
         project_builds = sa.select(builds.c.id).where(builds.c.project == project)
         await conn.execute(chunks.delete().where(chunks.c.build_id.in_(project_builds)))
         await conn.execute(documents.delete().where(documents.c.project == project))
+        await conn.execute(community_reports.delete().where(community_reports.c.project == project))
         await conn.execute(builds.delete().where(builds.c.project == project))
         await conn.commit()
     await engine.dispose()
@@ -371,3 +372,164 @@ async def test_a_malformed_chunk_id_never_reaches_the_binding(
     assert unwrapped["chunk"] is None
     assert "STORED form" in unwrapped["error"]  # MCP7: emitted refs carry chunk UUIDs now
     assert unwrapped["build_id"] == _NIL_BUILD  # binding was never opened
+
+
+async def _seed_browse_build(project: str) -> uuid.UUID:
+    """A build with the MCP9 browse corpus: entities that discriminate the
+    LIVE SQL search semantics (substring, character-AND, literal LIKE
+    metachars), plus chunks and reports to page over."""
+    engine = _engine()
+    async with engine.connect() as conn:
+        await ensure_project(conn, project)
+        await conn.execute(
+            projects_table.update()
+            .where(projects_table.c.name == project)
+            .values(config={"query_policy": DEMO_QUERY_POLICY})
+        )
+        build_id: uuid.UUID = (
+            await conn.execute(
+                builds.insert().values(project=project, status="building").returning(builds.c.id)
+            )
+        ).scalar_one()
+        writer = await BuildScopedWriter.for_building_build(conn, project, build_id)
+        for name, etype in (
+            ("主題館", "FACILITY"),
+            ("深海展區", "EXHIBIT"),
+            ("100%純金模型", "EXHIBIT"),
+        ):
+            await writer.insert(
+                entities,
+                id=uuid.uuid4(),
+                type=etype,
+                canonical_name=name,
+                entity_key=fingerprints.entity_key(etype, name),
+                status="active",
+                review_status="unreviewed",
+                created_by="rule",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        document_id = uuid.uuid4()
+        await writer.insert(
+            documents,
+            id=document_id,
+            source_uri="file:///browse.md",
+            raw="corpus",
+            content_hash=f"bb{build_id.hex[:10]}",
+            mime="text/markdown",
+            metadata={},
+            ingested_at=NOW,
+        )
+        for ordinal in range(3):
+            await writer.insert(
+                chunks,
+                id=uuid.uuid4(),
+                document_id=document_id,
+                ordinal=ordinal,
+                text=f"chunk-{ordinal} " + "長" * 250,
+                token_count=5,
+                start_offset=0,
+                end_offset=10,
+            )
+        for i in range(3):
+            await writer.insert(
+                community_reports,
+                id=uuid.uuid4(),
+                level=0,
+                title=f"report-{i}",
+                summary="s",
+                member_entity_ids=[uuid.uuid4()],
+                rating=float(i),
+            )
+        await conn.commit()
+        await conn.execute(
+            builds.update()
+            .where(builds.c.project == project, builds.c.status == "active")
+            .values(status="archived")
+        )
+        await conn.execute(builds.update().where(builds.c.id == build_id).values(status="active"))
+        await conn.commit()
+    await engine.dispose()
+    return build_id
+
+
+async def test_browse_tools_search_and_page_over_live_sql(context: ProjectContext) -> None:
+    """MCP9's headline, proven against REAL SQL (the unit fake reimplements
+    the matching in Python and cannot verify it): substring finds 題館,
+    character-AND resolves the visitor's 主館 (NOT a substring of 主題館)
+    with the precision drop NAMED, a literal % stays a character (LIKE
+    escaping), the type facet filters, and chunks/reports page exhaustively
+    with named-truncation previews — nothing unreachable."""
+    from core.mcp.server import _list_chunks, _list_entities, _list_reports
+
+    await _seed_browse_build(context.project)
+    async with context.bound() as deps:
+        sub = await _list_entities(deps.repo, context.project, 50, None, "題館", None)
+        assert [e["name"] for e in sub["entities"]] == ["主題館"]
+        assert sub["match"] == "substring"
+
+        fuzzy = await _list_entities(deps.repo, context.project, 50, None, "主館", None)
+        assert [e["name"] for e in fuzzy["entities"]] == ["主題館"]
+        assert fuzzy["match"] == "characters"  # the near-miss resolves, SAID
+
+        literal = await _list_entities(deps.repo, context.project, 50, None, "100%純金", None)
+        assert [e["name"] for e in literal["entities"]] == ["100%純金模型"]
+        assert literal["match"] == "substring"  # % matched literally, not as wildcard
+
+        # Codex #129: wildcards must stay literal in the FUZZY fallback too —
+        # "%%" (no substring hit) must match only names containing a literal
+        # %, never degrade into match-everything
+        wild = await _list_entities(deps.repo, context.project, 50, None, "%%", None)
+        assert [e["name"] for e in wild["entities"]] == ["100%純金模型"]
+        assert wild["match"] == "characters"
+
+        typed = await _list_entities(deps.repo, context.project, 50, None, None, "EXHIBIT")
+        assert sorted(e["name"] for e in typed["entities"]) == ["100%純金模型", "深海展區"]
+
+        # exhaustive cursor walks at page size 2 over live keysets
+        seen_chunks: list[int] = []
+        cursor: str | None = None
+        while True:
+            page = await _list_chunks(deps.repo, context.project, 2, cursor)
+            assert page["error"] is None
+            seen_chunks.extend(c["ordinal"] for c in page["chunks"])
+            assert all(c["text_truncated"] for c in page["chunks"])  # 250 chars > preview
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        assert sorted(seen_chunks) == [0, 1, 2]
+
+        seen_reports: list[str] = []
+        cursor = None
+        while True:
+            page = await _list_reports(deps.repo, context.project, 2, cursor)
+            assert page["error"] is None
+            seen_reports.extend(r["title"] for r in page["reports"])
+            # the FULL summary rides with every page (Codex #129 P1: no
+            # get_report exists — omitting it left beyond-ceiling report
+            # CONTENT permanently unreachable)
+            assert all(r["summary"] == "s" for r in page["reports"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        assert sorted(seen_reports) == ["report-0", "report-1", "report-2"]
+
+
+async def test_browse_reads_only_the_active_build(context: ProjectContext) -> None:
+    """DR-006 for the browse surface: after a new activation the old build's
+    entities are invisible, and the old build's cursor is REFUSED naming
+    the build change — never silently re-anchored."""
+    from core.mcp.server import _list_entities
+
+    await _seed_browse_build(context.project)
+    async with context.bound() as deps:
+        first = await _list_entities(deps.repo, context.project, 2, None, None, None)
+        old_cursor = first["next_cursor"]
+        assert old_cursor is not None
+
+    await _activate_build(context.project, entity_name="OnlyMe")
+    async with context.bound() as deps:
+        fresh = await _list_entities(deps.repo, context.project, 50, None, None, None)
+        assert [e["name"] for e in fresh["entities"]] == ["OnlyMe"]  # old build invisible
+        replay = await _list_entities(deps.repo, context.project, 2, old_cursor, None, None)
+        assert replay["entities"] == [] and "different build" in replay["error"]

@@ -36,6 +36,8 @@ one-project runs.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -411,10 +413,13 @@ def build_server(project: str) -> FastMCP:
 
     @server.tool()
     async def get_entity(name: str) -> dict[str, Any]:
-        """Look one entity up by canonical name (active entities only; the
-        SoR decides what an entity IS). Introspection shape — NOT a §16
-        response (the frozen tool enum covers only the five retrieval tools)
-        — but each entity still carries its §27.2-spirit mention citations."""
+        """Look one entity up by EXACT canonical name (active entities only;
+        the SoR decides what an entity IS) — unsure of the name? Use
+        list_entities(q=...) for substring search first. Introspection
+        shape — NOT a §16 response (the frozen tool enum covers only the
+        five retrieval tools) — but each entity still carries its
+        §27.2-spirit mention citations (uncapped: this is the full-membership
+        surface)."""
         rt = _rt()
         bound_build: str | None = None
         try:
@@ -473,6 +478,69 @@ def build_server(project: str) -> FastMCP:
             return _introspection_timeout(rt, bound_build, document_id)
         except _STORE_ERRORS as exc:
             return _introspection_store_error(rt, bound_build, document_id, exc)
+
+    @server.tool()
+    async def list_entities(
+        q: str | None = None,
+        entity_type: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Browse or SEARCH the build's entities, paged (MCP9). q is a
+        case-insensitive substring over the canonical name (主館 finds
+        主題館 — use this instead of get_entity when unsure of the exact
+        name); entity_type filters the ontology type. Walk next_cursor for
+        the full listing — nothing is unreachable. Introspection shape —
+        NOT a §16 response."""
+        rt = _rt()
+        bound_build: str | None = None
+        try:
+            async with asyncio.timeout(rt.policy.max_latency_ms / 1000.0):
+                async with rt.context.bound() as deps:
+                    bound_build = str(deps.repo.build_id)
+                    return await _list_entities(
+                        deps.repo, rt.context.project, limit, cursor, q, entity_type
+                    )
+        except TimeoutError:
+            return _introspection_timeout(rt, bound_build, q or "list_entities")
+        except _STORE_ERRORS as exc:
+            return _introspection_store_error(rt, bound_build, q or "list_entities", exc)
+
+    @server.tool()
+    async def list_chunks(limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+        """Browse the build's text chunks, paged, with a named-truncation
+        text preview (full text via get_chunk). Walk next_cursor for the
+        complete corpus — the retrieval top_k ceiling does not apply here.
+        Introspection shape — NOT a §16 response."""
+        rt = _rt()
+        bound_build: str | None = None
+        try:
+            async with asyncio.timeout(rt.policy.max_latency_ms / 1000.0):
+                async with rt.context.bound() as deps:
+                    bound_build = str(deps.repo.build_id)
+                    return await _list_chunks(deps.repo, rt.context.project, limit, cursor)
+        except TimeoutError:
+            return _introspection_timeout(rt, bound_build, "list_chunks")
+        except _STORE_ERRORS as exc:
+            return _introspection_store_error(rt, bound_build, "list_chunks", exc)
+
+    @server.tool()
+    async def list_reports(limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+        """Browse the build's community reports, paged, each with its FULL
+        summary (the global_summary retrieval ceiling hid most of them —
+        this reaches ALL, content included). Introspection shape — NOT a
+        §16 response."""
+        rt = _rt()
+        bound_build: str | None = None
+        try:
+            async with asyncio.timeout(rt.policy.max_latency_ms / 1000.0):
+                async with rt.context.bound() as deps:
+                    bound_build = str(deps.repo.build_id)
+                    return await _list_reports(deps.repo, rt.context.project, limit, cursor)
+        except TimeoutError:
+            return _introspection_timeout(rt, bound_build, "list_reports")
+        except _STORE_ERRORS as exc:
+            return _introspection_store_error(rt, bound_build, "list_reports", exc)
 
     @server.tool()
     async def list_schema() -> dict[str, Any]:
@@ -597,6 +665,241 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
             }
             for entity_id in entity_ids
         ],
+    }
+
+
+#: Browse-page ceiling (MCP9): one introspection page tops out here — the
+#: agent walks the cursor for more, so nothing is ever unreachable (the
+#: max_top_k=20 retrieval ceiling made 73 of 93 reports and 422 of 442
+#: chunks permanently invisible; browsing is how "this is ALL the options"
+#: becomes answerable in principle).
+BROWSE_LIMIT_CAP = 200
+
+#: Chunk text preview length in list_chunks — browsing is for discovery,
+#: get_chunk returns the full text; the truncation is NAMED per item.
+_PREVIEW_CHARS = 200
+
+
+def _browse_scope(tool: str, **facets: Any) -> str:
+    """Canonical scope fingerprint of ONE browse result set (class 31 — the
+    REST ``_scope_fingerprint`` pattern): sha256 over canonical JSON of the
+    tool name and every facet that shapes the set (q, type, match mode), so
+    no separator-injection edge exists and any axis change flips the tag."""
+    payload = json.dumps({"tool": tool, **facets}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _browse_cursor(build_id: str, last_id: str, scope: str) -> str:
+    """Mint a continuation cursor pinned to its full result-set identity
+    (class 31): the ACTIVE build and the scope fingerprint — a cursor
+    replayed after an activation, from another tool, or with different
+    filters must be refused, never silently re-anchored."""
+    return f"{build_id}|{scope}|{last_id}"
+
+
+def _parse_browse_cursor(
+    cursor: str, build_id: str, scope: str
+) -> tuple[uuid.UUID | None, str | None]:
+    """``(after_id, error)`` — refuses a cursor minted for another build or
+    another listing scope, naming the cause (the agent re-lists instead of
+    silently walking a MIXED result set)."""
+    parts = cursor.split("|", 2)
+    if len(parts) != 3:
+        return None, "cursor is not a graphRAG browse cursor — start again without one"
+    cursor_build, cursor_scope, last = parts
+    if cursor_build != build_id:
+        return None, (
+            "cursor was minted for a different build (the active build changed) — "
+            "restart the listing without a cursor"
+        )
+    if cursor_scope != scope:
+        return None, (
+            "cursor was minted for a different listing scope (another tool, other "
+            "filters, or another match mode) — restart the listing without a cursor"
+        )
+    parsed = _parse_uuid(last)
+    if parsed is None:
+        return None, "cursor is corrupt — start again without one"
+    return parsed, None
+
+
+#: Search-string ceiling (Codex #129 r2): q is agent-controlled and the
+#: character-AND fallback builds ONE ILIKE predicate per character — an
+#: unbounded q would compile an enormous statement. 64 covers any real
+#: name probe; the fuzzy fallback additionally engages only for short
+#: (name-ish) queries.
+BROWSE_Q_CAP = 64
+FUZZY_Q_CAP = 16
+
+
+def _bad_q(q: str | None) -> str | None:
+    if q is not None and len(q) > BROWSE_Q_CAP:
+        return f"q must be at most {BROWSE_Q_CAP} characters, got {len(q)}"
+    return None
+
+
+def _bad_limit(limit: Any) -> str | None:
+    if type(limit) is not int or limit < 1 or limit > BROWSE_LIMIT_CAP:
+        return f"limit must be an integer in 1..{BROWSE_LIMIT_CAP}, got {limit!r}"
+    return None
+
+
+async def _list_entities(
+    repo: Any,
+    project: str,
+    limit: int,
+    cursor: str | None,
+    q: str | None,
+    entity_type: str | None,
+) -> dict[str, Any]:
+    """§9 ``list_entities`` (MCP9): paged browse/search over ACTIVE entities.
+
+    ``q`` is a case-insensitive SUBSTRING over canonical_name — the same
+    semantics as the REST search, closing the exact-match dead end where a
+    visitor's 主館 zeroed against the corpus's 主題館. ``next_cursor`` is
+    scope-pinned (build + filters, class 31)."""
+    build_id = str(repo.build_id)
+    envelope = {"project": project, "build_id": build_id}
+    bad = _bad_limit(limit) or _bad_q(q)
+    if bad is not None:
+        return {**envelope, "entities": [], "next_cursor": None, "error": bad}
+    # the match mode is STICKY across pages via the cursor scope (class 31):
+    # substring first; when a fresh search finds nothing, fall back to
+    # character-AND (主館 is not a substring of 主題館 — but 主 and 館 both
+    # are), and the response NAMES which mode matched. On continuation the
+    # mode is recovered by matching the cursor against either mode's
+    # fingerprint — an unknown tag is refused, never guessed.
+    match = "substring"
+    after_id: uuid.UUID | None = None
+    if cursor is not None:
+        sub_scope = _entity_scope("substring", q, entity_type)
+        chr_scope = _entity_scope("characters", q, entity_type)
+        tag = cursor.split("|", 2)[1] if cursor.count("|") >= 2 else ""
+        match = "characters" if tag == chr_scope else "substring"
+        scope = chr_scope if match == "characters" else sub_scope
+        after_id, cursor_error = _parse_browse_cursor(cursor, build_id, scope)
+        if cursor_error is not None:
+            return {**envelope, "entities": [], "next_cursor": None, "error": cursor_error}
+        rows = await repo.page_entities(
+            limit + 1, after_id, q, entity_type, fuzzy=(match == "characters")
+        )
+    else:
+        rows = await repo.page_entities(limit + 1, None, q, entity_type)
+        if not rows and q and 2 <= len(q) <= FUZZY_Q_CAP:
+            # the per-character fallback engages only for short (name-ish)
+            # probes — each character costs one ILIKE predicate
+            match = "characters"
+            rows = await repo.page_entities(limit + 1, None, q, entity_type, fuzzy=True)
+    scope = _entity_scope(match, q, entity_type)
+    page = rows[:limit]
+    next_cursor = (
+        _browse_cursor(build_id, str(page[-1].id), scope) if len(rows) > limit and page else None
+    )
+    return {
+        **envelope,
+        "entities": [
+            {"id": str(row.id), "name": row.canonical_name, "type": row.type} for row in page
+        ],
+        "match": match if q else None,
+        "next_cursor": next_cursor,
+        "error": None,
+    }
+
+
+def _entity_scope(match: str, q: str | None, entity_type: str | None) -> str:
+    return _browse_scope("list_entities", match=match, q=q or "", type=entity_type or "")
+
+
+async def _list_chunks(repo: Any, project: str, limit: int, cursor: str | None) -> dict[str, Any]:
+    """§9 ``list_chunks`` (MCP9): paged browse over the build's chunks with a
+    NAMED-truncation text preview (get_chunk returns the full text)."""
+    build_id = str(repo.build_id)
+    envelope = {"project": project, "build_id": build_id}
+    bad = _bad_limit(limit)
+    if bad is not None:
+        return {**envelope, "chunks": [], "next_cursor": None, "error": bad}
+    after_id: uuid.UUID | None = None
+    if cursor is not None:
+        after_id, cursor_error = _parse_browse_cursor(
+            cursor, build_id, _browse_scope("list_chunks")
+        )
+        if cursor_error is not None:
+            return {**envelope, "chunks": [], "next_cursor": None, "error": cursor_error}
+    columns = (
+        tables.chunks.c.id,
+        tables.chunks.c.document_id,
+        tables.chunks.c.ordinal,
+        tables.chunks.c.text,
+    )
+    rows = await repo.page_rows(tables.chunks, columns, limit + 1, after_id)
+    page = rows[:limit]
+    next_cursor = (
+        _browse_cursor(build_id, str(page[-1].id), _browse_scope("list_chunks"))
+        if len(rows) > limit and page
+        else None
+    )
+    return {
+        **envelope,
+        "chunks": [
+            {
+                "id": str(row.id),
+                "document_id": str(row.document_id),
+                "ordinal": row.ordinal,
+                "text_preview": (row.text or "")[:_PREVIEW_CHARS],
+                "text_truncated": bool(row.text) and len(row.text) > _PREVIEW_CHARS,
+            }
+            for row in page
+        ],
+        "next_cursor": next_cursor,
+        "error": None,
+    }
+
+
+async def _list_reports(repo: Any, project: str, limit: int, cursor: str | None) -> dict[str, Any]:
+    """§9 ``list_reports`` (MCP9): paged browse over community reports —
+    73 of 93 were permanently invisible under the retrieval ceiling."""
+    build_id = str(repo.build_id)
+    envelope = {"project": project, "build_id": build_id}
+    bad = _bad_limit(limit)
+    if bad is not None:
+        return {**envelope, "reports": [], "next_cursor": None, "error": bad}
+    after_id: uuid.UUID | None = None
+    if cursor is not None:
+        after_id, cursor_error = _parse_browse_cursor(
+            cursor, build_id, _browse_scope("list_reports")
+        )
+        if cursor_error is not None:
+            return {**envelope, "reports": [], "next_cursor": None, "error": cursor_error}
+    columns = (
+        tables.community_reports.c.id,
+        tables.community_reports.c.title,
+        tables.community_reports.c.summary,
+        tables.community_reports.c.rating,
+    )
+    rows = await repo.page_rows(tables.community_reports, columns, limit + 1, after_id)
+    page = rows[:limit]
+    next_cursor = (
+        _browse_cursor(build_id, str(page[-1].id), _browse_scope("list_reports"))
+        if len(rows) > limit and page
+        else None
+    )
+    return {
+        **envelope,
+        "reports": [
+            {
+                "id": str(row.id),
+                "title": row.title if isinstance(row.title, str) else None,
+                # the FULL summary rides along (Codex #129 P1): there is no
+                # get_report tool and global_summary cannot select by id, so
+                # omitting it here would leave beyond-ceiling report content
+                # permanently unreachable — the exact wall MCP9 removes
+                "summary": row.summary if isinstance(row.summary, str) else None,
+                "rating": row.rating,
+            }
+            for row in page
+        ],
+        "next_cursor": next_cursor,
+        "error": None,
     }
 
 
