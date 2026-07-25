@@ -107,7 +107,7 @@ class McpGateway:
         # that the child still serves would restart its clock and resume
         # the stale snapshot; a forgotten DEAD id is harmless, the child
         # answers "session not found" itself).
-        self._session_seen: dict[bytes, tuple[float, float]] = {}
+        self._session_seen: dict[tuple[str, bytes], tuple[float, float]] = {}
         self._session_max_age_s = 7200.0
         self._session_idle_timeout_s = 1800.0
         # compaction high-water mark (Codex #137 r9): a plain len>4096 check
@@ -186,7 +186,7 @@ class McpGateway:
         # server-side teardown (Codex #137 r7) happens AFTER the child is
         # mounted below — an internal DELETE releases the SDK session's task
         # + lifespan instead of leaving them allocated until the idle timeout
-        terminate_by_age = session_id is not None and self._touch_session_age(session_id)
+        terminate_by_age = session_id is not None and self._touch_session_age(project, session_id)
         refusal = await self._preflight(project, initializing=initializing)
         if refusal is not None:
             status, payload = refusal
@@ -257,7 +257,7 @@ class McpGateway:
             # pass-through
             terminated = await self._terminate_child_session(app, project, headers, session_id)
             if terminated:
-                self._session_seen.pop(session_id, None)
+                self._session_seen.pop((project, session_id), None)
                 self._evict_from_manager(project, session_id)
             await self._send_json(
                 send,
@@ -288,7 +288,7 @@ class McpGateway:
                 if message.get("type") == "http.response.start":
                     for key, value in message.get("headers", []):
                         if key.lower() == b"mcp-session-id":
-                            self._record_session_start(bytes(value))
+                            self._record_session_start(project, bytes(value))
                 await send(message)
 
             await app(child_scope, receive, send_capturing)
@@ -302,13 +302,20 @@ class McpGateway:
             # within the reap window. A dead id later re-sent takes the
             # unknown-id pass-through (the child's own 404); a NON-2xx
             # DELETE (already gone / rejected) keeps the entry, harmless.
+            # Codex #137 r13 P1: the pinned SDK's explicit-DELETE path marks
+            # the transport terminated but leaves it in _server_instances /
+            # _session_owners (only the idle reaper pops those), so a
+            # client's own initialize/DELETE churn would grow the per-project
+            # manager without bound despite the ledger drop — evict the SDK
+            # registries here too, exactly as the max-age teardown does.
             captured = session_id
 
             async def send_terminating(message: dict[str, Any]) -> None:
                 if message.get("type") == "http.response.start" and (
                     200 <= int(message.get("status", 0)) < 300
                 ):
-                    self._session_seen.pop(captured, None)
+                    self._session_seen.pop((project, captured), None)
+                    self._evict_from_manager(project, captured)
                 await send(message)
 
             await app(child_scope, receive, send_terminating)
@@ -399,22 +406,28 @@ class McpGateway:
             return
         cutoff = now - horizon_s
         self._session_seen = {
-            sid: (f, s) for sid, (f, s) in self._session_seen.items() if s > cutoff
+            key: (f, s) for key, (f, s) in self._session_seen.items() if s > cutoff
         }
         self._last_compact_at = now
         self._compact_at = max(4096, 2 * len(self._session_seen))
 
-    def _record_session_start(self, session_id: bytes) -> None:
+    def _record_session_start(self, project: str, session_id: bytes) -> None:
         """Stamp a session's creation (Codex #137 r2 P2): the id is captured
         from the INITIALIZE response, so the absolute clock starts at
         creation — not at the first follow-up request, which a client could
         delay to stretch the documented ceiling. Compacts on insert so a
-        gateway that only ever sees initializations stays bounded (r5 P1)."""
+        gateway that only ever sees initializations stays bounded (r5 P1).
+
+        Keyed by ``(project, session_id)`` (Codex #137 r13 P1): a session id
+        is only meaningful within its own project's SDK manager, so the
+        ledger must scope by project — otherwise the confirm-before-pop
+        teardown could cross-talk between projects (see
+        :meth:`_touch_session_age`)."""
         now = time.monotonic()
-        self._session_seen.setdefault(session_id, (now, now))
+        self._session_seen.setdefault((project, session_id), (now, now))
         self._compact_sessions(now)
 
-    def _touch_session_age(self, session_id: bytes) -> bool:
+    def _touch_session_age(self, project: str, session_id: bytes) -> bool:
         """Inspect a KNOWN session id's age — True when past the absolute
         ceiling (MCP17: the idle timeout resets per request, so ONLY an
         absolute bound caps a chatty session's stale policy snapshot).
@@ -425,15 +438,27 @@ class McpGateway:
         unauthenticated flood of unique ids grow the ledger without bound;
         an unknown id now passes through untracked to the SDK, which
         answers its own 404). A known entry is KEPT on expiry (an ignored
-        404 must not restart the clock)."""
+        404 must not restart the clock).
+
+        Keyed by ``(project, session_id)`` (Codex #137 r13 P1): the ledger is
+        global but a session id is minted by, and only valid within, ONE
+        project's SDK manager. Keying by the bare id let a still-live
+        over-age session for project A be forgotten by replaying its id
+        against project B: B's manager 404s the id it never issued,
+        :meth:`_terminate_child_session` reads that 404 as confirmed
+        teardown, and A's entry was popped — after which A's next request
+        passed through untracked, escaping the age ceiling with its stale
+        policy snapshot intact. Scoping the key to the project closes that
+        cross-project escape: B's 404 can only ever drop ``(B, id)``, which
+        was never tracked."""
         now = time.monotonic()
-        seen = self._session_seen.get(session_id)
+        seen = self._session_seen.get((project, session_id))
         if seen is None:
             # untracked (never initialized through this gateway, or already
             # reaped): pass through — the child owns the session-not-found
             return False
         first, _last = seen
-        self._session_seen[session_id] = (first, now)
+        self._session_seen[(project, session_id)] = (first, now)
         self._compact_sessions(now)  # before the expiry return: a refused touch must still compact
         return now - first > self._session_max_age_s
 

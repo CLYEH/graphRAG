@@ -546,7 +546,7 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         # (Codex #137 r3 P1: an unknown id must NOT be inserted, or an
         # unauthenticated flood of unique ids grows the ledger unbounded) —
         # simulate the initialize capture, then use the id
-        app._record_session_start(b"chatty-1")  # noqa: SLF001
+        app._record_session_start("nmmst", b"chatty-1")  # noqa: SLF001
         sid = [(b"mcp-session-id", b"chatty-1")]
         status, _ = await _request(app, "/mcp/nmmst", headers=sid)
         assert status == 200  # young session serves
@@ -557,7 +557,7 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         before = len(app._session_seen)  # noqa: SLF001
         status, _ = await _request(app, "/mcp/nmmst", headers=[(b"mcp-session-id", b"forged-xyz")])
         assert status == 200  # passed through to the (fake) child
-        assert b"forged-xyz" not in app._session_seen  # noqa: SLF001
+        assert ("nmmst", b"forged-xyz") not in app._session_seen  # noqa: SLF001
         assert len(app._session_seen) == before  # untracked, no growth  # noqa: SLF001
 
         # backdate first-seen past the ceiling: the NEXT request must 404
@@ -565,8 +565,11 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         # is KEPT, so a client that ignores the 404 and re-sends the SAME
         # id stays refused (popping would restart its clock, making the
         # ceiling depend on client compliance — gate-2)
-        first, last = app._session_seen[b"chatty-1"]  # noqa: SLF001
-        app._session_seen[b"chatty-1"] = (first - app._session_max_age_s - 1, last)  # noqa: SLF001
+        first, last = app._session_seen[("nmmst", b"chatty-1")]  # noqa: SLF001
+        app._session_seen[("nmmst", b"chatty-1")] = (  # noqa: SLF001
+            first - app._session_max_age_s - 1,  # noqa: SLF001
+            last,
+        )
         sid_host = [(b"mcp-session-id", b"chatty-1"), (b"host", b"127.0.0.1:8300")]
         status, body = await _request(app, "/mcp/nmmst", headers=sid_host)
         assert status == 404 and b"TERMINATED" in body  # honest wording (r5): not "refresh"
@@ -578,7 +581,7 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         child = harness.children["nmmst"]
         assert b"chatty-1" in child.deletes
         assert b"host" in dict(child.scopes[-1]["headers"])  # Host carried into the DELETE
-        assert b"chatty-1" not in app._session_seen  # noqa: SLF001 — confirmed teardown popped it
+        assert ("nmmst", b"chatty-1") not in app._session_seen  # noqa: SLF001 — teardown popped it
         # Codex #137 r12: the SDK manager's OWN registries are evicted too —
         # the pinned SDK never pops an explicitly-DELETEd transport, so
         # without this each rollover leaks one _server_instances entry. The
@@ -590,18 +593,21 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         # a re-sent id is now unknown → passes through to the child's own 404
         status, _ = await _request(app, "/mcp/nmmst", headers=sid_host)
         assert status == 200  # the fake child accepts it; the gateway does not re-track it
-        assert b"chatty-1" not in app._session_seen  # noqa: SLF001
+        assert ("nmmst", b"chatty-1") not in app._session_seen  # noqa: SLF001
 
         # Codex #137 r8: a DELETE the transport REJECTS (no confirmed
         # teardown) must KEEP the ledger entry — else the still-live session
         # escapes the bound via the unknown-id pass-through. Age a session
         # and send WITHOUT Host so the fake guard 421s the internal DELETE.
-        app._record_session_start(b"rebind-1")  # noqa: SLF001
-        f, la = app._session_seen[b"rebind-1"]  # noqa: SLF001
-        app._session_seen[b"rebind-1"] = (f - app._session_max_age_s - 1, la)  # noqa: SLF001
+        app._record_session_start("nmmst", b"rebind-1")  # noqa: SLF001
+        f, la = app._session_seen[("nmmst", b"rebind-1")]  # noqa: SLF001
+        app._session_seen[("nmmst", b"rebind-1")] = (  # noqa: SLF001
+            f - app._session_max_age_s - 1,  # noqa: SLF001
+            la,
+        )
         status, _ = await _request(app, "/mcp/nmmst", headers=[(b"mcp-session-id", b"rebind-1")])
         assert status == 404  # still refused
-        assert b"rebind-1" in app._session_seen  # noqa: SLF001 — KEPT (teardown not confirmed)
+        assert ("nmmst", b"rebind-1") in app._session_seen  # noqa: SLF001 — KEPT (not confirmed)
 
         # Codex #137 r2 P1: compaction must NOT forget a LIVE (still-touched,
         # not-yet-over-age) session under a dead flood. Establish a young
@@ -609,21 +615,21 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         # touch the young one — it survives, the dead flood is forgotten.
         import time as _t
 
-        app._record_session_start(b"young-1")  # noqa: SLF001
+        app._record_session_start("nmmst", b"young-1")  # noqa: SLF001
         young = [(b"mcp-session-id", b"young-1")]
         stale = _t.monotonic() - app._session_idle_timeout_s - 120  # noqa: SLF001
         for i in range(4100):
-            app._session_seen[f"dead-{i}".encode()] = (stale, stale)  # noqa: SLF001
+            app._session_seen[("nmmst", f"dead-{i}".encode())] = (stale, stale)  # noqa: SLF001
         status, _ = await _request(app, "/mcp/nmmst", headers=young)  # touch → compaction
         assert status == 200  # young session still serves
-        assert b"young-1" in app._session_seen  # noqa: SLF001 — live entry survived
+        assert ("nmmst", b"young-1") in app._session_seen  # noqa: SLF001 — live entry survived
         assert len(app._session_seen) < 100  # the dead flood was forgotten  # noqa: SLF001
 
         # Codex #137 r2 P2: the clock starts at CREATION — the id minted in
         # the initialize RESPONSE is stamped immediately, not on first use
         status, _ = await _request(app, "/mcp/nmmst")  # initializing (no header)
         assert status == 200
-        assert b"minted-nmmst" in app._session_seen  # noqa: SLF001
+        assert ("nmmst", b"minted-nmmst") in app._session_seen  # noqa: SLF001
 
         # Codex #137 r5 P1: a gateway that ONLY ever sees initializations
         # (one-shot clients that never follow up) must still stay bounded —
@@ -631,10 +637,10 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         # (idle-past-horizon) entries, then one more initialize must trim.
         stale = _t.monotonic() - app._session_idle_timeout_s - 120  # noqa: SLF001
         for i in range(4100):
-            app._session_seen[f"reaped-{i}".encode()] = (stale, stale)  # noqa: SLF001
-        app._record_session_start(b"fresh-init")  # noqa: SLF001 — insert compacts
+            app._session_seen[("nmmst", f"reaped-{i}".encode())] = (stale, stale)  # noqa: SLF001
+        app._record_session_start("nmmst", b"fresh-init")  # noqa: SLF001 — insert compacts
         assert len(app._session_seen) < 100  # the dead flood was forgotten  # noqa: SLF001
-        assert b"fresh-init" in app._session_seen  # noqa: SLF001 — the fresh one survives
+        assert ("nmmst", b"fresh-init") in app._session_seen  # noqa: SLF001 — fresh one survives
 
         # Codex #137 r9: a LARGE LIVE set (nothing to reap) must NOT rebuild
         # the dict on every request — the high-water mark rises to 2x the
@@ -643,7 +649,7 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         # and confirm the mark advanced beyond the current size.
         live = _t.monotonic()
         for i in range(5000):
-            app._session_seen[f"live-{i}".encode()] = (live, live)  # noqa: SLF001
+            app._session_seen[("nmmst", f"live-{i}".encode())] = (live, live)  # noqa: SLF001
         app._compact_sessions(live)  # noqa: SLF001 — one compaction over live entries
         assert app._compact_at >= 2 * len(app._session_seen) - 1  # noqa: SLF001 — mark raised
         assert app._compact_at > len(app._session_seen)  # noqa: SLF001 — no immediate re-trigger
@@ -666,9 +672,16 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         # Codex #137 r6: an explicit MCP session termination (DELETE) drops
         # the ledger entry IMMEDIATELY on a 2xx — a high-churn client that
         # creates+DELETEs many short-lived sessions cannot grow the ledger
-        # within the idle reap window
-        app._record_session_start(b"short-lived")  # noqa: SLF001
-        assert b"short-lived" in app._session_seen  # noqa: SLF001
+        # within the idle reap window. Codex #137 r13 P1: the SAME DELETE must
+        # ALSO evict the SDK manager's registries — the pinned SDK leaves an
+        # explicitly-DELETEd transport in _server_instances (only the idle
+        # reaper pops it), so a client's own init/DELETE churn would otherwise
+        # grow the per-project manager unbounded despite the ledger drop.
+        mgr = app._session_managers["nmmst"]  # noqa: SLF001
+        mgr._server_instances["short-lived"] = object()  # noqa: SLF001 — simulate SDK's leftover
+        mgr._session_owners["short-lived"] = object()  # noqa: SLF001
+        app._record_session_start("nmmst", b"short-lived")  # noqa: SLF001
+        assert ("nmmst", b"short-lived") in app._session_seen  # noqa: SLF001
         status, _ = await _request(
             app,
             "/mcp/nmmst",
@@ -676,8 +689,60 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
             method="DELETE",
         )
         assert status == 200  # the (fake) child accepted the termination
-        assert b"short-lived" not in app._session_seen  # noqa: SLF001 — dropped at once
+        assert ("nmmst", b"short-lived") not in app._session_seen  # noqa: SLF001 — dropped at once
+        assert "short-lived" not in mgr._server_instances  # noqa: SLF001 — SDK registry evicted too
+        assert "short-lived" not in mgr._session_owners  # noqa: SLF001
 
+        finish.set()
+
+
+async def test_over_age_session_is_not_droppable_via_another_project(harness: _Harness) -> None:
+    """Codex #137 r13 P1: the age ledger keys by (project, session_id), so a
+    still-live OVER-AGE session for project A cannot be forgotten by replaying
+    its id against a DIFFERENT registered project B. Under the earlier bare-id
+    ledger, B's manager would 404 the id it never issued,
+    `_terminate_child_session` would read that 404 as CONFIRMED teardown and
+    pop A's entry, and A's next request would then pass through UNTRACKED —
+    escaping the ceiling with its stale DR-012 policy snapshot intact. Keying
+    by project closes that: B's request can only ever affect (B, id)."""
+    harness.registry.add("gushan")  # a SECOND path-addressable project
+    app = build_gateway()
+    started = anyio.Event()
+    finish = anyio.Event()
+
+    async def lifespan_receive() -> dict[str, Any]:
+        if not started.is_set():
+            return {"type": "lifespan.startup"}
+        await finish.wait()
+        return {"type": "lifespan.shutdown"}
+
+    async def lifespan_send(message: dict[str, Any]) -> None:
+        if message["type"] == "lifespan.startup.complete":
+            started.set()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(app, {"type": "lifespan"}, lifespan_receive, lifespan_send)
+        await started.wait()
+
+        # A is initialized under project nmmst and aged past the ceiling
+        app._record_session_start("nmmst", b"escapee")  # noqa: SLF001
+        first, last = app._session_seen[("nmmst", b"escapee")]  # noqa: SLF001
+        app._session_seen[("nmmst", b"escapee")] = (  # noqa: SLF001
+            first - app._session_max_age_s - 1,  # noqa: SLF001
+            last,
+        )
+        replay = [(b"mcp-session-id", b"escapee"), (b"host", b"127.0.0.1:8300")]
+
+        # replay A's id against project B: B never issued it, so the gateway
+        # treats it as unknown-to-B and passes through — A's entry is untouched
+        status, _ = await _request(app, "/mcp/gushan", headers=replay)
+        assert status == 200  # B's (fake) child serves its own unknown id
+        assert ("nmmst", b"escapee") in app._session_seen  # noqa: SLF001 — A's entry SURVIVES
+        assert ("gushan", b"escapee") not in app._session_seen  # noqa: SLF001 — never tracked for B
+
+        # and A is still terminated at its ceiling — the escape is closed
+        status, body = await _request(app, "/mcp/nmmst", headers=replay)
+        assert status == 404 and b"TERMINATED" in body  # A stays refused
         finish.set()
 
 
