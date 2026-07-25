@@ -623,6 +623,7 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
             app._session_seen[f"reaped-{i}".encode()] = (stale, stale)  # noqa: SLF001
         app._record_session_start(b"fresh-init")  # noqa: SLF001 — insert compacts
         assert len(app._session_seen) < 100  # the dead flood was forgotten  # noqa: SLF001
+        assert b"fresh-init" in app._session_seen  # noqa: SLF001 — the fresh one survives
 
         # Codex #137 r9: a LARGE LIVE set (nothing to reap) must NOT rebuild
         # the dict on every request — the high-water mark rises to 2x the
@@ -635,7 +636,21 @@ async def test_sessions_expire_at_the_absolute_age_ceiling(harness: _Harness) ->
         app._compact_sessions(live)  # noqa: SLF001 — one compaction over live entries
         assert app._compact_at >= 2 * len(app._session_seen) - 1  # noqa: SLF001 — mark raised
         assert app._compact_at > len(app._session_seen)  # noqa: SLF001 — no immediate re-trigger
-        assert b"fresh-init" in app._session_seen  # ...the fresh one survives  # noqa: SLF001
+
+        # Codex #137 r10: after a spike raises the mark, sessions time out,
+        # and the ledger sits BELOW the raised mark — the size trigger never
+        # fires again. A TIME trigger (once per reap horizon) must still
+        # compact so the mark FALLS back and reaped memory is reclaimed.
+        raised_mark = app._compact_at  # noqa: SLF001 — the post-spike high mark
+        assert raised_mark > 4096
+        # the whole live set is now reaped (last activity beyond the horizon)
+        # and the last compaction was more than one horizon ago
+        old = live - app._session_idle_timeout_s - 120  # noqa: SLF001
+        app._session_seen = {sid: (f, old) for sid, (f, _) in app._session_seen.items()}  # noqa: SLF001
+        app._last_compact_at = live - app._session_idle_timeout_s - 120  # noqa: SLF001
+        app._compact_sessions(live + 1)  # noqa: SLF001 — below the mark, but past the horizon
+        assert app._session_seen == {}  # noqa: SLF001 — reaped entries cleared by the time trigger
+        assert app._compact_at == 4096  # noqa: SLF001 — mark fell back
 
         # Codex #137 r6: an explicit MCP session termination (DELETE) drops
         # the ledger entry IMMEDIATELY on a 2xx — a high-churn client that

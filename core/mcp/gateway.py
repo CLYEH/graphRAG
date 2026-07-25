@@ -112,6 +112,13 @@ class McpGateway:
         # amortized O(1) per request, and a genuinely-large live set never
         # rebuilds until it doubles.
         self._compact_at = 4096
+        # ...but a TIME trigger too (Codex #137 r10): a traffic spike raises
+        # the mark to 2× its peak; once those sessions time out the ledger
+        # sits below the (now huge) mark, so the reaped entries would linger
+        # until traffic re-exceeded the historical peak. A compaction at
+        # least once per reap horizon lets the mark FALL back after a spike
+        # subsides, reclaiming memory within ~one idle horizon.
+        self._last_compact_at = time.monotonic()
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
@@ -353,13 +360,20 @@ class McpGateway:
         makes this amortized O(1): it rebuilds the dict only past
         ``_compact_at`` and then RAISES the mark to 2× the post-compaction
         size, so a large live set (nothing to reap) does not rebuild on
-        every request — it waits until the ledger grows again."""
-        if len(self._session_seen) <= self._compact_at:
+        every request — it waits until the ledger grows again. A TIME
+        trigger (Codex #137 r10) also fires once per reap horizon so the
+        mark FALLS back after a spike subsides (else post-spike reaped
+        entries linger below the raised mark indefinitely)."""
+        horizon_s = self._session_idle_timeout_s + 60.0
+        over_mark = len(self._session_seen) > self._compact_at
+        past_horizon = now - self._last_compact_at >= horizon_s
+        if not (over_mark or past_horizon):
             return
-        horizon = now - (self._session_idle_timeout_s + 60.0)
+        cutoff = now - horizon_s
         self._session_seen = {
-            sid: (f, s) for sid, (f, s) in self._session_seen.items() if s > horizon
+            sid: (f, s) for sid, (f, s) in self._session_seen.items() if s > cutoff
         }
+        self._last_compact_at = now
         self._compact_at = max(4096, 2 * len(self._session_seen))
 
     def _record_session_start(self, session_id: bytes) -> None:
