@@ -173,7 +173,9 @@ Tool map:
 - get_entity / get_chunk / get_document exchange ids from citations for full
   content. list_entities / list_chunks / list_reports browse the corpus with
   cursors — use them to see everything; retrieval responses are capped.
-- list_schema shows the sql-queryable tables.
+- list_schema shows the sql-queryable tables AND this session's policy
+  ceilings (max_top_k, max_graph_hops, max_latency_ms, query/browse caps,
+  enabled modes) — check it before probing limits by trial and error.
 
 Reading responses:
 - Retrieval tools return one envelope: results[] (each with source_refs
@@ -1029,10 +1031,13 @@ def build_server(project: str) -> FastMCP:
 
     @server.tool()
     async def list_schema() -> dict[str, Any]:
-        """The queryable structured surface: each whitelisted sql table with
-        the columns it actually has in the ACTIVE build (empty when the sql
-        mode is disabled). Introspection shape (error/error_code) — there is
-        no retrieval result to cite."""
+        """The queryable structured surface (each whitelisted sql table
+        with its live columns) PLUS this session's operative policy
+        ceilings — max_top_k, max_graph_hops, max_latency_ms, query/browse caps,
+        whether NL->SQL is enabled (parameterized graph_query is always
+        available), expose_debug — so
+        limits are discoverable up front instead of by tripping them.
+        Introspection shape (error/error_code)."""
         return await _list_schema(_rt())
 
     @server.tool()
@@ -1073,6 +1078,50 @@ def build_server(project: str) -> FastMCP:
     return server
 
 
+def _policy_disclosure(runtime: _Runtime) -> dict[str, Any]:
+    """The session's ACTUAL policy, disclosed (MCP15). Built from the
+    lifespan-loaded object alone — NO store is touched, so every list_schema
+    branch (including no-active-build / timeout / store-error, exactly the
+    degraded states where an agent most needs to inspect its session before
+    retrying — Codex #135 r1) can carry it."""
+    return {
+        # default_mode is deliberately NOT disclosed (same rule as the
+        # text_to_cypher toggle): no MCP dispatch path consumes it — the
+        # initialize instructions designate hybrid_query as the default
+        # entry — so disclosing it would hand agents routing guidance that
+        # contradicts the instructions (Codex #135 r4). It returns if MCP
+        # dispatch ever starts honoring it.
+        "max_top_k": runtime.policy.max_top_k,
+        "max_graph_hops": runtime.policy.max_graph_hops,
+        # RECONCILED values throughout (Codex #135 r2): what is disclosed
+        # must be what is ENFORCED — raw top-level fields overstate whenever
+        # a project lowers a mode-local ceiling (rows) or a mode-local
+        # timeout sits under max_latency_ms
+        "max_sql_rows": runtime.policy.sql_rows(),
+        "max_graph_rows": runtime.policy.cypher_policy().max_rows,
+        "max_latency_ms": runtime.policy.max_latency_ms,
+        "sql_timeout_ms": runtime.policy.sql_policy().timeout_ms,
+        "graph_timeout_ms": runtime.policy.cypher_policy().timeout_ms,
+        "expose_debug": runtime.policy.expose_debug,
+        "sql_enabled": runtime.policy.text_to_sql.enabled,
+        # text_to_cypher.enabled is deliberately NOT disclosed: it toggles
+        # the OPTIONAL free NL(prose)->Cypher path, which no MCP surface
+        # currently exposes (core/query/graph.py: no API in the chain
+        # accepts query text) — any value would mislead (false read as
+        # "graph unavailable" though parameterized graph_query always works;
+        # true suggests a nonexistent free-form tool). The field returns
+        # when the optional path ships (Codex #135 r3 + gate-2 residual).
+        # response size has NO application-level limit — said explicitly
+        # (null = unbounded), so "unbounded" is distinguishable from an
+        # omitted setting without experimenting (Codex #135 r3; the task
+        # names response size among the discoverable constraints)
+        "max_response_bytes": None,
+        "query_chars_cap": _QUERY_CHARS_CAP,
+        "browse_limit_cap": BROWSE_LIMIT_CAP,
+        "browse_q_cap": BROWSE_Q_CAP,
+    }
+
+
 async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
     """§9 ``list_schema``: the whitelisted sql tables with their live columns
     (introspection shape). The wall clock covers binding + discovery; the
@@ -1105,21 +1154,45 @@ async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
                     "build_id": bound_build,
                     "sql_enabled": runtime.policy.text_to_sql.enabled,
                     "tables": tables,
+                    # MCP15: every ceiling an agent could previously learn
+                    # only by tripping it (or reverse-engineering warnings)
+                    # — and per-project policy divergence was INVISIBLE
+                    # (measured: a policy edit changed behavior with no
+                    # discoverable surface reflecting it). This block is the
+                    # session's ACTUAL policy, read at lifespan start.
+                    "policy": _policy_disclosure(runtime),
                     "error": None,
                     "error_code": None,
                 }
     except NoActiveBuildError:
-        return _introspection_no_active_build(runtime, "list_schema")
+        # the policy rides EVERY branch (it needs no store): the degraded
+        # states are exactly when an agent inspects its session (Codex #135)
+        return {
+            **_introspection_no_active_build(runtime, "list_schema"),
+            "policy": _policy_disclosure(runtime),
+        }
     except TimeoutError:
-        return _introspection_timeout(runtime, bound_build, "list_schema")
+        return {
+            **_introspection_timeout(runtime, bound_build, "list_schema"),
+            "policy": _policy_disclosure(runtime),
+        }
     except DBAPIError as exc:
         if _is_statement_timeout(exc):
-            return _introspection_timeout(runtime, bound_build, "list_schema")
-        return _introspection_store_error(runtime, bound_build, "list_schema", exc)
+            return {
+                **_introspection_timeout(runtime, bound_build, "list_schema"),
+                "policy": _policy_disclosure(runtime),
+            }
+        return {
+            **_introspection_store_error(runtime, bound_build, "list_schema", exc),
+            "policy": _policy_disclosure(runtime),
+        }
     except _STORE_ERRORS as exc:
         # binding touches the other stores' clients too (qdrant/neo4j) — the
         # same §22 line as _bounded
-        return _introspection_store_error(runtime, bound_build, "list_schema", exc)
+        return {
+            **_introspection_store_error(runtime, bound_build, "list_schema", exc),
+            "policy": _policy_disclosure(runtime),
+        }
 
 
 async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:

@@ -632,6 +632,89 @@ async def test_introspection_errors_carry_typed_codes() -> None:
     assert missing["error_code"] == "NOT_FOUND"
 
 
+async def test_list_schema_discloses_the_session_policy_ceilings() -> None:
+    """MCP15: of the ten operative limits only the SQL whitelist was
+    discoverable up front — max_top_k/max_graph_hops/max_latency_ms/
+    expose_debug/enabled modes/query caps could be learned only by tripping
+    them, and PER-PROJECT policy divergence was invisible (measured: an
+    operator's max_top_k=3 edit changed behavior with no discoverable
+    surface reflecting it). list_schema now discloses the session's ACTUAL
+    policy — the divergent values below are deliberately non-default."""
+    import uuid
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from core.mcp.server import _list_schema, _Runtime
+
+    build_id = uuid.uuid4()
+    deps = SimpleNamespace(repo=SimpleNamespace(project="museum", build_id=build_id))
+
+    class _Ctx:
+        project = "museum"
+
+        @asynccontextmanager
+        async def bound(self):  # type: ignore[no-untyped-def]
+            yield deps
+
+    policy = SimpleNamespace(
+        default_mode="semantic",
+        max_top_k=3,  # the measured divergent edit
+        max_graph_hops=2,
+        max_sql_rows=50,
+        max_latency_ms=9000,
+        expose_debug=True,
+        text_to_sql=SimpleNamespace(enabled=False),
+        sql_rows=lambda: 40,  # the RECONCILED cap (min of top-level and mode-local)
+        # mode-local reconciled ceilings (Codex #135 r2): rows below top_k,
+        # timeouts below max_latency_ms — the divergences that would be
+        # overstated by raw top-level fields
+        sql_policy=lambda: SimpleNamespace(timeout_ms=800),
+        cypher_policy=lambda: SimpleNamespace(max_rows=7, timeout_ms=700),
+        text_to_cypher=SimpleNamespace(enabled=False),
+    )
+    runtime = _Runtime(context=_Ctx(), policy=policy)  # type: ignore[arg-type]
+    payload = await _list_schema(runtime)
+    assert payload["error"] is None and payload["error_code"] is None
+
+    # Codex #135 r1: the policy needs NO store, so it rides the DEGRADED
+    # branches too — no-active-build/timeout/store-error are exactly the
+    # states where an agent inspects its session before retrying
+    from core.stores.repo import NoActiveBuildError
+
+    class _NoBuildCtx:
+        project = "museum"
+
+        @asynccontextmanager
+        async def bound(self):  # type: ignore[no-untyped-def]
+            raise NoActiveBuildError("museum")
+            yield deps
+
+    degraded = await _list_schema(_Runtime(context=_NoBuildCtx(), policy=policy))  # type: ignore[arg-type]
+    assert degraded["error_code"] == "NO_ACTIVE_BUILD"
+    assert degraded["policy"] == payload["policy"]  # same disclosure, store or no store
+
+    assert payload["policy"] == {
+        # NO default_mode key: nothing on the MCP surface dispatches by it,
+        # and disclosing it contradicts the instructions' hybrid_query
+        # default (Codex #135 r4 — same rule as the cypher toggle)
+        "max_top_k": 3,
+        "max_graph_hops": 2,
+        "max_sql_rows": 40,  # sql_rows(): the enforced, reconciled value
+        "max_graph_rows": 7,  # cypher_policy().max_rows — likewise reconciled
+        "sql_timeout_ms": 800,
+        "graph_timeout_ms": 700,
+        "max_latency_ms": 9000,
+        "expose_debug": True,
+        "sql_enabled": False,
+        # NO nl_to_cypher/cypher_enabled key: the toggle's path is not
+        # exposed on any MCP surface — disclosing it can only mislead
+        "max_response_bytes": None,  # explicitly unbounded, not omitted
+        "query_chars_cap": 4000,
+        "browse_limit_cap": 200,
+        "browse_q_cap": 64,
+    }
+
+
 def test_the_introspection_no_active_build_shape_is_explicit() -> None:
     """MCP12: the introspection tools' DR-001 refusal is the same explicit
     error-field shape as their timeout/store degradations — previously the
@@ -721,17 +804,29 @@ async def test_list_schema_maps_db_deadline_and_failures_typed() -> None:
             max_latency_ms=1000,
             text_to_sql=SimpleNamespace(enabled=True, allowed_tables=("orders",)),
             sql_policy=lambda: SimpleNamespace(timeout_ms=500),
+            # MCP15: the disclosure block rides every branch, so the fake
+            # carries the disclosed fields too
+            default_mode="hybrid",
+            max_top_k=20,
+            max_graph_hops=3,
+            max_sql_rows=50,
+            expose_debug=False,
+            text_to_cypher=SimpleNamespace(enabled=False),
+            sql_rows=lambda: 50,
+            cypher_policy=lambda: SimpleNamespace(max_rows=50, timeout_ms=500),
         )
         return _Runtime(context=_Ctx(), policy=policy)  # type: ignore[arg-type]
 
     timed_out = await _list_schema(_runtime(DBAPIError("q", None, _PgTimeout())))
     assert "deadline" in timed_out["error"]  # 57014 IS the §21 deadline
+    assert timed_out["policy"]["max_top_k"] == 20  # MCP15: disclosure rides this branch too
 
     failed = await _list_schema(_runtime(DBAPIError("q", None, _PgOther())))
     # MCP2: the store is NAMED — "store unavailable" left the agent unable to
     # tell "route around Qdrant" from "everything is dead" (postgres down)
     assert failed["error"] == "postgres unavailable (DBAPIError) — §22"
     assert failed["build_id"] == "b-1"
+    assert failed["policy"]["max_top_k"] == 20  # MCP15: ...and this one
 
     with pytest.raises(ValueError, match="in-code bug"):
         await _list_schema(_runtime(ValueError("in-code bug")))
