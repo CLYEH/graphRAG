@@ -1033,10 +1033,11 @@ def build_server(project: str) -> FastMCP:
     async def list_schema() -> dict[str, Any]:
         """The queryable structured surface (each whitelisted sql table
         with its live columns) PLUS this session's policy ceilings —
-        max_top_k, max_graph_hops, max_latency_ms, query/browse caps, which
-        modes are enabled, expose_debug — so limits are discoverable up
-        front instead of by tripping them. Introspection shape
-        (error/error_code)."""
+        max_top_k, max_graph_hops, max_latency_ms, query/browse caps,
+        whether NL->SQL is enabled (parameterized graph_query is always
+        available), expose_debug — so
+        limits are discoverable up front instead of by tripping them.
+        Introspection shape (error/error_code)."""
         return await _list_schema(_rt())
 
     @server.tool()
@@ -1098,7 +1099,18 @@ def _policy_disclosure(runtime: _Runtime) -> dict[str, Any]:
         "graph_timeout_ms": runtime.policy.cypher_policy().timeout_ms,
         "expose_debug": runtime.policy.expose_debug,
         "sql_enabled": runtime.policy.text_to_sql.enabled,
-        "cypher_enabled": runtime.policy.text_to_cypher.enabled,
+        # text_to_cypher.enabled is deliberately NOT disclosed: it toggles
+        # the OPTIONAL free NL(prose)->Cypher path, which no MCP surface
+        # currently exposes (core/query/graph.py: no API in the chain
+        # accepts query text) — any value would mislead (false read as
+        # "graph unavailable" though parameterized graph_query always works;
+        # true suggests a nonexistent free-form tool). The field returns
+        # when the optional path ships (Codex #135 r3 + gate-2 residual).
+        # response size has NO application-level limit — said explicitly
+        # (null = unbounded), so "unbounded" is distinguishable from an
+        # omitted setting without experimenting (Codex #135 r3; the task
+        # names response size among the discoverable constraints)
+        "max_response_bytes": None,
         "query_chars_cap": _QUERY_CHARS_CAP,
         "browse_limit_cap": BROWSE_LIMIT_CAP,
         "browse_q_cap": BROWSE_Q_CAP,

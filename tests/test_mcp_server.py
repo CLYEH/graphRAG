@@ -704,7 +704,9 @@ async def test_list_schema_discloses_the_session_policy_ceilings() -> None:
         "max_latency_ms": 9000,
         "expose_debug": True,
         "sql_enabled": False,
-        "cypher_enabled": False,
+        # NO nl_to_cypher/cypher_enabled key: the toggle's path is not
+        # exposed on any MCP surface — disclosing it can only mislead
+        "max_response_bytes": None,  # explicitly unbounded, not omitted
         "query_chars_cap": 4000,
         "browse_limit_cap": 200,
         "browse_q_cap": 64,
