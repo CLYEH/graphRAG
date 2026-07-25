@@ -31,11 +31,13 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import time
 from typing import Any
 from urllib.parse import unquote
 
 import anyio
 from anyio.abc import TaskGroup, TaskStatus
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -85,6 +87,45 @@ class McpGateway:
         # alive until full shutdown, accumulating orphans across
         # delete/recreate cycles. Shutdown sets every remaining event.
         self._child_stops: dict[str, anyio.Event] = {}
+        # the pre-seeded SDK session manager per project (Codex #137 r12):
+        # an explicit-DELETE termination does NOT remove the transport from
+        # the manager's own _server_instances/_session_owners maps (only the
+        # idle path pops them), so after a confirmed max-age teardown the
+        # gateway must evict the id from the manager registry too — else one
+        # SDK entry leaks per rollover until project eviction / shutdown
+        self._session_managers: dict[str, Any] = {}
+        # MCP17 (Codex #137 r1): ABSOLUTE session age. The SDK's idle timeout
+        # resets on every request, so a chatty session's DR-012 policy
+        # snapshot would never expire — this gateway-side ledger records when
+        # a session id was FIRST seen (>= its true start, so the bound errs
+        # tight) and answers 404 past the ceiling; the client re-initializes
+        # and the fresh lifespan reads the CURRENT policy.
+        # sid -> (first_seen, last_seen). first_seen drives the ceiling;
+        # last_seen drives SAFE compaction (Codex #137 r2 P1: an entry may
+        # be forgotten only once the SDK has necessarily reaped the session
+        # - idle_timeout past its last activity - because a forgotten id
+        # that the child still serves would restart its clock and resume
+        # the stale snapshot; a forgotten DEAD id is harmless, the child
+        # answers "session not found" itself).
+        self._session_seen: dict[tuple[str, bytes], tuple[float, float]] = {}
+        self._session_max_age_s = 7200.0
+        self._session_idle_timeout_s = 1800.0
+        # compaction high-water mark (Codex #137 r9): a plain len>4096 check
+        # rebuilds the whole dict on EVERY request once the live set stays
+        # above 4096 (compaction keeps live entries, so it removes nothing
+        # and the count never drops) — O(n²) under high concurrency. Instead
+        # compact only past this mark and RAISE it to 2× the post-compaction
+        # size, so between compactions the ledger must grow substantially:
+        # amortized O(1) per request, and a genuinely-large live set never
+        # rebuilds until it doubles.
+        self._compact_at = 4096
+        # ...but a TIME trigger too (Codex #137 r10): a traffic spike raises
+        # the mark to 2× its peak; once those sessions time out the ledger
+        # sits below the (now huge) mark, so the reaped entries would linger
+        # until traffic re-exceeded the historical peak. A compaction at
+        # least once per reap horizon lets the mark FALL back after a spike
+        # subsides, reclaiming memory within ~one idle horizon.
+        self._last_compact_at = time.monotonic()
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
@@ -93,6 +134,17 @@ class McpGateway:
         if scope["type"] != "http":
             raise RuntimeError(f"unsupported ASGI scope type {scope['type']!r}")
         raw_path = scope.get("raw_path") or scope["path"].encode("utf-8")
+        # MCP17: a minimal liveness surface — /health answers 200 (previously
+        # /, /mcp and /health all 404'd, so an operator could not tell the
+        # gateway was even alive). Deliberately NON-SENSITIVE (Codex #137
+        # r11): this gateway-level response bypasses the SDK transport's
+        # DNS-rebinding validation, so a rebinding page could read whatever
+        # it returns — the mounted-PROJECT-NAMES enumeration is therefore
+        # NOT exposed here (that is an authenticated admin concern for the
+        # §23 auth round); only a bare liveness result leaks nothing.
+        if scope["path"] == "/health":
+            await self._send_json(send, 200, {"status": "ok"})
+            return
         match = _MCP_PATH_RAW.match(raw_path)
         if match is None:
             await self._send_json(
@@ -128,7 +180,13 @@ class McpGateway:
         # not a config edit), and during a registry outage they pass through
         # to their own IN-PROTOCOL typed degradation.
         headers = scope.get("headers") or []
-        initializing = not any(k.lower() == b"mcp-session-id" for k, _ in headers)
+        session_id = next((v for k, v in headers if k.lower() == b"mcp-session-id"), None)
+        initializing = session_id is None
+        # over-age is decided BEFORE preflight/mount, but the actual
+        # server-side teardown (Codex #137 r7) happens AFTER the child is
+        # mounted below — an internal DELETE releases the SDK session's task
+        # + lifespan instead of leaving them allocated until the idle timeout
+        terminate_by_age = session_id is not None and self._touch_session_age(project, session_id)
         refusal = await self._preflight(project, initializing=initializing)
         if refusal is not None:
             status, payload = refusal
@@ -139,6 +197,7 @@ class McpGateway:
                 # orphaned session manager alive until full shutdown)
                 async with self._lock:
                     self._apps.pop(project, None)
+                    self._session_managers.pop(project, None)
                     child_stop = self._child_stops.pop(project, None)
                 if child_stop is not None:
                     child_stop.set()
@@ -179,6 +238,40 @@ class McpGateway:
                 {"error": f"project {project!r} is not in the registry (or not path-addressable)"},
             )
             return
+        if terminate_by_age and session_id is not None:
+            # Codex #137 r7: actually RELEASE the server-side session at the
+            # ceiling — a bare 404 here would leave the SDK's session task +
+            # lifespan allocated until its idle timeout (another ~30 min),
+            # so N simultaneously-aging sessions overlap avoidably. An
+            # internal DELETE into the child triggers the SDK's own session
+            # teardown; then we drop our ledger entry and answer the client
+            # the honest termination 404 (its request is over regardless —
+            # the r5 reconnect contract). If the SDK already reaped it, the
+            # internal DELETE is a harmless no-op.
+            # carry the ORIGINAL request's headers (Codex #137 r8): the SDK
+            # transport's DNS-rebinding guard (auto-on for a localhost bind)
+            # 421s a Host-less request, so a bare synthetic DELETE would be
+            # rejected — and only forget the ledger entry once teardown is
+            # CONFIRMED, or a rejected DELETE + an unconditional pop would
+            # let the still-live session escape the bound via the unknown-id
+            # pass-through
+            terminated = await self._terminate_child_session(app, project, headers, session_id)
+            if terminated:
+                self._session_seen.pop((project, session_id), None)
+                self._evict_from_manager(project, session_id)
+            await self._send_json(
+                send,
+                404,
+                {
+                    "error": "session TERMINATED — it exceeded the maximum age "
+                    f"({int(self._session_max_age_s)}s). Open a NEW transport and "
+                    "re-initialize to continue with the project's CURRENT policy "
+                    "(the same 404-then-reconnect contract as the SDK's idle "
+                    "reaper — a client that keeps the old session id on a fresh "
+                    "transport stays terminated)."
+                },
+            )
+            return
         # the mounted app sees itself at root — root_path keeps URL
         # reconstruction (and the SDK's own endpoint echoes) correct
         child_scope = {
@@ -186,7 +279,188 @@ class McpGateway:
             "path": rest,
             "root_path": scope.get("root_path", "") + f"/mcp/{project}",
         }
+        if initializing:
+            # Codex #137 r2 P2: the absolute clock starts at CREATION — the
+            # id is minted in the initialize RESPONSE headers, so intercept
+            # them (a clock started at first follow-up could be delayed
+            # almost a full idle_timeout, stretching the ceiling)
+            async def send_capturing(message: dict[str, Any]) -> None:
+                if message.get("type") == "http.response.start":
+                    for key, value in message.get("headers", []):
+                        if key.lower() == b"mcp-session-id":
+                            self._record_session_start(project, bytes(value))
+                await send(message)
+
+            await app(child_scope, receive, send_capturing)
+            return
+        if scope.get("method") == "DELETE" and session_id is not None:
+            # Codex #137 r6: an explicit MCP session termination (DELETE)
+            # releases the session in the SDK immediately — drop the ledger
+            # entry on a successful (2xx) response instead of waiting the
+            # full idle_timeout+margin, so a high-churn client that creates
+            # and DELETEs many short-lived sessions cannot grow the ledger
+            # within the reap window. A dead id later re-sent takes the
+            # unknown-id pass-through (the child's own 404); a NON-2xx
+            # DELETE (already gone / rejected) keeps the entry, harmless.
+            # Codex #137 r13 P1: the pinned SDK's explicit-DELETE path marks
+            # the transport terminated but leaves it in _server_instances /
+            # _session_owners (only the idle reaper pops those), so a
+            # client's own initialize/DELETE churn would grow the per-project
+            # manager without bound despite the ledger drop — evict the SDK
+            # registries here too, exactly as the max-age teardown does.
+            captured = session_id
+
+            async def send_terminating(message: dict[str, Any]) -> None:
+                if message.get("type") == "http.response.start" and (
+                    200 <= int(message.get("status", 0)) < 300
+                ):
+                    self._session_seen.pop((project, captured), None)
+                    self._evict_from_manager(project, captured)
+                await send(message)
+
+            await app(child_scope, receive, send_terminating)
+            return
         await app(child_scope, receive, send)
+
+    async def _terminate_child_session(
+        self, app: Any, project: str, orig_headers: list[tuple[bytes, bytes]], session_id: bytes
+    ) -> bool:
+        """Issue an internal DELETE into the child so the SDK tears down the
+        over-age session's task + lifespan (Codex #137 r7). Returns True only
+        when teardown is CONFIRMED — a 2xx (we terminated it) or a 404 (the
+        SDK says it is already gone); a 421 (the transport's DNS-rebinding
+        guard rejecting a Host-less request) or any other status returns
+        False so the caller KEEPS the ledger entry rather than letting a
+        still-live session escape the age bound (Codex #137 r8).
+
+        The ORIGINAL request's headers are carried so Host (and the
+        session-id) satisfy the rebinding guard; body-framing headers are
+        dropped since the DELETE carries no body. Best-effort — a teardown
+        exception returns False (keep the entry), never a 500."""
+        headers = [
+            (k, v)
+            for k, v in orig_headers
+            if k.lower() not in (b"content-length", b"content-type", b"transfer-encoding")
+        ]
+        delete_scope = {
+            "type": "http",
+            "method": "DELETE",
+            "path": "/",
+            "raw_path": b"/",
+            "root_path": f"/mcp/{project}",
+            "headers": headers,
+        }
+        status = 0
+
+        async def _receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": b""}
+
+        async def _capture(message: dict[str, Any]) -> None:
+            nonlocal status
+            if message.get("type") == "http.response.start":
+                status = int(message.get("status", 0))
+
+        with contextlib.suppress(Exception):
+            await app(delete_scope, _receive, _capture)
+        return (200 <= status < 300) or status == 404
+
+    def _evict_from_manager(self, project: str, session_id: bytes) -> None:
+        """Remove a confirmed-terminated id from the SDK manager's own
+        registries (Codex #137 r12): the pinned SDK does NOT pop an
+        explicitly-DELETEd transport from ``_server_instances`` /
+        ``_session_owners`` (only the idle path does), so without this each
+        max-age rollover leaks one SDK entry until project eviction. Keyed
+        by the session-id STRING (the SDK's key type). Defensive: unknown
+        attributes / a renamed SDK field are no-ops, never a crash — a
+        tripwire test pins the current attribute names so an SDK upgrade
+        surfaces red rather than silently leaking again."""
+        manager = self._session_managers.get(project)
+        sid = session_id.decode("utf-8", "replace")
+        for attr in ("_server_instances", "_session_owners"):
+            registry = getattr(manager, attr, None)
+            if isinstance(registry, dict):
+                registry.pop(sid, None)
+
+    def _compact_sessions(self, now: float) -> None:
+        """Forget ids whose sessions the SDK has CERTAINLY reaped
+        (idle_timeout + margin since their LAST activity) once the ledger is
+        large. A live session keeps refreshing its last-seen — even while
+        being refused past the ceiling — so its tombstone survives and the
+        age bound holds by construction; only genuinely-dead ids are
+        dropped, and a request under a dropped (reaped) id then takes the
+        unknown-id pass-through to the child's own 404. Runs from BOTH
+        insertion and touch (Codex #137 r5 P1: one-shot init clients never
+        touch, so insert-time compaction is what bounds a gateway that only
+        ever sees initializations). The high-water mark (Codex #137 r9)
+        makes this amortized O(1): it rebuilds the dict only past
+        ``_compact_at`` and then RAISES the mark to 2× the post-compaction
+        size, so a large live set (nothing to reap) does not rebuild on
+        every request — it waits until the ledger grows again. A TIME
+        trigger (Codex #137 r10) also fires once per reap horizon so the
+        mark FALLS back after a spike subsides (else post-spike reaped
+        entries linger below the raised mark indefinitely)."""
+        horizon_s = self._session_idle_timeout_s + 60.0
+        over_mark = len(self._session_seen) > self._compact_at
+        past_horizon = now - self._last_compact_at >= horizon_s
+        if not (over_mark or past_horizon):
+            return
+        cutoff = now - horizon_s
+        self._session_seen = {
+            key: (f, s) for key, (f, s) in self._session_seen.items() if s > cutoff
+        }
+        self._last_compact_at = now
+        self._compact_at = max(4096, 2 * len(self._session_seen))
+
+    def _record_session_start(self, project: str, session_id: bytes) -> None:
+        """Stamp a session's creation (Codex #137 r2 P2): the id is captured
+        from the INITIALIZE response, so the absolute clock starts at
+        creation — not at the first follow-up request, which a client could
+        delay to stretch the documented ceiling. Compacts on insert so a
+        gateway that only ever sees initializations stays bounded (r5 P1).
+
+        Keyed by ``(project, session_id)`` (Codex #137 r13 P1): a session id
+        is only meaningful within its own project's SDK manager, so the
+        ledger must scope by project — otherwise the confirm-before-pop
+        teardown could cross-talk between projects (see
+        :meth:`_touch_session_age`)."""
+        now = time.monotonic()
+        self._session_seen.setdefault((project, session_id), (now, now))
+        self._compact_sessions(now)
+
+    def _touch_session_age(self, project: str, session_id: bytes) -> bool:
+        """Inspect a KNOWN session id's age — True when past the absolute
+        ceiling (MCP17: the idle timeout resets per request, so ONLY an
+        absolute bound caps a chatty session's stale policy snapshot).
+
+        Only ids CAPTURED from a successful initialize response are tracked
+        (:meth:`_record_session_start`) — an UNKNOWN id is NOT inserted here
+        (Codex #137 r3 P1: setdefault-ing every client-supplied id let an
+        unauthenticated flood of unique ids grow the ledger without bound;
+        an unknown id now passes through untracked to the SDK, which
+        answers its own 404). A known entry is KEPT on expiry (an ignored
+        404 must not restart the clock).
+
+        Keyed by ``(project, session_id)`` (Codex #137 r13 P1): the ledger is
+        global but a session id is minted by, and only valid within, ONE
+        project's SDK manager. Keying by the bare id let a still-live
+        over-age session for project A be forgotten by replaying its id
+        against project B: B's manager 404s the id it never issued,
+        :meth:`_terminate_child_session` reads that 404 as confirmed
+        teardown, and A's entry was popped — after which A's next request
+        passed through untracked, escaping the age ceiling with its stale
+        policy snapshot intact. Scoping the key to the project closes that
+        cross-project escape: B's 404 can only ever drop ``(B, id)``, which
+        was never tracked."""
+        now = time.monotonic()
+        seen = self._session_seen.get((project, session_id))
+        if seen is None:
+            # untracked (never initialized through this gateway, or already
+            # reaped): pass through — the child owns the session-not-found
+            return False
+        first, _last = seen
+        self._session_seen[(project, session_id)] = (first, now)
+        self._compact_sessions(now)  # before the expiry return: a refused touch must still compact
+        return now - first > self._session_max_age_s
 
     async def _preflight(
         self, project: str, *, initializing: bool
@@ -253,6 +527,8 @@ class McpGateway:
         assert message["type"] == "lifespan.startup"
         try:
             settings = get_settings()
+            self._session_max_age_s = float(settings.mcp_session_max_age_s)
+            self._session_idle_timeout_s = float(settings.mcp_session_idle_timeout_s)
             self._engine = create_async_engine(
                 settings.postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
                 poolclass=NullPool,
@@ -295,6 +571,27 @@ class McpGateway:
             server = build_server(project)
             # the child serves at ITS root — the gateway prefix owns the path
             server.settings.streamable_http_path = "/"
+            # MCP17: the SDK's session manager supports session_idle_timeout
+            # but FastMCP.streamable_http_app never passes it (its lazy init
+            # omits the param → sessions lived until client DELETE or
+            # gateway restart, so an abandoned agent-platform session — and
+            # its DR-012 policy snapshot — could survive FOREVER). Pre-seed
+            # the manager with the timeout; streamable_http_app reuses a
+            # non-None _session_manager as-is.
+            server._session_manager = StreamableHTTPSessionManager(  # noqa: SLF001
+                app=server._mcp_server,  # noqa: SLF001
+                json_response=server.settings.json_response,
+                stateless=server.settings.stateless_http,
+                security_settings=server.settings.transport_security,
+                # the SAME lifetime the compaction horizon uses (Codex #137
+                # r4): reading get_settings() fresh here would let a runtime
+                # env change give a later-mounted manager a LONGER reap
+                # timeout than _session_idle_timeout_s (captured at lifespan
+                # start), so compaction could forget an id the SDK still
+                # holds live — its next request then takes the unknown-id
+                # pass-through and permanently escapes the age ceiling
+                session_idle_timeout=self._session_idle_timeout_s,
+            )
             app = server.streamable_http_app()
             assert self._tasks is not None, "gateway lifespan not started"
             child_stop = anyio.Event()
@@ -324,6 +621,7 @@ class McpGateway:
             await self._tasks.start(host)
             self._apps[project] = app
             self._child_stops[project] = child_stop
+            self._session_managers[project] = server._session_manager  # noqa: SLF001
             return app
 
     async def _project_exists(self, project: str) -> bool:
@@ -349,3 +647,14 @@ class McpGateway:
 def build_gateway() -> McpGateway:
     """The gateway ASGI app ``graphrag serve-mcp`` runs (CFG1)."""
     return McpGateway()
+
+
+def create_app() -> McpGateway:
+    """Uvicorn FACTORY entrypoint (MCP17): ``uvicorn.run("core.mcp.gateway:
+    create_app", factory=True, workers=N)``. Passing an already-instantiated
+    app object made uvicorn's ``workers`` unusable (it must import the app in
+    each worker process) — the gateway was structurally single-process with
+    no multi-process escape. Each worker builds its OWN gateway (own mounts,
+    own sessions); streamable-HTTP sessions are process-sticky, so workers>1
+    needs session-affinity in front (the CLI says so loudly)."""
+    return build_gateway()
