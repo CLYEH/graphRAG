@@ -57,7 +57,7 @@ from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
 from core.llm.errors import LLM_CLIENT_ERRORS
-from core.llm.factory import chat_model, embedding_model
+from core.llm.factory import chat_model, query_embedding_model
 from core.mcp.context import ProjectContext
 from core.mcp.policy import (
     QueryPolicy,
@@ -550,7 +550,7 @@ def build_server(project: str) -> FastMCP:
                 # heavyweight clients) go to a worker thread — none of them
                 # needs the running loop to construct
                 qdrant, embedder, llm = await asyncio.to_thread(
-                    lambda: (vector_client(), embedding_model(), chat_model())
+                    lambda: (vector_client(), query_embedding_model(), chat_model())
                 )
                 shared["context"] = ProjectContext(
                     project=project,

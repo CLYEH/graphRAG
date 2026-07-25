@@ -30,7 +30,7 @@ from qdrant_client import AsyncQdrantClient
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from core.config import get_settings
-from core.llm.factory import chat_model, embedding_model
+from core.llm.factory import chat_model, query_embedding_model
 from core.mcp.context import ProjectContext
 from core.stores.graph import graph_driver
 from core.stores.vectors import vector_client
@@ -194,7 +194,7 @@ def project_query_context(request: Request, project: str) -> ProjectContext:
     if state.neo4j is None:
         state.neo4j = graph_driver()
     if state.embedder is None:
-        state.embedder = embedding_model()
+        state.embedder = query_embedding_model()
     if state.llm is None:
         state.llm = chat_model()
     return ProjectContext(

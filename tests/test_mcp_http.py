@@ -113,7 +113,7 @@ async def test_streamable_http_serves_the_full_tool_set_in_process(
     monkeypatch.setattr(server_module, "create_async_engine", lambda *a, **k: _Closeable())
     monkeypatch.setattr(server_module, "vector_client", lambda: _Closeable())
     monkeypatch.setattr(server_module, "graph_driver", lambda: _Closeable())
-    monkeypatch.setattr(server_module, "embedding_model", lambda: object())
+    monkeypatch.setattr(server_module, "query_embedding_model", lambda: object())
     monkeypatch.setattr(server_module, "chat_model", lambda: object())
     _stub_registry_policy(monkeypatch)
 
@@ -186,7 +186,7 @@ async def test_http_sessions_get_isolated_runtimes(
     monkeypatch.setattr(server_module, "create_async_engine", lambda *a, **k: _Engine())
     monkeypatch.setattr(server_module, "vector_client", _factory("qdrant"))
     monkeypatch.setattr(server_module, "graph_driver", _factory("neo4j"))
-    monkeypatch.setattr(server_module, "embedding_model", lambda: object())
+    monkeypatch.setattr(server_module, "query_embedding_model", lambda: object())
     monkeypatch.setattr(server_module, "chat_model", lambda: object())
     _stub_registry_policy(monkeypatch)
 

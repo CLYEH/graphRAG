@@ -143,6 +143,17 @@ class Settings(BaseSettings):
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-nano"
     embedding_model: str = Field(default="text-embedding-3-large")
+    # MCP18 query-latency: a QUERY's text embedding is a ~1s OpenAI round-trip
+    # (measured ~88% of `semantic` mode latency). A text embedding is a pure
+    # function of (model, text) and BUILD-independent, so the query path wraps
+    # its embedder in a bounded LRU (query_embedding_model): a repeated question
+    # — a museum guide sees the same few (ticket price, hours, directions) — is
+    # served from cache and skips the API call. This is the LRU size PER query-
+    # embedder instance (one per project server / API app — so a multi-project
+    # gateway's aggregate ceiling is N×this); 0 disables it. Ingestion embedders
+    # are NOT cached — each chunk/entity text is distinct, so caching them only
+    # burns memory.
+    embedding_cache_size: int = Field(default=512, ge=0)
     # .env keeps the conventional unprefixed name (see .env.example); the
     # GRAPHRAG_-prefixed alias also works. Read here so no other module ever
     # touches os.environ for it (CLAUDE.md guardrail).
