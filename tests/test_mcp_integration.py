@@ -476,6 +476,13 @@ async def test_browse_tools_search_and_page_over_live_sql(context: ProjectContex
         assert [e["name"] for e in literal["entities"]] == ["100%純金模型"]
         assert literal["match"] == "substring"  # % matched literally, not as wildcard
 
+        # Codex #129: wildcards must stay literal in the FUZZY fallback too —
+        # "%%" (no substring hit) must match only names containing a literal
+        # %, never degrade into match-everything
+        wild = await _list_entities(deps.repo, context.project, 50, None, "%%", None)
+        assert [e["name"] for e in wild["entities"]] == ["100%純金模型"]
+        assert wild["match"] == "characters"
+
         typed = await _list_entities(deps.repo, context.project, 50, None, None, "EXHIBIT")
         assert sorted(e["name"] for e in typed["entities"]) == ["100%純金模型", "深海展區"]
 
@@ -498,6 +505,10 @@ async def test_browse_tools_search_and_page_over_live_sql(context: ProjectContex
             page = await _list_reports(deps.repo, context.project, 2, cursor)
             assert page["error"] is None
             seen_reports.extend(r["title"] for r in page["reports"])
+            # the FULL summary rides with every page (Codex #129 P1: no
+            # get_report exists — omitting it left beyond-ceiling report
+            # CONTENT permanently unreachable)
+            assert all(r["summary"] == "s" for r in page["reports"])
             cursor = page["next_cursor"]
             if cursor is None:
                 break

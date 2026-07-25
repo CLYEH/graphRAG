@@ -690,11 +690,12 @@ class BuildScopedRepo:
             if fuzzy:
                 # character-AND (MCP9): 主館 is NOT a substring of 主題館 —
                 # each query character must appear somewhere in the name;
-                # the CJK-friendly fallback when substring finds nothing
+                # the CJK-friendly fallback when substring finds nothing.
+                # EVERY character is escaped and kept (Codex #129: skipping
+                # %/_/backslash made "%%" match every entity — a wildcard in
+                # q must match literally, not vanish)
                 conditions.extend(
-                    entities.c.canonical_name.ilike(f"%{ch}%", escape="\\")
-                    for ch in q
-                    if ch not in ("%", "_", "\\")
+                    entities.c.canonical_name.ilike(f"%{escape_like(ch)}%", escape="\\") for ch in q
                 )
             else:
                 conditions.append(entities.c.canonical_name.ilike(f"%{escaped}%", escape="\\"))

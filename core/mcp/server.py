@@ -526,9 +526,10 @@ def build_server(project: str) -> FastMCP:
 
     @server.tool()
     async def list_reports(limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
-        """Browse the build's community reports, paged (title + rating; the
-        global_summary retrieval ceiling hid most of them — this lists ALL).
-        Introspection shape — NOT a §16 response."""
+        """Browse the build's community reports, paged, each with its FULL
+        summary (the global_summary retrieval ceiling hid most of them —
+        this reaches ALL, content included). Introspection shape — NOT a
+        §16 response."""
         rt = _rt()
         bound_build: str | None = None
         try:
@@ -855,6 +856,7 @@ async def _list_reports(repo: Any, project: str, limit: int, cursor: str | None)
     columns = (
         tables.community_reports.c.id,
         tables.community_reports.c.title,
+        tables.community_reports.c.summary,
         tables.community_reports.c.rating,
     )
     rows = await repo.page_rows(tables.community_reports, columns, limit + 1, after_id)
@@ -870,6 +872,11 @@ async def _list_reports(repo: Any, project: str, limit: int, cursor: str | None)
             {
                 "id": str(row.id),
                 "title": row.title if isinstance(row.title, str) else None,
+                # the FULL summary rides along (Codex #129 P1): there is no
+                # get_report tool and global_summary cannot select by id, so
+                # omitting it here would leave beyond-ceiling report content
+                # permanently unreachable — the exact wall MCP9 removes
+                "summary": row.summary if isinstance(row.summary, str) else None,
                 "rating": row.rating,
             }
             for row in page
