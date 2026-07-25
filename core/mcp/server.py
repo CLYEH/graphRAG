@@ -36,6 +36,7 @@ one-project runs.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import time
@@ -508,37 +509,86 @@ def build_server(project: str) -> FastMCP:
     once per protocol session: a policy edit applies to the NEXT session,
     and a project with a missing/invalid registry policy fails that
     session's startup loud (typed :class:`~core.mcp.policy.PolicyError`),
-    never half-serves."""
+    never half-serves.
+
+    MCP16 — store/model clients are built ONCE per server instance and
+    SHARED across its sessions. Measured: the concurrency ramp (5→15→30→60
+    sessions, initialize+get_entity, pure Postgres) degraded linearly
+    5.3s→40.0s at a fixed ~0.8 session/s with PG connections peaking at 7 —
+    serialization, not the database. Root cause: ``AsyncQdrantClient``'s
+    constructor performs synchronous blocking I/O (measured 1,302ms
+    event-loop stall) and ran once per session lifespan, freezing every
+    other in-flight session on the single-threaded loop. Now the first
+    session builds the bundle (the blocking constructors under
+    ``asyncio.to_thread``, so even that one build never stalls the loop)
+    and later sessions reuse it — which also stops the per-session
+    engine+Qdrant+Neo4j+2×OpenAI accumulation. The POLICY stays per-session
+    (DR-012), read before the bundle is touched (Codex #93 R5: a policy
+    error must surface, not a masking client error). Sessions no longer
+    close the clients; the OWNER of the server instance does — the gateway
+    host task after the child app's lifespan exits (eviction/shutdown), or
+    :func:`run_server` after a stdio run — via the ``close`` handle on the
+    returned server (``_graphrag_close_shared``)."""
+
+    shared: dict[str, Any] = {}
+    shared_lock: dict[str, asyncio.Lock] = {}  # created lazily inside the running loop
+
+    async def _shared_context() -> ProjectContext:
+        # the lock itself is minted lazily (asyncio.Lock at import/build time
+        # would bind no running loop); dict-setdefault is atomic enough here
+        # because the FIRST await below is what yields control
+        lock = shared_lock.setdefault("lock", asyncio.Lock())
+        async with lock:
+            if "context" not in shared:
+                settings = get_settings()
+                engine = create_async_engine(
+                    settings.postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
+                    poolclass=NullPool,
+                )
+                # the measured loop-blockers (Qdrant client construction:
+                # 1,302ms stall; the OpenAI model factories import/build
+                # heavyweight clients) go to a worker thread — none of them
+                # needs the running loop to construct
+                qdrant, embedder, llm = await asyncio.to_thread(
+                    lambda: (vector_client(), embedding_model(), chat_model())
+                )
+                shared["context"] = ProjectContext(
+                    project=project,
+                    engine=engine,
+                    qdrant=qdrant,
+                    neo4j=graph_driver(),
+                    embedder=embedder,
+                    llm=llm,
+                )
+        context: ProjectContext = shared["context"]
+        return context
+
+    async def _close_shared() -> None:
+        context = shared.pop("context", None)
+        if context is not None:
+            await context.aclose()
 
     @asynccontextmanager
     async def lifespan(_server: FastMCP) -> AsyncIterator[_Runtime]:
         settings = get_settings()
-        engine = create_async_engine(
-            settings.postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
-            poolclass=NullPool,
-        )
         # policy BEFORE any store/model client (Codex #93 R5): when the
         # registry policy is missing/invalid AND a client factory would also
         # fail (e.g. no OPENAI_API_KEY), startup must surface the actionable
-        # typed PolicyError, not the masking client error. Only the engine
-        # exists at this point, so a load failure disposes exactly that.
-        try:
-            policy, exposure = await _load_runtime_config(engine, project)
-        except BaseException:
-            await engine.dispose()
-            raise
-        context = ProjectContext(
-            project=project,
-            engine=engine,
-            qdrant=vector_client(),
-            neo4j=graph_driver(),
-            embedder=embedding_model(),
-            llm=chat_model(),
+        # typed PolicyError, not the masking client error. The policy read
+        # uses its OWN throwaway engine so a failure here cannot poison or
+        # tear down the shared bundle other live sessions are using.
+        policy_engine = create_async_engine(
+            settings.postgres_dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
+            poolclass=NullPool,
         )
         try:
-            yield _Runtime(context=context, policy=policy, exposure=exposure)
+            policy, exposure = await _load_runtime_config(policy_engine, project)
         finally:
-            await context.aclose()
+            await policy_engine.dispose()
+        context = await _shared_context()
+        # NO per-session close: the bundle outlives the session (MCP16) —
+        # the server owner closes it via _graphrag_close_shared
+        yield _Runtime(context=context, policy=policy, exposure=exposure)
 
     # host/port are read at BUILD time like the policy (a later env change
     # applies on the next build); they only matter for the http transport —
@@ -1075,6 +1125,10 @@ def build_server(project: str) -> FastMCP:
         return _with_clamp_warning(payload, rt.policy, top_k)
 
     _finalize_server_metadata(server)
+    # MCP16: the shared client bundle's close handle — called by the OWNER
+    # of the server instance (the gateway host task after the child app's
+    # lifespan exits, or run_server after a stdio run), never per session
+    server._graphrag_close_shared = _close_shared  # type: ignore[attr-defined]
     return server
 
 
@@ -1770,7 +1824,19 @@ def run_server(server: FastMCP, transport: str = "stdio") -> None:
     stdio and strand the HTTP consumer)."""
     if transport not in TRANSPORTS:
         raise ValueError(f"unknown transport {transport!r} (choose from {sorted(TRANSPORTS)})")
-    server.run(transport=cast(Any, TRANSPORTS[transport]))
+    try:
+        server.run(transport=cast(Any, TRANSPORTS[transport]))
+    finally:
+        # MCP16: sessions no longer close the shared client bundle — the
+        # server's OWNER does; for a direct run that owner is this function.
+        # Best-effort: the clients were bound to server.run's now-gone loop,
+        # so a loop-bound close may complain — at process exit the OS
+        # reclaims either way, and an ugly close must not mask the run's
+        # own outcome (gate-2 nit).
+        closer = getattr(server, "_graphrag_close_shared", None)
+        if closer is not None:
+            with contextlib.suppress(Exception):  # best-effort shutdown release
+                asyncio.run(closer())
 
 
 async def run_bounded_query(

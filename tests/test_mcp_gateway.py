@@ -31,9 +31,21 @@ class _ChildApp:
         self.scopes: list[dict[str, Any]] = []
         self.lifespan_entered = False
         self.lifespan_closed = False
+        self.shared_closed = False
         self.closed_event = anyio.Event()
         self.settings = SimpleNamespace(streamable_http_path="/mcp")
         self.router = SimpleNamespace(lifespan_context=self._lifespan)
+
+    #: set to make this child's shared-bundle close RAISE — the gateway must
+    #: contain it (one project's close error must never cancel the others)
+    close_raises = False
+
+    async def _graphrag_close_shared(self) -> None:
+        # MCP16: the gateway host must close the shared client bundle once
+        # the child app is done (eviction or shutdown) — sessions never do
+        self.shared_closed = True
+        if self.close_raises:
+            raise RuntimeError("store unhealthy at close")
 
     def _lifespan(self, app: object) -> Any:
         child = self
@@ -285,6 +297,25 @@ async def test_preflight_answers_typed_for_every_unservable_state(harness: _Harn
         with anyio.fail_after(2):
             await evicted.closed_event.wait()
         assert evicted.lifespan_closed
+        assert evicted.shared_closed  # MCP16: the host released the client bundle
+
+        # a close that RAISES must be CONTAINED (gate-2 blocker): an
+        # exception through the host's finally would make anyio cancel the
+        # whole task group — one project's close error tearing down every
+        # OTHER project's host. Evict a close-raising child and prove the
+        # gateway keeps serving an unrelated, already-mounted neighbor.
+        harness.registry.update({"fragile", "steady"})
+        assert (await _request(app, "/mcp/steady"))[0] == 200
+        assert (await _request(app, "/mcp/fragile"))[0] == 200
+        harness.children["fragile"].close_raises = True
+        harness.registry.discard("fragile")
+        status, _ = await _request(app, "/mcp/fragile")
+        assert status == 404
+        with anyio.fail_after(2):
+            await harness.children["fragile"].closed_event.wait()
+        # the gateway survived — the neighbor still serves
+        status, body = await _request(app, "/mcp/steady")
+        assert status == 200 and body == b"ok:steady"
         # ...and a RECREATED project mounts a FRESH child, not the orphan
         harness.registry.add("nmmst")
         status, _ = await _request(app, "/mcp/nmmst")

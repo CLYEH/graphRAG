@@ -14,6 +14,7 @@ from __future__ import annotations
 from contextlib import AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -153,25 +154,38 @@ async def test_streamable_http_serves_the_full_tool_set_in_process(
 async def test_http_sessions_get_isolated_runtimes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # WHY (Codex #58 P1): streamable HTTP multiplexes MANY protocol sessions
-    # on one FastMCP instance, and the SDK enters the lifespan once PER
-    # session — a module-level runtime slot would be overwritten by every
-    # later session and, once any session closed, hand the survivors closed
-    # store clients. Each session must see ITS OWN lifespan runtime, and one
-    # session's shutdown must close only its own stores.
+    # WHY (Codex #58 P1 + MCP16): streamable HTTP multiplexes MANY protocol
+    # sessions on one FastMCP instance, and the SDK enters the lifespan once
+    # PER session — each session must see ITS OWN runtime (its own POLICY,
+    # DR-012). Since MCP16 the store/model clients are ONE shared bundle per
+    # server (the Qdrant constructor's measured 1.3s loop stall must not run
+    # per session, nor may clients accumulate per connection): the runtimes
+    # stay distinct while the factories run ONCE, no session close tears the
+    # bundle from under a survivor, and only the OWNER's close handle
+    # (_graphrag_close_shared) releases the clients.
     disposed: list[int] = []
 
     class _Engine:
         async def dispose(self) -> None:
             disposed.append(id(self))
 
+    store_closes: list[int] = []
+    factory_calls: list[str] = []
+
     class _Store:
         async def close(self) -> None:
-            return None
+            store_closes.append(id(self))
+
+    def _factory(name: str) -> Any:
+        def make() -> _Store:
+            factory_calls.append(name)
+            return _Store()
+
+        return make
 
     monkeypatch.setattr(server_module, "create_async_engine", lambda *a, **k: _Engine())
-    monkeypatch.setattr(server_module, "vector_client", lambda: _Store())
-    monkeypatch.setattr(server_module, "graph_driver", lambda: _Store())
+    monkeypatch.setattr(server_module, "vector_client", _factory("qdrant"))
+    monkeypatch.setattr(server_module, "graph_driver", _factory("neo4j"))
     monkeypatch.setattr(server_module, "embedding_model", lambda: object())
     monkeypatch.setattr(server_module, "chat_model", lambda: object())
     _stub_registry_policy(monkeypatch)
@@ -215,8 +229,20 @@ async def test_http_sessions_get_isolated_runtimes(
                 b_runtime = await _probe(session_b)
                 assert b_runtime != a_runtime  # each session sees its OWN runtime
 
-            # B closed: only B's stores may be disposed, and A still resolves
+            # B closed: the SHARED bundle must survive (a session close that
+            # tore it down would hand A closed clients — the exact Codex #58
+            # hazard, now impossible by construction), and A still resolves
             # to the SAME runtime it started with
             assert await _probe(session_a) == a_runtime
-        assert len(disposed) >= 1  # B's engine went down with B
-    assert len(disposed) == 2  # ...and A's only when A closed
+            assert store_closes == []  # no session close touches the bundle
+        # the factories ran ONCE for TWO sessions (MCP16: the measured
+        # 1.3s Qdrant constructor stall must not repeat per session)
+        assert factory_calls.count("qdrant") == 1
+        assert factory_calls.count("neo4j") == 1
+        # each session's POLICY read used a throwaway engine, disposed at
+        # startup — plus the one shared engine (disposed only via the owner)
+        assert len(disposed) == 2  # two policy engines; the shared one lives
+        # only the OWNER's handle releases the bundle
+        await server._graphrag_close_shared()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert len(store_closes) == 2  # qdrant + neo4j closed exactly then
+        assert len(disposed) == 3  # ...and the shared engine with them
