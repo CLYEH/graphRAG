@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: d673e708-e836-4b8a-8fc7-cb33527c5fc3
-  modified: 2026-07-22T03:12:05.804Z
+  modified: 2026-07-25T03:15:06.501Z
 ---
 
 散落在已刪除記憶檔裡仍然「活著」的 follow-ups,集中一處(狀態以 TASKS.md/
@@ -114,3 +114,4 @@ GitHub 為準;立案或了結後從本檔劃掉):
   semantic」)——實際上 MCP8 後 deps.llm 只有 sql/NLSQL 路徑會碰。行為無誤(fake 從未被
   諮詢),純命名/註解過期。順手時機:下一個動 hybrid 整合測試的任務改名為 `_FakeLLM`
   並修 docstring。
+- **inspect.py 讀面 metadata filter 仍 NUL-only(2026-07-25, MCP10 #130 gate-2 nit)**:寫面 guard 已泛化為 unstorable_string_reason 含 surrogate,讀面未跟。gate-2 判 adequate:lone surrogate 幾乎不可能經 URL query decode 存活(不像 %00),讀面非寫入邊界。純 cross-reference parity 的一行 tightening,下次動 inspect.py filter 時順手收。

@@ -354,3 +354,7 @@ RunsTable 失敗建置列展開加「失敗診斷」:useBuildSteps/useStepItems 
 ## MCP9
 
 (a) 游標=sha256 canonical-JSON 指紋(class 31,gate-2 nit 採納取代 raw concat——separator-injection 邊緣消滅),四軸拒絕測試(build/q/entity_type/跨工具);sticky match 由指紋比對恢復,未知 tag 拒絕不猜。(b) gate-2 一輪 FAIL 兩 blocker:headline 行為零 live 覆蓋(fake 用 Python 重實作配對語意,無法驗證真 SQL)→ live 整合兩支(題館 substring/主館 字元-AND/100% 字面逸出/type facet/雙表窮盡遊走/DR-006 舊 build+舊游標拒絕);entity_type 游標軸未測→補。(c) 遠端 3 輪:r1 P1 list_reports 漏 summary(無 get_report=內容仍不可達,#124 死路類在自己修法裡)→完整 summary 隨頁;r1 P2 fuzzy 跳過 wildcard 字元(%% 配全部)→逐字元 escape_like;r2 P2 q 無上界(逐字元謂詞爆炸)→BROWSE_Q_CAP=64+FUZZY_Q_CAP=16;r3 +1。(d) escape_like 上移 core 供 REST/MCP 共用。
+
+## MCP10
+
+(a) gate-2 一輪 FAIL:sidecar context 未驗形——build_envelope 靜默丟未知 context key,最常見失誤(source_url 放錯層)無聲產出無出處 envelope,正是任務要修的沉默失效→context 收 closed core。(b) 遠端 5 輪全 P2 must-fix,同一 fence-parity class 連環:r1 attributes 未過 project metadata_schema(upload 有驗、sidecar 繞過)→BuildConfig 增 metadata_schema 沿 pinned config 穿線至 connector,None 摺疊空 schema fail-closed;r2 governance 兄弟洞(dict() 整包落庫)→鏡射 upload 模型 + 顯式 null parity;r3 resolve() keying 讓 symlink 的 sidecar 被 referent 搶走→改 lexical keying(同一 rglob 走訪,sidecar 命名目錄項非 inode);r4 JSONB 不可存值(NaN/1e999/NUL)→三 guard 上移 core 共用(escape_like 前例),uploads aliased import 零改呼叫點;r5 lone surrogate(gate-2 r4 已預告)→contains_nul 泛化 unstorable_string_reason,一處收口雙邊生效(連 upload 既存缺口)。(c) 教訓:fenced surface 的新入口要在開工時就把「同 class 的每個 namespace/每種不可存值」sibling-sweep 掃完,五輪其實是同一張 fence 檢查表。
