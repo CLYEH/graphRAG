@@ -536,6 +536,49 @@ def test_sidecar_context_shape_is_closed(tmp_path: Path) -> None:
         list(read_text_documents(tmp_path))
 
 
+def test_sidecar_governance_shape_is_validated(tmp_path: Path) -> None:
+    """The governance namespace is context's sibling and carries the same
+    silent hole without a fence (Codex #130 r2): the frozen
+    DocumentMetadataGovernance contract types visibility/classification as
+    string|null, but build_envelope persists whatever dict it gets — a
+    wrong-typed value would land in the stored envelope, and a non-object
+    governance would crash later in dict() with an error naming no cause.
+    The rest of governance stays an OPEN bag (additionalProperties: true),
+    and explicit-null namespaces are rejected — both exactly the upload
+    boundary's rules."""
+    import json as jsonlib
+
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    sidecar = tmp_path / "a.txt.meta.json"
+
+    sidecar.write_text(jsonlib.dumps({"governance": {"visibility": 42}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="governance.visibility must be a string"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text(jsonlib.dumps({"governance": ["not", "an", "object"]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="governance must be a JSON object"):
+        list(read_text_documents(tmp_path))
+
+    # optional-but-non-nullable, like the upload boundary's context/governance
+    sidecar.write_text(jsonlib.dumps({"governance": None}), encoding="utf-8")
+    with pytest.raises(ValueError, match="governance must be an object when present, not null"):
+        list(read_text_documents(tmp_path))
+    sidecar.write_text(jsonlib.dumps({"context": None}), encoding="utf-8")
+    with pytest.raises(ValueError, match="context must be an object when present, not null"):
+        list(read_text_documents(tmp_path))
+    sidecar.write_text(jsonlib.dumps({"context": {"attributes": None}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="context.attributes must be a JSON object"):
+        list(read_text_documents(tmp_path))
+
+    # a well-typed governance with extra open-bag keys passes and persists
+    sidecar.write_text(
+        jsonlib.dumps({"governance": {"visibility": "public", "retention": "2y"}}),
+        encoding="utf-8",
+    )
+    [payload] = read_text_documents(tmp_path)
+    assert payload.metadata["governance"] == {"visibility": "public", "retention": "2y"}
+
+
 def test_sidecar_attributes_validate_against_the_project_schema(tmp_path: Path) -> None:
     """Sidecar attributes pass through the SAME metadata_schema fence the
     upload boundary applies at capture (Codex #130): without it, a sidecar

@@ -216,7 +216,17 @@ def _collect_sidecars(
                 f"allowed: {sorted(_SIDECAR_KEYS)} (system/schema_version are "
                 "server-stamped and cannot be forged from a sidecar)"
             )
+        for key in _SIDECAR_KEYS:
+            # parity with the upload boundary's _reject_null_subobjects: the
+            # namespaces are optional-but-non-nullable, so an explicit null is
+            # a malformed sidecar, not "absent"
+            if key in parsed and parsed[key] is None:
+                raise ValueError(
+                    f"metadata sidecar {sidecar_path}: {key} must be an object "
+                    "when present, not null"
+                )
         _validate_sidecar_context(sidecar_path, parsed.get("context"))
+        _validate_sidecar_governance(sidecar_path, parsed.get("governance"))
         try:
             schema.validate_context(parsed.get("context") or {})
         except MetadataValidationError as exc:
@@ -263,11 +273,34 @@ def _validate_sidecar_context(sidecar_path: Path, context: Any) -> None:
                 f"metadata sidecar {sidecar_path}: context.{field_name} must be a "
                 f"string or null, got {type(value).__name__}"
             )
-    attributes = context.get("attributes")
-    if attributes is not None and not isinstance(attributes, dict):
+    if "attributes" in context and not isinstance(context["attributes"], dict):
+        # explicit null included — parity with the upload boundary, which
+        # rejects present-and-null attributes rather than folding them to {}
         raise ValueError(
             f"metadata sidecar {sidecar_path}: context.attributes must be a JSON object"
         )
+
+
+def _validate_sidecar_governance(sidecar_path: Path, governance: Any) -> None:
+    """The sidecar's ``governance`` mirrors the upload boundary's
+    ``DocumentMetadataGovernance`` shape: an OBJECT whose ``visibility`` /
+    ``classification`` are strings or null, the rest an open bag
+    (``additionalProperties: true`` — extra keys are project data, allowed).
+    Without this, a wrong-typed value (``{"visibility": 42}``) would persist
+    into the envelope despite the frozen contract typing those fields, and a
+    non-object governance would crash later in ``build_envelope``'s ``dict()``
+    with an incidental error naming no cause (Codex #130 r2)."""
+    if governance is None:
+        return
+    if not isinstance(governance, dict):
+        raise ValueError(f"metadata sidecar {sidecar_path}: governance must be a JSON object")
+    for field_name in ("visibility", "classification"):
+        value = governance.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(
+                f"metadata sidecar {sidecar_path}: governance.{field_name} must be a "
+                f"string or null, got {type(value).__name__}"
+            )
 
 
 def read_csv_rows(path: Path, *, table: str, pk_column: str) -> Iterator[DocumentPayload]:
