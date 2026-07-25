@@ -33,7 +33,16 @@ class _ChildApp:
         self.lifespan_closed = False
         self.shared_closed = False
         self.closed_event = anyio.Event()
-        self.settings = SimpleNamespace(streamable_http_path="/mcp")
+        # the session-manager pre-seed (MCP17) constructs a REAL manager
+        # against these — the fake carries what the constructor reads
+        self._mcp_server = SimpleNamespace(name=f"graphrag-{project}")
+        self._session_manager: Any = None
+        self.settings = SimpleNamespace(
+            streamable_http_path="/mcp",
+            json_response=False,
+            stateless_http=False,
+            transport_security=None,
+        )
         self.router = SimpleNamespace(lifespan_context=self._lifespan)
 
     #: set to make this child's shared-bundle close RAISE — the gateway must
@@ -189,14 +198,27 @@ async def test_routing_registry_and_isolation(harness: _Harness) -> None:
         assert (await _request(app, "/mcp/."))[0] == 404
         assert (await _request(app, "/mcp/.."))[0] == 404
 
-        # outside /mcp → 404
-        assert (await _request(app, "/health"))[0] == 404
+        # outside /mcp → 404 (except /health, asserted above — MCP17)
+        assert (await _request(app, "/other"))[0] == 404
+
+        # /health: a minimal ops surface (MCP17 — previously every non-/mcp
+        # path 404'd, so liveness/mounts were unobservable)
+        status, body = await _request(app, "/health")
+        assert status == 200 and b'"mounted_projects": []' in body
 
         # known project → routed; child sees root-relative path + prefix root_path
         status, body = await _request(app, "/mcp/nmmst")
         assert status == 200 and body == b"ok:nmmst"
         child = harness.children["nmmst"]
         assert child.lifespan_entered
+        # MCP17: the pre-seeded session manager carries the idle timeout the
+        # SDK supports but FastMCP never passes (sessions previously lived
+        # until client DELETE or gateway restart — a stale DR-012 policy
+        # snapshot could survive forever)
+        assert child._session_manager is not None  # noqa: SLF001
+        assert child._session_manager.session_idle_timeout == 1800.0  # noqa: SLF001
+        status, body = await _request(app, "/health")
+        assert status == 200 and b"nmmst" in body  # mounts enumerated
         assert child.scopes[0]["path"] == "/"
         assert child.scopes[0]["root_path"] == "/mcp/nmmst"
         # the child's own streamable path was re-rooted so the gateway prefix
@@ -316,6 +338,7 @@ async def test_preflight_answers_typed_for_every_unservable_state(harness: _Harn
         # the gateway survived — the neighbor still serves
         status, body = await _request(app, "/mcp/steady")
         assert status == 200 and body == b"ok:steady"
+
         # ...and a RECREATED project mounts a FRESH child, not the orphan
         harness.registry.add("nmmst")
         status, _ = await _request(app, "/mcp/nmmst")
@@ -464,3 +487,15 @@ async def test_established_sessions_pass_through_a_registry_outage(
         assert status == 503 and b"registry unreachable" in body
 
         finish.set()
+
+
+def test_create_app_is_a_uvicorn_factory() -> None:
+    """MCP17: `uvicorn.run(app_instance)` made `workers` unusable (each
+    worker process must IMPORT the app) — the gateway was structurally
+    single-process. The import-string factory is the multi-process escape;
+    each call builds a fresh, independent gateway."""
+    from core.mcp.gateway import McpGateway, create_app
+
+    a, b = create_app(), create_app()
+    assert isinstance(a, McpGateway) and isinstance(b, McpGateway)
+    assert a is not b  # one per worker process, no shared instance

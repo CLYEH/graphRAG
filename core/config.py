@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     mcp_http_host: str = "127.0.0.1"
     mcp_http_port: int = 8300
 
+    # MCP17: idle sessions are RECLAIMED after this many seconds (the SDK
+    # default is never — an agent platform's abandoned sessions lived until
+    # gateway restart, and a policy edit could stay invisible to them
+    # forever since policy is a session-lifespan snapshot, DR-012). 30 min
+    # keeps a chatty guide session alive across a museum visit while
+    # guaranteeing an upper bound on both resource accumulation and how
+    # long a stale policy snapshot can survive.
+    mcp_session_idle_timeout_s: int = Field(default=1800, gt=0)
+
     # The host an EXTERNAL agent should dial, when that differs from the bind
     # interface above. A bind is an interface, not an address: `0.0.0.0` / `::`
     # mean "every interface" and are meaningless to a client — advertising them

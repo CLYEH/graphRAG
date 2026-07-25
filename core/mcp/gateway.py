@@ -36,6 +36,7 @@ from urllib.parse import unquote
 
 import anyio
 from anyio.abc import TaskGroup, TaskStatus
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -93,6 +94,15 @@ class McpGateway:
         if scope["type"] != "http":
             raise RuntimeError(f"unsupported ASGI scope type {scope['type']!r}")
         raw_path = scope.get("raw_path") or scope["path"].encode("utf-8")
+        # MCP17: a minimal ops surface — /health answers 200 with the
+        # mounted projects (previously /, /mcp and /health all 404'd, so an
+        # operator could not even tell the gateway was alive or what it had
+        # mounted). Read-only; sessions stay SDK-internal.
+        if scope["path"] == "/health":
+            await self._send_json(
+                send, 200, {"status": "ok", "mounted_projects": sorted(self._apps)}
+            )
+            return
         match = _MCP_PATH_RAW.match(raw_path)
         if match is None:
             await self._send_json(
@@ -295,6 +305,20 @@ class McpGateway:
             server = build_server(project)
             # the child serves at ITS root — the gateway prefix owns the path
             server.settings.streamable_http_path = "/"
+            # MCP17: the SDK's session manager supports session_idle_timeout
+            # but FastMCP.streamable_http_app never passes it (its lazy init
+            # omits the param → sessions lived until client DELETE or
+            # gateway restart, so an abandoned agent-platform session — and
+            # its DR-012 policy snapshot — could survive FOREVER). Pre-seed
+            # the manager with the timeout; streamable_http_app reuses a
+            # non-None _session_manager as-is.
+            server._session_manager = StreamableHTTPSessionManager(  # noqa: SLF001
+                app=server._mcp_server,  # noqa: SLF001
+                json_response=server.settings.json_response,
+                stateless=server.settings.stateless_http,
+                security_settings=server.settings.transport_security,
+                session_idle_timeout=float(get_settings().mcp_session_idle_timeout_s),
+            )
             app = server.streamable_http_app()
             assert self._tasks is not None, "gateway lifespan not started"
             child_stop = anyio.Event()
@@ -349,3 +373,14 @@ class McpGateway:
 def build_gateway() -> McpGateway:
     """The gateway ASGI app ``graphrag serve-mcp`` runs (CFG1)."""
     return McpGateway()
+
+
+def create_app() -> McpGateway:
+    """Uvicorn FACTORY entrypoint (MCP17): ``uvicorn.run("core.mcp.gateway:
+    create_app", factory=True, workers=N)``. Passing an already-instantiated
+    app object made uvicorn's ``workers`` unusable (it must import the app in
+    each worker process) — the gateway was structurally single-process with
+    no multi-process escape. Each worker builds its OWN gateway (own mounts,
+    own sessions); streamable-HTTP sessions are process-sticky, so workers>1
+    needs session-affinity in front (the CLI says so loudly)."""
+    return build_gateway()

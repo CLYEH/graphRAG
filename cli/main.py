@@ -86,6 +86,15 @@ def _parser() -> argparse.ArgumentParser:
             "the SETTINGS port"
         ),
     )
+    serve_mcp.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "uvicorn worker processes (MCP17). Streamable-HTTP sessions are process-sticky: "
+            "workers>1 needs a session-affinity load balancer in front"
+        ),
+    )
 
     prune = sub.add_parser("prune", help="GC builds beyond the retention window")
     prune.add_argument("project")
@@ -232,7 +241,6 @@ def _serve_mcp(args: argparse.Namespace) -> int:
     import uvicorn
 
     from core.mcp.addressing import resolved_advertised_host, validated_advertised_port
-    from core.mcp.gateway import build_gateway
 
     settings = get_settings()
     host = args.host or settings.mcp_http_host
@@ -279,7 +287,21 @@ def _serve_mcp(args: argparse.Namespace) -> int:
             "to the address agents should dial).",
             file=sys.stderr,
         )
-    uvicorn.run(build_gateway(), host=host, port=port)
+    workers = getattr(args, "workers", 1)
+    if workers > 1:
+        # MCP17: sessions are process-sticky (streamable-HTTP state lives in
+        # the worker that created it) — without session-affinity in front, a
+        # follow-up request landing on another worker loses its session
+        print(
+            f"warning: workers={workers} — streamable-HTTP sessions are "
+            "process-sticky; put a session-affinity load balancer in front, "
+            "or keep workers=1.",
+            file=sys.stderr,
+        )
+    # the IMPORT-STRING + factory form (MCP17): an already-instantiated app
+    # object made uvicorn's `workers` unusable — each worker process must
+    # import and build its own gateway
+    uvicorn.run("core.mcp.gateway:create_app", factory=True, host=host, port=port, workers=workers)
     return 0
 
 

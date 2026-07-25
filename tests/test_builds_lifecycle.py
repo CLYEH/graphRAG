@@ -112,7 +112,7 @@ def test_serve_mcp_divergence_warning_names_the_advertised_address(
             mcp_http_host=settings_host, mcp_http_port=8300, mcp_public_host=public
         ),
     )
-    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port, factory=False, workers=1: None)
     monkeypatch.setattr("core.mcp.gateway.build_gateway", lambda: object())
 
     assert _serve_mcp(argparse.Namespace(host=None, port=9000)) == 0
@@ -136,7 +136,7 @@ def test_serve_mcp_warns_separately_for_an_unusable_public_host(
             mcp_http_host="127.0.0.1", mcp_http_port=8300, mcp_public_host="bad host"
         ),
     )
-    monkeypatch.setattr("uvicorn.run", lambda app, host, port: None)
+    monkeypatch.setattr("uvicorn.run", lambda app, host, port, factory=False, workers=1: None)
     monkeypatch.setattr("core.mcp.gateway.build_gateway", lambda: object())
 
     assert _serve_mcp(argparse.Namespace(host=None, port=9000)) == 0
@@ -180,7 +180,10 @@ def test_serve_mcp_warns_only_when_the_bind_diverges_from_the_advertised_setting
         ),
     )
     bound: dict[str, Any] = {}
-    monkeypatch.setattr("uvicorn.run", lambda app, host, port: bound.update(host=host, port=port))
+    monkeypatch.setattr(
+        "uvicorn.run",
+        lambda app, host, port, factory=False, workers=1: bound.update(host=host, port=port),
+    )
     monkeypatch.setattr("core.mcp.gateway.build_gateway", lambda: object())
 
     assert _serve_mcp(argparse.Namespace(host=host, port=port)) == 0
