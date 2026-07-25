@@ -167,3 +167,49 @@ async def test_reingesting_converges_instead_of_duplicating(migrated: None) -> N
             await trans.rollback()
     finally:
         await engine.dispose()
+
+
+async def test_sidecar_envelope_survives_to_the_document_row(
+    migrated: None, tmp_path: Path
+) -> None:
+    """MCP10 end-to-end (connector → persisted SoR row): the sidecar's
+    context — the end-user-presentable provenance, e.g. the real public
+    page URL — lands in documents.metadata as the stamped DR-010 envelope,
+    which is exactly what the UXC1b enrichment projects into chunk
+    source_refs under the metadata_exposure allowlist. Without this row
+    round-trip the citation surface stays a dev-machine file:// path."""
+    import json as jsonlib
+
+    from core.ingest.connectors import read_text_documents
+
+    (tmp_path / "faq.txt").write_text("full fare 200", encoding="utf-8")
+    (tmp_path / "faq.txt.meta.json").write_text(
+        jsonlib.dumps(
+            {
+                "context": {
+                    "title": "FAQ: fares",
+                    "attributes": {"source_url": "https://www.nmmst.gov.tw/faq/105"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            writer = await _building_writer(conn, project)
+            report = await ingest_documents(writer, list(read_text_documents(tmp_path)))
+            assert [o.status for o in report.outcomes] == ["ingested"]
+            row = (await writer.fetch_all(documents))[0]
+            assert row.metadata["system"] == {
+                "connector": "text-directory",
+                "original_filename": "faq.txt",
+            }
+            assert row.metadata["context"]["attributes"]["source_url"] == (
+                "https://www.nmmst.gov.tw/faq/105"
+            )
+            await trans.rollback()
+    finally:
+        await engine.dispose()

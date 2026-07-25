@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.metadata.schema import build_envelope
 from core.stores.tables import STRUCTURED_MIME
 
 #: Free-text suffixes the document connector accepts, mapped to their mime
@@ -130,15 +131,114 @@ def read_text_documents(
                 metadata=metadata_by_filename[name],
             )
         return
+    sidecars = _collect_sidecars(root)
     for path in sorted(root.rglob("*")):
         suffix = path.suffix.lower()
         if not path.is_file() or suffix not in TEXT_SUFFIXES:
             continue
+        sidecar = sidecars.pop(path.resolve(), None)
         yield DocumentPayload(
             source_uri=path.resolve().as_uri(),
             raw=path.read_text(encoding="utf-8"),
             mime=TEXT_SUFFIXES[suffix],
-            metadata={"filename": path.name},
+            metadata=(
+                build_envelope(
+                    connector="text-directory",
+                    original_filename=path.name,
+                    context=sidecar.get("context"),
+                    governance=sidecar.get("governance"),
+                )
+                if sidecar is not None
+                else {"filename": path.name}
+            ),
+        )
+    if sidecars:
+        # an orphan sidecar means someone's metadata is silently NOT applied
+        # (a typo'd target name) — that is a config error, not a skippable file
+        orphans = sorted(str(p) for p in sidecars)
+        raise ValueError(
+            f"metadata sidecar(s) without a matching document file: {orphans} — "
+            "each <name>.meta.json must sit beside the <name> it describes"
+        )
+
+
+#: MCP10 sidecar convention: a plain-directory source file <name> may carry a
+#: display/provenance envelope in <name>.meta.json beside it — the path that
+#: finally gives citations an end-user-presentable source (the dev-machine
+#: file:// uri identifies the document; context.title / context.attributes
+#: hold what a guide agent may SHOW, e.g. the real public page URL — exposed
+#: to agents only through the projects.config metadata_exposure allowlist,
+#: DR-010). Uploads capture the same envelope through the API instead.
+_SIDECAR_SUFFIX = ".meta.json"
+_SIDECAR_KEYS = {"context", "governance"}
+
+
+def _collect_sidecars(root: Path) -> dict[Path, dict[str, Any]]:
+    """``{target-file-resolved-path: parsed sidecar}`` for every
+    ``<name>.meta.json`` under ``root``. A corrupt sidecar is a LOUD failure
+    (same rule as an undecodable source file); unknown top-level keys are
+    rejected — ``system``/``schema_version`` are server-stamped namespaces a
+    sidecar must not forge (DR-010 rule 1/4)."""
+    collected: dict[Path, dict[str, Any]] = {}
+    for sidecar_path in sorted(root.rglob(f"*{_SIDECAR_SUFFIX}")):
+        if not sidecar_path.is_file():
+            continue
+        try:
+            parsed = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError(f"metadata sidecar {sidecar_path} is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"metadata sidecar {sidecar_path} must be a JSON object")
+        unknown = set(parsed) - _SIDECAR_KEYS
+        if unknown:
+            raise ValueError(
+                f"metadata sidecar {sidecar_path} has unknown key(s) {sorted(unknown)} — "
+                f"allowed: {sorted(_SIDECAR_KEYS)} (system/schema_version are "
+                "server-stamped and cannot be forged from a sidecar)"
+            )
+        _validate_sidecar_context(sidecar_path, parsed.get("context"))
+        stem = sidecar_path.name[: -len(_SIDECAR_SUFFIX)]
+        if not stem:
+            raise ValueError(
+                f"metadata sidecar {sidecar_path} names no target file — the "
+                "convention is <name>.meta.json beside <name>"
+            )
+        target = sidecar_path.with_name(stem)
+        collected[target.resolve()] = parsed
+    return collected
+
+
+def _validate_sidecar_context(sidecar_path: Path, context: Any) -> None:
+    """The sidecar's ``context`` must be the CLOSED core shape — mirroring
+    the upload boundary's ``extra=\"forbid\"`` model and the frozen
+    ``DocumentMetadataContext`` (``additionalProperties:false``). Without
+    this, ``build_envelope``'s normalization SILENTLY drops any other
+    context key: the single most likely operator mistake —
+    ``context.source_url`` instead of ``context.attributes.source_url`` —
+    would quietly yield an envelope with no presentable provenance, the
+    exact silent failure MCP10 exists to fix (gate-2 blocker)."""
+    if context is None:
+        return
+    if not isinstance(context, dict):
+        raise ValueError(f"metadata sidecar {sidecar_path}: context must be a JSON object")
+    unknown = set(context) - {"title", "document_type", "attributes"}
+    if unknown:
+        raise ValueError(
+            f"metadata sidecar {sidecar_path}: unknown context key(s) {sorted(unknown)} — "
+            "the closed core is title/document_type/attributes; project fields "
+            "(e.g. source_url) belong INSIDE context.attributes"
+        )
+    for field_name in ("title", "document_type"):
+        value = context.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(
+                f"metadata sidecar {sidecar_path}: context.{field_name} must be a "
+                f"string or null, got {type(value).__name__}"
+            )
+    attributes = context.get("attributes")
+    if attributes is not None and not isinstance(attributes, dict):
+        raise ValueError(
+            f"metadata sidecar {sidecar_path}: context.attributes must be a JSON object"
         )
 
 

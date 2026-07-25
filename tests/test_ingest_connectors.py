@@ -421,3 +421,110 @@ def test_xlsx_missing_mapped_column_and_empty_sheet_fail_loud(tmp_path: Path) ->
     openpyxl.Workbook().save(empty)
     with pytest.raises(ValueError, match="empty"):
         list(read_xlsx_rows(empty, title_column="標題", body_column="內容"))
+
+
+def test_sidecar_metadata_becomes_a_stamped_envelope(tmp_path: Path) -> None:
+    """MCP10: every citation's source_uri was a dev-machine file:// path — an
+    end-user-facing agent had NOTHING presentable to cite. A plain-directory
+    file may now carry <name>.meta.json beside it: its context (e.g. the
+    real public page URL in attributes) lands in the stored DR-010 envelope,
+    while system/schema_version stay SERVER-stamped (a sidecar cannot forge
+    them). Files without a sidecar keep the old {"filename"} fallback."""
+    import json as jsonlib
+
+    (tmp_path / "faq.txt").write_text("票價資訊", encoding="utf-8")
+    (tmp_path / "faq.txt.meta.json").write_text(
+        jsonlib.dumps(
+            {
+                "context": {
+                    "title": "常見問題:票價",
+                    "attributes": {"source_url": "https://www.nmmst.gov.tw/faq/105"},
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "plain.txt").write_text("no sidecar", encoding="utf-8")
+
+    payloads = {
+        p.metadata.get("system", {}).get("original_filename") or p.metadata.get("filename"): p
+        for p in read_text_documents(tmp_path)
+    }
+    assert set(payloads) == {"faq.txt", "plain.txt"}  # the sidecar itself never ingests
+
+    enveloped = payloads["faq.txt"].metadata
+    assert enveloped["system"] == {"connector": "text-directory", "original_filename": "faq.txt"}
+    assert enveloped["context"]["title"] == "常見問題:票價"
+    assert enveloped["context"]["attributes"]["source_url"] == "https://www.nmmst.gov.tw/faq/105"
+    assert enveloped["schema_version"]  # server-stamped, present
+
+    assert payloads["plain.txt"].metadata == {"filename": "plain.txt"}  # fallback unchanged
+
+
+def test_sidecar_misuse_fails_loudly(tmp_path: Path) -> None:
+    """The sidecar failure modes are LOUD (a silent skip would mean someone's
+    provenance metadata is quietly not applied): corrupt JSON, forged server
+    namespaces, and an orphan sidecar whose target file does not exist (a
+    typo'd name)."""
+    import json as jsonlib
+
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+
+    (tmp_path / "a.txt.meta.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        list(read_text_documents(tmp_path))
+
+    (tmp_path / "a.txt.meta.json").write_text(
+        jsonlib.dumps({"system": {"connector": "forged"}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="server-stamped"):
+        list(read_text_documents(tmp_path))
+
+    (tmp_path / "a.txt.meta.json").unlink()
+    (tmp_path / "typo.txt.meta.json").write_text(jsonlib.dumps({"context": {}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="without a matching document file"):
+        list(read_text_documents(tmp_path))
+
+
+def test_sidecar_context_shape_is_closed(tmp_path: Path) -> None:
+    """build_envelope normalizes context to exactly {title, document_type,
+    attributes} and SILENTLY DROPS anything else — so without a shape check
+    at the sidecar door, the single most likely operator mistake (putting
+    source_url at context top level instead of inside context.attributes)
+    would quietly produce an envelope with NO presentable provenance: the
+    exact silent failure MCP10 exists to fix. The sidecar's context is
+    therefore CLOSED, mirroring the upload boundary's extra="forbid" model
+    and the frozen DocumentMetadataContext (additionalProperties:false)."""
+    import json as jsonlib
+
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    sidecar = tmp_path / "a.txt.meta.json"
+
+    # the flagship mistake: provenance one level too high — must be loud
+    sidecar.write_text(
+        jsonlib.dumps({"context": {"source_url": "https://example.com"}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match=r"unknown context key.*source_url.*INSIDE context"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text(jsonlib.dumps({"context": "a string"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="context must be a JSON object"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text(jsonlib.dumps({"context": {"title": 42}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="context.title must be a string"):
+        list(read_text_documents(tmp_path))
+
+    sidecar.write_text(
+        jsonlib.dumps({"context": {"attributes": ["not", "a", "map"]}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="context.attributes must be a JSON object"):
+        list(read_text_documents(tmp_path))
+
+    # a file literally named ".meta.json" names no target — domain error, not
+    # a bare pathlib crash from with_name("")
+    sidecar.unlink()
+    (tmp_path / ".meta.json").write_text(jsonlib.dumps({"context": {}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="names no target file"):
+        list(read_text_documents(tmp_path))
