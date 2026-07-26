@@ -1611,6 +1611,72 @@ async def test_every_pre_binding_claim_is_pinned_by_a_raising_bind(
         assert "not a store outage" in blob, tool
 
 
+async def test_the_browse_filter_is_capped_on_length_before_the_storability_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``list_entities(q=...)`` refuses an oversized q on LENGTH before it runs
+    the per-character storability scan (Codex #140 r7). The MCP input schema
+    puts no ceiling on q, and the surrogate/NUL scan is O(n) in that length, so
+    a value that BROWSE_Q_CAP will always refuse must be rejected in O(1) first
+    — the same length-first ordering ``_unusable_query_payload`` already gives
+    the retrieval query (Codex #140 r5).
+
+    The probe is a q that is BOTH oversized AND unstorable (a trailing NUL): the
+    two orderings print DIFFERENT messages, so the message names which ran
+    first. Length-first says "at most 64 characters"; a regression that scanned
+    first would say "NUL". Asserting the length wording (and the ABSENCE of the
+    NUL wording) pins the order, not merely that some refusal came back — a
+    plain oversized q would be refused either way and prove nothing. The raising
+    ``bound`` keeps it honest that this all happens before any store read."""
+    import json
+
+    from mcp import types as _mcp_types
+
+    import core.mcp.server as server_module
+    from core.mcp.server import BROWSE_Q_CAP, build_server
+
+    monkeypatch.setattr(server_module, "chat_model", lambda: cast(Any, object()))
+    monkeypatch.setattr(server_module, "query_embedding_model", lambda: cast(Any, object()))
+    monkeypatch.setattr(server_module, "vector_client", lambda: cast(Any, object()))
+    monkeypatch.setattr(server_module, "graph_driver", lambda: cast(Any, object()))
+    monkeypatch.setattr(
+        server_module, "create_async_engine", lambda *a, **k: SimpleNamespace(dispose=None)
+    )
+    server = build_server("demo")
+
+    def _explode() -> Any:
+        raise AssertionError("length must be capped BEFORE any store is bound")
+
+    runtime = SimpleNamespace(
+        context=SimpleNamespace(project="demo", bound=_explode),
+        policy=SimpleNamespace(max_latency_ms=10_000, max_top_k=20),
+        exposure=None,
+    )
+    monkeypatch.setattr(
+        server,
+        "get_context",
+        lambda: SimpleNamespace(request_context=SimpleNamespace(lifespan_context=runtime)),
+    )
+    handler = server._mcp_server.request_handlers[_mcp_types.CallToolRequest]  # noqa: SLF001
+
+    # oversized (66 > BROWSE_Q_CAP) AND unstorable (trailing NUL): the message
+    # tells us which guard ran first
+    oversized_and_unstorable = "長" * (BROWSE_Q_CAP + 1) + chr(0)
+    request = _mcp_types.CallToolRequest(
+        method="tools/call",
+        params=_mcp_types.CallToolRequestParams(
+            name="list_entities", arguments={"q": oversized_and_unstorable}
+        ),
+    )
+    result = cast(_mcp_types.CallToolResult, (await handler(request)).root)
+    structured = result.structuredContent
+    assert structured is not None
+    blob = json.dumps(structured, ensure_ascii=False)
+    assert f"at most {BROWSE_Q_CAP} characters" in blob  # refused on LENGTH...
+    assert "NUL" not in blob and "surrogate" not in blob  # ...scan never ran
+    assert structured["build_id"] == "00000000-0000-0000-0000-000000000000"
+
+
 async def test_the_dispatch_guard_is_actually_wired_into_the_registered_handler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

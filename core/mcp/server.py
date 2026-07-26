@@ -1317,10 +1317,16 @@ def build_server(project: str) -> FastMCP:
         # entity_type is the SIBLING free-text filter handed to the very same
         # page_entities() call — guarding only q would leave D5 reproducible
         # verbatim through the other parameter
-        for param, value in (("q", q), ("entity_type", entity_type)):
+        # q carries the browse cap (BROWSE_Q_CAP) so an oversized value is
+        # refused on length before the O(n) storability scan runs (Codex #140
+        # r7); entity_type has no length cap, so its scan — now C-speed — is the
+        # only guard it needs.
+        for param, value, cap in (("q", q, BROWSE_Q_CAP), ("entity_type", entity_type, None)):
             if value is None:
                 continue
-            unusable = _unusable_subject_payload(rt.context.project, param, value, allow_blank=True)
+            unusable = _unusable_subject_payload(
+                rt.context.project, param, value, allow_blank=True, max_len=cap
+            )
             if unusable is not None:
                 return unusable
         bound_build: str | None = None
@@ -2012,7 +2018,12 @@ def _invalid_chunk_payload(project: str, chunk_id: str) -> dict[str, Any] | None
 
 
 def _unusable_subject_payload(
-    project: str, subject_field: str, subject: str, *, allow_blank: bool = False
+    project: str,
+    subject_field: str,
+    subject: str,
+    *,
+    allow_blank: bool = False,
+    max_len: int | None = None,
 ) -> dict[str, Any] | None:
     """Typed rejection for an introspection argument that cannot be served AS
     GIVEN — a NUL / unpaired surrogate, or nothing but whitespace — BEFORE
@@ -2028,7 +2039,25 @@ def _unusable_subject_payload(
 
     ``allow_blank`` marks a subject where emptiness is MEANINGFUL rather than
     a mistake — ``list_entities(q=...)`` browses everything without a filter,
-    unlike an exact-name lookup, where blank can only be a bug."""
+    unlike an exact-name lookup, where blank can only be a bug.
+
+    ``max_len`` caps the subject BEFORE the storability scan (Codex #140 r7):
+    that scan is O(n) per character, and the MCP input schema imposes no length
+    bound, so an oversized value that will always be refused must be rejected on
+    length (O(1)) before it can drive an O(n) surrogate/NUL walk — the same
+    length-first ordering ``_unusable_query_payload`` gives the retrieval query.
+    ``None`` means the subject has no cap (an exact-name lookup)."""
+    if max_len is not None and len(subject) > max_len:
+        return {
+            "project": project,
+            "build_id": _NIL_BUILD,
+            "subject": _safe_echo(subject),
+            "error": (
+                f"{subject_field} must be at most {max_len} characters, "
+                f"got {len(subject)} — this is an INPUT problem, not a store outage"
+            ),
+            "error_code": "INVALID_INPUT",
+        }
     reason = _unusable_text_reason(subject, allow_blank=allow_blank)
     if reason is None:
         return None
