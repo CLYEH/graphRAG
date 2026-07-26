@@ -34,6 +34,7 @@ from typing import Any
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from core.graph.structured import split_row_source_ref
+from core.metadata.schema import unstorable_string_reason
 from core.query.mentions import mention_warnings, resolved_mention_refs
 from core.query.policy import (
     GRAPH_QUERY_TEMPLATES,
@@ -119,6 +120,15 @@ def _validate_params(params: GraphQueryParams, max_graph_hops: int) -> str | Non
         # AttributeError on .strip() — out-of-contract input degrades typed
         # (§22), it does not 500 (same rule as hops below)
         return "entity must be a non-blank canonical name string"
+    # QA5: the seed reaches a Postgres name lookup, so a NUL / unpaired
+    # surrogate came back a DBAPIError — reported as STORE_UNAVAILABLE by MCP
+    # and a bare 500 by REST, both blaming the store for the caller's byte.
+    # It belongs HERE, beside the blankness rule, for the reason that rule is
+    # here: the REST facade builds GraphQueryParams itself and calls this
+    # module directly, so a guard in either tool body would cover one facade
+    # and leave the other answering differently to the same input.
+    if (reason := unstorable_string_reason(params.entity)) is not None:
+        return f"entity {reason} — remove it and retry"
     if type(params.hops) is not int:
         # bool <: int is annotation-silent, and a str would TypeError below —
         # an out-of-contract hops degrades typed (§22), it does not 500
@@ -132,6 +142,8 @@ def _validate_params(params: GraphQueryParams, max_graph_hops: int) -> str | Non
         if not isinstance(params.other_entity, str) or not params.other_entity.strip():
             # None and non-string both land here — isinstance first, like entity
             return "the path template needs other_entity (a non-blank name string)"
+        if (reason := unstorable_string_reason(params.other_entity)) is not None:
+            return f"other_entity {reason} — remove it and retry"
     elif params.other_entity is not None:
         return f"other_entity is only meaningful for the path template, not {params.template!r}"
     return None

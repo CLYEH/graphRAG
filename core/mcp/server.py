@@ -50,7 +50,7 @@ from typing import Annotated, Any, Final, cast
 
 from mcp import types as mcp_types
 from mcp.server.fastmcp import FastMCP
-from pydantic import Field
+from pydantic import Field, ValidationError
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -65,7 +65,7 @@ from core.mcp.policy import (
     load_runtime_config_from_registry,
     top_k_clamp_warning,
 )
-from core.metadata.schema import MetadataExposure
+from core.metadata.schema import MetadataExposure, unstorable_string_reason
 from core.query.global_reports import global_summary as run_global
 from core.query.graph import GraphQueryParams
 from core.query.graph import graph_query as run_graph
@@ -197,6 +197,171 @@ Reading responses:
 """
 
 
+#: the tools whose advertised outputSchema IS the frozen §16 contract, mapped
+#: to the value each reports in the envelope's ``tool`` field. Those differ for
+#: ``explain_retrieval``: it RUNS the hybrid router, and the frozen contract's
+#: ``tool`` enum lists only the five retrieval modes — so its envelopes say
+#: "hybrid_query", as its own success path already does. One mapping, two
+#: consumers (the advertisement in _finalize_server_metadata and the refusal
+#: shape in _argument_refusal): a tool added to one but not the other would
+#: advertise the contract and then answer something else.
+_ENVELOPE_TOOLS = {
+    "semantic_search": "semantic_search",
+    "graph_query": "graph_query",
+    "global_summary": "global_summary",
+    "sql_query": "sql_query",
+    "hybrid_query": "hybrid_query",
+    "explain_retrieval": "hybrid_query",
+}
+
+_ARGUMENT_HELP = (
+    "Check tools/list for this tool's parameter types; every argument is "
+    "validated before the query runs, so nothing was read and retrying the "
+    "SAME call will fail identically."
+)
+
+
+def _readable_validation_error(exc: ValidationError) -> str:
+    """A caller-actionable rendering of a pydantic failure.
+
+    The raw ``str(exc)`` names the SDK's generated model
+    (``semantic_searchArguments``) and links the pinned pydantic version's
+    error docs — internals an unauthenticated caller has no use for and no
+    business seeing, in place of the parameter-level fact it needs (QA5 D10).
+    Only the field path and the human message survive."""
+    parts = []
+    for err in exc.errors():
+        where = ".".join(str(p) for p in err.get("loc", ())) or "arguments"
+        parts.append(f"{where}: {err.get('msg', 'invalid value')}")
+    return "; ".join(parts) or "the arguments did not validate"
+
+
+def _bool_for_integer_reason(server: FastMCP, name: str, arguments: dict[str, Any]) -> str | None:
+    """QA5 D12: pydantic coerces JSON ``true``/``false`` into 1/0 before any
+    tool body runs, so a server-side ``type(limit) is not int`` guard is dead
+    code and ``{"limit": true}`` becomes a perfectly successful 1-item page —
+    a client bug that gets a green light (and 1405 round-trips instead of 8).
+    ``false`` was worse: it reached the range check as 0, which then reported
+    "got 0" for a value the caller never sent. The declared schema already
+    says integer, so a bool is a caller error the surface should NAME."""
+    tool = server._tool_manager._tools.get(name)  # noqa: SLF001 — no public accessor
+    schema = getattr(tool, "parameters", None) if tool is not None else None
+    props = (schema or {}).get("properties") or {}
+    for key, value in arguments.items():
+        if not isinstance(value, bool):
+            continue
+        declared = props.get(key) or {}
+        types = {declared.get("type")} | {
+            branch.get("type") for branch in declared.get("anyOf", []) if isinstance(branch, dict)
+        }
+        if "integer" in types:
+            return f"{key}: expected an integer, got the boolean {str(value).lower()}"
+    return None
+
+
+def _argument_refusal(
+    tool: str, detail: str, *, project: str, arguments: dict[str, Any]
+) -> mcp_types.CallToolResult:
+    """The typed shape for an argument rejected by the FRAMEWORK rather than
+    by a tool body, IN THE SHAPE THAT TOOL ADVERTISES.
+
+    Returned as a ``CallToolResult`` so the SDK hands it back verbatim rather
+    than re-reporting it as an "Output validation error" that would bury the
+    caller's real mistake. But bypassing OUR validator is not the same as
+    being valid (Codex #140): the envelope tools advertise the frozen §16
+    contract as their outputSchema, so a schema-driven client deserializes
+    ``structuredContent`` against it and a bare ``{error, error_code}`` fails
+    on ITS side — the refusal would be unreadable to exactly the careful
+    clients that read the schema. Envelope tools therefore get a contract-
+    valid §16 refusal (nil build, no results, GUARDRAIL_BLOCKED); the
+    introspection tools keep their own error shape, which is what THEY
+    advertise."""
+    message = f"{tool}: {detail}. {_ARGUMENT_HELP}"
+    if tool in _ENVELOPE_TOOLS:
+        # the query may itself be the invalid argument (query=null is the
+        # canonical case), so echo it only when it is usable as one
+        raw = arguments.get("query")
+        structured: dict[str, Any] = McpResponse(
+            query=_safe_echo(raw) if isinstance(raw, str) else "",
+            tool=_ENVELOPE_TOOLS[tool],
+            project=project,
+            build_id=_NIL_BUILD,
+            results=(),
+            warnings=(QueryWarning("GUARDRAIL_BLOCKED", message),),
+        ).to_dict()
+    else:
+        structured = {"error": message, "error_code": "INVALID_INPUT"}
+    return mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text=message)],
+        structuredContent=structured,
+        isError=True,
+    )
+
+
+def _guard_tool_dispatch(server: FastMCP, project: str) -> None:
+    """Wrap the ONE seam every tool call passes through so framework-level
+    argument failures answer in the same typed vocabulary the tools promise
+    (QA5 D10/D12).
+
+    ``FastMCP.call_tool`` is registered as the low-level handler at
+    construction, so the wrapper is installed by RE-registering — the same
+    ``request_handlers`` surgery :func:`_finalize_server_metadata` already
+    performs. Wrapping here (rather than inside each tool) is what makes the
+    guarantee exhaustive: validation happens BEFORE any tool body runs, so no
+    tool can be added that forgets it. The raw ``arguments`` mapping is also
+    only available here — before pydantic coerces it — which is the only
+    place the bool-for-integer substitution is still visible.
+
+    Classification is by PHASE, never by exception type (Codex #140 r2): the
+    arguments are validated HERE, before ``inner`` runs, so a ValidationError
+    caught in this scope is definitionally about the arguments. Reading it off
+    ``ToolError.__cause__`` instead looked equivalent — the SDK does chain it
+    — but the SDK wraps EVERY tool failure that way, so a pydantic error
+    raised by a tool body or by a dependency decoding malformed store data
+    would have been relabelled ``INVALID_INPUT`` and told the caller to fix a
+    request that was fine. That is the same misdiagnosis class this task
+    exists to end, and validating first makes it unreachable rather than
+    merely unlikely. The double validation is a pure function of the
+    arguments, so running it twice costs a little and risks nothing."""
+    inner = server.call_tool
+
+    async def guarded(name: str, arguments: dict[str, Any]) -> Any:
+        reason = _bool_for_integer_reason(server, name, arguments)
+        if reason is not None:
+            return _argument_refusal(name, reason, project=project, arguments=arguments)
+        tool = server._tool_manager._tools.get(name)  # noqa: SLF001 — no public accessor
+        meta = getattr(tool, "fn_metadata", None)
+        arg_model = getattr(meta, "arg_model", None)
+        if arg_model is not None:
+            try:
+                # the SDK validates pre_parse_json(arguments), not the raw
+                # mapping — clients JSON-STRINGIFY argument values (the SDK's
+                # own note says Claude desktop "seems incapable of NOT doing
+                # this"), so the two disagree in BOTH directions on the raw
+                # dict: `{"q": "[1]"}` looks like a valid str to us while the
+                # SDK parses it to a list and rejects (the D10 leak reopens
+                # through its generic error), and `{"top_k": "null"}` parses
+                # to a legal None for the SDK while we refuse a call it would
+                # have served. Running the framework's OWN transform on the
+                # framework's OWN input makes our verdict equal to its verdict
+                # by construction rather than by resemblance.
+                pre_parse = getattr(meta, "pre_parse_json", None)
+                arg_model.model_validate(pre_parse(arguments) if callable(pre_parse) else arguments)
+            except ValidationError as exc:
+                return _argument_refusal(
+                    name,
+                    _readable_validation_error(exc),
+                    project=project,
+                    arguments=arguments,
+                )
+        # everything past here is the TOOL's own outcome — a fault inside it
+        # flows to the SDK's error result untouched, still labelled as what it
+        # is rather than as the caller's mistake
+        return await inner(name, arguments)
+
+    server._mcp_server.call_tool(validate_input=False)(guarded)  # noqa: SLF001
+
+
 def _finalize_server_metadata(server: FastMCP) -> None:
     """MCP14 — metadata only, no execution-path change.
 
@@ -220,14 +385,7 @@ def _finalize_server_metadata(server: FastMCP) -> None:
     ):
         server._mcp_server.request_handlers.pop(request, None)  # noqa: SLF001
     frozen = _mcp_response_schema()
-    for name in (
-        "semantic_search",
-        "graph_query",
-        "global_summary",
-        "sql_query",
-        "hybrid_query",
-        "explain_retrieval",
-    ):
+    for name in _ENVELOPE_TOOLS:
         tool = server._tool_manager._tools[name]  # noqa: SLF001
         tool.__dict__["output_schema"] = frozen
 
@@ -250,17 +408,91 @@ def _echoable(query: str) -> str:
     return query if len(query) <= _QUERY_CHARS_CAP else query[:200]
 
 
-def _oversized_query_payload(project: str, tool: str, query: str) -> dict[str, Any] | None:
-    """The shared §21 query-length refusal, or None when within the cap
-    (MCP12; extracted for MCP13 — every path that would ECHO the query must
-    run this FIRST, including tool-level early returns that bypass
-    ``_bounded``, or an oversized input is reflected whole: response
-    amplification and a cap the surface no longer shares — Codex #133 r1).
-    The echo is truncated to 200 chars for the same reason."""
-    if len(query) <= _QUERY_CHARS_CAP:
+def _safe_echo(value: str, limit: int = 200) -> str:
+    """A version of ``value`` that can survive the response's own JSON
+    encoding. An unpaired UTF-16 surrogate is legal in a JSON *document* but
+    cannot be encoded to UTF-8, so echoing a caller's malformed string whole
+    turns a REFUSAL into a raw ``UnicodeEncodeError`` from the transport (QA5,
+    D11) — the caller then learns nothing about what it sent wrong. Each bad
+    code unit becomes U+FFFD so the echo still shows the SHAPE of the input.
+
+    The echo is a best-effort AID, never a claim: it is also windowed to
+    ``limit``, so the offending unit may not appear in it at all. No refusal
+    message describes the echo's contents for exactly that reason — what the
+    caller must act on is the code point, which the reason names outright
+    (see :func:`_unusable_text_reason`).
+
+    The slice comes BEFORE the substitution (Codex #140): transforming the
+    whole value first and slicing after would let a multi-MB malformed
+    argument drive an O(len) transient allocation that the advertised
+    80/200-char window does not bound — the caller is refused either way, so
+    only the echoed prefix is worth touching. Slicing is 1:1 with the
+    substitution (each code unit maps to one), so the result is identical."""
+    return "".join(
+        "�" if ch == "\x00" or 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in value[:limit]
+    )
+
+
+def _unusable_text_reason(value: str, *, allow_blank: bool = False) -> str | None:
+    """The ONE predicate behind every QA5 refusal — why ``value`` cannot be
+    served as given, or None when it can.
+
+    Storability defers to ``unstorable_string_reason``, the guard the WRITE
+    path already uses (MCP10), so both directions agree on exactly what
+    Postgres can hold instead of drifting apart. ``allow_blank`` marks a field
+    where emptiness is MEANINGFUL rather than a mistake — a
+    ``list_entities(q=...)`` filter browses everything, unlike a question or
+    an exact-name lookup, where blank can only be a bug.
+
+    The reason names the offending CODE POINT ("contains a NUL character
+    (U+0000)", "contains an unpaired UTF-16 surrogate") and deliberately says
+    nothing about the echo that accompanies it. Earlier revisions appended a
+    "U+FFFD marks it in the echoed value" legend and were wrong four times
+    over — the substitution character was actually ``?``; then the value was
+    not echoed at all; then a blank value carried the legend; then a long
+    blank re-earned it through truncation; then a bad unit past the 80-char echo
+    window fell outside it. Each fix moved the flaw rather than ending it,
+    because the CLAIM and the ARTIFACT it described were produced by
+    different code under different rules (this predicate knows the
+    substitution set, the payload builder owns the echo window). A message
+    that asserts nothing about the echo cannot be wrong about it, and the
+    code point already tells the caller exactly what to remove."""
+    reason = unstorable_string_reason(value)
+    if reason is not None:
+        return f"contains a character this store cannot hold — {reason}"
+    if not allow_blank and not value.strip():
+        return "is empty or only whitespace"
+    return None
+
+
+def _unusable_param_payload(
+    project: str,
+    tool: str,
+    label: str,
+    field: str,
+    value: str,
+    *,
+    allow_blank: bool = False,
+) -> dict[str, Any] | None:
+    """The §16-shaped pre-binding refusal for a malformed tool PARAMETER, or
+    None when it is usable.
+
+    Every free-text parameter that reaches a store needs this, not just the
+    question: ``graph_query``'s ``entity``/``other_entity`` are resolved by a
+    Postgres name lookup, and guarding only the echoed label left the seed
+    itself unguarded — a caller supplying a clean ``query`` label with a
+    malformed seed still reached the store and drew the fake
+    ``STORE_UNAVAILABLE`` (the D5 mechanism through a different door)."""
+    reason = _unusable_text_reason(value, allow_blank=allow_blank)
+    if reason is None:
         return None
+    # the offending VALUE is named, not just the field: a call can carry
+    # several free-text parameters, and "one of them is malformed" is not
+    # something a caller can act on. Whether the echo carries a U+FFFD is the
+    # reason's business (see _unusable_text_reason) — deciding it here meant
+    # comparing echo against value, which also fires on plain truncation.
     return McpResponse(
-        query=query[:200],
+        query=_safe_echo(label),
         tool=tool,
         project=project,
         build_id=_NIL_BUILD,
@@ -268,11 +500,64 @@ def _oversized_query_payload(project: str, tool: str, query: str) -> dict[str, A
         warnings=(
             QueryWarning(
                 "GUARDRAIL_BLOCKED",
-                f"query length {len(query)} exceeds the {_QUERY_CHARS_CAP}-char cap "
-                "— shorten the query (§21); rejected, not clamped",
+                f"{field} {reason} (received {_safe_echo(value, 80)!r}) — this "
+                "is an INPUT problem, not a store outage; fix the parameter "
+                "and retry",
             ),
         ),
     ).to_dict()
+
+
+def _unusable_query_payload(project: str, tool: str, query: str) -> dict[str, Any] | None:
+    """The shared pre-binding refusal for a query that cannot be served AS
+    GIVEN — or None when it is usable.
+
+    §21 length (MCP12; extracted for MCP13 — every path that would ECHO the
+    query must run this FIRST, including tool-level early returns that bypass
+    ``_bounded``, or an oversized input is reflected whole: response
+    amplification and a cap the surface no longer shares — Codex #133 r1).
+    The echo is truncated to 200 chars for the same reason.
+
+    QA5 adds the two malformed classes this gate used to let through, because
+    a refusal HERE is the only one that can name the real cause:
+    - a NUL or unpaired surrogate reached Postgres and came back as a
+      ``DBAPIError``, which the §22 handler faithfully reported as
+      ``STORE_UNAVAILABLE`` "postgres unavailable" — one byte and the server
+      LIED about infrastructure health, telling a contract-abiding agent to
+      back off from a database that was fine (D5). The predicate is the SAME
+      ``unstorable_string_reason`` the write path uses, so both directions
+      agree on what Postgres cannot hold.
+    - a whitespace-only query ran a real retrieval and returned scored
+      results (the corpus's own "（未指明）" placeholder ranked first) with no
+      warning at all — a confident answer to a question nobody asked (D9).
+      An EMPTY query only failed once it reached the embedding provider,
+      which blamed "the model provider" for the caller's own input.
+
+    Length is checked FIRST (Codex #140 r5): it is an O(1) ``len`` while the
+    storability/blankness scan is a Python-level per-character pass, and MCP
+    arguments carry no schema-level max length, so scanning a multi-MB query
+    before the cap rejects it would hand an attacker O(len) work for an input
+    the cap refuses anyway. An oversized query is refused on length alone —
+    its content is never scanned — and its echo runs through ``_safe_echo``
+    like every other, so an oversized-AND-malformed query cannot smuggle a
+    lone surrogate into the refusal and kill its own serialization.
+    """
+    if len(query) > _QUERY_CHARS_CAP:
+        return McpResponse(
+            query=_safe_echo(query, 200),
+            tool=tool,
+            project=project,
+            build_id=_NIL_BUILD,
+            results=(),
+            warnings=(
+                QueryWarning(
+                    "GUARDRAIL_BLOCKED",
+                    f"query length {len(query)} exceeds the {_QUERY_CHARS_CAP}-char cap "
+                    "— shorten the query (§21); rejected, not clamped",
+                ),
+            ),
+        ).to_dict()
+    return _unusable_param_payload(project, tool, query, "query", query)
 
 
 def _with_clamp_warning(
@@ -312,9 +597,9 @@ async def _bounded(
     # length check needs no store — refuse an oversized query BEFORE the
     # binding opens one (MCP12: the query rides into the model provider's
     # token limits; a §21 refusal here is actionable, a provider error not)
-    oversized = _oversized_query_payload(runtime.context.project, tool, query)
-    if oversized is not None:
-        return oversized
+    unusable = _unusable_query_payload(runtime.context.project, tool, query)
+    if unusable is not None:
+        return unusable
     deadline = time.monotonic() + runtime.policy.max_latency_ms / 1000.0
     try:
         async with asyncio.timeout(runtime.policy.max_latency_ms / 1000.0):
@@ -695,10 +980,22 @@ def build_server(project: str) -> FastMCP:
         its text via get_chunk (row/document evidence refs are other shapes —
         get_chunk does not accept them)."""
         rt = _rt()
+        # QA5 D5 (sibling of the query guard): the SEED names are free text
+        # resolved by a Postgres name lookup, and _bounded only guards the
+        # echoed LABEL — with a clean `query` supplied, a malformed seed
+        # sailed past it into the store and drew the fake STORE_UNAVAILABLE
+        label = query or f"{template}({entity})"
+        for param, value in (("entity", entity), ("other_entity", other_entity)):
+            if value is None:
+                continue
+            unusable = _unusable_param_payload(
+                rt.context.project, "graph_query", label, param, value
+            )
+            if unusable is not None:
+                return unusable
         params = GraphQueryParams(
             template=template, entity=entity, other_entity=other_entity, hops=hops
         )
-        label = query or f"{template}({entity})"
 
         async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
             return await run_graph(
@@ -833,9 +1130,9 @@ def build_server(project: str) -> FastMCP:
         # the incomplete-invocation refusal below is a pre-_bounded early
         # return that echoes the query — unchecked, an oversized query with
         # a half graph invocation would be reflected whole
-        oversized = _oversized_query_payload(rt.context.project, "hybrid_query", query)
-        if oversized is not None:
-            return oversized
+        unusable = _unusable_query_payload(rt.context.project, "hybrid_query", query)
+        if unusable is not None:
+            return unusable
         refused = _incomplete_graph_invocation_payload(
             rt.context.project,
             query,
@@ -846,6 +1143,19 @@ def build_server(project: str) -> FastMCP:
         )
         if refused is not None:
             return refused
+        # QA5 D5: same seed exposure as graph_query — the guard above covers
+        # the QUERY, these reach the store as entity names
+        for param, seed in (
+            ("graph_entity", graph_entity),
+            ("graph_other_entity", graph_other_entity),
+        ):
+            if seed is None:
+                continue
+            unusable = _unusable_param_payload(
+                rt.context.project, "hybrid_query", query, param, seed
+            )
+            if unusable is not None:
+                return unusable
         params: GraphQueryParams | None = None
         if graph_template is not None and graph_entity is not None:
             params = GraphQueryParams(
@@ -882,6 +1192,13 @@ def build_server(project: str) -> FastMCP:
         shape (error/error_code, not the retrieval envelope); each entity
         carries its full, uncapped mention citations."""
         rt = _rt()
+        # QA5 D5: validate BEFORE binding — a NUL here used to reach Postgres
+        # and come back as a DBAPIError the §22 handler reported as
+        # "postgres unavailable", i.e. the server blaming a healthy store for
+        # the caller's own byte
+        unusable = _unusable_subject_payload(rt.context.project, "name", name)
+        if unusable is not None:
+            return unusable
         bound_build: str | None = None
         try:
             async with asyncio.timeout(rt.policy.max_latency_ms / 1000.0):
@@ -993,6 +1310,25 @@ def build_server(project: str) -> FastMCP:
         the full listing — nothing is unreachable. Introspection shape
         (error/error_code)."""
         rt = _rt()
+        # QA5 D5: the substring filter is free text and reaches the same LIKE
+        # predicate — validate before binding, for the same reason as
+        # get_entity's name (a blank q is NOT rejected: it is the documented
+        # "browse everything" case, unlike a blank exact-name lookup)
+        # entity_type is the SIBLING free-text filter handed to the very same
+        # page_entities() call — guarding only q would leave D5 reproducible
+        # verbatim through the other parameter
+        # q carries the browse cap (BROWSE_Q_CAP) so an oversized value is
+        # refused on length before the O(n) storability scan runs (Codex #140
+        # r7); entity_type has no length cap, so its scan — now C-speed — is the
+        # only guard it needs.
+        for param, value, cap in (("q", q, BROWSE_Q_CAP), ("entity_type", entity_type, None)):
+            if value is None:
+                continue
+            unusable = _unusable_subject_payload(
+                rt.context.project, param, value, allow_blank=True, max_len=cap
+            )
+            if unusable is not None:
+                return unusable
         bound_build: str | None = None
         try:
             async with asyncio.timeout(rt.policy.max_latency_ms / 1000.0):
@@ -1088,9 +1424,9 @@ def build_server(project: str) -> FastMCP:
         # the shared query cap runs FIRST (Codex #133 r1): this early return
         # bypasses _bounded, and _debug_disabled_payload echoes the query —
         # an unchecked oversized input would be reflected whole
-        oversized = _oversized_query_payload(rt.context.project, "hybrid_query", query)
-        if oversized is not None:
-            return oversized
+        unusable = _unusable_query_payload(rt.context.project, "hybrid_query", query)
+        if unusable is not None:
+            return unusable
         if not rt.policy.expose_debug:
             return _debug_disabled_payload(rt.context.project, query)
 
@@ -1106,6 +1442,7 @@ def build_server(project: str) -> FastMCP:
         return _with_clamp_warning(payload, rt.policy, top_k)
 
     _finalize_server_metadata(server)
+    _guard_tool_dispatch(server, project)
     # MCP16: the shared client bundle's close handle — called by the OWNER
     # of the server instance (the gateway host task after the child app's
     # lifespan exits, or run_server after a stdio run), never per session
@@ -1673,9 +2010,62 @@ def _invalid_chunk_payload(project: str, chunk_id: str) -> dict[str, Any] | None
     return {
         "project": project,
         "build_id": _NIL_BUILD,
-        "chunk_id": chunk_id,
+        "chunk_id": _safe_echo(chunk_id),
         "chunk": None,
         "error": _CHUNK_ID_MESSAGE,
+        "error_code": "INVALID_INPUT",
+    }
+
+
+def _unusable_subject_payload(
+    project: str,
+    subject_field: str,
+    subject: str,
+    *,
+    allow_blank: bool = False,
+    max_len: int | None = None,
+) -> dict[str, Any] | None:
+    """Typed rejection for an introspection argument that cannot be served AS
+    GIVEN — a NUL / unpaired surrogate, or nothing but whitespace — BEFORE
+    store binding, or None when it is usable (QA5; the ``_invalid_chunk_payload``
+    bind-then-validate precedent, Codex #125 r3).
+
+    Without it a NUL rode into Postgres and returned a ``DBAPIError``, which
+    the §22 handler faithfully relabelled ``STORE_UNAVAILABLE`` "postgres
+    unavailable" (D5) — the server telling a contract-abiding agent to back
+    off from a database that was perfectly healthy. Validating here costs no
+    store read and keeps the two answers honest: a bad ARGUMENT is
+    INVALID_INPUT, an unreachable store is STORE_UNAVAILABLE.
+
+    ``allow_blank`` marks a subject where emptiness is MEANINGFUL rather than
+    a mistake — ``list_entities(q=...)`` browses everything without a filter,
+    unlike an exact-name lookup, where blank can only be a bug.
+
+    ``max_len`` caps the subject BEFORE the storability scan (Codex #140 r7):
+    that scan is O(n) per character, and the MCP input schema imposes no length
+    bound, so an oversized value that will always be refused must be rejected on
+    length (O(1)) before it can drive an O(n) surrogate/NUL walk — the same
+    length-first ordering ``_unusable_query_payload`` gives the retrieval query.
+    ``None`` means the subject has no cap (an exact-name lookup)."""
+    if max_len is not None and len(subject) > max_len:
+        return {
+            "project": project,
+            "build_id": _NIL_BUILD,
+            "subject": _safe_echo(subject),
+            "error": (
+                f"{subject_field} must be at most {max_len} characters, "
+                f"got {len(subject)} — this is an INPUT problem, not a store outage"
+            ),
+            "error_code": "INVALID_INPUT",
+        }
+    reason = _unusable_text_reason(subject, allow_blank=allow_blank)
+    if reason is None:
+        return None
+    return {
+        "project": project,
+        "build_id": _NIL_BUILD,
+        "subject": _safe_echo(subject),
+        "error": (f"{subject_field} {reason} — this is an INPUT problem, not a store outage"),
         "error_code": "INVALID_INPUT",
     }
 
@@ -1687,7 +2077,7 @@ def _invalid_document_payload(project: str, document_id: str) -> dict[str, Any] 
     return {
         "project": project,
         "build_id": _NIL_BUILD,
-        "document_id": document_id,
+        "document_id": _safe_echo(document_id),
         "document": None,
         "error": _DOCUMENT_ID_MESSAGE,
         "error_code": "INVALID_INPUT",

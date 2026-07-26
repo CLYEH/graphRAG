@@ -47,7 +47,11 @@ from api.pagination import (
     encode_sorted_cursor,
 )
 from api.registry_errors import translate_registry_error
-from api.routers._query import reject_unsupported_query, single_filter_value
+from api.routers._query import (
+    reject_unsupported_query,
+    reject_unusable_text,
+    single_filter_value,
+)
 from api.schemas import chunk_dto, document_dto, entity_dto, relation_dto, relation_evidence_dto
 from core.mcp.policy import PolicyError, query_policy_from_mapping
 from core.metadata.schema import MetadataConfigError, filterable_attributes
@@ -272,6 +276,11 @@ async def list_documents_endpoint(
     cursor: str | None = None,
     q: str | None = Query(None, min_length=1, max_length=256),
 ) -> dict[str, Any]:
+    # QA5: input-only shape checks run BEFORE the registry/build lookup, like
+    # the other request-shape rejections — a malformed q on a project with no
+    # active build would otherwise answer NO_ACTIVE_BUILD, and the refusal's
+    # own claim that nothing was read would be false
+    reject_unusable_text(q, "q")
     # the project row is fetched for its config: metadata_schema's filterable
     # attributes become live filter[<attr>] facets (DR-010 rule 2 / review
     # rule 8's SEARCH half, SS1b) — the allowlist is the schema itself, so a
@@ -446,6 +455,11 @@ async def list_entities_endpoint(
         # (NOT NULL, tie-broken on id) and recency (nullable — COALESCE keyset)
         extra_sorts=frozenset({"canonical_name", "created_at"}),
     )
+    # QA5: input-only, so it belongs with the other request-shape checks —
+    # ABOVE the bind. Below it, a malformed q on a project with no active
+    # build answers NO_ACTIVE_BUILD instead, and the refusal's own claim that
+    # nothing was read would be false.
+    reject_unusable_text(q, "q")
     etype = single_filter_value(request, "type")
     status = single_filter_value(request, "status", vocabulary=LIFECYCLE_STATUS)
     review_status = single_filter_value(request, "review_status", vocabulary=REVIEW_STATUS)

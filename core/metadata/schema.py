@@ -31,6 +31,7 @@ review, DR-002 untouched.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, NoReturn
@@ -328,10 +329,19 @@ def finite_float(value: str) -> float:
     return parsed
 
 
+# A single character class, scanned at C speed. The per-character Python form
+# (`any("\ud800" <= ch <= "\udfff" for ch in text)`) is O(n) in the interpreter,
+# so an oversized attacker-controlled string with no length cap upstream (a
+# graph seed, an entity name) burns interpreter time before any refusal — this
+# scan is on every write-path and query-path string. `re.search` short-circuits
+# on the first surrogate and is ~25x faster on surrogate-free input.
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
 def _string_storability_reason(text: str) -> str | None:
     if "\x00" in text:
         return "contains a NUL character (U+0000)"
-    if any("\ud800" <= ch <= "\udfff" for ch in text):
+    if _SURROGATE_RE.search(text) is not None:
         # json.loads materializes an ESCAPED lone surrogate ("\ud800") as a
         # surrogate code point; paired escapes combine into the astral char at
         # parse time, so any surrogate REMAINING in a parsed string is unpaired

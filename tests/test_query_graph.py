@@ -268,6 +268,25 @@ def _codes(response: McpResponse) -> list[str]:
             GraphQueryParams(template="neighbors", entity="acme", other_entity="bob"),
             "only meaningful for the path template",
         ),
+        # QA5: the seed is resolved by a Postgres name lookup, so a byte the
+        # store cannot hold used to come back a DBAPIError — reported as
+        # STORE_UNAVAILABLE by MCP and a bare 500 by REST, both blaming the
+        # store for the caller's input. The rule lives HERE, beside blankness,
+        # because the REST facade builds these params itself and calls this
+        # module directly: a guard in either tool body would cover one facade
+        # and leave the other answering differently to the same input.
+        (
+            GraphQueryParams(template="neighbors", entity="海科館" + chr(0)),
+            "entity contains a NUL character (U+0000)",
+        ),
+        (
+            GraphQueryParams(template="neighbors", entity="\ud800"),
+            "entity contains an unpaired UTF-16 surrogate",
+        ),
+        (
+            GraphQueryParams(template="path", entity="acme", other_entity="bob" + chr(0)),
+            "other_entity contains a NUL character (U+0000)",
+        ),
     ],
 )
 async def test_the_parameter_guardrail_rejects_loud_and_typed(
