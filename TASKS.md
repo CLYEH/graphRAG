@@ -201,7 +201,7 @@ Keep items small enough to finish in one loop.
 - [x] QA4 REST 靜默 clamp(D4)— `policy.top_k()` 的 min() 夾在 REST facade 無揭露、MCP 有(同產品兩套說法);TRUNCATED 訊息上移 `core/mcp/policy.py` 成單一來源,兩表面共用,REST 於 `_run_mode` 單點注入(semantic/global/sql/hybrid 全掃;graph 本就拒收 top_k),nil-build 不謊報。契約 enum 已含 TRUNCATED,免 bump。
 
 ### 框架層與型別化錯誤(P3,建議一次修掉)
-- [x] QA5 字串/框架層驗證一次收口(D5/D9/D10/D11/D12/D14)— 六個逃逸點同源:查詢面 `_unusable_query_payload` 併入 NUL/surrogate/空白(重用寫入面既有的 `unstorable_string_reason`)、introspection 面加 `_unusable_subject_payload` pre-binding 拒絕、gateway 路徑段同守衛(NUL 不再假報 503)、dispatch seam 包裝把 pydantic/bool 錯誤轉型別化(不外洩 class 名與版本 URL)。
+- [x] QA5 字串/框架層驗證一次收口(D5/D9/D10/D11/D12/D14)— 單一述詞 `unstorable_string_reason` 貫穿 MCP 查詢/introspection、core graph 種子(兩 facade 同答)、REST `q`/`filter`(400 非 500)、gateway 路徑(不再假報 503)。框架層於 dispatch seam 依**階段**分類(先驗參數再 dispatch,tool body 例外不再誤貼 INVALID_INPUT);拒絕回各工具**廣告的**形狀。
 - [ ] QA6 型別化錯誤一致性與診斷措辭(D8/D13)— (a) `get_entity` 查無此名回**成功**(`error_code=null`、`entities=[]`),而同族的 `get_chunk`/`get_document` 查無回 `NOT_FOUND`;initialize instructions 為 get_*/list_* 定義的是單一 taxonomy,按文件以 error_code 分支的消費者會把落空查詢(改名、過期引文)讀成成功。(b) 任何三段式垃圾 cursor 被誤診為「cursor was minted for a different build (the active build changed)」——什麼都沒變;根因是 split-on-pipe 先於形狀驗證,第一段未驗 UUID 就當 build id 比對。「active build changed」在 DR-001 系統是操作上有份量的宣稱,會引發不必要的 build 稽查。
 
 ### 生命週期與衛生(P3)

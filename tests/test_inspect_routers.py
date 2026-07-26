@@ -528,6 +528,27 @@ def test_documents_search_is_supported_but_relations_and_chunks_reject_q(
         assert r.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
+def test_a_search_string_the_store_cannot_hold_is_a_400_not_a_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # QA5 on the REST half: a NUL rode into the LIKE predicate and came back a
+    # DBAPIError, which this facade reported as a bare 500 INTERNAL — a
+    # server-bug envelope for the caller's own byte, sending an operator after
+    # a fault that never happened. The MCP surface already refuses it; both
+    # facades must agree that this is the caller's input, not an outage.
+    _bindable(monkeypatch)
+    repo.pages = (_doc_row(),)
+    repo.total = 1
+    for path in ("/projects/p/documents", "/projects/p/entities"):
+        r = client.get(path, params={"q": "海科館" + chr(0)})
+        assert r.status_code == 400, path
+        body = r.json()["error"]
+        assert body["code"] == "VALIDATION_ERROR", path
+        assert "U+0000" in body["message"], path  # names the code point to remove
+    # the over-block dual: a normal search still works
+    assert client.get("/projects/p/documents", params={"q": "corpus"}).status_code == 200
+
+
 def test_blank_and_overlong_q_are_rejected(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
 ) -> None:

@@ -15,6 +15,28 @@ from __future__ import annotations
 from fastapi import Request
 
 from api.errors import ApiError, ErrorCode
+from core.metadata.schema import unstorable_string_reason
+
+
+def reject_unusable_text(value: str | None, field: str) -> None:
+    """Refuse a caller string Postgres cannot hold, BEFORE it reaches a query.
+
+    QA5 on the REST half: a NUL rode into the SQL predicate and came back a
+    ``DBAPIError``, which this facade reported as a bare 500 ``INTERNAL`` —
+    a server-bug envelope for a caller's own byte, telling an operator to go
+    look for a fault that never happened. The predicate is the SAME
+    ``unstorable_string_reason`` the write path and the MCP surface use, so
+    all three agree on what is storable rather than each deciding locally."""
+    if value is None:
+        return
+    reason = unstorable_string_reason(value)
+    if reason is not None:
+        raise ApiError(
+            ErrorCode.VALIDATION_ERROR,
+            f"{field} {reason} — remove it and retry; rejected before any "
+            "store was read, so this is an input problem, not an outage",
+            details={field: "unstorable"},
+        )
 
 
 def reject_unsupported_query(
@@ -143,4 +165,7 @@ def single_filter_value(
             f"filter[{field}] must be a non-blank value",
             details={f"filter[{field}]": value},
         )
+    # open-valued facets carry caller text straight into an equality
+    # predicate, so they need the same storability gate as q (QA5)
+    reject_unusable_text(value, f"filter[{field}]")
     return value

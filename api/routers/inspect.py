@@ -47,7 +47,11 @@ from api.pagination import (
     encode_sorted_cursor,
 )
 from api.registry_errors import translate_registry_error
-from api.routers._query import reject_unsupported_query, single_filter_value
+from api.routers._query import (
+    reject_unsupported_query,
+    reject_unusable_text,
+    single_filter_value,
+)
 from api.schemas import chunk_dto, document_dto, entity_dto, relation_dto, relation_evidence_dto
 from core.mcp.policy import PolicyError, query_policy_from_mapping
 from core.metadata.schema import MetadataConfigError, filterable_attributes
@@ -320,6 +324,7 @@ async def list_documents_endpoint(
     if status is not None:
         filters.append(docs.c.status == status)
         applied["status"] = status
+    reject_unusable_text(q, "q")  # QA5: a NUL here used to surface as a bare 500
     if q is not None:
         filters.append(docs.c.source_uri.ilike(f"%{escape_like(q)}%", escape="\\"))
     for attr_name, declared in sorted(fattrs.items()):
@@ -465,6 +470,7 @@ async def list_entities_endpoint(
         filters.append(ents.c.status == status)
     if review_status is not None:
         filters.append(ents.c.review_status == review_status)
+    reject_unusable_text(q, "q")  # QA5: a NUL here used to surface as a bare 500
     if q is not None:
         filters.append(ents.c.canonical_name.ilike(f"%{escape_like(q)}%", escape="\\"))
     total = await repo.fetch_count(ents, *filters)

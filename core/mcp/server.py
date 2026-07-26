@@ -50,7 +50,6 @@ from typing import Annotated, Any, Final, cast
 
 from mcp import types as mcp_types
 from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import Field, ValidationError
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -311,34 +310,54 @@ def _guard_tool_dispatch(server: FastMCP, project: str) -> None:
     guarantee exhaustive: validation happens BEFORE any tool body runs, so no
     tool can be added that forgets it. The raw ``arguments`` mapping is also
     only available here — before pydantic coerces it — which is the only
-    place the bool-for-integer substitution is still visible."""
+    place the bool-for-integer substitution is still visible.
+
+    Classification is by PHASE, never by exception type (Codex #140 r2): the
+    arguments are validated HERE, before ``inner`` runs, so a ValidationError
+    caught in this scope is definitionally about the arguments. Reading it off
+    ``ToolError.__cause__`` instead looked equivalent — the SDK does chain it
+    — but the SDK wraps EVERY tool failure that way, so a pydantic error
+    raised by a tool body or by a dependency decoding malformed store data
+    would have been relabelled ``INVALID_INPUT`` and told the caller to fix a
+    request that was fine. That is the same misdiagnosis class this task
+    exists to end, and validating first makes it unreachable rather than
+    merely unlikely. The double validation is a pure function of the
+    arguments, so running it twice costs a little and risks nothing."""
     inner = server.call_tool
 
     async def guarded(name: str, arguments: dict[str, Any]) -> Any:
         reason = _bool_for_integer_reason(server, name, arguments)
         if reason is not None:
             return _argument_refusal(name, reason, project=project, arguments=arguments)
-        try:
-            return await inner(name, arguments)
-        except ToolError as exc:
-            # the SDK re-raises every tool-call failure as ToolError, keeping
-            # the original on __cause__ — only the ARGUMENT failures are ours
-            # to relabel; a genuine tool fault keeps flowing to the SDK's own
-            # error result untouched
-            if isinstance(exc.__cause__, ValidationError):
+        tool = server._tool_manager._tools.get(name)  # noqa: SLF001 — no public accessor
+        meta = getattr(tool, "fn_metadata", None)
+        arg_model = getattr(meta, "arg_model", None)
+        if arg_model is not None:
+            try:
+                # the SDK validates pre_parse_json(arguments), not the raw
+                # mapping — clients JSON-STRINGIFY argument values (the SDK's
+                # own note says Claude desktop "seems incapable of NOT doing
+                # this"), so the two disagree in BOTH directions on the raw
+                # dict: `{"q": "[1]"}` looks like a valid str to us while the
+                # SDK parses it to a list and rejects (the D10 leak reopens
+                # through its generic error), and `{"top_k": "null"}` parses
+                # to a legal None for the SDK while we refuse a call it would
+                # have served. Running the framework's OWN transform on the
+                # framework's OWN input makes our verdict equal to its verdict
+                # by construction rather than by resemblance.
+                pre_parse = getattr(meta, "pre_parse_json", None)
+                arg_model.model_validate(pre_parse(arguments) if callable(pre_parse) else arguments)
+            except ValidationError as exc:
                 return _argument_refusal(
                     name,
-                    _readable_validation_error(exc.__cause__),
+                    _readable_validation_error(exc),
                     project=project,
                     arguments=arguments,
                 )
-            raise
-        except ValidationError as exc:
-            # defensive: an SDK that stops wrapping would otherwise re-open
-            # the leak silently (the wrapping is SDK-internal, not contract)
-            return _argument_refusal(
-                name, _readable_validation_error(exc), project=project, arguments=arguments
-            )
+        # everything past here is the TOOL's own outcome — a fault inside it
+        # flows to the SDK's error result untouched, still labelled as what it
+        # is rather than as the caller's mistake
+        return await inner(name, arguments)
 
     server._mcp_server.call_tool(validate_input=False)(guarded)  # noqa: SLF001
 

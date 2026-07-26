@@ -1509,7 +1509,7 @@ async def test_the_dispatch_guard_is_actually_wired_into_the_registered_handler(
     import mcp.server.fastmcp.tools.base as _sdk_tool_base
     from mcp import types as _mcp_types
     from mcp.server.fastmcp.exceptions import ToolError
-    from pydantic import ValidationError as _ValidationError
+    from pydantic import ValidationError
 
     import core.mcp.server as server_module
     from core.mcp.server import build_server
@@ -1530,10 +1530,12 @@ async def test_the_dispatch_guard_is_actually_wired_into_the_registered_handler(
     assert issubclass(ToolError, Exception)
     src = inspect.getsource(_sdk_tool_base)
     assert "raise ToolError" in src and "from e" in src, (
-        "the guard's primary branch reads ValidationError off ToolError.__cause__ — "
-        "an SDK that stops chaining would silently demote it to the fallback branch"
+        "the backend-fault case below fakes how the SDK surfaces a tool-body "
+        "failure (ToolError chained from the original) — if the SDK stopped "
+        "chaining, that fake would stop reproducing reality and the test would "
+        "be pinning a scenario that no longer occurs"
     )
-    assert issubclass(_ValidationError, Exception)
+    assert issubclass(ValidationError, Exception)
 
     handler = server._mcp_server.request_handlers[_mcp_types.CallToolRequest]  # noqa: SLF001
 
@@ -1573,3 +1575,66 @@ async def test_the_dispatch_guard_is_actually_wired_into_the_registered_handler(
     text = cast(_mcp_types.TextContent, typed.content[0]).text
     assert "query: " in text  # the parameter is NAMED
     assert "Arguments" not in text and "pydantic.dev" not in text  # no internals
+
+    # Our verdict must equal the SDK's, and it only does if we validate the
+    # SAME VALUE: FastMCP validates pre_parse_json(arguments), because clients
+    # JSON-stringify argument values (its own note says Claude desktop "seems
+    # incapable of NOT doing this"). Validating the raw mapping diverges in
+    # BOTH directions, so both are pinned.
+    # (i) a stringified value the SDK parses into something ILLEGAL: judging
+    # the raw string as a valid str let it through to the SDK's generic error,
+    # reopening D10's leak verbatim.
+    parsed_bad = await _call("list_entities", {"q": "[1]"})
+    assert parsed_bad.isError is True
+    bad_text = cast(_mcp_types.TextContent, parsed_bad.content[0]).text
+    assert "Arguments" not in bad_text and "pydantic.dev" not in bad_text
+    assert parsed_bad.structuredContent is not None  # our typed refusal, not the SDK's
+    # (ii) a stringified value the SDK parses into something LEGAL: refusing it
+    # would block a call the server would otherwise answer (the over-block dual)
+    parsed_ok = await _call("semantic_search", {"query": "票價多少", "top_k": "null"})
+    # it must not be OUR refusal: pre-parsing yields a legal None, so the call
+    # proceeds (and then fails on this fixture's absent request context, which
+    # is the SDK's own generic error — content only, no structuredContent)
+    assert parsed_ok.structuredContent is None
+
+    # A ValidationError raised by the TOOL BODY (or by a dependency decoding
+    # malformed store data) is a BACKEND fault, not the caller's mistake. The
+    # SDK wraps every tool failure in ToolError with the original on
+    # __cause__, so classifying by exception TYPE would relabel it
+    # INVALID_INPUT and tell a client to fix a request that was fine — the
+    # very misdiagnosis this task exists to end, reintroduced by its own fix.
+    # Arguments are therefore validated BEFORE dispatch, so the phase decides:
+    # anything raised past that point flows out as what it is.
+    from pydantic import BaseModel as _BaseModel
+
+    class _StoreRow(_BaseModel):
+        count: int
+
+    async def _exploding(name: str, arguments: dict[str, Any]) -> Any:
+        # exactly how the SDK surfaces a fault from inside a tool body:
+        # fastmcp/tools/base.py raises ToolError(...) FROM the original, so
+        # __cause__ is a ValidationError that has nothing to do with the
+        # caller's arguments (here: malformed data decoded from a store)
+        try:
+            _StoreRow(count=cast(int, "not a number"))
+        except ValidationError as exc:
+            raise ToolError(f"Error executing tool {name}: {exc}") from exc
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(server, "call_tool", _exploding)
+    server_module._guard_tool_dispatch(server, "demo")  # noqa: SLF001
+    handler2 = server._mcp_server.request_handlers[_mcp_types.CallToolRequest]  # noqa: SLF001
+    result = await handler2(
+        _mcp_types.CallToolRequest(
+            method="tools/call",
+            params=_mcp_types.CallToolRequestParams(
+                name="semantic_search", arguments={"query": "票價多少"}
+            ),
+        )
+    )
+    backend = cast(_mcp_types.CallToolResult, result.root)
+    # it still FAILS — but as the SDK's own generic tool error (content only,
+    # no structuredContent), never as our argument refusal
+    assert backend.isError is True
+    assert backend.structuredContent is None
+    assert "INVALID_INPUT" not in cast(_mcp_types.TextContent, backend.content[0]).text
