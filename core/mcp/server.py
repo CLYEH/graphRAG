@@ -198,6 +198,23 @@ Reading responses:
 """
 
 
+#: the tools whose advertised outputSchema IS the frozen §16 contract, mapped
+#: to the value each reports in the envelope's ``tool`` field. Those differ for
+#: ``explain_retrieval``: it RUNS the hybrid router, and the frozen contract's
+#: ``tool`` enum lists only the five retrieval modes — so its envelopes say
+#: "hybrid_query", as its own success path already does. One mapping, two
+#: consumers (the advertisement in _finalize_server_metadata and the refusal
+#: shape in _argument_refusal): a tool added to one but not the other would
+#: advertise the contract and then answer something else.
+_ENVELOPE_TOOLS = {
+    "semantic_search": "semantic_search",
+    "graph_query": "graph_query",
+    "global_summary": "global_summary",
+    "sql_query": "sql_query",
+    "hybrid_query": "hybrid_query",
+    "explain_retrieval": "hybrid_query",
+}
+
 _ARGUMENT_HELP = (
     "Check tools/list for this tool's parameter types; every argument is "
     "validated before the query runs, so nothing was read and retrying the "
@@ -243,21 +260,46 @@ def _bool_for_integer_reason(server: FastMCP, name: str, arguments: dict[str, An
     return None
 
 
-def _argument_refusal(tool: str, detail: str) -> mcp_types.CallToolResult:
+def _argument_refusal(
+    tool: str, detail: str, *, project: str, arguments: dict[str, Any]
+) -> mcp_types.CallToolResult:
     """The typed shape for an argument rejected by the FRAMEWORK rather than
-    by a tool body. Returned as a ``CallToolResult`` so the SDK hands it back
-    verbatim: the six §16 tools advertise the frozen response contract as
-    their outputSchema, and any other structured shape would be re-reported
-    as an "Output validation error" — burying the caller's real mistake."""
+    by a tool body, IN THE SHAPE THAT TOOL ADVERTISES.
+
+    Returned as a ``CallToolResult`` so the SDK hands it back verbatim rather
+    than re-reporting it as an "Output validation error" that would bury the
+    caller's real mistake. But bypassing OUR validator is not the same as
+    being valid (Codex #140): the envelope tools advertise the frozen §16
+    contract as their outputSchema, so a schema-driven client deserializes
+    ``structuredContent`` against it and a bare ``{error, error_code}`` fails
+    on ITS side — the refusal would be unreadable to exactly the careful
+    clients that read the schema. Envelope tools therefore get a contract-
+    valid §16 refusal (nil build, no results, GUARDRAIL_BLOCKED); the
+    introspection tools keep their own error shape, which is what THEY
+    advertise."""
     message = f"{tool}: {detail}. {_ARGUMENT_HELP}"
+    if tool in _ENVELOPE_TOOLS:
+        # the query may itself be the invalid argument (query=null is the
+        # canonical case), so echo it only when it is usable as one
+        raw = arguments.get("query")
+        structured: dict[str, Any] = McpResponse(
+            query=_safe_echo(raw) if isinstance(raw, str) else "",
+            tool=_ENVELOPE_TOOLS[tool],
+            project=project,
+            build_id=_NIL_BUILD,
+            results=(),
+            warnings=(QueryWarning("GUARDRAIL_BLOCKED", message),),
+        ).to_dict()
+    else:
+        structured = {"error": message, "error_code": "INVALID_INPUT"}
     return mcp_types.CallToolResult(
         content=[mcp_types.TextContent(type="text", text=message)],
-        structuredContent={"error": message, "error_code": "INVALID_INPUT"},
+        structuredContent=structured,
         isError=True,
     )
 
 
-def _guard_tool_dispatch(server: FastMCP) -> None:
+def _guard_tool_dispatch(server: FastMCP, project: str) -> None:
     """Wrap the ONE seam every tool call passes through so framework-level
     argument failures answer in the same typed vocabulary the tools promise
     (QA5 D10/D12).
@@ -275,7 +317,7 @@ def _guard_tool_dispatch(server: FastMCP) -> None:
     async def guarded(name: str, arguments: dict[str, Any]) -> Any:
         reason = _bool_for_integer_reason(server, name, arguments)
         if reason is not None:
-            return _argument_refusal(name, reason)
+            return _argument_refusal(name, reason, project=project, arguments=arguments)
         try:
             return await inner(name, arguments)
         except ToolError as exc:
@@ -284,12 +326,19 @@ def _guard_tool_dispatch(server: FastMCP) -> None:
             # to relabel; a genuine tool fault keeps flowing to the SDK's own
             # error result untouched
             if isinstance(exc.__cause__, ValidationError):
-                return _argument_refusal(name, _readable_validation_error(exc.__cause__))
+                return _argument_refusal(
+                    name,
+                    _readable_validation_error(exc.__cause__),
+                    project=project,
+                    arguments=arguments,
+                )
             raise
         except ValidationError as exc:
             # defensive: an SDK that stops wrapping would otherwise re-open
             # the leak silently (the wrapping is SDK-internal, not contract)
-            return _argument_refusal(name, _readable_validation_error(exc))
+            return _argument_refusal(
+                name, _readable_validation_error(exc), project=project, arguments=arguments
+            )
 
     server._mcp_server.call_tool(validate_input=False)(guarded)  # noqa: SLF001
 
@@ -317,14 +366,7 @@ def _finalize_server_metadata(server: FastMCP) -> None:
     ):
         server._mcp_server.request_handlers.pop(request, None)  # noqa: SLF001
     frozen = _mcp_response_schema()
-    for name in (
-        "semantic_search",
-        "graph_query",
-        "global_summary",
-        "sql_query",
-        "hybrid_query",
-        "explain_retrieval",
-    ):
+    for name in _ENVELOPE_TOOLS:
         tool = server._tool_manager._tools[name]  # noqa: SLF001
         tool.__dict__["output_schema"] = frozen
 
@@ -1362,7 +1404,7 @@ def build_server(project: str) -> FastMCP:
         return _with_clamp_warning(payload, rt.policy, top_k)
 
     _finalize_server_metadata(server)
-    _guard_tool_dispatch(server)
+    _guard_tool_dispatch(server, project)
     # MCP16: the shared client bundle's close handle — called by the OWNER
     # of the server instance (the gateway host task after the child app's
     # lifespan exits, or run_server after a stdio run), never per session

@@ -1416,15 +1416,72 @@ def test_framework_argument_failures_answer_typed_without_leaking_internals() ->
     assert rendered.startswith("query: ")  # the parameter is NAMED
     assert "_Args" not in rendered and "pydantic.dev" not in rendered  # no internals
 
-    refusal = _argument_refusal("list_entities", "limit: expected an integer, got the boolean true")
+    # an INTROSPECTION tool's refusal keeps that family's error shape, which
+    # is what those tools advertise
+    refusal = _argument_refusal(
+        "list_entities",
+        "limit: expected an integer, got the boolean true",
+        project="demo",
+        arguments={"limit": True},
+    )
     assert refusal.isError is True
     block = refusal.content[0]
     assert isinstance(block, _mcp_types.TextContent)
     assert refusal.structuredContent == {"error": block.text, "error_code": "INVALID_INPUT"}
-    # a CallToolResult is handed back VERBATIM by the SDK — any other shape
-    # would be re-reported as an "Output validation error" against the six §16
-    # tools' advertised outputSchema, burying the caller's real mistake
+    # a CallToolResult is handed back VERBATIM by the SDK rather than being
+    # re-reported as an "Output validation error" that would bury the real
+    # mistake — but bypassing OUR validator is not the same as being valid.
+    # The envelope tools advertise the FROZEN §16 contract as their
+    # outputSchema, so a schema-driven client deserializes structuredContent
+    # against it and a bare {error, error_code} fails on ITS side: the refusal
+    # would be unreadable to exactly the careful clients that read the schema.
     assert isinstance(refusal, _mcp_types.CallToolResult)
+
+    import json
+
+    import jsonschema
+
+    from core.mcp.server import _ENVELOPE_TOOLS
+
+    validator = jsonschema.Draft202012Validator(
+        json.loads((REPO_ROOT / "contracts" / "mcp_response.schema.json").read_text("utf-8")),
+        format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER,
+    )
+    for tool in _ENVELOPE_TOOLS:
+        for arguments, why in (
+            ({"query": None}, "the query itself is the invalid argument"),
+            ({"query": "票價多少", "top_k": 2.5}, "a sibling argument is invalid"),
+        ):
+            envelope = _argument_refusal(
+                tool, "query: Input should be a valid string", project="demo", arguments=arguments
+            )
+            structured = envelope.structuredContent
+            assert structured is not None, (tool, why)
+            validator.validate(structured)  # the CLIENT's own check, not ours
+            # explain_retrieval RUNS the hybrid router and the contract's tool
+            # enum lists only the five modes — its envelopes say hybrid_query,
+            # exactly as its success path already does
+            assert structured["tool"] == _ENVELOPE_TOOLS[tool], (tool, why)
+            assert structured["results"] == [], (tool, why)
+            assert structured["build_id"] == "00000000-0000-0000-0000-000000000000", (tool, why)
+            assert [w["code"] for w in structured["warnings"]] == ["GUARDRAIL_BLOCKED"], (tool, why)
+            # a non-string query cannot be echoed as one; a usable one is kept
+            expected = arguments["query"] if isinstance(arguments["query"], str) else ""
+            assert structured["query"] == expected, (tool, why)
+
+    # The mapping CLAIMS what each tool reports in `tool`, but the tool bodies
+    # are what actually report it — a third owner the mapping does not reach.
+    # Rather than trust the claim, read the artifact: the set of names the
+    # bodies hand to _bounded must be exactly the set the mapping promises, so
+    # editing a literal without the mapping (or the reverse) makes the refusal
+    # and the success path disagree about which tool answered.
+    import inspect
+    import re
+
+    import core.mcp.server as _server_module
+
+    reported = set(re.findall(r'_bounded\(rt, "([^"]+)"', inspect.getsource(_server_module)))
+    assert reported == set(_ENVELOPE_TOOLS.values()), (reported, set(_ENVELOPE_TOOLS.values()))
 
 
 async def test_the_dispatch_guard_is_actually_wired_into_the_registered_handler(
