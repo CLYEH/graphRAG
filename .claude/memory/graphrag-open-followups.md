@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: d673e708-e836-4b8a-8fc7-cb33527c5fc3
-  modified: 2026-07-26T07:07:03.889Z
+  modified: 2026-07-26T16:21:15.571Z
 ---
 
 散落在已刪除記憶檔裡仍然「活著」的 follow-ups,集中一處(狀態以 TASKS.md/
@@ -98,11 +98,6 @@ GitHub 為準;立案或了結後從本檔劃掉):
 
 - **relations/review 的 default cursor 未綁 query scope(SS1a-era)**:SS1b(#120 R8/R9/R10)把 entities/documents 的 cursor tag 釘到 sort+q+filters(typed)+build,但 relations 與 review 端點的 default (id,) cursor 仍是無 tag 形——filter 換值/build 切換後重放靜默 re-anchor。SS1a 既有、非 SS1b 回歸;修法=沿用 `_scope_fingerprint` + `decode_scoped_id_cursor`(pattern 見 lesson class 31)。順手時機:任何動 relations/review 分頁的任務。
 
-- **get_entity 的 bind-then-validate(MCP5 #125 r3 同型未修面)**:get_chunk/get_document
-  已改為 wrapper 在 context.bound() 之前拒絕 malformed id(_NIL_BUILD sentinel 慣例),
-  但 get_entity 的空白 name 檢查仍在 binding 之後——壞輸入白付一次 active-build 解析。
-  gate-2 reviewer 附議入帳。順手時機:下一個動 core/mcp/server.py 自省工具的任務
-  (MCP7/MCP9 最近)。
 - **delta-review receipt 被 harness 自動誤旗(#125 期間兩次)**:gate-2 persistent
   reviewer 依 SendMessage delta-review 協議自查 diff 後蓋章,harness 的 security
   heuristic 兩度標為「無真審查的自我蓋章」。誤報(輸出含具體查證),但訊號值得
@@ -114,7 +109,6 @@ GitHub 為準;立案或了結後從本檔劃掉):
   semantic」)——實際上 MCP8 後 deps.llm 只有 sql/NLSQL 路徑會碰。行為無誤(fake 從未被
   諮詢),純命名/註解過期。順手時機:下一個動 hybrid 整合測試的任務改名為 `_FakeLLM`
   並修 docstring。
-- **inspect.py 讀面 metadata filter 仍 NUL-only(2026-07-25, MCP10 #130 gate-2 nit)**:寫面 guard 已泛化為 unstorable_string_reason 含 surrogate,讀面未跟。gate-2 判 adequate:lone surrogate 幾乎不可能經 URL query decode 存活(不像 %00),讀面非寫入邊界。純 cross-reference parity 的一行 tightening,下次動 inspect.py filter 時順手收。
 - **MCP session 透明 policy 刷新 transport(2026-07-25, MCP17 #137 r5)**:gateway 的 max-age 逾齡以 404 終止 session,與 SDK idle reaper 同契約——pinned MCP Python client 收 404 不自動重連(保留舊 id、後續全 404),故長跑 agent 的 policy 撤銷需客戶端主動開新 transport。真正透明的「session 到齡自動重連並帶新 policy」需自訂 transport 或 SDK 支援,屬產品層決策(§23 auth round 一併考量)。現況:idle+max-age 皆終止式,DESIGN §9 已誠實記載。
 - **gateway routing 的 rebinding 確認洩漏(2026-07-25, MCP17 #137 r11 gate-2)**：未認證 /mcp routing 的 404(not-in-registry)vs child-421(rebinding 拒)狀態差,可讓 DNS-rebinding 頁「確認猜中的專案名」——比已修的 /health 枚舉弱,但屬未認證 §23 routing 固有,唯 gateway 層自帶 rebinding 驗證可閉。留待 §23 auth round 與 gateway 認證一併處理。
 - **hybrid 模態併發執行(2026-07-26, MCP18 owner 定案 defer)**:hybrid 現以循序 `for mode in selected:` 跑各模態(端到端實測 3,078ms≈各模態耗時和),模態彼此獨立本可併發——但 semantic/graph/sql 共用單一 asyncpg 連線,同連線併發協程會炸(asyncpg 單連線不可並發),故真併發需 per-mode PG 連線隔離(各自 build-scoped、DR-006 再驗、清理)+改寫釘住循序假設的 §21 deadline/§22 degradation/mode-order 測試(`tests/test_query_hybrid.py` 的 `test_the_whole_call_shares_one_wall_clock_deadline`、`test_auto_planned_graph_runs_at_its_mode_order_position`)。MCP18 owner 定案先落地 (b) embedding 快取、(a) 併發改列 follow-up 待重估(風險 vs 收益)。附:QP1 auto-plan(`distinct_active_entity_names` DB 往返 ~766ms)於模態前循序跑,可與不需 graph_params 的 semantic/sql 併發。核心 `core/query/hybrid.py:185` 循序迴圈;house style 並發用 asyncio(core)/anyio task group(gateway)。
