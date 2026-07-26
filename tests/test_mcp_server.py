@@ -1535,18 +1535,25 @@ def test_framework_argument_failures_answer_typed_without_leaking_internals() ->
 async def test_every_pre_binding_claim_is_pinned_by_a_raising_bind(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """These refusals TELL the caller "rejected before any store was read" —
-    the anti-back-off signal D5 exists to deliver, since the same input used to
-    come back as ``STORE_UNAVAILABLE`` and send an agent into retry.
+    """These refusals used to also TELL the caller "rejected before any store
+    was read" — but that clause is now GONE from the message (Codex #140 r6),
+    because the caller set was not closed after all. Round 3 concluded the MCP
+    claim was keepable because its callers were "these tool bodies"; that
+    enumeration missed the seventh caller — the REST facade's
+    ``run_bounded_query`` reaches the SAME ``_unusable_query_payload`` AFTER
+    ``_load_policy`` has read the store, so the claim was false on that path
+    exactly as its REST twin was. The rule (assert only what you can guarantee)
+    was right; the caller enumeration under it was incomplete. What survives in
+    the message is the ANTI-BACK-OFF half — "this is an INPUT problem, not a
+    store outage" — which is true from every call site.
 
-    A message may assert only what its asserter can guarantee, and that needs a
-    closed caller set AND a mechanical pin. The REST twin of this claim had
-    neither: ``single_filter_value`` opened the caller set, one caller
-    structurally could not comply, and nothing went red — so the clause was
-    dropped there. Here the caller set IS closed (these tool bodies), which
-    makes the claim keepable — but "true today" is exactly the state REST was
-    in the moment before it broke. So it is pinned: binding RAISES, and every
-    guard must still answer, which is only possible if it runs first."""
+    The ORDERING is now a property THIS TEST guarantees rather than a promise
+    printed in shared text (the correct form, round 3): binding RAISES, and
+    every MCP guard must still answer, which is only possible if it runs first.
+    Its machine-readable form is ``build_id == _NIL_BUILD`` — no build was ever
+    resolved, because nothing tried to."""
+    import json
+
     from mcp import types as _mcp_types
 
     import core.mcp.server as server_module
@@ -1594,6 +1601,14 @@ async def test_every_pre_binding_claim_is_pinned_by_a_raising_bind(
         # the nil sentinel is the machine-readable half of the same claim: no
         # build was ever resolved, because nothing ever tried to resolve one
         assert structured["build_id"] == "00000000-0000-0000-0000-000000000000", tool
+        # ...and the ordering is guaranteed by THIS test, not asserted in the
+        # message — the shared helper carries no "before any store" clause (it
+        # would be false on the REST path, whose run_bounded_query reaches the
+        # same helper after _load_policy has read the store, Codex #140 r6),
+        # only the anti-back-off half that holds from every call site
+        blob = json.dumps(structured, ensure_ascii=False)
+        assert "before any store" not in blob, tool
+        assert "not a store outage" in blob, tool
 
 
 async def test_the_dispatch_guard_is_actually_wired_into_the_registered_handler(

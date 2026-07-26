@@ -500,9 +500,9 @@ def _unusable_param_payload(
         warnings=(
             QueryWarning(
                 "GUARDRAIL_BLOCKED",
-                f"{field} {reason} (received {_safe_echo(value, 80)!r}) — "
-                "rejected before any store was read, so this is an INPUT "
-                "problem and not a store outage; fix the parameter and retry",
+                f"{field} {reason} (received {_safe_echo(value, 80)!r}) — this "
+                "is an INPUT problem, not a store outage; fix the parameter "
+                "and retry",
             ),
         ),
     ).to_dict()
@@ -2036,10 +2036,7 @@ def _unusable_subject_payload(
         "project": project,
         "build_id": _NIL_BUILD,
         "subject": _safe_echo(subject),
-        "error": (
-            f"{subject_field} {reason}; rejected before any store was read — "
-            "this is an INPUT problem, not a store outage"
-        ),
+        "error": (f"{subject_field} {reason} — this is an INPUT problem, not a store outage"),
         "error_code": "INVALID_INPUT",
     }
 
