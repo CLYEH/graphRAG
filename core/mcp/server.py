@@ -532,26 +532,32 @@ def _unusable_query_payload(project: str, tool: str, query: str) -> dict[str, An
       warning at all — a confident answer to a question nobody asked (D9).
       An EMPTY query only failed once it reached the embedding provider,
       which blamed "the model provider" for the caller's own input.
+
+    Length is checked FIRST (Codex #140 r5): it is an O(1) ``len`` while the
+    storability/blankness scan is a Python-level per-character pass, and MCP
+    arguments carry no schema-level max length, so scanning a multi-MB query
+    before the cap rejects it would hand an attacker O(len) work for an input
+    the cap refuses anyway. An oversized query is refused on length alone —
+    its content is never scanned — and its echo runs through ``_safe_echo``
+    like every other, so an oversized-AND-malformed query cannot smuggle a
+    lone surrogate into the refusal and kill its own serialization.
     """
-    unusable = _unusable_param_payload(project, tool, query, "query", query)
-    if unusable is not None:
-        return unusable
-    if len(query) <= _QUERY_CHARS_CAP:
-        return None
-    return McpResponse(
-        query=query[:200],
-        tool=tool,
-        project=project,
-        build_id=_NIL_BUILD,
-        results=(),
-        warnings=(
-            QueryWarning(
-                "GUARDRAIL_BLOCKED",
-                f"query length {len(query)} exceeds the {_QUERY_CHARS_CAP}-char cap "
-                "— shorten the query (§21); rejected, not clamped",
+    if len(query) > _QUERY_CHARS_CAP:
+        return McpResponse(
+            query=_safe_echo(query, 200),
+            tool=tool,
+            project=project,
+            build_id=_NIL_BUILD,
+            results=(),
+            warnings=(
+                QueryWarning(
+                    "GUARDRAIL_BLOCKED",
+                    f"query length {len(query)} exceeds the {_QUERY_CHARS_CAP}-char cap "
+                    "— shorten the query (§21); rejected, not clamped",
+                ),
             ),
-        ),
-    ).to_dict()
+        ).to_dict()
+    return _unusable_param_payload(project, tool, query, "query", query)
 
 
 def _with_clamp_warning(

@@ -555,6 +555,23 @@ def test_explain_retrieval_refusal_is_a_real_refusal() -> None:
     assert "4000-char cap" in oversized["warnings"][0]["message"]
     assert _unusable_query_payload("demo", "hybrid_query", "x" * 4000) is None  # dual
 
+    # Codex #140 r5: the O(1) length check runs BEFORE the per-character
+    # storability/blankness scan. Pinned by DIAGNOSIS, which discriminates the
+    # order without a timing assertion: an oversized query that ALSO carries a
+    # NUL is refused on LENGTH — its content is never scanned, so the message
+    # names the cap, not the NUL. Scan-first would have named the NUL instead.
+    oversized_and_bad = "\x00" + "x" * 4001
+    both = _unusable_query_payload("demo", "hybrid_query", oversized_and_bad)
+    assert both is not None
+    msg = both["warnings"][0]["message"]
+    assert "4000-char cap" in msg and "NUL" not in msg  # length decided it, content unseen
+    # and an oversized query carrying a SURROGATE still serializes: its echo
+    # runs through _safe_echo, so length-first cannot smuggle a lone surrogate
+    # into the refusal and kill the response (D11 through the oversized path)
+    surrogate_oversized = _unusable_query_payload("demo", "hybrid_query", "\ud800" + "x" * 4001)
+    assert surrogate_oversized is not None
+    json.dumps(surrogate_oversized, ensure_ascii=False).encode("utf-8")
+
     # gate-2 sweep: hybrid_query's MCP11 incomplete-invocation refusal is the
     # SAME pre-_bounded early-return class — the tool runs the cap first,
     # AND (defense in depth) the refusal itself truncates its echo, so no
@@ -1661,6 +1678,20 @@ async def test_the_dispatch_guard_is_actually_wired_into_the_registered_handler(
             _mcp_types.TextContent, (await _call("list_entities", {"limit": False})).content[0]
         ).text
     )
+
+    # The STRINGIFIED form {"limit": "true"} does NOT become a successful
+    # 1-item page (Codex #140 r5 worried it would): `pre_parse_json` leaves it
+    # as the string "true", because `json.loads("true")` is the bool True and
+    # a bool is an int subclass, so the SDK's `isinstance(parsed, str|int|float)`
+    # guard skips it. Pydantic then rejects the string against `int` — verified
+    # here rather than reasoned about — so it is a typed INVALID_INPUT refusal,
+    # never a coerced 1.
+    stringified = await _call("list_entities", {"limit": "true"})
+    assert stringified.isError is True
+    assert stringified.structuredContent is not None
+    assert stringified.structuredContent["error_code"] == "INVALID_INPUT"
+    # and NOT a success carrying results/a cursor (what "coerced to 1" would be)
+    assert "results" not in stringified.structuredContent
 
     # D10: a type error never reached a tool body, so it escaped the error
     # vocabulary entirely — pydantic's raw dump named the SDK's generated
