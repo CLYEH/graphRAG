@@ -106,6 +106,42 @@ class QueryPolicy:
         )
 
 
+def top_k_clamp_warning(policy: QueryPolicy, requested: int | None) -> dict[str, str] | None:
+    """The §16 TRUNCATED warning owed when :meth:`QueryPolicy.top_k` clamped
+    an over-cap ask — ``None`` when nothing was clamped.
+
+    MCP13 (a): ``top_k()`` reconciles an over-cap ask via ``min()`` SILENTLY.
+    A caller asking 9999 and receiving ``max_top_k`` results with empty
+    warnings cannot distinguish "the corpus only has this many" from "you were
+    clamped" — exactly the judgment (rephrase? page with the list_* tools?)
+    the warning exists to inform; the OTHER end of the same parameter (a
+    negative top_k) already refuses loudly. DESIGN §27.2 states the rule
+    generally: any clamp must say so, silent clamping is forbidden.
+
+    It lives HERE, beside the method that does the clamping, because BOTH
+    query surfaces reconcile through that method and so both owe the same
+    disclosure (QA4/#138: the MCP tools emitted this warning while the REST
+    facade clamped silently, so one product answered the SAME request with two
+    different stories about the completeness of its results). One message, one
+    predicate, both surfaces — a second copy would be free to drift.
+
+    Emitted at the FACADE layer, not inside the modes: the clamp happens when
+    the request meets the policy, before any mode runs. A mode's own ceiling
+    (sql's row cap, global's result cap) is a different truncation that the
+    mode itself already reports.
+    """
+    if requested is None or requested <= policy.max_top_k:
+        return None
+    return {
+        "code": "TRUNCATED",
+        "message": (
+            f"top_k={requested} exceeds the policy ceiling {policy.max_top_k} — "
+            f"clamped to {policy.max_top_k} (§21 max_top_k); use the list_* tools "
+            "to page beyond the retrieval ceiling"
+        ),
+    }
+
+
 def load_query_policy(config_path: Path, *, text: str | None = None) -> QueryPolicy:
     """Load + validate ``query_policy`` from a project's ``config.yaml``.
 

@@ -63,6 +63,7 @@ from core.mcp.policy import (
     QueryPolicy,
     hybrid_policy,
     load_runtime_config_from_registry,
+    top_k_clamp_warning,
 )
 from core.metadata.schema import MetadataExposure
 from core.query.global_reports import global_summary as run_global
@@ -240,26 +241,6 @@ _STORE_ERRORS: tuple[type[BaseException], ...] = STORE_CLIENT_ERRORS
 _store_name = store_name
 
 
-def _top_k_clamp_warning(policy: QueryPolicy, requested: int | None) -> dict[str, str] | None:
-    """MCP13 (a): ``policy.top_k`` reconciles an over-cap ask via ``min()`` —
-    SILENTLY. An agent asking 9999 and receiving ``max_top_k`` results with
-    empty warnings cannot distinguish "the corpus only has this many" from
-    "you were clamped" — exactly the judgment (rephrase? paginate with the
-    list_* tools?) the warning exists to inform; the OTHER end of the same
-    parameter (a negative top_k) already refuses loudly. Emitted at the tool
-    layer because the clamp happens here, not in the mode functions."""
-    if requested is None or requested <= policy.max_top_k:
-        return None
-    return {
-        "code": "TRUNCATED",
-        "message": (
-            f"top_k={requested} exceeds the policy ceiling {policy.max_top_k} — "
-            f"clamped to {policy.max_top_k} (§21 max_top_k); use the list_* tools "
-            "to page beyond the retrieval ceiling"
-        ),
-    }
-
-
 def _echoable(query: str) -> str:
     """The §16 envelope echo of a caller's query: a WITHIN-cap query is
     returned whole (clients correlate, log, and retry from the envelope —
@@ -304,7 +285,7 @@ def _with_clamp_warning(
     happened and claiming one would overstate the response."""
     if payload["build_id"] == _NIL_BUILD:
         return payload
-    clamp = _top_k_clamp_warning(policy, requested)
+    clamp = top_k_clamp_warning(policy, requested)
     if clamp is not None:
         payload["warnings"] = [*payload["warnings"], clamp]
     return payload
