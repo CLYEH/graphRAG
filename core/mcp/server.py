@@ -420,10 +420,17 @@ def _safe_echo(value: str, limit: int = 200) -> str:
     ``limit``, so the offending unit may not appear in it at all. No refusal
     message describes the echo's contents for exactly that reason — what the
     caller must act on is the code point, which the reason names outright
-    (see :func:`_unusable_text_reason`)."""
-    return "".join("�" if ch == "\x00" or 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in value)[
-        :limit
-    ]
+    (see :func:`_unusable_text_reason`).
+
+    The slice comes BEFORE the substitution (Codex #140): transforming the
+    whole value first and slicing after would let a multi-MB malformed
+    argument drive an O(len) transient allocation that the advertised
+    80/200-char window does not bound — the caller is refused either way, so
+    only the echoed prefix is worth touching. Slicing is 1:1 with the
+    substitution (each code unit maps to one), so the result is identical."""
+    return "".join(
+        "�" if ch == "\x00" or 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in value[:limit]
+    )
 
 
 def _unusable_text_reason(value: str, *, allow_blank: bool = False) -> str | None:

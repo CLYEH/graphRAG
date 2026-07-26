@@ -1301,6 +1301,37 @@ def test_an_unusable_introspection_subject_is_typed_before_binding() -> None:
     assert _unusable_subject_payload("demo", "name", "票價資訊") is None  # a good name passes
 
 
+def test_safe_echo_bounds_its_work_to_the_window_not_the_whole_input() -> None:
+    """QA5 (Codex #140 r4): the echo is advertised as windowed to `limit`, so a
+    multi-MB malformed argument must not drive an O(len) transform before the
+    typed refusal comes back — the caller is refused either way, so only the
+    echoed prefix is worth touching. Slicing BEFORE the substitution is what
+    makes the window bound the work, not just the output.
+
+    Pinned so it can't regress to transform-then-slice: a value whose slice is
+    cheap but whose full iteration EXPLODES passes only if the slice happens
+    first. (Slicing is 1:1 with the substitution, so the result is unchanged —
+    the plain cases below assert the truncation and U+FFFD mapping still hold.)"""
+    from core.mcp.server import _safe_echo
+
+    assert _safe_echo("x" * 500) == "x" * 200  # default window
+    assert _safe_echo("ab" + chr(0) + "c", 80) == "ab�c"  # substitution intact
+    assert _safe_echo("\ud800" * 10, 3) == "�" * 3  # window applies to surrogates
+
+    class _CheapSliceExplodingIter(str):
+        """__getitem__(slice) is a normal small str; iterating the WHOLE thing
+        raises — so transform-then-slice (which iterates `value`) blows up,
+        while slice-then-transform (which iterates `value[:limit]`) does not."""
+
+        def __iter__(self) -> Any:
+            raise AssertionError("_safe_echo iterated the whole value instead of the window")
+
+        def __getitem__(self, key: Any) -> Any:
+            return "safe-prefix" if isinstance(key, slice) else super().__getitem__(key)
+
+    assert _safe_echo(cast(str, _CheapSliceExplodingIter("huge")), 80) == "safe-prefix"
+
+
 def test_every_refusal_echo_survives_its_own_serialization() -> None:
     """QA5 D11, swept to the refusals that ALREADY rejected the input.
 
