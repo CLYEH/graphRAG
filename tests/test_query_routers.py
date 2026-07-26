@@ -22,6 +22,7 @@ from sqlalchemy.exc import OperationalError
 
 from api.app import create_app
 from core.llm.factory import LLMNotConfiguredError
+from core.mcp.policy import query_policy_from_mapping, top_k_clamp_warning
 from core.stores.repo import NoActiveBuildError
 
 pytestmark = pytest.mark.contract
@@ -217,6 +218,74 @@ def test_top_k_is_accepted_and_reaches_the_mode(
     assert client.post("/projects/p/query/sql", json={"query": "q"}).status_code == 200
     # 1 passes; 999 → max_top_k (20), NOT just sql_rows (100); absent → ceiling
     assert captured_rows == [1, 20, 100]
+
+
+def test_an_over_cap_top_k_is_disclosed_on_this_surface_too(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY (QA4, from the #138 black-box QA): the test ABOVE pins that an
+    # over-cap ask is CLAMPED — this pins that the caller is TOLD. `top_k()`
+    # reconciles via min() silently, and this facade used to project that
+    # clamp with empty warnings while the MCP tools disclosed it since MCP13:
+    # one product answering the SAME request with two different stories about
+    # whether the result set is complete. DESIGN §27.2 forbids silent clamping
+    # on ANY surface, so every endpoint that ACCEPTS top_k owes the warning —
+    # the sibling sweep is the point, not the one endpoint that was reported.
+    _queryable(monkeypatch)
+    expected = top_k_clamp_warning(query_policy_from_mapping(_QUERY_POLICY), 500)
+    assert expected is not None  # 500 > max_top_k=20
+
+    async def fake_bounded(
+        context: Any, policy: Any, tool: str, query: str, runner: Any, exposure: Any = None
+    ) -> Any:
+        # a warning the MODE itself raised: the clamp must APPEND to it, never
+        # replace it (the facade adds a fact, it does not own the list)
+        return _mcp_dict(warnings=[{"code": "LOW_CONFIDENCE", "message": "the mode said so"}])
+
+    _stub(monkeypatch, "run_bounded_query", fake_bounded)
+
+    for mode in ("semantic", "global", "sql", "hybrid"):
+        data = client.post(f"/projects/p/query/{mode}", json={"query": "q", "top_k": 500}).json()[
+            "data"
+        ]
+        codes = [w["code"] for w in data["warnings"]]
+        assert "TRUNCATED" in codes, mode
+        assert "LOW_CONFIDENCE" in codes, mode  # the mode's own warning survived
+        clamp = next(w for w in data["warnings"] if w["code"] == "TRUNCATED")
+        # byte-identical to the ONE helper the MCP surface emits: a message
+        # re-forked on this side is exactly the defect's shape, so it goes red
+        assert clamp == expected, mode
+
+    # the other end of the same parameter: at or under the cap nothing was
+    # clamped, so a warning here would be a FALSE alarm teaching the caller to
+    # distrust a complete answer
+    for mode in ("semantic", "global", "sql", "hybrid"):
+        for body in ({"query": "q", "top_k": 20}, {"query": "q"}):
+            data = client.post(f"/projects/p/query/{mode}", json=body).json()["data"]
+            assert "TRUNCATED" not in [w["code"] for w in data["warnings"]], (mode, body)
+
+
+def test_a_nil_build_never_claims_a_clamp(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WHY: the nil sentinel means binding never completed (pre-binding refusal
+    # or a deadline firing DURING binding) — the retrieval never ran, so no
+    # clamp ever happened and reporting one would overstate what the response
+    # is. Same guard the MCP surface applies; pinned here so the two surfaces
+    # cannot drift on the empty case either.
+    _queryable(monkeypatch)
+
+    async def fake_bounded(
+        context: Any, policy: Any, tool: str, query: str, runner: Any, exposure: Any = None
+    ) -> Any:
+        return _mcp_dict(build_id=_NIL, results=[], warnings=[])
+
+    _stub(monkeypatch, "run_bounded_query", fake_bounded)
+    data = client.post("/projects/p/query/semantic", json={"query": "q", "top_k": 500}).json()[
+        "data"
+    ]
+    assert data["build_id"] == _NIL
+    assert data["warnings"] == []  # no clamp claimed for a retrieval that never ran
 
 
 def test_nil_build_sentinel_stays_in_data_never_meta(

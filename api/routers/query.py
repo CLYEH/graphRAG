@@ -31,7 +31,13 @@ from api.errors import ApiError, ErrorCode
 from api.registry_errors import translate_registry_error
 from api.schemas import GraphOptions, GraphQueryRequest, HybridQueryRequest, QueryRequest
 from core.llm.factory import LLMNotConfiguredError
-from core.mcp.policy import PolicyError, QueryPolicy, hybrid_policy, query_policy_from_mapping
+from core.mcp.policy import (
+    PolicyError,
+    QueryPolicy,
+    hybrid_policy,
+    query_policy_from_mapping,
+    top_k_clamp_warning,
+)
 from core.mcp.server import run_bounded_query
 from core.metadata.schema import MetadataConfigError, MetadataExposure, load_metadata_exposure
 from core.query.global_reports import global_summary as run_global
@@ -126,6 +132,8 @@ async def _run_mode(
     mode: str,
     query: str,
     runner: Any,
+    *,
+    requested_top_k: int | None = None,
 ) -> dict[str, Any]:
     policy, exposure = await _load_policy(request, project)
     try:
@@ -141,12 +149,25 @@ async def _run_mode(
     except NoActiveBuildError as exc:
         raise translate_registry_error(exc) from exc
     build_id = mcp_dict.get("build_id")
+    warnings = list(mcp_dict.get("warnings", []))
+    # QA4 (#138 black-box QA): `policy.top_k()` reconciles an over-cap ask via
+    # min() SILENTLY, and this facade used to project that clamp with empty
+    # warnings while the MCP tools disclosed it — one product answering the
+    # SAME request with two different stories about result completeness.
+    # DESIGN §27.2 forbids silent clamping, so the disclosure is owed on BOTH
+    # surfaces and comes from the ONE helper beside the clamping method.
+    # A nil build means the retrieval never ran (pre-binding refusal, binding
+    # stall) — no clamp happened, and claiming one would overstate the answer.
+    if build_id != _NIL_BUILD:
+        clamp = top_k_clamp_warning(policy, requested_top_k)
+        if clamp is not None:
+            warnings.append(clamp)
     payload = {
         "mode": mode,
         "build_id": build_id,
         "results": mcp_dict.get("results", []),
         "graph_context": mcp_dict.get("graph_context"),
-        "warnings": mcp_dict.get("warnings", []),
+        "warnings": warnings,
         "debug": mcp_dict.get("debug"),
     }
     return success(
@@ -171,7 +192,9 @@ async def query_semantic_endpoint(
 
         return _run
 
-    return await _run_mode(request, project, "semantic", body.query, runner)
+    return await _run_mode(
+        request, project, "semantic", body.query, runner, requested_top_k=body.top_k
+    )
 
 
 @router.post("/projects/{project}/query/sql")
@@ -193,7 +216,7 @@ async def query_sql_endpoint(request: Request, project: str, body: QueryRequest)
 
         return _run
 
-    return await _run_mode(request, project, "sql", body.query, runner)
+    return await _run_mode(request, project, "sql", body.query, runner, requested_top_k=body.top_k)
 
 
 @router.post("/projects/{project}/query/global")
@@ -206,7 +229,9 @@ async def query_global_endpoint(
 
         return _run
 
-    return await _run_mode(request, project, "global", body.query, runner)
+    return await _run_mode(
+        request, project, "global", body.query, runner, requested_top_k=body.top_k
+    )
 
 
 @router.post("/projects/{project}/query/graph")
@@ -258,4 +283,6 @@ async def query_hybrid_endpoint(
 
         return _run
 
-    return await _run_mode(request, project, "hybrid", body.query, runner)
+    return await _run_mode(
+        request, project, "hybrid", body.query, runner, requested_top_k=body.top_k
+    )

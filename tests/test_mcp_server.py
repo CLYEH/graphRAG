@@ -486,20 +486,25 @@ def test_top_k_clamp_is_said_not_silent() -> None:
     were clamped" — the exact judgment (rephrase? page with list_*?) the
     warning informs; the OTHER end of the same parameter (negative top_k)
     already refuses loudly. The clamp must be SAID (TRUNCATED), and only
-    when it actually happened (the over-block dual)."""
+    when it actually happened (the over-block dual).
+
+    QA4 moved the message itself beside the clamping method (core.mcp.policy)
+    so the REST facade discloses the SAME clamp identically; this pins the MCP
+    half of that shared contract."""
     from types import SimpleNamespace
 
-    from core.mcp.server import _top_k_clamp_warning, _with_clamp_warning
+    from core.mcp.policy import top_k_clamp_warning
+    from core.mcp.server import _with_clamp_warning
 
     policy = SimpleNamespace(max_top_k=20)
-    clamp = _top_k_clamp_warning(policy, 9999)  # type: ignore[arg-type]
+    clamp = top_k_clamp_warning(policy, 9999)  # type: ignore[arg-type]
     assert clamp is not None
     assert clamp["code"] == "TRUNCATED"
     assert "9999" in clamp["message"] and "20" in clamp["message"]  # both numbers named
 
     # no ask / at-cap / under-cap: NOT clamped — no warning (over-block dual)
     for requested in (None, 20, 5):
-        assert _top_k_clamp_warning(policy, requested) is None  # type: ignore[arg-type]
+        assert top_k_clamp_warning(policy, requested) is None  # type: ignore[arg-type]
 
     payload = {"build_id": "b-1", "warnings": [{"code": "MODE_SKIPPED", "message": "x"}]}
     out = _with_clamp_warning(payload, policy, 9999)  # type: ignore[arg-type]
