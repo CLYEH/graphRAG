@@ -44,7 +44,7 @@ from sqlalchemy.pool import NullPool
 from core.config import get_settings
 from core.mcp.policy import PolicyError, load_runtime_config_from_registry
 from core.mcp.server import build_server
-from core.metadata.schema import MetadataConfigError
+from core.metadata.schema import MetadataConfigError, unstorable_string_reason
 from core.stores.errors import STORE_CLIENT_ERRORS
 
 #: matched against the RAW (undecoded) path: a percent-encoded slash
@@ -155,7 +155,21 @@ class McpGateway:
         # into the name here and is rejected below, never re-split as a path
         project = unquote(match.group(1).decode("utf-8", "replace"))
         rest = unquote((match.group(2) or b"/").decode("utf-8", "replace"))
-        if "/" in project or project in (".", ".."):
+        if (
+            "/" in project
+            or project in (".", "..")
+            # QA5 D14: a NUL in the segment (a surrogate cannot reach here —
+            # the segment was decoded with errors="replace" two lines above)
+            # used to slip past this gate, reach the registry SELECT, and
+            # come back a
+            # DBAPIError the preflight reported as 503 "registry unreachable
+            # — check Postgres" — a fabricated infrastructure alarm sending
+            # on-call after an outage that never happened, from a byte no
+            # registry row can hold. Every OTHER malformed name (tab, emoji,
+            # dots, encoded slash) already answered the honest 404; this is
+            # the same shared storability predicate the query tools use.
+            or unstorable_string_reason(project) is not None
+        ):
             # non-addressable names answer 404 BEFORE any registry read —
             # the same rule _app_for enforces (kept there as defense in
             # depth); the preflight below must not spend a DB read on them

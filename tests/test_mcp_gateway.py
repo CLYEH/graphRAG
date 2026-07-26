@@ -215,6 +215,15 @@ async def test_routing_registry_and_isolation(harness: _Harness) -> None:
         # non-addressable names → 404 WITHOUT a registry lookup
         assert (await _request(app, "/mcp/."))[0] == 404
         assert (await _request(app, "/mcp/.."))[0] == 404
+        # QA5 D14: a name Postgres cannot hold is non-addressable for the SAME
+        # reason — it used to slip past this gate into the registry SELECT and
+        # come back a DBAPIError the preflight reported as 503 "registry
+        # unreachable — check Postgres", inventing an infrastructure outage
+        # from a byte no row could ever contain. Every OTHER malformed name
+        # already answered 404; this closes the one that lied.
+        status, body = await _request(app, "/mcp/nmmst%00", raw_path=b"/mcp/nmmst%00")
+        assert status == 404, "a NUL in the segment must be a routing 404, never a store 503"
+        assert b"registry unreachable" not in body and b"Postgres" not in body
 
         # outside /mcp → 404 (except /health, asserted above — MCP17)
         assert (await _request(app, "/other"))[0] == 404

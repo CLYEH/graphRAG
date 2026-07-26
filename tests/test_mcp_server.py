@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -531,7 +531,7 @@ def test_explain_retrieval_refusal_is_a_real_refusal() -> None:
 
     import jsonschema
 
-    from core.mcp.server import _debug_disabled_payload, _oversized_query_payload
+    from core.mcp.server import _debug_disabled_payload, _unusable_query_payload
 
     payload = _debug_disabled_payload("demo", "票價")
     validator = jsonschema.Draft202012Validator(
@@ -548,12 +548,12 @@ def test_explain_retrieval_refusal_is_a_real_refusal() -> None:
     # Codex #133 r1: the debug refusal echoes the query, and the tool's
     # early return bypasses _bounded's cap — so the SHARED cap helper must
     # run first, truncating the echo (no whole-input reflection/amplification)
-    oversized = _oversized_query_payload("demo", "hybrid_query", "x" * 4001)
+    oversized = _unusable_query_payload("demo", "hybrid_query", "x" * 4001)
     assert oversized is not None
     validator.validate(oversized)
     assert len(oversized["query"]) == 200  # echo truncated, never reflected whole
     assert "4000-char cap" in oversized["warnings"][0]["message"]
-    assert _oversized_query_payload("demo", "hybrid_query", "x" * 4000) is None  # dual
+    assert _unusable_query_payload("demo", "hybrid_query", "x" * 4000) is None  # dual
 
     # gate-2 sweep: hybrid_query's MCP11 incomplete-invocation refusal is the
     # SAME pre-_bounded early-return class — the tool runs the cap first,
@@ -1238,3 +1238,281 @@ async def test_browse_limit_is_bounded_and_chunk_previews_name_truncation() -> N
     by_ordinal = {c["ordinal"]: c for c in chunks["chunks"]}
     assert len(by_ordinal[0]["text_preview"]) == 200 and by_ordinal[0]["text_truncated"]
     assert by_ordinal[1]["text_preview"] == "短" and not by_ordinal[1]["text_truncated"]
+
+
+def test_a_query_the_store_cannot_hold_is_an_input_refusal_not_a_store_outage() -> None:
+    """QA5 D5/D9/D11: the §16 query gate used to pass three malformed classes
+    straight through to the stores, and each came back wearing the WRONG
+    diagnosis.
+
+    A NUL (or unpaired surrogate) reached Postgres, raised a DBAPIError, and
+    the §22 handler faithfully relabelled it STORE_UNAVAILABLE "postgres
+    unavailable" — one byte from the caller and the server LIED about
+    infrastructure health, telling a contract-abiding agent to back off from a
+    database that was fine. A whitespace-only query ran a real retrieval and
+    scored the corpus's own placeholder entity first: a confident answer to a
+    question nobody asked. Both must be refused BEFORE binding, in the
+    vocabulary that names the caller's own input."""
+    from core.mcp.server import _unusable_query_payload
+
+    for bad, why in (
+        ("海科館" + chr(0), "NUL"),
+        ("\ud800", "unpaired surrogate"),
+        ("   \t\n  ", "whitespace only"),
+        ("", "empty"),
+    ):
+        payload = _unusable_query_payload("demo", "semantic_search", bad)
+        assert payload is not None, why
+        # nil build: nothing was ever bound, so no store was consulted
+        assert payload["build_id"] == "00000000-0000-0000-0000-000000000000", why
+        assert payload["results"] == [], why
+        codes = [w["code"] for w in payload["warnings"]]
+        assert codes == ["GUARDRAIL_BLOCKED"], why  # never STORE_UNAVAILABLE
+        # the echo must survive the response's OWN utf-8 encoding: echoing a
+        # lone surrogate whole turned the refusal itself into a raw
+        # UnicodeEncodeError, so the caller learned nothing about its mistake
+        payload["query"].encode("utf-8")
+
+    # the over-block dual: a normal question is NOT refused, and the §21
+    # length cap still is (the guard absorbed that check, it did not lose it)
+    assert _unusable_query_payload("demo", "semantic_search", "票價多少") is None
+    assert _unusable_query_payload("demo", "semantic_search", "x" * 4000) is None
+    over = _unusable_query_payload("demo", "semantic_search", "x" * 4001)
+    assert over is not None and "4001" in over["warnings"][0]["message"]
+
+
+def test_an_unusable_introspection_subject_is_typed_before_binding() -> None:
+    """QA5 D5: get_entity had NO pre-binding validation, so a NUL in ``name``
+    became the same "postgres unavailable" lie. A blank exact-name lookup can
+    only be a caller bug — but a blank ``q`` is the documented
+    browse-everything case, so the guard must tell those two apart rather than
+    refusing both."""
+    from core.mcp.server import _unusable_subject_payload
+
+    bad = _unusable_subject_payload("demo", "name", "海科館" + chr(0))
+    assert bad is not None
+    assert bad["error_code"] == "INVALID_INPUT"  # not STORE_UNAVAILABLE
+    assert bad["build_id"] == "00000000-0000-0000-0000-000000000000"
+    assert "not a store outage" in bad["error"]
+    bad["subject"].encode("utf-8")  # sanitized echo, encodable
+
+    assert _unusable_subject_payload("demo", "name", "  ") is not None  # blank name = bug
+    assert _unusable_subject_payload("demo", "q", "", allow_blank=True) is None  # blank q = browse
+    assert _unusable_subject_payload("demo", "name", "票價資訊") is None  # a good name passes
+
+
+def test_every_refusal_echo_survives_its_own_serialization() -> None:
+    """QA5 D11, swept to the refusals that ALREADY rejected the input.
+
+    ``get_chunk``/``get_document`` parse the id and refuse a malformed one, so
+    the surrogate never reaches a store — but the refusal echoed the id RAW,
+    and the response then died encoding ITSELF: the caller got a transport
+    UnicodeEncodeError instead of the perfectly good "not a UUID" answer the
+    server had already computed. A guard that rejects the input but cannot
+    SAY so is not a guard; every echo of caller text needs the same
+    treatment, not just the one the defect was reported against."""
+    import json
+
+    from core.mcp.server import (
+        _invalid_chunk_payload,
+        _invalid_document_payload,
+        _unusable_param_payload,
+        _unusable_query_payload,
+        _unusable_subject_payload,
+    )
+
+    bad = "\ud800"
+    for label, payload in (
+        ("get_chunk", _invalid_chunk_payload("demo", bad)),
+        ("get_document", _invalid_document_payload("demo", bad)),
+        ("get_entity", _unusable_subject_payload("demo", "name", bad)),
+        ("graph seed", _unusable_param_payload("demo", "graph_query", "lbl", "entity", bad)),
+        ("query", _unusable_query_payload("demo", "semantic_search", bad)),
+    ):
+        assert payload is not None, label
+        # the response is serialized to JSON and encoded as utf-8 by the
+        # transport — a lone surrogate anywhere in it kills the whole answer
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        # and the substitution character is U+FFFD, not the "?" that
+        # encode(..., "replace") produces: the echo exists to show the SHAPE
+        # of the input, and a "?" is indistinguishable from one the caller
+        # actually typed
+        assert "�" in json.dumps(payload, ensure_ascii=False), label
+
+
+def test_the_seed_and_filter_parameters_are_guarded_like_the_query() -> None:
+    """QA5 D5 sibling sweep: ``_bounded`` guards the echoed LABEL, not the
+    traversal parameters, and ``label = query or f"{template}({entity})"`` —
+    so a caller supplying a clean ``query`` slipped a malformed SEED straight
+    through to the Postgres name lookup and drew the same fake
+    "postgres unavailable". ``entity_type`` is the matching hole on the browse
+    side: it rides the very same ``page_entities`` call as the ``q`` filter."""
+    from core.mcp.server import _unusable_param_payload, _unusable_subject_payload
+
+    nul = "海科館" + chr(0)
+    for field in ("entity", "other_entity"):
+        refusal = _unusable_param_payload("demo", "graph_query", "a clean label", field, nul)
+        assert refusal is not None, field
+        assert refusal["build_id"] == "00000000-0000-0000-0000-000000000000", field
+        assert [w["code"] for w in refusal["warnings"]] == ["GUARDRAIL_BLOCKED"], field
+        assert field in refusal["warnings"][0]["message"], field  # NAMES the parameter
+
+    assert _unusable_subject_payload("demo", "entity_type", nul, allow_blank=True) is not None
+    # the over-block dual: real seeds and a real type filter still pass
+    assert _unusable_param_payload("demo", "graph_query", "lbl", "entity", "票價資訊") is None
+    assert _unusable_subject_payload("demo", "entity_type", "EVENT", allow_blank=True) is None
+
+    # NO refusal message may describe the ECHO's contents. Four revisions
+    # tried to and were wrong four different ways — the substitution character
+    # was really "?"; the value was not echoed at all; a blank value carried
+    # the claim; a long blank re-earned it through truncation; a bad unit past
+    # the 80-char window fell outside it. The claim and the artifact were
+    # produced by different code under different rules, so patching the
+    # predicate again would only move the flaw. The reason names the offending
+    # CODE POINT instead, which is what the caller must act on, and a message
+    # that asserts nothing about the echo can never be wrong about it.
+    cases = (
+        (" " * 3, "short blank"),
+        (" " * 300, "blank past the echo window"),
+        ("\ud800", "mangled at index 0"),
+        ("x" * 100 + chr(0), "mangled PAST the echo window"),  # the uncovered shape
+    )
+    for value, why in cases:
+        refusal = _unusable_param_payload("demo", "semantic_search", "lbl", "query", value)
+        assert refusal is not None, why
+        message = refusal["warnings"][0]["message"]
+        assert "U+FFFD" not in message, why  # never claims anything about the echo
+        assert message.encode("utf-8"), why  # and still serializes
+    # the reason stays actionable WITHOUT the echo: it names the code point
+    named = _unusable_param_payload("demo", "t", "lbl", "query", "x" * 100 + chr(0))
+    assert named is not None and "U+0000" in named["warnings"][0]["message"]
+
+
+def test_framework_argument_failures_answer_typed_without_leaking_internals() -> None:
+    """QA5 D10/D12: a TYPE-level argument error never reached a tool body, so
+    it escaped the documented error vocabulary entirely — the caller got
+    pydantic's raw dump naming the SDK's generated model
+    (``semantic_searchArguments``) and the pinned pydantic version's docs URL:
+    internals an unauthenticated caller cannot act on and should not see.
+
+    D12 is the same seam from the other side: pydantic coerces JSON ``true``
+    into 1 BEFORE any body runs, so the server's own ``type(limit) is not int``
+    guard was dead code and ``{"limit": true}`` became a successful 1-item page
+    — a client bug given a green light. ``false`` was worse: it arrived as 0
+    and the range error quoted "0", a value the caller never sent."""
+    from mcp import types as _mcp_types
+    from pydantic import BaseModel, ValidationError
+
+    from core.mcp.server import _argument_refusal, _readable_validation_error
+
+    class _Args(BaseModel):
+        query: str
+
+    try:
+        _Args(query=cast(str, None))
+        raise AssertionError("expected a validation error")
+    except ValidationError as exc:
+        rendered = _readable_validation_error(exc)
+    assert rendered.startswith("query: ")  # the parameter is NAMED
+    assert "_Args" not in rendered and "pydantic.dev" not in rendered  # no internals
+
+    refusal = _argument_refusal("list_entities", "limit: expected an integer, got the boolean true")
+    assert refusal.isError is True
+    block = refusal.content[0]
+    assert isinstance(block, _mcp_types.TextContent)
+    assert refusal.structuredContent == {"error": block.text, "error_code": "INVALID_INPUT"}
+    # a CallToolResult is handed back VERBATIM by the SDK — any other shape
+    # would be re-reported as an "Output validation error" against the six §16
+    # tools' advertised outputSchema, burying the caller's real mistake
+    assert isinstance(refusal, _mcp_types.CallToolResult)
+
+
+async def test_the_dispatch_guard_is_actually_wired_into_the_registered_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """QA5 D10/D12, driven through the REAL seam rather than by hand.
+
+    Asserting on the refusal builders alone leaves the wiring unpinned:
+    ``_guard_tool_dispatch(server)`` could be deleted outright and a
+    builder-only test stays green, which is exactly the false-green this
+    project treats as a defect. So this drives
+    ``request_handlers[CallToolRequest]`` — the handler an actual MCP client
+    reaches — and pins that BOTH classes come back typed.
+
+    It also tripwires the SDK internals the guard reads: the bool check walks
+    ``_tool_manager._tools[...].parameters``, and every accessor on that path
+    is a ``getattr``/``.get`` that degrades SILENTLY to "no refusal" if the
+    SDK renames a field — the leak would reopen with every test still green
+    (the MCP17 ``_evict_from_manager`` lesson). The same reasoning covers
+    ``ToolError.__cause__``: the guard's primary branch depends on the SDK
+    wrapping validation errors, so a version that stops wrapping must turn
+    this red rather than quietly fall through to the defensive branch."""
+    import inspect
+
+    import mcp.server.fastmcp.tools.base as _sdk_tool_base
+    from mcp import types as _mcp_types
+    from mcp.server.fastmcp.exceptions import ToolError
+    from pydantic import ValidationError as _ValidationError
+
+    import core.mcp.server as server_module
+    from core.mcp.server import build_server
+
+    monkeypatch.setattr(server_module, "chat_model", lambda: cast(Any, object()))
+    monkeypatch.setattr(server_module, "query_embedding_model", lambda: cast(Any, object()))
+    monkeypatch.setattr(server_module, "vector_client", lambda: cast(Any, object()))
+    monkeypatch.setattr(server_module, "graph_driver", lambda: cast(Any, object()))
+    monkeypatch.setattr(
+        server_module, "create_async_engine", lambda *a, **k: SimpleNamespace(dispose=None)
+    )
+    server = build_server("demo")
+
+    # --- SDK attribute tripwires: the guard reads these; a rename must be red
+    tool = server._tool_manager._tools["list_entities"]  # noqa: SLF001
+    assert isinstance(tool.parameters, dict)  # the schema the bool check reads
+    assert "limit" in tool.parameters.get("properties", {})
+    assert issubclass(ToolError, Exception)
+    src = inspect.getsource(_sdk_tool_base)
+    assert "raise ToolError" in src and "from e" in src, (
+        "the guard's primary branch reads ValidationError off ToolError.__cause__ — "
+        "an SDK that stops chaining would silently demote it to the fallback branch"
+    )
+    assert issubclass(_ValidationError, Exception)
+
+    handler = server._mcp_server.request_handlers[_mcp_types.CallToolRequest]  # noqa: SLF001
+
+    async def _call(name: str, arguments: dict[str, Any]) -> _mcp_types.CallToolResult:
+        request = _mcp_types.CallToolRequest(
+            method="tools/call",
+            params=_mcp_types.CallToolRequestParams(name=name, arguments=arguments),
+        )
+        result = await handler(request)
+        return cast(_mcp_types.CallToolResult, result.root)
+
+    # D12: pydantic coerces JSON true -> 1 BEFORE any body runs, so the
+    # server's own `type(limit) is not int` guard was dead code and this used
+    # to be a perfectly successful 1-item page
+    boolean = await _call("list_entities", {"limit": True})
+    assert boolean.isError is True
+    assert boolean.structuredContent == {
+        "error": cast(_mcp_types.TextContent, boolean.content[0]).text,
+        "error_code": "INVALID_INPUT",
+    }
+    assert "boolean true" in cast(_mcp_types.TextContent, boolean.content[0]).text
+
+    # false was worse: it arrived as 0 and the range error quoted "0", a value
+    # the caller never sent
+    assert (
+        "boolean false"
+        in cast(
+            _mcp_types.TextContent, (await _call("list_entities", {"limit": False})).content[0]
+        ).text
+    )
+
+    # D10: a type error never reached a tool body, so it escaped the error
+    # vocabulary entirely — pydantic's raw dump named the SDK's generated
+    # model and linked the pinned pydantic version's docs
+    typed = await _call("semantic_search", {"query": None})
+    assert typed.isError is True
+    text = cast(_mcp_types.TextContent, typed.content[0]).text
+    assert "query: " in text  # the parameter is NAMED
+    assert "Arguments" not in text and "pydantic.dev" not in text  # no internals
