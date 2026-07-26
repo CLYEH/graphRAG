@@ -19,22 +19,33 @@ from core.metadata.schema import unstorable_string_reason
 
 
 def reject_unusable_text(value: str | None, field: str) -> None:
-    """Refuse a caller string Postgres cannot hold, BEFORE it reaches a query.
+    """Refuse a caller string Postgres cannot hold.
 
     QA5 on the REST half: a NUL rode into the SQL predicate and came back a
     ``DBAPIError``, which this facade reported as a bare 500 ``INTERNAL`` —
     a server-bug envelope for a caller's own byte, telling an operator to go
     look for a fault that never happened. The predicate is the SAME
     ``unstorable_string_reason`` the write path and the MCP surface use, so
-    all three agree on what is storable rather than each deciding locally."""
+    all three agree on what is storable rather than each deciding locally.
+
+    The message says WHAT is wrong and that it is the request's fault, and
+    deliberately makes no claim about WHEN it ran. A shared helper cannot
+    assert anything about where its callers place it: this text once read
+    "rejected before any store was read", which was true where it was first
+    dropped in and false the moment ``single_filter_value`` carried it into a
+    path that binds first — and for the schema-declared attribute facets it
+    can never be true, since those field names come from the project row
+    itself. Callers that CAN refuse before reading still should (and the
+    ``q`` sites do, pinned by an ordering test); the claim just does not
+    belong in text every caller has to keep honest."""
     if value is None:
         return
     reason = unstorable_string_reason(value)
     if reason is not None:
         raise ApiError(
             ErrorCode.VALIDATION_ERROR,
-            f"{field} {reason} — remove it and retry; rejected before any "
-            "store was read, so this is an input problem, not an outage",
+            f"{field} {reason} — remove it and retry; this is a problem with "
+            "the request, not a store outage",
             details={field: "unstorable"},
         )
 

@@ -1484,6 +1484,70 @@ def test_framework_argument_failures_answer_typed_without_leaking_internals() ->
     assert reported == set(_ENVELOPE_TOOLS.values()), (reported, set(_ENVELOPE_TOOLS.values()))
 
 
+async def test_every_pre_binding_claim_is_pinned_by_a_raising_bind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """These refusals TELL the caller "rejected before any store was read" —
+    the anti-back-off signal D5 exists to deliver, since the same input used to
+    come back as ``STORE_UNAVAILABLE`` and send an agent into retry.
+
+    A message may assert only what its asserter can guarantee, and that needs a
+    closed caller set AND a mechanical pin. The REST twin of this claim had
+    neither: ``single_filter_value`` opened the caller set, one caller
+    structurally could not comply, and nothing went red — so the clause was
+    dropped there. Here the caller set IS closed (these tool bodies), which
+    makes the claim keepable — but "true today" is exactly the state REST was
+    in the moment before it broke. So it is pinned: binding RAISES, and every
+    guard must still answer, which is only possible if it runs first."""
+    from mcp import types as _mcp_types
+
+    import core.mcp.server as server_module
+    from core.mcp.server import build_server
+
+    monkeypatch.setattr(server_module, "chat_model", lambda: cast(Any, object()))
+    monkeypatch.setattr(server_module, "query_embedding_model", lambda: cast(Any, object()))
+    monkeypatch.setattr(server_module, "vector_client", lambda: cast(Any, object()))
+    monkeypatch.setattr(server_module, "graph_driver", lambda: cast(Any, object()))
+    monkeypatch.setattr(
+        server_module, "create_async_engine", lambda *a, **k: SimpleNamespace(dispose=None)
+    )
+    server = build_server("demo")
+
+    def _explode() -> Any:
+        raise AssertionError("the guard must refuse BEFORE the build is bound")
+
+    runtime = SimpleNamespace(
+        context=SimpleNamespace(project="demo", bound=_explode),
+        policy=SimpleNamespace(max_latency_ms=10_000, max_top_k=20),
+        exposure=None,
+    )
+    monkeypatch.setattr(
+        server,
+        "get_context",
+        lambda: SimpleNamespace(request_context=SimpleNamespace(lifespan_context=runtime)),
+    )
+    handler = server._mcp_server.request_handlers[_mcp_types.CallToolRequest]  # noqa: SLF001
+    nul = "海科館" + chr(0)
+
+    for tool, arguments in (
+        ("get_entity", {"name": nul}),  # _unusable_subject_payload
+        ("list_entities", {"q": nul}),  # the same, via the browse filter
+        ("semantic_search", {"query": nul}),  # _unusable_query_payload, inside _bounded
+        ("graph_query", {"template": "neighbors", "entity": nul}),  # _unusable_param_payload
+        ("hybrid_query", {"query": "票價", "graph_template": "neighbors", "graph_entity": nul}),
+    ):
+        request = _mcp_types.CallToolRequest(
+            method="tools/call",
+            params=_mcp_types.CallToolRequestParams(name=tool, arguments=arguments),
+        )
+        result = cast(_mcp_types.CallToolResult, (await handler(request)).root)
+        structured = result.structuredContent
+        assert structured is not None, tool
+        # the nil sentinel is the machine-readable half of the same claim: no
+        # build was ever resolved, because nothing ever tried to resolve one
+        assert structured["build_id"] == "00000000-0000-0000-0000-000000000000", tool
+
+
 async def test_the_dispatch_guard_is_actually_wired_into_the_registered_handler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

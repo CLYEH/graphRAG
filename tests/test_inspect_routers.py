@@ -549,6 +549,50 @@ def test_a_search_string_the_store_cannot_hold_is_a_400_not_a_500(
     assert client.get("/projects/p/documents", params={"q": "corpus"}).status_code == 200
 
 
+def test_the_search_guard_runs_before_the_build_lookup(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The refusal above TELLS the caller nothing was read — so it must run
+    # before anything reads. Placed after the bind (where it first landed), a
+    # malformed q on a project with no active build answered NO_ACTIVE_BUILD
+    # instead, and the refusal's own claim would have been false: the same
+    # "a message asserting something it does not control" defect this task
+    # exists to end. It is an INPUT-shape check, so it belongs with the other
+    # input-shape rejections, above the registry/build lookup.
+    import api.routers.inspect as inspect_module
+
+    async def _no_active_build(conn: Any, project: str) -> Any:
+        raise AssertionError("the guard must refuse before any registry/build read")
+
+    monkeypatch.setattr(inspect_module, "_bind", _no_active_build)
+    monkeypatch.setattr(inspect_module, "get_project", _no_active_build)
+    for path in ("/projects/p/documents", "/projects/p/entities"):
+        r = client.get(path, params={"q": "海科館" + chr(0)})
+        assert r.status_code == 400, path
+        assert r.json()["error"]["code"] == "VALIDATION_ERROR", path
+
+
+def test_no_refusal_message_claims_an_ordering_the_shared_helper_cannot_keep(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    # `single_filter_value` carries the SAME refusal into paths that bind
+    # first, and for schema-declared attribute facets it can NEVER precede the
+    # read — those field names come from the project row itself. So the shared
+    # message must not assert when it ran: a text every caller has to keep
+    # honest goes false the first time a caller is added. It still says what
+    # is wrong and whose fault it is, which is the actionable half.
+    _bindable(monkeypatch)
+    repo.pages = (_doc_row(),)
+    repo.total = 1
+    r = client.get("/projects/p/documents", params={"filter[status]": "ready" + chr(0)})
+    assert r.status_code == 400
+    body = r.json()["error"]
+    assert body["code"] == "VALIDATION_ERROR"
+    assert "U+0000" in body["message"]  # still names the code point
+    assert "not a store outage" in body["message"]  # still assigns the fault
+    assert "before any store" not in body["message"]  # claims no ordering
+
+
 def test_blank_and_overlong_q_are_rejected(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
 ) -> None:
