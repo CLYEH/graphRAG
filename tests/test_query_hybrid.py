@@ -377,6 +377,20 @@ def test_fusion_keeps_a_floor_of_passages_so_the_page_is_never_all_entities() ->
     assert fits_truncated is False
     assert {r.id for r in fits} == {r.id for r in small}  # nothing evicted at all
 
+    # The floor is PROPORTIONAL (top_k // 2), so a single-result page has no
+    # half to reserve and rank alone decides — it can legitimately be an
+    # entity even when a chunk was available (Codex #142). Pinned because the
+    # tool description states this edge: promising otherwise would either lie
+    # or force a passage over the caller's own ranking on a page they
+    # deliberately narrowed to one, and would split hybrid from `_fair_page`,
+    # which computes the same floor.
+    both_modes = (_result("entity", rid="shared", score=1.0),)
+    one_each = (_result("entity", rid="shared", score=0.7), _result("chunk", rid="ck", score=0.5))
+    single, _ = _fuse([both_modes, one_each], top_k=1)
+    assert [r.result_type for r in single] == ["entity"]  # the doubly-ranked entity wins
+    pair, _ = _fuse([both_modes, one_each], top_k=2)
+    assert [r.result_type for r in pair].count("chunk") == 1  # floor engages from top_k=2
+
 
 async def test_fusion_clips_to_top_k_and_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     results = [_result(rid=f"r{i}") for i in range(3)]
