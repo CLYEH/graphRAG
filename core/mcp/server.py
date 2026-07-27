@@ -259,6 +259,52 @@ def _bool_for_integer_reason(server: FastMCP, name: str, arguments: dict[str, An
     return None
 
 
+def _unknown_parameter_reason(server: FastMCP, name: str, arguments: dict[str, Any]) -> str | None:
+    """QA3 D3: an argument name this tool does not declare.
+
+    The generated argument model carries pydantic's DEFAULT ``extra`` policy —
+    ``ignore`` — so a misspelled key is DROPPED and the real parameter falls
+    back to its default: ``semantic_search {"query": …, "topk": 3}`` silently
+    served 20 results instead of 3, with ``warnings: []`` and no error code.
+    A clean success carrying an answer to a different question is the worst
+    shape a wrong call can take, and the callers here are LLM agents — the
+    population most likely to emit a plausible-but-wrong parameter name. REST
+    already refuses the identical typo with ``400 extra_forbidden``; this is
+    the MCP facade catching up to its sibling.
+
+    Compared against the RAW mapping, which is sound because the framework's
+    own ``pre_parse_json`` returns "a dict with same keys as input" — it
+    transforms VALUES, never the key set (the Codex #140 r5 lesson: run the
+    framework's transform rather than assume it, and here the transform
+    provably leaves keys alone). Every registered tool exposes ``properties``,
+    including the no-argument ``list_schema`` whose empty set makes any key
+    unknown — which is correct, not a crash.
+    """
+    tool = server._tool_manager._tools.get(name)  # noqa: SLF001 — no public accessor
+    schema = getattr(tool, "parameters", None) if tool is not None else None
+    if not isinstance(schema, dict):
+        return None  # an unknown tool: the SDK's own dispatch refuses it
+    declared = set((schema.get("properties") or {}).keys())
+    unknown = sorted(set(arguments) - declared)
+    if not unknown:
+        return None
+    # The KEY is caller-chosen bytes — the first echo path in this module whose
+    # text does not come from our own schema (the bool check echoes a DECLARED
+    # key; _readable_validation_error's loc can only be a declared field,
+    # because the model is extra="ignore"). So it takes the same two guards
+    # every other echo here does: _safe_echo, or an unpaired surrogate in a key
+    # kills the response in serialization and the caller gets NOTHING back
+    # (QA5/D11 — the refusal dying in its own encoding); and a window, or a
+    # 5000-char key reflects a 5000-char message (#133 r1: no refusal path
+    # reflects a large input). `accepts` is built from our schema and needs
+    # neither.
+    shown = ", ".join(_safe_echo(key, 80) for key in unknown[:5])
+    if len(unknown) > 5:
+        shown = f"{shown} (+{len(unknown) - 5} more)"
+    accepts = ", ".join(sorted(declared)) if declared else "no arguments"
+    return f"{shown}: unknown parameter (this tool accepts {accepts})"
+
+
 def _argument_refusal(
     tool: str, detail: str, *, project: str, arguments: dict[str, Any]
 ) -> mcp_types.CallToolResult:
@@ -326,7 +372,9 @@ def _guard_tool_dispatch(server: FastMCP, project: str) -> None:
     inner = server.call_tool
 
     async def guarded(name: str, arguments: dict[str, Any]) -> Any:
-        reason = _bool_for_integer_reason(server, name, arguments)
+        reason = _bool_for_integer_reason(server, name, arguments) or _unknown_parameter_reason(
+            server, name, arguments
+        )
         if reason is not None:
             return _argument_refusal(name, reason, project=project, arguments=arguments)
         tool = server._tool_manager._tools.get(name)  # noqa: SLF001 — no public accessor
@@ -388,6 +436,16 @@ def _finalize_server_metadata(server: FastMCP) -> None:
     for name in _ENVELOPE_TOOLS:
         tool = server._tool_manager._tools[name]  # noqa: SLF001
         tool.__dict__["output_schema"] = frozen
+    # QA3 D3: ADVERTISE the rule the dispatch guard enforces. Enforcement alone
+    # leaves the published schema saying extra keys are acceptable, so a
+    # schema-reading client learns the constraint only by being refused —
+    # taking a behavior without the sentence it makes true (the QA2 lesson).
+    # JSON Schema's default for a missing `additionalProperties` is permissive,
+    # so the absence WAS a claim, and it was the wrong one.
+    for tool in server._tool_manager._tools.values():  # noqa: SLF001
+        schema = getattr(tool, "parameters", None)
+        if isinstance(schema, dict) and "additionalProperties" not in schema:
+            tool.__dict__["parameters"] = {**schema, "additionalProperties": False}
 
 
 #: the store CLIENTS' exception families (§22 STORE_UNAVAILABLE) and their
