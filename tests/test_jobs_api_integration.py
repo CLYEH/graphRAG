@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from api.app import create_app
-from api.deps import arq_redis_provider, db_conn
+from api.deps import arq_redis_provider, db_conn, db_conn_provider
 from core.config import get_settings
 from core.registry import get_job, set_progress
 from core.stores.tables import idempotency_keys
@@ -71,7 +72,17 @@ async def api(migrated: None, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[
 
         return _get
 
+    # A handler that OWNS its transaction resolves db_conn_provider, not
+    # db_conn — and it must be the SAVEPOINT variant, or the delete would run
+    # on a second real connection that cannot see this outer transaction and
+    # would commit for real, bypassing the rollback-at-teardown isolation.
+    @asynccontextmanager
+    async def _open_nested() -> AsyncIterator[AsyncConnection]:
+        async with conn.begin_nested():
+            yield conn
+
     app.dependency_overrides[db_conn] = _override
+    app.dependency_overrides[db_conn_provider] = lambda: _open_nested
     app.dependency_overrides[arq_redis_provider] = _provider
     monkeypatch.setattr("api.routers.triggers.enqueue_build", _spy_enqueue)
     transport = ASGITransport(app=app)
