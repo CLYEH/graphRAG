@@ -1122,10 +1122,14 @@ def build_server(project: str) -> FastMCP:
         `confidence` carries its origin mode's RAW score (cosine for
         semantic) — comparable within a mode, not across modes. No warning
         flags an out-of-domain question (see semantic_search on why scores
-        cannot) — judge answerability from the returned content. Text
-        passages are guaranteed up to half the fused page whenever the
-        semantic mode returns any — a floor of top_k//2, so at top_k=1 there
-        is no half to reserve and rank alone decides; for factual text
+        cannot) — judge answerability from the returned content. The page
+        reserves a share for each KIND of answer it carries: HALF for text
+        passages, a quarter for graph facts (relation/path), an eighth each
+        for sql rows and bare entity names — so the abundant names cannot
+        take the page. A kind with nothing to offer yields its slots to the
+        others. Each share rounds down, so the passage half appears from
+        top_k=2, the quarter from top_k=4, the eighths from top_k=8, and at
+        top_k=1 nothing is reserved and rank alone decides. For factual text
         questions semantic_search alone is often faster."""
         rt = _rt()
         # cap FIRST (the explain_retrieval ordering, Codex #133 r1 class):

@@ -22,10 +22,11 @@ with a MODE_SKIPPED warning.
 comparable (cosine vs positional), ranks are. Duplicates (same result_type +
 id across modes) merge — first mode's payload wins (mode order is fixed, so
 the merge is deterministic), source_refs union. The fused list is clipped to
-``top_k`` with TRUNCATED (§22) — but NOT by rank alone: a passage floor
-(:func:`_chunk_floor`) reserves chunks their share first, because RRF ranks
-entity and passage hits against each other and a mode returning many strong
-entities would otherwise take the whole page (QA2/D1).
+``top_k`` with TRUNCATED (§22) — but NOT by rank alone: :func:`_fair_page`
+first reserves a share for each KIND of answer (passage · stated fact ·
+name), because RRF ranks them all against each other and entities, the most
+abundant and least informative type, would otherwise take the whole page
+(QA2/D1).
 
 **Failure boundary = the mode** (§22 verbatim: 單一 store 不可用 → hybrid 降級
 為可用模態子集,warnings 標示,不整體失敗): each mode call is individually
@@ -77,6 +78,19 @@ _MODE_ORDER = ("semantic", "graph", "sql")
 #: RRF's standard damping constant — rank 1 scores 1/61; the exact value only
 #: shifts absolute scores, never the relative order for a single list.
 _RRF_K = 60
+
+#: :func:`_fair_page` bucket per ``result_type`` — the KINDS of answer a fused
+#: page carries, each with its own rank economics (see that function).
+_FLOOR_BUCKET = {"chunk": 0, "relation": 1, "path": 1, "row": 2, "entity": 3}
+
+#: Where an UNRECOGNISED ``result_type`` lands. It is the names bucket, i.e. the
+#: smallest floor — deliberately, because the only unknown reachable today is
+#: nothing at all (``community_report`` is never fused, MCP8), and a type this
+#: file has not reasoned about should not silently claim a reserved share ahead
+#: of the four it has. The cost is the QA2 class in miniature: a future
+#: answer-bearing type would be under-served until it is given its own bucket,
+#: so ADD IT HERE when one is introduced rather than relying on this default.
+_UNKNOWN_BUCKET = 3
 
 #: §16 debug.stores_used per mode (the stores a mode reads).
 _MODE_STORES = {
@@ -419,9 +433,9 @@ def _fuse(
     currency: ``score(d) = Σ 1/(k + rank_mode(d))``. Duplicates (same
     result_type + id) accumulate rank contributions and merge their
     source_refs (first mode's payload wins; mode order is fixed, so the merge
-    is deterministic). Clipped to ``top_k`` through :func:`_chunk_floor`, which
-    reserves passages their share of the page rather than clipping by rank
-    alone (TRUNCATED reported by caller)."""
+    is deterministic). Clipped to ``top_k`` through :func:`_fair_page`, which
+    reserves each KIND of answer a share rather than clipping by rank alone
+    (TRUNCATED reported by caller)."""
     scores: dict[tuple[str, str], float] = {}
     first: dict[tuple[str, str], RetrievalResult] = {}
     merged_refs: dict[tuple[str, str], list[SourceRef]] = {}
@@ -456,10 +470,10 @@ def _fuse(
         for key, base in first.items()
     ]
     ordered = ordered_results(fused)
-    return ordered_results(_chunk_floor(ordered, top_k)), len(ordered) > top_k
+    return ordered_results(_fair_page(ordered, top_k)), len(ordered) > top_k
 
 
-def _chunk_floor(ordered: tuple[RetrievalResult, ...], top_k: int) -> list[RetrievalResult]:
+def _fair_page(ordered: tuple[RetrievalResult, ...], top_k: int) -> list[RetrievalResult]:
     """Guarantee passage results a share of the fused page (QA2/D1).
 
     RRF ranks every mode's results against each other, so a mode that returns
@@ -472,35 +486,69 @@ def _chunk_floor(ordered: tuple[RetrievalResult, ...], top_k: int) -> list[Retri
     This is the SIBLING of the skew :func:`core.query.semantic._fair_page`
     already fixes one facade over (MCP6: 1405 entities vs 442 chunks let bare
     name matches crowd out every passage), so it takes that helper's shape
-    rather than re-deriving one: a floor of ``top_k // 2``, ``min(floor, len)``
-    so a scarce type never BLOCKS the other (the §22 over-block dual), the rest
+    rather than re-deriving one: a per-bucket floor, ``min(floor, len)`` so a
+    scarce bucket never BLOCKS the others (the §22 over-block dual), the rest
     by fused score with the id tiebreak (#34: rerun-stable). Final §16 ordering
     is re-imposed downstream by ``ordered_results`` (the caller owns it, as in
-    the sibling).
+    the sibling). Floors are PROPORTIONAL, so a page too small to divide
+    reserves nothing and rank alone decides — the tool description says so
+    rather than promising otherwise.
 
-    Chunks are the passage bucket; everything else shares the other floor. The
-    sibling worth naming is ``row``, which DOES carry text (``core.query.sql``
-    renders it): it stays out because the demotion this fixes is WITHIN a mode
-    — semantic's own §16 ordering buries its chunks at ranks 11-20 behind its
-    higher-cosine entities, whereas sql rows occupy ranks 1..N of their own
-    list and are never pushed down before fusion sees them.
-    (``community_report`` needs no ruling: global is not a fused mode, MCP8.)
+    THREE buckets, not two (Codex #142 r2). Lumping relations with entities
+    reproduced the same defect one level down: ``core.query.graph._score``
+    assigns positional scores across ``[entities…, relations…]``, so a graph
+    mode's relations ALWAYS rank below its own entities, and a shared
+    entity+relation floor spent every slot on entities. Measured on the fused
+    shapes: a 5-entity/15-relation graph answer kept 5 relations under rank-only
+    fusion and **0** under a two-bucket floor — this fix would have silently
+    deleted the graph answers it was not aiming at, and depressed §20
+    ``relation_hit_rate`` with it. The buckets are therefore the KINDS of answer
+    a fused page carries, each with its own rank economics:
+
+    * ``chunk`` — the passage text;
+    * ``relation``/``path`` — a stated graph fact, demoted behind its own
+      mode's entities by ``_score``;
+    * ``row`` — a stated sql fact, which is NOT demoted (rows hold ranks 1..N
+      of their own list), so it gets its own share rather than out-competing
+      relations for a shared one;
+    * ``entity`` — a NAME, the low-information type whose abundance causes the
+      crowding in the first place.
+
+    ``min(floor, len)`` per bucket keeps the §22 over-block dual: a bucket that
+    is empty or scarce yields its slots to the others, so a page with no graph
+    answers is still full and a page with no passages is still full. (It is not
+    IDENTICAL to the two-bucket page — the name floor also changed, so leftover
+    passages win backfill they used to lose; only the yields-its-slots property
+    is claimed.) (``community_report`` needs no ruling: global is not a fused
+    mode, MCP8.)
 
     Operates on the FUSED list, whose entries are each mode's own validated
     results (semantic has already applied ``_fair_page`` and SoR validation) —
     the Codex #126 rule that a floor slot must never be filled by an unvalidated
     hit that then evicts a fetched valid one.
     """
-    chunks = [result for result in ordered if result.result_type == "chunk"]
-    others = [result for result in ordered if result.result_type != "chunk"]
-    floor = top_k // 2
-    take_chunks = min(floor, len(chunks))
-    take_others = min(floor, len(others))
-    page = chunks[:take_chunks] + others[:take_others]
-    rest = sorted(
-        chunks[take_chunks:] + others[take_others:],
-        key=lambda result: (-result.score, result.id),
-    )
+    buckets: list[list[RetrievalResult]] = [[], [], [], []]
+    for result in ordered:
+        buckets[_FLOOR_BUCKET.get(result.result_type, _UNKNOWN_BUCKET)].append(result)
+    # 4:2:1:1 — passages keep the half QA2 measured and verified live; graph
+    # facts, sql rows and bare names split the rest. Two shapes were tried and
+    # measured wrong first. EQUAL thirds drops the passage floor from 10 to 6 on
+    # a 20-slot page even when no graph answer exists to use the slots,
+    # weakening the guarantee this function exists for. And putting `row` WITH
+    # the graph facts reproduced the defect one level down: sql rows occupy
+    # ranks 1..N of their OWN list (RRF 1/61…) while `core.query.graph._score`
+    # demotes relations behind their own mode's entities (1/66…), so rows took
+    # the entire facts share and every relation was evicted — measured
+    # {'entity': 7, 'row': 5, 'chunk': 8}, relations 0. The divisors sum to 1
+    # (1/2 + 1/4 + 1/8 + 1/8), so the floors never over-subscribe the page.
+    floors = (top_k // 2, top_k // 4, top_k // 8, top_k // 8)
+    page: list[RetrievalResult] = []
+    spare: list[RetrievalResult] = []
+    for bucket, floor in zip(buckets, floors, strict=True):
+        take = min(floor, len(bucket))
+        page += bucket[:take]
+        spare += bucket[take:]
+    rest = sorted(spare, key=lambda result: (-result.score, result.id))
     return page + rest[: top_k - len(page)]
 
 

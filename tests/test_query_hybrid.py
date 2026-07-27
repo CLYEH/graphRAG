@@ -354,7 +354,10 @@ def test_fusion_keeps_a_floor_of_passages_so_the_page_is_never_all_entities() ->
     fused, truncated = _fuse([entities, semantic], top_k=20)
     kinds = [r.result_type for r in fused]
     assert len(fused) == 20 and truncated is True
-    # the defect: this was 0 before the floor
+    # the defect: this was 0 before the floor. Floors are 4:2:1:1 — passages
+    # keep half the page, graph facts a quarter, sql rows and names an eighth
+    # each — so with no facts or rows in play their unused slots flow to names
+    # on rank, and passages still hold their measured half.
     assert kinds.count("chunk") == 10, "passages must hold their half of the page"
     assert kinds.count("entity") == 10
 
@@ -377,19 +380,43 @@ def test_fusion_keeps_a_floor_of_passages_so_the_page_is_never_all_entities() ->
     assert fits_truncated is False
     assert {r.id for r in fits} == {r.id for r in small}  # nothing evicted at all
 
-    # The floor is PROPORTIONAL (top_k // 2), so a single-result page has no
-    # half to reserve and rank alone decides — it can legitimately be an
-    # entity even when a chunk was available (Codex #142). Pinned because the
-    # tool description states this edge: promising otherwise would either lie
-    # or force a passage over the caller's own ranking on a page they
-    # deliberately narrowed to one, and would split hybrid from `_fair_page`,
-    # which computes the same floor.
+    # Each share ROUNDS DOWN (floors are top_k//2, //4, //8, //8), so a page
+    # too small to divide reserves nothing and rank alone decides — the single
+    # slot can legitimately be an entity even when a chunk was available (Codex
+    # #142 r1). Pinned because the tool description states this edge: promising
+    # otherwise would either lie, or force a passage over the caller's own
+    # ranking on a page they deliberately narrowed to one.
     both_modes = (_result("entity", rid="shared", score=1.0),)
     one_each = (_result("entity", rid="shared", score=0.7), _result("chunk", rid="ck", score=0.5))
     single, _ = _fuse([both_modes, one_each], top_k=1)
     assert [r.result_type for r in single] == ["entity"]  # the doubly-ranked entity wins
+    # ...and the passage half appears from top_k=2, which is where the
+    # description says it does — the only pin on where the guarantee BEGINS
     pair, _ = _fuse([both_modes, one_each], top_k=2)
-    assert [r.result_type for r in pair].count("chunk") == 1  # floor engages from top_k=2
+    assert [r.result_type for r in pair].count("chunk") == 1
+
+    # STATED FACTS ARE NOT NAMES, AND SQL ROWS ARE NOT GRAPH FACTS (Codex #142
+    # r2 + gate-2). `core.query.graph._score` positions relations AFTER
+    # entities in the graph mode's own list, so a bucket shared with entities
+    # spent every slot on entities and deleted the graph answers this change
+    # never aimed at — depressing §20 relation_hit_rate with them. Rows then
+    # reproduced it one level down: sql rows hold ranks 1..N of their OWN list,
+    # so sharing a bucket with the demoted relations let rows take the whole
+    # share and evict every relation. Separate buckets keep both.
+    graph_dense = tuple(
+        _result("entity", rid=f"gd{i}", score=1.0 - i * 0.01) for i in range(2)
+    ) + tuple(_result("relation", rid=f"rel{i}", score=0.5 - i * 0.01) for i in range(12))
+    sem_mixed = tuple(
+        _result("entity", rid=f"sm{i}", score=0.7 - i * 0.01) for i in range(10)
+    ) + tuple(_result("chunk", rid=f"cm{i}", score=0.4 - i * 0.01) for i in range(8))
+    facts = [r.result_type for r in _fuse([graph_dense, sem_mixed], top_k=20)[0]]
+    assert facts.count("relation") == 5, "graph facts must not compete with names"
+    assert facts.count("chunk") == 8  # and not at the passage share's expense
+
+    sql_rows = tuple(_result("row", rid=f"rw{i}", score=0.9 - i * 0.01) for i in range(10))
+    mixed = [r.result_type for r in _fuse([graph_dense, sem_mixed, sql_rows], top_k=20)[0]]
+    assert mixed.count("relation") == 5, "rows must not evict the demoted relations"
+    assert mixed.count("row") == 3 and mixed.count("chunk") == 8
 
 
 async def test_fusion_clips_to_top_k_and_flags(monkeypatch: pytest.MonkeyPatch) -> None:
