@@ -151,6 +151,19 @@ async def delete_project_endpoint(open_conn: ConnProvider, project: str) -> Resp
             raise translate_registry_error(exc) from exc
         if not existed:
             raise _not_found(project)
+    # The corpus directory is addressed by NAME, and a name is reusable the
+    # moment the row is gone. Multiple one-worker instances sharing a corpus
+    # root is the documented scaling shape, so between the commit above and
+    # the rmtree below another instance can create this same name and upload
+    # into it — and a name-based delete would then destroy the NEW project's
+    # documents (Codex #145 P1). Re-check against the SoR first: if the name
+    # is taken again, the directory belongs to a generation we are not
+    # deleting, and we leave it alone. That degrades to the pre-existing leak
+    # — which is already a filed follow-up — instead of deleting a live
+    # project's corpus, so the default outcome is never worse than today.
+    async with open_conn() as conn:
+        if await get_project(conn, project) is not None:
+            return Response(status_code=204)
     _delete_upload_dir(project)
     return Response(status_code=204)
 

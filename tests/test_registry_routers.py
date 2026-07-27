@@ -134,7 +134,12 @@ def test_delete_project_204_and_has_builds(
     async def ok(conn: Any, name: str) -> bool:
         return True
 
+    async def _gone(conn: Any, name: str) -> None:
+        return None
+
     _stub(monkeypatch, "projects", "delete_project", ok)
+    # the post-commit re-check (Codex #145 P1) consults the SoR before cleanup
+    _stub(monkeypatch, "projects", "get_project", _gone)
     r = client.delete("/projects/p")
     assert r.status_code == 204
     assert r.content == b""
@@ -375,6 +380,42 @@ def test_deleting_a_project_removes_its_uploads_without_escaping_the_corpus_root
     assert (tmp_path / "neighbour").exists() and tmp_path.exists()
 
 
+def test_a_recreated_project_keeps_its_corpus_when_an_old_delete_cleans_up(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name is reusable the moment its row is gone (Codex #145 P1).
+
+    The corpus directory is addressed by NAME, and multiple one-worker
+    instances sharing a corpus root is the documented scaling shape — so
+    between this delete's COMMIT and its rmtree, another instance can create
+    the same name and upload into it. A name-based delete would then destroy
+    the NEW project's documents: worse than the leak this change removes.
+
+    The endpoint therefore re-checks the source of truth after committing and
+    skips cleanup when the name is taken again, degrading to the pre-existing
+    leak (already a filed follow-up) rather than deleting live data.
+    """
+    (tmp_path / "demo").mkdir()
+    (tmp_path / "demo" / "fresh.txt").write_text("the NEW project's upload", encoding="utf-8")
+
+    class _Settings:
+        upload_corpus_dir = str(tmp_path)
+
+    monkeypatch.setattr("api.routers.projects.get_settings", lambda: _Settings())
+
+    async def _deleted(conn: Any, name: str) -> bool:
+        return True
+
+    async def _recreated(conn: Any, name: str) -> Any:
+        return object()  # someone took the name again before cleanup ran
+
+    _stub(monkeypatch, "projects", "delete_project", _deleted)
+    _stub(monkeypatch, "projects", "get_project", _recreated)
+
+    assert client.delete("/projects/demo").status_code == 204
+    assert (tmp_path / "demo" / "fresh.txt").exists(), "must not delete a live project's corpus"
+
+
 def test_the_delete_endpoint_actually_removes_the_uploads(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -398,7 +439,12 @@ def test_the_delete_endpoint_actually_removes_the_uploads(
     async def _deleted(conn: Any, name: str) -> bool:
         return True
 
+    async def _gone(conn: Any, name: str) -> None:
+        return None
+
     _stub(monkeypatch, "projects", "delete_project", _deleted)
+    # the post-commit re-check consults the SoR: name free => safe to clean
+    _stub(monkeypatch, "projects", "get_project", _gone)
     assert client.delete("/projects/demo").status_code == 204
     assert not (tmp_path / "demo").exists()
 
