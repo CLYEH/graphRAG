@@ -1122,9 +1122,11 @@ def build_server(project: str) -> FastMCP:
         `confidence` carries its origin mode's RAW score (cosine for
         semantic) — comparable within a mode, not across modes. No warning
         flags an out-of-domain question (see semantic_search on why scores
-        cannot) — judge answerability from the returned content. For factual
-        text questions, semantic_search alone is often faster and returns
-        more readable passages."""
+        cannot) — judge answerability from the returned content. Text
+        passages are guaranteed up to half the fused page whenever the
+        semantic mode returns any, so a fused answer is not starved of
+        readable text; for factual text questions semantic_search alone is
+        often faster."""
         rt = _rt()
         # cap FIRST (the explain_retrieval ordering, Codex #133 r1 class):
         # the incomplete-invocation refusal below is a pre-_bounded early

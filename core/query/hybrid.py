@@ -22,7 +22,10 @@ with a MODE_SKIPPED warning.
 comparable (cosine vs positional), ranks are. Duplicates (same result_type +
 id across modes) merge — first mode's payload wins (mode order is fixed, so
 the merge is deterministic), source_refs union. The fused list is clipped to
-``top_k`` with TRUNCATED (§22).
+``top_k`` with TRUNCATED (§22) — but NOT by rank alone: a passage floor
+(:func:`_chunk_floor`) reserves chunks their share first, because RRF ranks
+entity and passage hits against each other and a mode returning many strong
+entities would otherwise take the whole page (QA2/D1).
 
 **Failure boundary = the mode** (§22 verbatim: 單一 store 不可用 → hybrid 降級
 為可用模態子集,warnings 標示,不整體失敗): each mode call is individually
@@ -416,7 +419,9 @@ def _fuse(
     currency: ``score(d) = Σ 1/(k + rank_mode(d))``. Duplicates (same
     result_type + id) accumulate rank contributions and merge their
     source_refs (first mode's payload wins; mode order is fixed, so the merge
-    is deterministic). Clipped to ``top_k`` (TRUNCATED reported by caller)."""
+    is deterministic). Clipped to ``top_k`` through :func:`_chunk_floor`, which
+    reserves passages their share of the page rather than clipping by rank
+    alone (TRUNCATED reported by caller)."""
     scores: dict[tuple[str, str], float] = {}
     first: dict[tuple[str, str], RetrievalResult] = {}
     merged_refs: dict[tuple[str, str], list[SourceRef]] = {}
@@ -451,7 +456,52 @@ def _fuse(
         for key, base in first.items()
     ]
     ordered = ordered_results(fused)
-    return ordered[:top_k], len(ordered) > top_k
+    return ordered_results(_chunk_floor(ordered, top_k)), len(ordered) > top_k
+
+
+def _chunk_floor(ordered: tuple[RetrievalResult, ...], top_k: int) -> list[RetrievalResult]:
+    """Guarantee passage results a share of the fused page (QA2/D1).
+
+    RRF ranks every mode's results against each other, so a mode that returns
+    many strong ENTITIES takes the whole page: the documented default tool
+    answered a real visitor question with 20/20 ``result_type=entity`` and every
+    ``text`` empty, while single-mode ``semantic_search`` on the SAME question
+    returned 10 answer-bearing chunks — the flagship strictly worse than the
+    tool it fuses, and silently so.
+
+    This is the SIBLING of the skew :func:`core.query.semantic._fair_page`
+    already fixes one facade over (MCP6: 1405 entities vs 442 chunks let bare
+    name matches crowd out every passage), so it takes that helper's shape
+    rather than re-deriving one: a floor of ``top_k // 2``, ``min(floor, len)``
+    so a scarce type never BLOCKS the other (the §22 over-block dual), the rest
+    by fused score with the id tiebreak (#34: rerun-stable). Final §16 ordering
+    is re-imposed downstream by ``ordered_results`` (the caller owns it, as in
+    the sibling).
+
+    Chunks are the passage bucket; everything else shares the other floor. The
+    sibling worth naming is ``row``, which DOES carry text (``core.query.sql``
+    renders it): it stays out because the demotion this fixes is WITHIN a mode
+    — semantic's own §16 ordering buries its chunks at ranks 11-20 behind its
+    higher-cosine entities, whereas sql rows occupy ranks 1..N of their own
+    list and are never pushed down before fusion sees them.
+    (``community_report`` needs no ruling: global is not a fused mode, MCP8.)
+
+    Operates on the FUSED list, whose entries are each mode's own validated
+    results (semantic has already applied ``_fair_page`` and SoR validation) —
+    the Codex #126 rule that a floor slot must never be filled by an unvalidated
+    hit that then evicts a fetched valid one.
+    """
+    chunks = [result for result in ordered if result.result_type == "chunk"]
+    others = [result for result in ordered if result.result_type != "chunk"]
+    floor = top_k // 2
+    take_chunks = min(floor, len(chunks))
+    take_others = min(floor, len(others))
+    page = chunks[:take_chunks] + others[:take_others]
+    rest = sorted(
+        chunks[take_chunks:] + others[take_others:],
+        key=lambda result: (-result.score, result.id),
+    )
+    return page + rest[: top_k - len(page)]
 
 
 def _response(
