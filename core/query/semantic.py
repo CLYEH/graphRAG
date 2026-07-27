@@ -209,7 +209,7 @@ async def semantic_search(
             QueryWarning(
                 "PARTIAL_RESULTS",
                 f"{dropped} hit(s) omitted: no citable source in the active build "
-                "(projection drift — see Health)",
+                "(uncitable mention or projection drift — see Health for drift)",
             )
         )
     # mention-loss warnings are PAGE-EXACT and single-source (Codex #127:

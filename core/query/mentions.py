@@ -147,7 +147,7 @@ def mention_warnings(
             QueryWarning(
                 "PARTIAL_RESULTS",
                 f"{sum(dropped_on_page.values())} {MENTION_DROP_STEM}: {detail} "
-                "(projection drift — see Health)",
+                "(uncitable mention or projection drift — see Health for drift)",
             )
         )
     capped_on_page = sorted((str(eid) for eid in returned_entity_ids & capped_entities), key=str)
