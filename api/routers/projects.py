@@ -153,6 +153,19 @@ async def delete_project_endpoint(open_conn: ConnProvider, project: str) -> Resp
     # REFUSAL (builds present, active jobs) raises before the rename and so
     # touches nothing, and a failure at COMMIT re-attaches the directory —
     # otherwise a project that still exists would have lost its corpus.
+    # The rename is SYNCHRONOUS, and that is load-bearing: no await separates
+    # it from the assignment below, so between those two points no other code
+    # runs and CancelledError cannot be delivered — the handler therefore knows
+    # about the tombstone if and only if the rename happened. Threading it
+    # breaks that invariant rather than improving it: `asyncio.to_thread`
+    # cannot cancel the thread it started AND the awaiter resumes with
+    # CancelledError without waiting for it, so a cancellation (worker
+    # shutdown, an infra timeout) can leave the rename landing after the
+    # rollback has already decided there was nothing to undo — the project and
+    # its managed sources alive while their corpus sits under an
+    # undiscoverable `.deleting-*` name. Shielding does not help; what is lost
+    # is the assignment, not the work. Only rmtree, the unbounded part, is
+    # worth a thread.
     tombstone: Path | None = None
     try:
         async with open_conn() as conn:
@@ -162,11 +175,15 @@ async def delete_project_endpoint(open_conn: ConnProvider, project: str) -> Resp
                 raise translate_registry_error(exc) from exc
             if not existed:
                 raise _not_found(project)
-            tombstone = await asyncio.to_thread(_detach_upload_dir, project)
+            tombstone = _detach_upload_dir(project)
     except BaseException:
         if tombstone is not None:
             try:
-                await asyncio.to_thread(_reattach_upload_dir, tombstone, project)
+                # SYNCHRONOUS on purpose: this runs on the cancellation path,
+                # where awaiting again may be interrupted immediately. A rename
+                # is a fast metadata operation, and giving the corpus back must
+                # not depend on being allowed to await.
+                _reattach_upload_dir(tombstone, project)
             except OSError:
                 # best-effort work must not MASK the failure it is recovering
                 # from: letting a rename error replace the original exception

@@ -371,10 +371,8 @@ def test_deleting_a_project_removes_its_uploads_without_escaping_the_corpus_root
     monkeypatch.setattr("api.routers.projects.get_settings", lambda: _Settings())
 
     tomb = _detach_upload_dir("demo")
-    assert tomb is not None and not (tmp_path / "demo").exists()
-    assert (
-        tomb.exists() and (tomb / "doc.txt").exists()
-    )  # detached, not yet removed  # the project's corpus is gone
+    assert tomb is not None and not (tmp_path / "demo").exists()  # the corpus moved aside
+    assert tomb.exists() and (tomb / "doc.txt").exists()  # detached, not yet removed
     assert (tmp_path / "neighbour" / "keep.txt").exists()  # nobody else's is
 
     assert _detach_upload_dir("never-uploaded") is None  # never uploaded: no-op
@@ -576,3 +574,54 @@ def test_a_cleanup_failure_answers_204_but_says_the_tombstone_survived(
     assert client.delete("/projects/demo").status_code == 204  # the delete DID happen
     assert any(".deleting-" in w for w in warnings), warnings
     assert rmtree_calls == [{"ignore_errors": True}], rmtree_calls
+
+
+def test_a_cancelled_delete_gives_the_corpus_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation must not strand the corpus under a tombstone (Codex #145).
+
+    The detach is deliberately synchronous, so the interleaving that would
+    strand it — rename lands, awaiter never learns the path — cannot exist:
+    no await separates the rename from the assignment, so CancelledError
+    cannot be delivered between them. Threading it made that racy rather than
+    safe, because the awaiter resumes on cancellation WITHOUT waiting for the
+    thread.
+
+    What remains reachable is cancellation at a real await, i.e. while the
+    transaction is completing. That must still hand the corpus back, and it
+    exercises the synchronous re-attach — the compensating action that has to
+    run when awaiting is no longer reliable.
+    """
+    import asyncio as _asyncio
+
+    (tmp_path / "demo").mkdir()
+    (tmp_path / "demo" / "doc.txt").write_text("registered bytes", encoding="utf-8")
+
+    class _Settings:
+        upload_corpus_dir = str(tmp_path)
+
+    monkeypatch.setattr("api.routers.projects.get_settings", lambda: _Settings())
+
+    async def _deleted(conn: Any, name: str) -> bool:
+        return True
+
+    _stub(monkeypatch, "projects", "delete_project", _deleted)
+
+    @asynccontextmanager
+    async def _cancelled_on_exit() -> AsyncIterator[object]:
+        yield object()
+        raise _asyncio.CancelledError
+
+    # driven directly rather than through the transport: CancelledError is a
+    # BaseException, and the point is that the handler catches BaseException
+    # rather than Exception — routed through TestClient it would surface as a
+    # transport error and stop testing that distinction
+    async def _drive() -> None:
+        await projects_module.delete_project_endpoint(lambda: _cancelled_on_exit(), "demo")  # type: ignore[arg-type,return-value]
+
+    with pytest.raises(_asyncio.CancelledError):
+        _asyncio.run(_drive())
+
+    assert (tmp_path / "demo" / "doc.txt").exists(), "a cancelled delete must give the corpus back"
+    assert not any(p.name.startswith(".deleting-") for p in tmp_path.iterdir())
