@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from api.app import create_app
-from api.deps import db_conn
+from api.deps import db_conn, db_conn_provider
 from core.registry import (
     MANAGED_FILES_KEY,
     Project,
@@ -43,7 +45,17 @@ def client() -> Iterator[TestClient]:
     async def _conn() -> AsyncIterator[object]:
         yield object()  # registry is stubbed; the connection is never used
 
+    @asynccontextmanager
+    async def _open() -> AsyncIterator[object]:
+        yield object()
+
     app.dependency_overrides[db_conn] = _conn
+    # BOTH must be overridden: a handler that owns its transaction resolves
+    # db_conn_provider instead, and leaving it unbound would silently hand
+    # this contract-tier file a REAL engine.connect() — a hidden live-DB
+    # dependency that passes wherever Postgres happens to be up and fails in
+    # CI's service-less backend job (the delete endpoint did exactly this).
+    app.dependency_overrides[db_conn_provider] = lambda: _open
     with TestClient(app) as c:
         yield c
 
@@ -319,3 +331,86 @@ def test_update_source_rejects_non_boolean_enabled(
     r = client.patch(f"/projects/p/sources/{uuid.uuid4()}", json={"enabled": bad})
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_deleting_a_project_removes_its_uploads_without_escaping_the_corpus_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deleted project must not leave its managed corpus on disk (QA7/D16).
+
+    DELETE only removed the registry row, so uploaded documents outlived the
+    project with no endpoint able to list or remove them — unbounded growth
+    and an unintended retention surface. The cleanup runs AFTER the row
+    delete, which is deliberately the opposite of prune's "projections first,
+    Postgres last": that rule assumes the truth-delete always proceeds, while
+    this one can legitimately REFUSE (builds present, active jobs), and
+    removing a caller's documents before a refusal would destroy data on a
+    request the server then rejects.
+
+    The path is resolved through the same containment guard the upload writer
+    uses, so a crafted project name cannot direct the delete outside the
+    corpus root — pinned here because this is the first code that DELETES
+    inside that root, and a traversal bug would be silent and unrecoverable.
+    """
+    from api.routers.projects import _delete_upload_dir
+
+    (tmp_path / "demo").mkdir()
+    (tmp_path / "demo" / "doc.txt").write_text("uploaded", encoding="utf-8")
+    (tmp_path / "neighbour").mkdir()
+    (tmp_path / "neighbour" / "keep.txt").write_text("not mine", encoding="utf-8")
+
+    class _Settings:
+        upload_corpus_dir = str(tmp_path)
+
+    monkeypatch.setattr("api.routers.projects.get_settings", lambda: _Settings())
+
+    _delete_upload_dir("demo")
+    assert not (tmp_path / "demo").exists()  # the project's corpus is gone
+    assert (tmp_path / "neighbour" / "keep.txt").exists()  # nobody else's is
+
+    _delete_upload_dir("never-uploaded")  # a project that never uploaded: no-op
+
+    for crafted in ("..", "../escape", "a/b", "/abs"):
+        _delete_upload_dir(crafted)
+    assert (tmp_path / "neighbour").exists() and tmp_path.exists()
+
+
+def test_the_delete_endpoint_actually_removes_the_uploads(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive the REAL endpoint, not the helper (QA7/D16).
+
+    The helper test above proves _delete_upload_dir behaves; it does NOT prove
+    anything calls it. Verified: with the call removed from the endpoint the
+    whole of this file still passed, so the fix could have been deleted
+    unnoticed — the "an unpinned mechanism is prose" failure. This drives
+    DELETE /projects/{p} through the app and asserts the corpus is gone, so
+    the WIRING is what is pinned.
+    """
+    (tmp_path / "demo").mkdir()
+    (tmp_path / "demo" / "doc.txt").write_text("uploaded", encoding="utf-8")
+
+    class _Settings:
+        upload_corpus_dir = str(tmp_path)
+
+    monkeypatch.setattr("api.routers.projects.get_settings", lambda: _Settings())
+
+    async def _deleted(conn: Any, name: str) -> bool:
+        return True
+
+    _stub(monkeypatch, "projects", "delete_project", _deleted)
+    assert client.delete("/projects/demo").status_code == 204
+    assert not (tmp_path / "demo").exists()
+
+    # ...and a REFUSED delete must not touch the caller's documents: the row
+    # delete is authoritative and runs first precisely so a rejection cannot
+    # destroy data (this is why the ordering is the opposite of prune's).
+    (tmp_path / "demo").mkdir()
+    (tmp_path / "demo" / "doc.txt").write_text("still mine", encoding="utf-8")
+
+    async def _refuses(conn: Any, name: str) -> bool:
+        raise ProjectHasBuildsError(name, 2)
+
+    _stub(monkeypatch, "projects", "delete_project", _refuses)
+    assert client.delete("/projects/demo").status_code == 400
+    assert (tmp_path / "demo" / "doc.txt").exists(), "a refused delete must keep the corpus"

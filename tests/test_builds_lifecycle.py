@@ -230,9 +230,31 @@ def test_serve_mcp_warns_only_when_the_bind_diverges_from_the_advertised_setting
         assert err == ""
 
 
-async def test_prune_refuses_a_zero_window() -> None:
-    with pytest.raises(ValueError, match="keep must be >= 1"):
+async def test_prune_accepts_a_zero_window_and_still_refuses_a_negative_one() -> None:
+    """keep=0 is the documented escape from an undeletable project (QA7/D7).
+
+    This test REVERSES its predecessor, deliberately. The old guard raised
+    "keep must be >= 1 — pruning everything would drop the active build", and
+    that sentence was never true of this code: the keepers union retains every
+    active build unconditionally, so keep=0 cannot drop one. It was flatly
+    false in the reported case, where nothing was active — and the falsity had
+    a cost, because a project that has ever built cannot be deleted until its
+    builds are pruned, REST says "prune them first", keep=0 raised, and keep=1
+    keeps the only build. The remedy the error named was closed at both ends,
+    and the measured way out was editing Postgres by hand.
+
+    keep=0 must therefore reach the store (it fails here on the None conn,
+    which is proof it got past the guard); only a NEGATIVE window is refused,
+    and with a message that describes the input rather than a consequence it
+    cannot know.
+    """
+    with pytest.raises(ValueError, match="keep must be >= 0"):
+        await prune(None, None, None, "p", keep=-1)  # type: ignore[arg-type]
+
+    # keep=0 is no longer rejected up front: it gets as far as the store call
+    with pytest.raises(Exception) as caught:  # noqa: PT011 — any store failure will do
         await prune(None, None, None, "p", keep=0)  # type: ignore[arg-type]
+    assert "keep must be" not in str(caught.value)
 
 
 # ---------------------------------------------------------- integration ----
@@ -519,6 +541,23 @@ async def test_prune_keeps_the_window_and_always_the_active(project: str) -> Non
             victims = await prune(conn, qdrant, session, project, keep=1)
             assert victims == []  # the ancient live build is NOT a victim
             assert live in {b.id for b in await list_builds(conn, project)}
+
+            # keep=0 is the SUBSTANTIVE claim that replaced the old guard
+            # (QA7/D7): it sweeps the whole window yet still cannot drop the
+            # active build, because the keepers union retains actives
+            # unconditionally. The old guard refused keep=0 saying it "would
+            # drop the active build" — a sentence this assertion shows was
+            # never true of this code, and which closed the only documented
+            # route to deleting a project that had ever built.
+            await conn.execute(
+                tables.builds.update().where(tables.builds.c.id == newest).values(status="archived")
+            )
+            await conn.commit()
+            victims = await prune(conn, qdrant, session, project, keep=0)
+            assert set(victims) == {newest}  # window empty → the archived one goes
+            survivors = {b.id: b.status for b in await list_builds(conn, project)}
+            assert survivors[old_active] == "active"  # kept by rule, not by window
+            assert live in survivors  # a live build is still never GC'd
     finally:
         await qdrant.close()
         await driver.close()

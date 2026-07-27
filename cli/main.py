@@ -211,7 +211,15 @@ async def _run(args: argparse.Namespace) -> int:
                 return 0 if eval_report.failed == 0 else 1
             if args.command == "prune":
                 keep = args.keep if args.keep is not None else settings.retention_keep_builds
-                victims = await lifecycle.prune(conn, qdrant, session, args.project, keep=keep)
+                try:
+                    victims = await lifecycle.prune(conn, qdrant, session, args.project, keep=keep)
+                except ValueError as exc:
+                    # QA7/D7: prune is the remedy REST names for an undeletable
+                    # project, so an operator following that instruction lands
+                    # here — a raw traceback is the wrong end of that trail.
+                    # Same typed refusal the diff branch gives.
+                    print(f"REFUSED: {exc}", file=sys.stderr)
+                    return 1
                 print(f"pruned {len(victims)} build(s)" + (":" if victims else ""))
                 for victim in victims:
                     print(f"  {victim}")

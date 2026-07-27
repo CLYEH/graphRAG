@@ -793,9 +793,19 @@ async def prune(
     blocks on the lock and then loses LOUD (no promotable row). No status is
     written; a crash rolls the Postgres truth back — the victim stays
     archived and the next run re-sweeps it."""
-    if keep < 1:
-        raise ValueError("keep must be >= 1 — pruning everything would drop the active build")
+    if keep < 0:
+        raise ValueError(f"keep must be >= 0, got {keep}")
     builds = await list_builds(conn, project)
+    # keep=0 is ALLOWED and cannot drop the active build (QA7/D7). The old
+    # guard refused it saying "pruning everything would drop the active
+    # build", but the union below already retains every active build
+    # unconditionally, so that sentence was never true of this code — and it
+    # was flatly false in the reported case, where nothing was active. The
+    # cost of the false guard was not cosmetic: a project that has ever built
+    # cannot be deleted until its builds are pruned, REST says "prune them
+    # first", `--keep 0` raised this, and `--keep 1` keeps the only build —
+    # so the documented remedy was closed at both ends and the measured way
+    # out was hand-editing Postgres rows.
     keepers = {b.id for b in builds[:keep]} | {b.id for b in builds if b.status == "active"}
     # only TERMINAL statuses are prunable: a 'building' row is a LIVE build —
     # sweeping it would delete truth and partial outputs from under the

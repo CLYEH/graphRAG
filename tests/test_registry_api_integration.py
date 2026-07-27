@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from api.app import create_app
-from api.deps import db_conn
+from api.deps import db_conn, db_conn_provider
 from core.config import get_settings
 from core.stores.tables import builds, idempotency_keys, jobs
 from tests.conftest import ensure_project
@@ -52,7 +53,20 @@ async def api(migrated: None) -> AsyncIterator[tuple[AsyncClient, AsyncConnectio
         async with conn.begin_nested():
             yield conn
 
+    # A handler that OWNS its transaction resolves db_conn_provider, not
+    # db_conn. Overriding only the latter left those routes on the real
+    # provider, which reads app.state.engine — never set here, since this
+    # fixture drives ASGITransport without lifespan — so they 500'd. It must
+    # also be the SAVEPOINT variant: a second real connection could not see
+    # this outer transaction's uncommitted rows, and the delete would commit
+    # for real, silently bypassing the rollback-at-teardown isolation.
+    @asynccontextmanager
+    async def _open_nested() -> AsyncIterator[AsyncConnection]:
+        async with conn.begin_nested():
+            yield conn
+
     app.dependency_overrides[db_conn] = _override
+    app.dependency_overrides[db_conn_provider] = lambda: _open_nested
     transport = ASGITransport(app=app)
     try:
         async with AsyncClient(transport=transport, base_url="http://t") as client:
