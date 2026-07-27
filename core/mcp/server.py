@@ -189,7 +189,7 @@ Reading responses:
   STORE_UNAVAILABLE / PARTIAL_RESULTS = a mode or store dropped out;
   NO_ACTIVE_BUILD = the project has no active build yet.
 - Introspection tools (get_* / list_*) instead carry error + error_code:
-  INVALID_INPUT (fix your input), NOT_FOUND (the id is not in the active
+  INVALID_INPUT (fix your input), NOT_FOUND (the id/name is not in the active
   build), QUERY_TIMEOUT (retry later), STORE_UNAVAILABLE (back off),
   NO_ACTIVE_BUILD (build and activate first). error_code null = success.
 - Scores rank results within a response; they do not measure whether the
@@ -1646,6 +1646,25 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
             "entities": [],
         }
     entity_ids = await repo.entity_ids_by_name(name)
+    if not entity_ids:
+        # QA6/D8: a MISS is NOT_FOUND, like every other get_* in this family.
+        # The initialize instructions define ONE taxonomy for get_*/list_* and
+        # say "error_code null = success", so returning null here told a
+        # consumer branching exactly as documented that a renamed entity or a
+        # stale citation was a successful empty answer. get_chunk and
+        # get_document already answer NOT_FOUND for the same shape of miss;
+        # this is get_entity joining its siblings, not a new rule.
+        return {
+            "project": project,
+            "build_id": str(repo.build_id),
+            "name": name,
+            "error": (
+                f"no active entity is named {_safe_echo(name, 80)!r} in this "
+                "build — search for it with list_entities(q=…)"
+            ),
+            "error_code": "NOT_FOUND",
+            "entities": [],
+        }
     # MCP7 (v1.1): mentions arrive RESOLVED — a chunk mention carries the
     # chunk UUID (get_chunk accepts it directly), source_uri, and the quote
     # + offsets; a row mention carries table+pk. The shared seam is
@@ -1716,6 +1735,25 @@ def _parse_browse_cursor(
     if len(parts) != 3:
         return None, "cursor is not a graphRAG browse cursor — start again without one"
     cursor_build, cursor_scope, last = parts
+    parsed_build = _parse_uuid(cursor_build)
+    if parsed_build is None or str(parsed_build) != cursor_build:
+        # QA6/D13: SHAPE before diagnosis. Splitting on "|" and comparing the
+        # first segment made any three-segment string — "a|b|c" — report that
+        # "the active build changed", which in a DR-001 system is an
+        # operationally weighty claim: it sends an operator to audit builds
+        # when nothing happened.
+        #
+        # CANONICAL form, not merely parseable (gate-2 on #144): `uuid.UUID()`
+        # also accepts de-dashed hex, `urn:uuid:…` and `{…}`, so a "is it a
+        # UUID" test alone still left a cursor naming THIS build in a
+        # non-canonical spelling failing the string compare below and drawing
+        # the build-changed alarm — the very harm being removed. We only ever
+        # mint `str(build_id)`, so anything else is a cursor we did not mint
+        # and the honest answer is "not ours", not "your build moved". Only a
+        # canonically-spelled build id that DIFFERS earns that sentence.
+        # (The scope segment is an opaque fingerprint with no shape to check —
+        # so nothing is claimed about it here.)
+        return None, "cursor is not a graphRAG browse cursor — start again without one"
     if cursor_build != build_id:
         return None, (
             "cursor was minted for a different build (the active build changed) — "

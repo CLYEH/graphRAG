@@ -1611,6 +1611,79 @@ async def test_every_pre_binding_claim_is_pinned_by_a_raising_bind(
         assert "not a store outage" in blob, tool
 
 
+async def test_a_miss_is_not_found_and_a_junk_cursor_does_not_blame_the_build() -> None:
+    """Two ways the typed vocabulary lied to a consumer that read the docs.
+
+    (a) The initialize instructions define ONE taxonomy for the get_*/list_*
+    family — "NOT_FOUND (the id is not in the active build)" and "error_code
+    null = success". `get_chunk`/`get_document` honour it; `get_entity` did
+    not, answering a miss with `error_code: null` and `entities: []`. A
+    consumer branching on error_code exactly as instructed read a renamed
+    entity or a stale citation as a SUCCESSFUL empty answer (QA6/D8).
+
+    (b) `_parse_browse_cursor` split on "|" and compared the first segment to
+    the build id without checking it was a UUID, so ANY three-segment string
+    reported "the active build changed" (QA6/D13). In a DR-001 system that is
+    an operationally weighty claim — it sends an operator to audit builds when
+    nothing happened. Shape must be established before a diagnosis names a
+    cause. The real build-mismatch case must survive, which is the second half
+    of this test: fixing a false alarm by deleting the true alarm is no fix.
+    """
+    import uuid as _uuid
+
+    from core.mcp.server import _get_entity, _parse_browse_cursor
+
+    class _Repo:
+        build_id = _uuid.uuid4()
+
+        def __init__(self, ids: list[Any]) -> None:
+            self._ids = ids
+
+        async def entity_ids_by_name(self, name: str) -> list[Any]:
+            return self._ids
+
+        async def mentions_by_entity(self, ids: Any) -> dict[Any, Any]:
+            return {}
+
+        async def chunks_by_content_ref(self, pairs: Any) -> dict[Any, Any]:
+            return {}
+
+    miss = await _get_entity(cast(Any, _Repo([])), "demo", "Nobody")
+    assert miss["error_code"] == "NOT_FOUND"  # was null — a miss read as success
+    assert miss["entities"] == []  # the shape callers already rely on is kept
+    blank = await _get_entity(cast(Any, _Repo([])), "demo", "  ")
+    assert blank["error_code"] == "INVALID_INPUT"  # a bad ARGUMENT stays distinct
+
+    build = "11111111-1111-1111-1111-111111111111"
+    other = "00000000-0000-0000-0000-000000000001"
+    last = "22222222-2222-2222-2222-222222222222"
+
+    _, junk = _parse_browse_cursor("a|b|c", build, "scope")
+    assert junk is not None and "not a graphRAG browse cursor" in junk
+    assert "active build changed" not in junk, "junk must not raise a build alarm"
+
+    # ...and "is a UUID" is NOT enough (gate-2 on #144): uuid.UUID() also
+    # accepts de-dashed hex, urn:uuid: and braced forms, so a cursor naming
+    # THIS VERY BUILD in a non-canonical spelling still failed the string
+    # compare and drew the same false alarm. We only ever mint str(build_id),
+    # so anything else is a cursor we did not mint — "not ours", not "your
+    # build moved".
+    for spelling in (build.replace("-", ""), f"urn:uuid:{build}", "{" + build + "}"):
+        _, odd = _parse_browse_cursor(f"{spelling}|scope|{last}", build, "scope")
+        assert odd is not None and "not a graphRAG browse cursor" in odd, spelling
+        assert "active build changed" not in odd, spelling
+
+    # ...and the TRUE alarm still fires for a well-formed foreign build id
+    _, moved = _parse_browse_cursor(f"{other}|scope|{last}", build, "scope")
+    assert moved is not None and "active build changed" in moved
+    # a matching build with a different scope keeps its own distinct cause
+    _, rescoped = _parse_browse_cursor(f"{build}|other|{last}", build, "scope")
+    assert rescoped is not None and "different listing scope" in rescoped
+    # and a well-formed cursor still works
+    after, ok = _parse_browse_cursor(f"{build}|scope|{last}", build, "scope")
+    assert ok is None and after == _uuid.UUID(last)
+
+
 async def test_an_unknown_parameter_is_refused_and_the_rule_is_advertised(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
