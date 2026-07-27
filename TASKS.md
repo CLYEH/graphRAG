@@ -194,7 +194,7 @@ Keep items small enough to finish in one loop.
 
 ### 核心承諾(P2)
 - [x] QA1 引用 quote 逐字化(D2)— mention 的 `surface_form` 改存**在該 chunk 逐字命中**的 span(prompt 新增 entity `"surface"` 欄,規則同 relation `quote`;定位序=模型 surface→canonical name→None)。無契約 bump(凍結 schema 本就寫明 quote 是 the mention's surface form)。定位不到存 NULL 而非假引文,由 mentions.py drop+逐 entity 告警。
-- [ ] QA2 hybrid_query 零文字頁(D1)— 文件明載的預設入口對真實遊客問題可回傳 20/20 全 `result_type=entity`、`text` 全空的頁面,把所有直接回答的 chunk 擠掉且**無任何警告**(`hybrid_query {"query":"有導覽解說嗎？"}` → rank0「銀眼魚」confidence=1.0;同題 `semantic_search` 有 10 個直接回答的 chunk,hybrid 20 筆裡一個都沒有)。單模式工具嚴格優於旗艦融合工具。修法:融合時保 chunk 配額(如 semantic 的 half-page 保證),或至少發警告揭露 chunk 位移。
+- [x] QA2 hybrid_query 零文字頁(D1)— 融合後按**答案種類**保樓地板 4:2:1:1(passage `top_k//2`、graph facts `top_k//4`、sql row `top_k//8`、bare name entity `top_k//8`;`min(floor,len)` 使稀缺種類不反向擋人)。根因:RRF 只看 mode 內名次,semantic 自身 §16 排序把 entity 排在 chunk 前使 chunk 落在 rank 11+,被兩個 mode 的 entity 擠出整頁。
 
 ### 靜默錯誤(P2)
 - [ ] QA3 未知參數靜默丟棄(D3)— MCP 靜默接受並忽略拼錯/未知的工具參數,以**乾淨成功**回傳錯誤資料:`semantic_search {"query":"票價多少","topk":3}` → 20 筆(非 3)、warnings=[];`list_entities {"entity":"票價資訊","limit":3}` → 3 個毫不相干的 entity、`error_code=null`;`graph_query …"hop":2` → 靜默退回 hops=1。REST 對同一 typo 正確回 `400 extra_forbidden`。MCP 的呼叫者正是最會打出似是而非參數名的 LLM agent——filter 被丟掉後 agent 以為在查單一 entity,實際在 1405 筆語料的未過濾切片上推理。修法:inputSchema 加 `additionalProperties:false` 或 server 端對未知 key 發警告/拒絕,對齊 REST。

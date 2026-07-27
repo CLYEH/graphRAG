@@ -325,6 +325,100 @@ async def test_fusion_merges_duplicates_and_ranks_by_rrf() -> None:
     assert abs(fused[1].score - 1 / 62) < 1e-12
 
 
+def test_fusion_keeps_a_floor_of_passages_so_the_page_is_never_all_entities() -> None:
+    """The documented DEFAULT tool must not answer with a page carrying no text.
+
+    QA2/D1: RRF ranks every mode against every other, so a graph mode returning
+    many strong entities took the WHOLE page — a real visitor question came back
+    20/20 `result_type=entity` with every `text` empty, while single-mode
+    `semantic_search` on the same question returned 10 answer-bearing chunks.
+    The flagship was strictly worse than the tool it fuses, and said nothing.
+
+    Same skew `semantic._fair_page` already fixes one facade over (MCP6), so the
+    floor takes that helper's shape — including its §22 over-block dual, which
+    is the second half of this test: a SCARCE passage set must never cost the
+    other bucket its slots, or the fix for an empty page becomes a starved one.
+    """
+    # Faithful to the live repro, which the first draft of this fixture was
+    # NOT (its probe stayed green): RRF scores by RANK WITHIN a mode's list, so
+    # what kills the chunks is their POSITION in semantic's own output. semantic
+    # fair-pages 10 entities + 10 chunks, then §16 ordering sorts by score and
+    # the entity cosines outrank the chunk ones — so semantic's chunks sit at
+    # ranks 11-20 (RRF 1/71..1/80) while BOTH modes' entities hold ranks 1-10
+    # (1/61..1/70). Twenty entities therefore outscore every chunk outright.
+    sem_entities = tuple(_result("entity", rid=f"se{i}", score=0.7 - i * 0.01) for i in range(10))
+    sem_chunks = tuple(_result("chunk", rid=f"c{i}", score=0.5 - i * 0.01) for i in range(10))
+    semantic = sem_entities + sem_chunks  # entities FIRST — the real ordering
+    entities = tuple(_result("entity", rid=f"ge{i}", score=1.0 - i * 0.01) for i in range(20))
+
+    fused, truncated = _fuse([entities, semantic], top_k=20)
+    kinds = [r.result_type for r in fused]
+    assert len(fused) == 20 and truncated is True
+    # the defect: this was 0 before the floor. Floors are 4:2:1:1 — passages
+    # keep half the page, graph facts a quarter, sql rows and names an eighth
+    # each — so with no facts or rows in play their unused slots flow to names
+    # on rank, and passages still hold their measured half.
+    assert kinds.count("chunk") == 10, "passages must hold their half of the page"
+    assert kinds.count("entity") == 10
+
+    # over-block dual: one lone chunk takes ONE slot, never a reserved ten
+    lone, _ = _fuse([entities, sem_entities + (sem_chunks[0],)], top_k=20)
+    lone_kinds = [r.result_type for r in lone]
+    assert len(lone) == 20
+    assert lone_kinds.count("chunk") == 1 and lone_kinds.count("entity") == 19
+
+    # and a page with no passages at all is still a full page, not a short one
+    none_left, _ = _fuse([entities], top_k=20)
+    assert len(none_left) == 20 and all(r.result_type == "entity" for r in none_left)
+
+    # The floor is a strict NO-OP whenever nothing is being clipped, which is
+    # why it needs no warning of its own: it can only ever change WHICH results
+    # a page keeps, and that case already carries TRUNCATED. If it could evict
+    # silently, an agent would lose a result with nothing said about it (§22).
+    small = entities[:6] + sem_chunks[:2]
+    fits, fits_truncated = _fuse([small], top_k=20)
+    assert fits_truncated is False
+    assert {r.id for r in fits} == {r.id for r in small}  # nothing evicted at all
+
+    # Each share ROUNDS DOWN (floors are top_k//2, //4, //8, //8), so a page
+    # too small to divide reserves nothing and rank alone decides — the single
+    # slot can legitimately be an entity even when a chunk was available (Codex
+    # #142 r1). Pinned because the tool description states this edge: promising
+    # otherwise would either lie, or force a passage over the caller's own
+    # ranking on a page they deliberately narrowed to one.
+    both_modes = (_result("entity", rid="shared", score=1.0),)
+    one_each = (_result("entity", rid="shared", score=0.7), _result("chunk", rid="ck", score=0.5))
+    single, _ = _fuse([both_modes, one_each], top_k=1)
+    assert [r.result_type for r in single] == ["entity"]  # the doubly-ranked entity wins
+    # ...and the passage half appears from top_k=2, which is where the
+    # description says it does — the only pin on where the guarantee BEGINS
+    pair, _ = _fuse([both_modes, one_each], top_k=2)
+    assert [r.result_type for r in pair].count("chunk") == 1
+
+    # STATED FACTS ARE NOT NAMES, AND SQL ROWS ARE NOT GRAPH FACTS (Codex #142
+    # r2 + gate-2). `core.query.graph._score` positions relations AFTER
+    # entities in the graph mode's own list, so a bucket shared with entities
+    # spent every slot on entities and deleted the graph answers this change
+    # never aimed at — depressing §20 relation_hit_rate with them. Rows then
+    # reproduced it one level down: sql rows hold ranks 1..N of their OWN list,
+    # so sharing a bucket with the demoted relations let rows take the whole
+    # share and evict every relation. Separate buckets keep both.
+    graph_dense = tuple(
+        _result("entity", rid=f"gd{i}", score=1.0 - i * 0.01) for i in range(2)
+    ) + tuple(_result("relation", rid=f"rel{i}", score=0.5 - i * 0.01) for i in range(12))
+    sem_mixed = tuple(
+        _result("entity", rid=f"sm{i}", score=0.7 - i * 0.01) for i in range(10)
+    ) + tuple(_result("chunk", rid=f"cm{i}", score=0.4 - i * 0.01) for i in range(8))
+    facts = [r.result_type for r in _fuse([graph_dense, sem_mixed], top_k=20)[0]]
+    assert facts.count("relation") == 5, "graph facts must not compete with names"
+    assert facts.count("chunk") == 8  # and not at the passage share's expense
+
+    sql_rows = tuple(_result("row", rid=f"rw{i}", score=0.9 - i * 0.01) for i in range(10))
+    mixed = [r.result_type for r in _fuse([graph_dense, sem_mixed, sql_rows], top_k=20)[0]]
+    assert mixed.count("relation") == 5, "rows must not evict the demoted relations"
+    assert mixed.count("row") == 3 and mixed.count("chunk") == 8
+
+
 async def test_fusion_clips_to_top_k_and_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     results = [_result(rid=f"r{i}") for i in range(3)]
     _patch_modes(monkeypatch, semantic=_mode_response("semantic_search", *results))
