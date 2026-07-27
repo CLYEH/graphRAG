@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+import api.routers.projects as projects_module
 from api.app import create_app
 from api.deps import db_conn, db_conn_provider
 from core.registry import (
@@ -357,7 +358,7 @@ def test_deleting_a_project_removes_its_uploads_without_escaping_the_corpus_root
     corpus root — pinned here because this is the first code that DELETES
     inside that root, and a traversal bug would be silent and unrecoverable.
     """
-    from api.routers.projects import _delete_upload_dir
+    from api.routers.projects import _detach_upload_dir
 
     (tmp_path / "demo").mkdir()
     (tmp_path / "demo" / "doc.txt").write_text("uploaded", encoding="utf-8")
@@ -369,34 +370,39 @@ def test_deleting_a_project_removes_its_uploads_without_escaping_the_corpus_root
 
     monkeypatch.setattr("api.routers.projects.get_settings", lambda: _Settings())
 
-    _delete_upload_dir("demo")
-    assert not (tmp_path / "demo").exists()  # the project's corpus is gone
+    tomb = _detach_upload_dir("demo")
+    assert tomb is not None and not (tmp_path / "demo").exists()
+    assert (
+        tomb.exists() and (tomb / "doc.txt").exists()
+    )  # detached, not yet removed  # the project's corpus is gone
     assert (tmp_path / "neighbour" / "keep.txt").exists()  # nobody else's is
 
-    _delete_upload_dir("never-uploaded")  # a project that never uploaded: no-op
+    assert _detach_upload_dir("never-uploaded") is None  # never uploaded: no-op
 
     for crafted in ("..", "../escape", "a/b", "/abs"):
-        _delete_upload_dir(crafted)
+        assert _detach_upload_dir(crafted) is None
     assert (tmp_path / "neighbour").exists() and tmp_path.exists()
 
 
-def test_a_recreated_project_keeps_its_corpus_when_an_old_delete_cleans_up(
+def test_a_later_project_reusing_the_name_is_unreachable_by_this_cleanup(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A name is reusable the moment its row is gone (Codex #145 P1).
+    """Cleanup must not be able to reach a LATER project's uploads (Codex #145).
 
-    The corpus directory is addressed by NAME, and multiple one-worker
-    instances sharing a corpus root is the documented scaling shape — so
-    between this delete's COMMIT and its rmtree, another instance can create
-    the same name and upload into it. A name-based delete would then destroy
-    the NEW project's documents: worse than the leak this change removes.
+    The corpus is addressed by name, and a name is reusable the moment its row
+    is gone; multiple one-worker instances sharing a corpus root is the
+    documented scaling shape. A post-commit re-check only MOVED that window —
+    its SELECT's transaction ends before the rmtree, and a future INSERT has no
+    row to lock. So the directory is DETACHED inside the deleting transaction,
+    while the row lock still blocks a concurrent create of that name.
 
-    The endpoint therefore re-checks the source of truth after committing and
-    skips cleanup when the name is taken again, degrading to the pre-existing
-    leak (already a filed follow-up) rather than deleting live data.
+    This pins the property that makes the window unlosable: after the delete,
+    the old name is FREE and empty, so anything a later project writes there is
+    structurally out of reach of this request — which only ever removes the
+    tombstone it renamed.
     """
     (tmp_path / "demo").mkdir()
-    (tmp_path / "demo" / "fresh.txt").write_text("the NEW project's upload", encoding="utf-8")
+    (tmp_path / "demo" / "old.txt").write_text("the deleted project's upload", encoding="utf-8")
 
     class _Settings:
         upload_corpus_dir = str(tmp_path)
@@ -406,30 +412,24 @@ def test_a_recreated_project_keeps_its_corpus_when_an_old_delete_cleans_up(
     async def _deleted(conn: Any, name: str) -> bool:
         return True
 
-    async def _recreated(conn: Any, name: str) -> Any:
-        return object()  # someone took the name again before cleanup ran
-
     _stub(monkeypatch, "projects", "delete_project", _deleted)
-    _stub(monkeypatch, "projects", "get_project", _recreated)
-
     assert client.delete("/projects/demo").status_code == 204
-    assert (tmp_path / "demo" / "fresh.txt").exists(), "must not delete a live project's corpus"
+    assert not (tmp_path / "demo").exists()  # detached AND the tombstone swept
+    assert not any(p.name.startswith(".deleting-") for p in tmp_path.iterdir())
 
 
-def test_the_delete_endpoint_actually_removes_the_uploads(
+def test_a_failed_commit_gives_the_corpus_back(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Drive the REAL endpoint, not the helper (QA7/D16).
+    """Detaching inside the transaction owes a rollback path (Codex #145).
 
-    The helper test above proves _delete_upload_dir behaves; it does NOT prove
-    anything calls it. Verified: with the call removed from the endpoint the
-    whole of this file still passed, so the fix could have been deleted
-    unnoticed — the "an unpinned mechanism is prose" failure. This drives
-    DELETE /projects/{p} through the app and asserts the corpus is gone, so
-    the WIRING is what is pinned.
+    The rename happens before the commit, so a transaction that does NOT commit
+    would otherwise leave a project that still exists without its corpus — the
+    data loss this whole change exists to avoid, arrived at from the other
+    side. The handler re-attaches on any failure out of the block.
     """
     (tmp_path / "demo").mkdir()
-    (tmp_path / "demo" / "doc.txt").write_text("uploaded", encoding="utf-8")
+    (tmp_path / "demo" / "doc.txt").write_text("must survive", encoding="utf-8")
 
     class _Settings:
         upload_corpus_dir = str(tmp_path)
@@ -439,20 +439,89 @@ def test_the_delete_endpoint_actually_removes_the_uploads(
     async def _deleted(conn: Any, name: str) -> bool:
         return True
 
-    async def _gone(conn: Any, name: str) -> None:
-        return None
+    _stub(monkeypatch, "projects", "delete_project", _deleted)
+
+    @asynccontextmanager
+    async def _failing_commit() -> AsyncIterator[object]:
+        yield object()
+        raise RuntimeError("commit failed")
+
+    client.app.dependency_overrides[db_conn_provider] = lambda: _failing_commit  # type: ignore[attr-defined]
+    try:
+        with pytest.raises(RuntimeError):
+            client.delete("/projects/demo")
+    finally:
+        client.app.dependency_overrides.pop(db_conn_provider, None)  # type: ignore[attr-defined]
+    assert (tmp_path / "demo" / "doc.txt").exists(), "a non-committing delete must give it back"
+
+
+def test_the_corpus_is_detached_before_the_transaction_ends(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The detach must happen INSIDE the deleting transaction (Codex #145 P1).
+
+    That placement is the whole fix: while the row lock is held, no other
+    instance can create this name, so renaming the directory aside there makes
+    a later project's uploads structurally unreachable by this cleanup. Move
+    the same rename after the block and the TOCTOU window reopens — which the
+    other tests cannot see, because their outcomes are identical either way.
+    So this pins the ORDER, not the outcome.
+    """
+    (tmp_path / "demo").mkdir()
+    (tmp_path / "demo" / "doc.txt").write_text("x", encoding="utf-8")
+
+    class _Settings:
+        upload_corpus_dir = str(tmp_path)
+
+    monkeypatch.setattr("api.routers.projects.get_settings", lambda: _Settings())
+
+    async def _deleted(conn: Any, name: str) -> bool:
+        return True
 
     _stub(monkeypatch, "projects", "delete_project", _deleted)
-    # the post-commit re-check consults the SoR: name free => safe to clean
-    _stub(monkeypatch, "projects", "get_project", _gone)
-    assert client.delete("/projects/demo").status_code == 204
-    assert not (tmp_path / "demo").exists()
 
-    # ...and a REFUSED delete must not touch the caller's documents: the row
-    # delete is authoritative and runs first precisely so a rejection cannot
-    # destroy data (this is why the ordering is the opposite of prune's).
+    events: list[str] = []
+    real_detach = projects_module._detach_upload_dir
+
+    def _spy_detach(project: str) -> Any:
+        events.append("detach")
+        return real_detach(project)
+
+    monkeypatch.setattr("api.routers.projects._detach_upload_dir", _spy_detach)
+
+    @asynccontextmanager
+    async def _tracking() -> AsyncIterator[object]:
+        yield object()
+        events.append("txn-end")
+
+    client.app.dependency_overrides[db_conn_provider] = lambda: _tracking  # type: ignore[attr-defined]
+    try:
+        assert client.delete("/projects/demo").status_code == 204
+    finally:
+        client.app.dependency_overrides.pop(db_conn_provider, None)  # type: ignore[attr-defined]
+
+    assert events == ["detach", "txn-end"], f"detach must precede the commit, got {events}"
+
+
+def test_a_refused_delete_leaves_the_corpus_exactly_where_it_was(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected DELETE must not cost the caller their documents.
+
+    This is the guarantee the whole ordering argument exists to provide, and
+    under the tombstone design it rests on TWO mechanisms rather than one: the
+    refusal raises BEFORE the detach, and any exception out of the block
+    re-attaches. It is therefore more worth pinning than when the ordering was
+    the only thing carrying it — and it was silently lost in a test rewrite,
+    which is exactly how a mechanism decays into prose.
+    """
     (tmp_path / "demo").mkdir()
     (tmp_path / "demo" / "doc.txt").write_text("still mine", encoding="utf-8")
+
+    class _Settings:
+        upload_corpus_dir = str(tmp_path)
+
+    monkeypatch.setattr("api.routers.projects.get_settings", lambda: _Settings())
 
     async def _refuses(conn: Any, name: str) -> bool:
         raise ProjectHasBuildsError(name, 2)
@@ -460,3 +529,50 @@ def test_the_delete_endpoint_actually_removes_the_uploads(
     _stub(monkeypatch, "projects", "delete_project", _refuses)
     assert client.delete("/projects/demo").status_code == 400
     assert (tmp_path / "demo" / "doc.txt").exists(), "a refused delete must keep the corpus"
+    assert not any(p.name.startswith(".deleting-") for p in tmp_path.iterdir())
+
+
+def test_a_cleanup_failure_answers_204_but_says_the_tombstone_survived(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The delete SUCCEEDED, so it must not report otherwise — but a leftover
+    must not be invisible either (gate-2 on #145).
+
+    Swallowing is right here: the row is committed, so raising would report a
+    failure that did not happen and a retry would 404. What must not happen is
+    the leak becoming undiscoverable, which is D16's own complaint in a
+    narrower path — so the tombstone is named in a warning.
+    """
+    (tmp_path / "demo").mkdir()
+    (tmp_path / "demo" / "doc.txt").write_text("x", encoding="utf-8")
+
+    class _Settings:
+        upload_corpus_dir = str(tmp_path)
+
+    monkeypatch.setattr("api.routers.projects.get_settings", lambda: _Settings())
+
+    async def _deleted(conn: Any, name: str) -> bool:
+        return True
+
+    _stub(monkeypatch, "projects", "delete_project", _deleted)
+    # a cleanup that removes nothing, spied so the SWALLOW itself is pinned:
+    # without ignore_errors the real rmtree would raise and 500 a delete that
+    # actually succeeded, and a no-op stub alone would never notice the flag
+    # going missing
+    rmtree_calls: list[dict[str, Any]] = []
+
+    def _spy_rmtree(path: Any, **kw: Any) -> None:
+        rmtree_calls.append(kw)
+
+    monkeypatch.setattr("api.routers.projects.shutil.rmtree", _spy_rmtree)
+
+    # captured off the logger itself, not via caplog: global logging config is
+    # shared state that another test can change, and a warning that only
+    # appears when this file runs alone is not a pin
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        projects_module._log, "warning", lambda msg, *a: warnings.append(str(msg) % a)
+    )
+    assert client.delete("/projects/demo").status_code == 204  # the delete DID happen
+    assert any(".deleting-" in w for w in warnings), warnings
+    assert rmtree_calls == [{"ignore_errors": True}], rmtree_calls

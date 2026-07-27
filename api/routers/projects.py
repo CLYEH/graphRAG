@@ -8,7 +8,10 @@ reads/PATCH/DELETE are naturally idempotent and take none.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import shutil
+import uuid
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -36,6 +39,8 @@ from core.registry import (
     list_projects,
     update_project,
 )
+
+_log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["projects"])
 
@@ -130,55 +135,95 @@ async def delete_project_endpoint(open_conn: ConnProvider, project: str) -> Resp
     # retention surface.
     #
     # The transaction is owned HERE rather than taken as a request-scoped
-    # ``Conn``, because WHEN it commits decides which failure is possible.
-    # A yield-dep commits only after the response is sent, so with ``Conn``
-    # the real order is delete → rmtree → 204 → COMMIT, and a commit failure
-    # after a successful rmtree would leave the client told 204, the project
-    # row alive, and its corpus irreversibly gone. Owning the block makes the
-    # row durable BEFORE any file is touched; the sibling upload writer
-    # refuses the mirror-image residue for the same reason.
+    # ``Conn``, because WHEN it commits decides which failures are possible: a
+    # yield-dep commits only after the response is sent, so the row would not
+    # be durable while this handler still had work to do.
     #
-    # Files go after the commit, deliberately the OPPOSITE of prune's
-    # "projections first, Postgres last": that rule assumes the truth-delete
-    # always proceeds, whereas this one can legitimately REFUSE (builds
-    # present, active jobs) — and those refusals raise inside the block, so
-    # they touch no files. The residual is a crash between commit and rmtree,
-    # which leaks the directory exactly as today: never worse, and loud.
-    async with open_conn() as conn:
-        try:
-            existed = await delete_project(conn, project)
-        except (ProjectHasBuildsError, ProjectHasActiveJobsError) as exc:
-            raise translate_registry_error(exc) from exc
-        if not existed:
-            raise _not_found(project)
-    # The corpus directory is addressed by NAME, and a name is reusable the
-    # moment the row is gone. Multiple one-worker instances sharing a corpus
-    # root is the documented scaling shape, so between the commit above and
-    # the rmtree below another instance can create this same name and upload
-    # into it — and a name-based delete would then destroy the NEW project's
-    # documents (Codex #145 P1). Re-check against the SoR first: if the name
-    # is taken again, the directory belongs to a generation we are not
-    # deleting, and we leave it alone. That degrades to the pre-existing leak
-    # — which is already a filed follow-up — instead of deleting a live
-    # project's corpus, so the default outcome is never worse than today.
-    async with open_conn() as conn:
-        if await get_project(conn, project) is not None:
-            return Response(status_code=204)
-    _delete_upload_dir(project)
+    # The corpus is addressed by NAME, and a name is reusable the moment its
+    # row is gone — multiple one-worker instances sharing a corpus root is the
+    # documented scaling shape. So the directory is DETACHED to a unique
+    # tombstone INSIDE the deleting transaction, while the row lock still
+    # blocks any concurrent create of that name; only the tombstone is removed
+    # afterwards. Nothing a later project writes can be reached by this
+    # request's cleanup, so there is no window to lose. (A post-commit
+    # re-check only MOVED the window — the SELECT's transaction ends before
+    # the rmtree, and a future INSERT has no row to lock. Codex #145 P1.)
+    #
+    # The two failure paths follow from detaching inside the transaction: a
+    # REFUSAL (builds present, active jobs) raises before the rename and so
+    # touches nothing, and a failure at COMMIT re-attaches the directory —
+    # otherwise a project that still exists would have lost its corpus.
+    tombstone: Path | None = None
+    try:
+        async with open_conn() as conn:
+            try:
+                existed = await delete_project(conn, project)
+            except (ProjectHasBuildsError, ProjectHasActiveJobsError) as exc:
+                raise translate_registry_error(exc) from exc
+            if not existed:
+                raise _not_found(project)
+            tombstone = await asyncio.to_thread(_detach_upload_dir, project)
+    except BaseException:
+        if tombstone is not None:
+            try:
+                await asyncio.to_thread(_reattach_upload_dir, tombstone, project)
+            except OSError:
+                # best-effort work must not MASK the failure it is recovering
+                # from: letting a rename error replace the original exception
+                # would show the operator the wrong cause entirely
+                _log.warning("could not re-attach %s after a failed delete", tombstone)
+        raise
+    if tombstone is not None:
+        # Off the event loop: an accumulated corpus is unbounded in size and
+        # file count, and a slow shared filesystem would otherwise stall every
+        # unrelated request on this worker.
+        #
+        # Errors are SWALLOWED here on purpose. The delete genuinely succeeded
+        # — the row is committed — so raising would report a failure that did
+        # not happen, and a retry would 404. What is left behind is an inert,
+        # self-identifying tombstone no code path scans, so the honest handling
+        # is to answer 204 and make the leftover DISCOVERABLE rather than
+        # invisible: hence the warning below, not silence.
+        await asyncio.to_thread(shutil.rmtree, tombstone, ignore_errors=True)
+        if await asyncio.to_thread(tombstone.exists):
+            _log.warning("upload corpus tombstone survives cleanup: %s", tombstone)
     return Response(status_code=204)
 
 
-def _delete_upload_dir(project: str) -> None:
-    """Remove ``<upload_corpus_dir>/<project>/`` after the project row is gone.
+def _detach_upload_dir(project: str) -> Path | None:
+    """Rename ``<upload_corpus_dir>/<project>/`` aside, returning the tombstone.
+
+    Called INSIDE the deleting transaction, while the row lock still blocks a
+    concurrent create of this name. The rename is what makes cleanup safe: it
+    is atomic, so after it the name is free for a new project to occupy with a
+    FRESH directory, and this request's remaining work names only the
+    tombstone. A cleanup that still addressed the project name after the
+    commit could reach a later project's uploads — deleting live documents,
+    which is worse than the leak this change removes.
 
     The path is resolved through :func:`core.paths.safe_project_subdir`, the
-    same guard the upload writer uses — a name that is not a safe single path
-    component (``..``, absolute, separators) resolves to None and nothing is
-    removed, so a crafted project name cannot direct a delete outside the
-    corpus root. A project that never received an upload has no directory and
-    that is a no-op, not an error.
+    same guard the upload writer uses, so a name that is not a safe single
+    path component (``..``, absolute, separators) resolves to None and nothing
+    is touched. A project that never received an upload has no directory, and
+    that is a no-op returning None rather than an error.
     """
     corpus_dir = safe_project_subdir(Path(get_settings().upload_corpus_dir), project)
     if corpus_dir is None or not corpus_dir.exists():
+        return None
+    tombstone = corpus_dir.with_name(f".deleting-{corpus_dir.name}-{uuid.uuid4().hex}")
+    corpus_dir.rename(tombstone)
+    return tombstone
+
+
+def _reattach_upload_dir(tombstone: Path, project: str) -> None:
+    """Undo :func:`_detach_upload_dir` when the deleting transaction did not
+    commit — otherwise a project that still exists would have lost its corpus.
+
+    Best-effort by design: if the original name has since been taken, the
+    tombstone is left in place rather than overwriting whatever now occupies
+    it. That leaves a recoverable directory instead of destroying one.
+    """
+    corpus_dir = safe_project_subdir(Path(get_settings().upload_corpus_dir), project)
+    if corpus_dir is None or corpus_dir.exists():
         return
-    shutil.rmtree(corpus_dir)
+    tombstone.rename(corpus_dir)
