@@ -43,3 +43,9 @@ Thumbs.db
 test-results/
 playwright-report/
 blob-report/
+
+# Managed-corpus uploads written at runtime (`data/uploads/{project}/`). Nothing
+# here is tracked, but it lands INSIDE the content-addressed receipt tree, so an
+# unguarded `git add -A` would commit a user's uploaded documents — the S8
+# receipt-hygiene rule, and a reviewer nit on two consecutive tasks (MCP18, QA1).
+data/

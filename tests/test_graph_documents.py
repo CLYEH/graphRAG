@@ -19,7 +19,12 @@ from typing import Any, cast
 
 from llama_index.core.llms import LLM, ChatMessage, ChatResponse
 
-from core.graph.documents import TextExtractReport, chunk_source_ref, extract_documents
+from core.graph.documents import (
+    _SYSTEM_PROMPT,
+    TextExtractReport,
+    chunk_source_ref,
+    extract_documents,
+)
 from core.graph.ontology import TextOntology
 from core.resolve import fingerprints
 from core.stores import tables
@@ -157,6 +162,73 @@ async def test_accepted_extractions_land_with_contract_grade_evidence() -> None:
     assert ev["end_offset"] == 100 + match + len(quote)
     assert ev["quote"] == quote and ev["source_uri"] == "mem://a.txt"
     assert _TEXT[ev["start_offset"] - 100 : ev["end_offset"] - 100] == quote
+
+
+async def test_mention_surface_form_is_the_verbatim_span_not_the_canonical_name() -> None:
+    """A mention's stored surface form must be findable in the chunk it cites.
+
+    §27.2 emits it as the mention's ``quote`` and demands "the same auditable
+    shape as relation chunk evidence"; DR-014 puts offsets at CHUNK level, so
+    this string is the ONLY mention-level anchor an auditor has. Storing the
+    canonical name broke that for ~10% of audited mentions (QA1/D2): the model
+    normalizes 「全票」 into 「全票（票價）」, which occurs nowhere in the cited
+    text, so an agent verifying groundedness REJECTS a correct answer because
+    its citation cannot be found — the failure this test exists to prevent.
+
+    Five cells, one invariant — whatever lands can be pointed at.
+    """
+    text = "問:請問潮境智能海洋館全票多少錢？答:全票300元。"
+    chunk = _chunk(text, start=100)
+    writer = _FakeWriter([_doc()], [chunk])
+    answer = _answer(
+        [
+            # the QA1 repro: the model normalizes `name`; only `surface` occurs
+            {"type": "Ticket", "name": "全票（票價）", "surface": "全票", "confidence": 0.9},
+            # no `surface` offered — the name itself is verbatim here
+            {"type": "Ticket", "name": "潮境智能海洋館", "confidence": 0.8},
+            # neither the name nor the offered surface occurs in the chunk
+            {"type": "Ticket", "name": "敬老票", "surface": "敬老票價", "confidence": 0.5},
+            # `surface` is a NEW untrusted leaf, and _apply_chunk runs OUTSIDE
+            # the per-document try/except — a regression in its handling would
+            # abort the whole graph stage instead of failing one document
+            # (§22), so its non-string and blank forms are pinned here
+            {"type": "Ticket", "name": "潮境", "surface": 42, "confidence": 0.4},
+            {"type": "Ticket", "name": "海洋館", "surface": "   ", "confidence": 0.3},
+        ],
+        [],
+    )
+    ontology = TextOntology(entity_types=("Ticket",), relation_types=("COSTS",))
+    report = await extract_documents(
+        cast(BuildScopedWriter, writer), cast(LLM, _FakeLLM({text: answer})), ontology
+    )
+
+    names = {e["id"]: e["canonical_name"] for e in writer.entities}
+    stored = {names[m["entity_id"]]: m["surface_form"] for m in writer.mentions}
+    assert stored["全票（票價）"] == "全票"  # the SPAN, not the canonical name
+    assert stored["潮境智能海洋館"] == "潮境智能海洋館"  # coincide → still verbatim
+    assert stored["敬老票"] is None  # nothing citable → absence, never a false quote
+    # an unusable `surface` is not a failure — it falls back to the name, which
+    # IS verbatim in both of these; neither may crash the stage
+    assert stored["潮境"] == "潮境"  # non-string surface ignored
+    assert stored["海洋館"] == "海洋館"  # blank surface ignored
+
+    # the invariant every cell exists to preserve
+    for mention in writer.mentions:
+        surface = mention["surface_form"]
+        assert surface is None or surface in chunk.text
+
+    # absence is not silence (§22): the refusal is named in the extraction
+    # report. The row still lands (it records what the model claimed), but a
+    # chunk mention's metadata REQUIRES a quote, so mentions.py drops+counts
+    # this one per entity downstream — a visible loss, where the old canonical
+    # name would have been emitted as a citation its chunk does not contain.
+    assert any("敬老票" in d.reason for d in report.discarded)
+    assert report.mentions == 5
+
+    # prompt and parser must agree on the field name: the parser reads
+    # "surface", so the prompt has to ask for it — renaming one side alone
+    # would silently restore canonical names with every other test still green
+    assert '"surface"' in _SYSTEM_PROMPT
 
 
 async def test_out_of_ontology_types_become_proposals_not_rows() -> None:

@@ -24,7 +24,11 @@ accept is VISIBLE, never silent:
 - an out-of-ontology entity type → a :class:`TypeProposal` in the report
   (the §6 待審池's input; storage lands with the proposal-pool slice);
 - a relation whose quote is not found verbatim, whose type is unknown, or
-  whose endpoint wasn't accepted → a :class:`Discarded` with the reason.
+  whose endpoint wasn't accepted → a :class:`Discarded` with the reason;
+- an entity mention whose surface form is not found verbatim → a
+  :class:`Discarded` with the reason. This one is the odd member: only the
+  QUOTE is refused, not the mention, so the row still lands — with a NULL
+  surface_form, which :mod:`core.query.mentions` then drops and counts.
 
 Evidence offsets are DOCUMENT-absolute (``chunk.start_offset + match``), the
 same frame as chunk offsets (§27.4 spans point into the original text); the
@@ -66,16 +70,19 @@ Allowed entity types: {entity_types}
 Allowed relation types: {relation_types}
 
 Answer ONLY a JSON object, no prose, shaped exactly:
-{{"entities": [{{"type": "...", "name": "...", "confidence": 0.0}}],
+{{"entities": [{{"type": "...", "name": "...", "surface": "...",
+                 "confidence": 0.0}}],
   "relations": [{{"src_type": "...", "src_name": "...", "type": "...",
                   "dst_type": "...", "dst_name": "...", "quote": "...",
                   "confidence": 0.0}}]}}
 
-Rules: every relation's "quote" MUST be copied VERBATIM from the chunk (it is
-the evidence span). Keep quotes short (under 300 characters). Only use the
-allowed types; if the text clearly needs a type outside the list, still emit
-the entity with that type — it will be routed to ontology review, not stored.
-confidence is your 0..1 estimate."""
+Rules: every relation's "quote" AND every entity's "surface" MUST be copied
+VERBATIM from the chunk — they are the evidence spans. "name" is the entity's
+canonical name; "surface" is the exact text it appears as in THIS chunk. The
+two often differ, and only the verbatim one can be cited. Keep quotes short
+(under 300 characters). Only use the allowed types; if the text clearly needs a
+type outside the list, still emit the entity with that type — it will be routed
+to ontology review, not stored. confidence is your 0..1 estimate."""
 
 
 def chunk_source_ref(content_hash: str, ordinal: int) -> str:
@@ -255,6 +262,40 @@ def _clamp(value: object) -> float:
         return 0.0
 
 
+def _locate_surface(chunk_text: str, name: str, offered: object) -> str | None:
+    """The mention's surface form as it VERBATIM occurs in this chunk, or None.
+
+    §27.2 calls the stored value "the mention's surface form" and requires "the
+    same auditable shape as relation chunk evidence"; DR-014 puts offsets at
+    CHUNK level, so this string is the ONLY mention-level anchor an auditor — or
+    a groundedness-checking agent — can verify. A canonical name is not that
+    anchor: the model normalizes 「全票」 into 「全票（票價）」, which then occurs
+    nowhere in the cited text, and a quote that cannot be found in its own chunk
+    reads as a fabricated citation (QA1/D2: ~10% of audited mentions).
+
+    The model's own ``surface`` wins when it checks out; the canonical name is
+    the fallback for the (common) case where the two coincide, and for a model
+    that omits the field at all. Neither locatable → None, never a value we
+    cannot point at. Absence is the HONEST outcome, not a loophole: a chunk
+    mention's ``metadata`` REQUIRES ``quote``, so :mod:`core.query.mentions`
+    drops a NULL-surface mention and counts it per entity (§22 over-drop, never
+    a schema-invalid emission), warning with the entity named — and an entity
+    left with no resolvable mention drops entirely, the pre-existing uncitable
+    rule. A stored-but-unfindable quote takes the opposite path: it is emitted
+    as a citation the cited chunk does not contain, which is the defect.
+
+    The §27.4 cap is applied before the search so the stored prefix is itself
+    the thing verified — truncating after would store an unverified tail.
+    """
+    for candidate in (offered, name):
+        if not isinstance(candidate, str):
+            continue
+        span = candidate.strip()[:_MAX_QUOTE_CHARS]
+        if span and span in chunk_text:
+            return span
+    return None
+
+
 async def _apply_chunk(
     writer: BuildScopedWriter,
     *,
@@ -315,11 +356,30 @@ async def _apply_chunk(
             counts["entities"] += 1
         entity_id = state.entity_id_by_key[key]
         if (entity_id, ref) not in state.mention_refs:
+            # the STORED surface form must be the span the entity occupies in
+            # this chunk, not the canonical name — §27.2 emits it as the
+            # mention's `quote` and it is the only mention-level audit anchor
+            # (DR-014 offsets are chunk-level). QA1/D2.
+            located = _locate_surface(chunk.text, name, item.get("surface"))
+            if located is None:
+                # the row still lands, but with NO quote rather than an
+                # unfindable one: mentions.py then drops+counts it per entity
+                # (§22 over-drop) and the query surface warns with the entity
+                # named — visible loss, instead of a citation whose own chunk
+                # does not contain it. Named here too, at extraction time,
+                # because THIS is where the model's claim was refused.
+                discarded.append(
+                    Discarded(
+                        ref,
+                        f"entity mention stored without quote — "
+                        f"no verbatim span in chunk: {name!r}",
+                    )
+                )
             await writer.insert_entity_mention(
                 entity_id=entity_id,
                 source_kind="text",
                 source_ref=ref,
-                surface_form=name,
+                surface_form=located,
                 confidence=_clamp(item.get("confidence")),
             )
             state.mention_refs.add((entity_id, ref))
