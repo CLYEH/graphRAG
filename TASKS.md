@@ -197,7 +197,7 @@ Keep items small enough to finish in one loop.
 - [x] QA2 hybrid_query 零文字頁(D1)— 融合後按**答案種類**保樓地板 4:2:1:1(passage `top_k//2`、graph facts `top_k//4`、sql row `top_k//8`、bare name entity `top_k//8`;`min(floor,len)` 使稀缺種類不反向擋人)。根因:RRF 只看 mode 內名次,semantic 自身 §16 排序把 entity 排在 chunk 前使 chunk 落在 rank 11+,被兩個 mode 的 entity 擠出整頁。
 
 ### 靜默錯誤(P2)
-- [ ] QA3 未知參數靜默丟棄(D3)— MCP 靜默接受並忽略拼錯/未知的工具參數,以**乾淨成功**回傳錯誤資料:`semantic_search {"query":"票價多少","topk":3}` → 20 筆(非 3)、warnings=[];`list_entities {"entity":"票價資訊","limit":3}` → 3 個毫不相干的 entity、`error_code=null`;`graph_query …"hop":2` → 靜默退回 hops=1。REST 對同一 typo 正確回 `400 extra_forbidden`。MCP 的呼叫者正是最會打出似是而非參數名的 LLM agent——filter 被丟掉後 agent 以為在查單一 entity,實際在 1405 筆語料的未過濾切片上推理。修法:inputSchema 加 `additionalProperties:false` 或 server 端對未知 key 發警告/拒絕,對齊 REST。
+- [x] QA3 未知參數靜默丟棄(D3)— dispatch seam 對未宣告的參數名 typed 拒絕(具名該鍵+列出該工具接受的參數),不再讓 `extra=ignore` 靜默丟掉拼錯鍵而以乾淨成功回答**另一個問題**;同時把規則**廣告出去**:13 個工具的 inputSchema 皆帶 `additionalProperties:false`(只執法不揭露=讀 schema 的客戶端只能靠被拒才學到)。與 REST 的 `extra_forbidden` 對齊。
 - [x] QA4 REST 靜默 clamp(D4)— `policy.top_k()` 的 min() 夾在 REST facade 無揭露、MCP 有(同產品兩套說法);TRUNCATED 訊息上移 `core/mcp/policy.py` 成單一來源,兩表面共用,REST 於 `_run_mode` 單點注入(semantic/global/sql/hybrid 全掃;graph 本就拒收 top_k),nil-build 不謊報。契約 enum 已含 TRUNCATED,免 bump。
 
 ### 框架層與型別化錯誤(P3,建議一次修掉)

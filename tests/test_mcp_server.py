@@ -1611,6 +1611,112 @@ async def test_every_pre_binding_claim_is_pinned_by_a_raising_bind(
         assert "not a store outage" in blob, tool
 
 
+async def test_an_unknown_parameter_is_refused_and_the_rule_is_advertised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A misspelled parameter must not return a CLEAN SUCCESS (QA3/D3).
+
+    The generated arg model carries pydantic's default ``extra="ignore"``, so
+    ``semantic_search {"query": …, "topk": 3}`` DROPPED the typo, let ``top_k``
+    fall back to its default, and answered with 20 results, ``warnings: []``
+    and no error code — an answer to a different question than the one asked,
+    presented as success. The callers here are LLM agents, i.e. exactly the
+    population that emits plausible-but-wrong parameter names, and REST already
+    refuses the identical typo with ``400 extra_forbidden``.
+
+    Both halves are pinned, because enforcing without advertising leaves the
+    published schema still saying extra keys are fine (the QA2 lesson: taking a
+    behavior without the sentence it makes true):
+      * the dispatch guard REFUSES, naming the offending key and the allowlist;
+      * every advertised ``inputSchema`` says ``additionalProperties: false``.
+    """
+    import json
+
+    from mcp import types as _mcp_types
+
+    import core.mcp.server as server_module
+    from core.mcp.server import build_server
+
+    for factory in ("chat_model", "query_embedding_model", "vector_client", "graph_driver"):
+        monkeypatch.setattr(server_module, factory, lambda: cast(Any, object()))
+    monkeypatch.setattr(
+        server_module, "create_async_engine", lambda *a, **k: SimpleNamespace(dispose=None)
+    )
+    server = build_server("demo")
+
+    def _explode() -> Any:
+        raise AssertionError("an unknown parameter must be refused BEFORE binding")
+
+    runtime = SimpleNamespace(
+        context=SimpleNamespace(project="demo", bound=_explode),
+        policy=SimpleNamespace(max_latency_ms=10_000, max_top_k=20),
+        exposure=None,
+    )
+    monkeypatch.setattr(
+        server,
+        "get_context",
+        lambda: SimpleNamespace(request_context=SimpleNamespace(lifespan_context=runtime)),
+    )
+    handler = server._mcp_server.request_handlers[_mcp_types.CallToolRequest]  # noqa: SLF001
+
+    async def call(tool: str, arguments: dict[str, Any]) -> str:
+        request = _mcp_types.CallToolRequest(
+            method="tools/call",
+            params=_mcp_types.CallToolRequestParams(name=tool, arguments=arguments),
+        )
+        result = cast(_mcp_types.CallToolResult, (await handler(request)).root)
+        return json.dumps(result.structuredContent, ensure_ascii=False)
+
+    # the three reported repros — each returned a clean success before
+    typo = await call("semantic_search", {"query": "票價多少", "topk": 3})
+    assert "topk: unknown parameter" in typo and "top_k" in typo  # names the fix
+    wrong_name = await call("list_entities", {"entity": "票價資訊", "limit": 3})
+    assert "entity: unknown parameter" in wrong_name and "INVALID_INPUT" in wrong_name
+    singular = await call("graph_query", {"template": "neighbors", "entity": "x", "hop": 2})
+    assert "hop: unknown parameter" in singular
+
+    # a tool that declares NO arguments makes every key unknown — correct, and
+    # it must not crash on the empty allowlist
+    assert "this tool accepts no arguments" in await call("list_schema", {"anything": 1})
+    # ...and a correct call is untouched: refusing the typo must not over-block
+    assert "unknown parameter" not in await call("semantic_search", {"query": "ok", "top_k": 3})
+
+    # The KEY is caller-chosen bytes, so this refusal is an ECHO PATH and takes
+    # the same two guards as every other one here. Without _safe_echo a
+    # surrogate in a key kills the response in serialization and the caller
+    # gets NOTHING back — QA5/D11 reopened through new machinery one commit
+    # after it was closed (Codex/gate-2 on #143).
+    surrogate = _mcp_types.CallToolRequest(
+        method="tools/call",
+        params=_mcp_types.CallToolRequestParams(
+            name="semantic_search", arguments={"query": "hi", "\ud800bad": 1}
+        ),
+    )
+    refused = cast(_mcp_types.CallToolResult, (await handler(surrogate)).root)
+    # the transport serializes the ServerResult — that is where D11 died
+    _mcp_types.ServerResult(refused).model_dump_json().encode("utf-8")
+
+    # ...and the echo is WINDOWED: a huge key or a flood of keys must not be
+    # reflected whole (#133 r1 — no refusal path reflects a large input)
+    huge = await call("semantic_search", {"query": "hi", "K" * 5000: 1})
+    assert len(huge) < 1000, "an oversized key must not be reflected whole"
+    flood = await call("semantic_search", {"query": "hi", **{f"k{i}": 1 for i in range(200)}})
+    assert len(flood) < 1000 and "more)" in flood  # says how many it withheld
+
+    # the ADVERTISED half: a schema-reading client sees the rule rather than
+    # discovering it by being refused
+    listed = cast(
+        _mcp_types.ListToolsResult,
+        (
+            await server._mcp_server.request_handlers[_mcp_types.ListToolsRequest](  # noqa: SLF001
+                _mcp_types.ListToolsRequest(method="tools/list")
+            )
+        ).root,
+    )
+    assert listed.tools, "no tools advertised"
+    assert all(t.inputSchema.get("additionalProperties") is False for t in listed.tools)
+
+
 async def test_the_browse_filter_is_capped_on_length_before_the_storability_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
