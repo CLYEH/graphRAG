@@ -94,6 +94,22 @@ describe("App shell", () => {
     expect(localStorage.getItem("graphrag.lastProject")).toBe("beta");
   });
 
+  it("a stale bookmark does not erase the remembered project", async () => {
+    // WHY (Codex #148 P2): the effect recorded EVERY decodable :project route,
+    // including one that no longer exists. Following a stale bookmark to a
+    // deleted project therefore overwrote a perfectly good preference, and the
+    // next visit to `/` rejected the now-unknown key and fell back to
+    // projects[0] — reinstating the newest-project landing this task exists to
+    // remove. The route being decodable says nothing about the project being
+    // real, so the list is what decides.
+    localStorage.setItem("graphrag.lastProject", "working-corpus");
+    stubProjects([project("brand-new-shell"), project("working-corpus")]);
+    renderWithProviders(<App />, { route: projectRoute("deleted-since") });
+
+    await screen.findByRole("combobox", { name: /專案/ });
+    expect(localStorage.getItem("graphrag.lastProject")).toBe("working-corpus");
+  });
+
   it("filters the switcher once the list is too long to scan", async () => {
     // WHY (QA9/D17): the old comment assumed "project counts are small". A
     // native select cannot be searched and its type-ahead only matches a label

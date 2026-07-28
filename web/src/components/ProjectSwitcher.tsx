@@ -25,9 +25,17 @@ export function ProjectSwitcher() {
   // next time instead of the newest project. Recorded from the URL rather than
   // from this component's onChange, so arriving by link, bookmark or
   // back-button counts too — those are the paths an onChange hook would miss.
+  //
+  // Only once the project is known to EXIST (Codex #148 P2). A route segment
+  // being decodable says nothing about the project being real, and recording a
+  // dead one overwrote a perfectly good preference: following a stale bookmark
+  // to a deleted project meant the next visit to `/` rejected the now-unknown
+  // key and fell back to projects[0] — reinstating the newest-project landing
+  // this task exists to remove. `projects` is undefined while loading, so this
+  // simply waits for the list rather than guessing.
   useEffect(() => {
-    if (active !== undefined) writeLastProject(active);
-  }, [active]);
+    if (active !== undefined && projects?.some((p) => p.name === active)) writeLastProject(active);
+  }, [active, projects]);
 
   const view = useMemo(() => switcherView(projects, filter, active), [projects, filter, active]);
 
