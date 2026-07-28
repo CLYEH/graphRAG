@@ -66,20 +66,17 @@ def is_safe_path_component(name: str) -> bool:
     check refuses it downstream), but this predicate is public now, and the
     first caller to use it alone would have inherited one.
 
-    Trailing spaces and dots are refused for the same anti-aliasing reason as
-    the backslash, and on the same "refuse it everywhere" principle: Windows
-    STRIPS them at ``mkdir``, so ``p``, ``p` ``` and ``p.`` all land in ``p``
-    (measured). Three distinct projects would then share one corpus directory —
-    one project's uploads become another's documents, and deleting any of them
-    removes the others' files.
+    Answers CONTAINMENT ONLY — "can this name be a safe child of a base
+    directory" — and deliberately nothing about whether the name is a wise one
+    to accept. That distinction is load-bearing: this predicate also gates the
+    CLEANUP path (``safe_project_subdir`` → ``_detach_upload_dir``), so a rule
+    added here retroactively strands data belonging to projects that ALREADY
+    EXIST — the delete endpoint would commit the registry row's removal while
+    skipping a directory it now refuses to name, orphaning the files. The
+    trailing-space/dot aliasing rule lives in :func:`is_creatable_project_key`
+    for exactly that reason (Codex #149 r3).
     """
-    return (
-        bool(name)
-        and name not in (".", "..")
-        and "\\" not in name
-        and name == name.rstrip(" .")
-        and name == Path(name).name
-    )
+    return bool(name) and name not in (".", "..") and "\\" not in name and name == Path(name).name
 
 
 def is_path_addressable(project: str) -> bool:
@@ -107,8 +104,8 @@ def is_path_addressable(project: str) -> bool:
     return project not in (".", "..") and "/" not in project
 
 
-def is_usable_project_key(project: str) -> bool:
-    """Whether a project key works on the two PURE-STRING surfaces.
+def is_creatable_project_key(project: str) -> bool:
+    """Whether a NEW project may be created under this key (pure-string half).
 
     A key has to survive several transports, and QA10 found them one at a time
     rather than by enumeration — which is the lesson, not the list. The two
@@ -128,5 +125,20 @@ def is_usable_project_key(project: str) -> bool:
     in that helper if it needs configuration or I/O. Putting an I/O rule here
     would make this predicate unusable in the Pydantic validator that is its
     whole point.
+
+    CREATION-only, and the name says so (Codex #149 r3). The trailing-space/dot
+    clause below is an ALIASING rule, not a containment one: Windows strips
+    them at ``mkdir``, so ``p``, ``p`` + space and ``p.`` would land in one
+    corpus directory (measured) — one project's uploads becoming another's
+    documents. Refusing that for a key nobody holds yet costs nothing; putting
+    it in the containment guard would retroactively make EXISTING POSIX
+    projects with such names un-cleanable, because ``safe_project_subdir``
+    would stop naming their directory and the delete endpoint would commit the
+    row's removal while skipping the files. A guard that gates cleanup can only
+    be tightened for data that does not exist yet.
     """
-    return is_path_addressable(project) and is_safe_path_component(project)
+    return (
+        is_path_addressable(project)
+        and is_safe_path_component(project)
+        and project == project.rstrip(" .")
+    )

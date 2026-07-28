@@ -25,7 +25,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validat
 
 from core.builds.lifecycle import BuildInfo
 from core.metadata.schema import unstorable_json_reason
-from core.paths import is_usable_project_key
+from core.paths import is_creatable_project_key
 from core.registry import Job, Project, Source
 
 
@@ -95,8 +95,10 @@ def _reject_unaddressable_project_name(v: str) -> str:
     """A project whose name cannot ride in a REST path is unreachable the
     moment it is created (QA10).
 
-    A key has to survive TWO transports and the first round of this task only
-    checked one. ``is_usable_project_key`` asks both:
+    A key has to survive SEVERAL surfaces, and each round of this task found
+    another by measurement rather than by enumeration — which is the lesson,
+    not the list. ``is_creatable_project_key`` asks the three decidable from
+    the string alone:
 
     * the REST path segment — ``.``/``..`` are normalized away before routing
       and ``%2F`` decodes back to ``/``, so such a project was created and then
@@ -104,15 +106,23 @@ def _reject_unaddressable_project_name(v: str) -> str:
       delete that would remove it;
     * the filesystem component — the rule ``safe_project_subdir`` enforces, now
       shared rather than restated, so ``a\\b``/``a:b``/``C:evil`` can no longer
-      be created only to have uploads 400 and eval preflight fail (Codex #149).
+      be created only to have uploads 400 and eval preflight fail (Codex #149);
+    * aliasing — Windows strips a trailing space or dot at ``mkdir``, so ``p``,
+      ``p`` + space and ``p.`` would share ONE corpus directory. Creation-only
+      by design: the containment guard cannot carry this rule without stranding
+      the corpus of projects that already exist (Codex #149 r3).
+
+    A FOURTH surface — the corpus ``file://`` uri — is checked separately in
+    ``api.routers._corpus``, because it needs settings and filesystem I/O and
+    so cannot live in a Pydantic validator.
 
     Refusing at creation is the only point where the caller can still be told.
     """
-    if not is_usable_project_key(v):
+    if not is_creatable_project_key(v):
         raise ValueError(
-            "must work as both a URL path segment and a filesystem name — "
-            "'.', '..', and names containing '/', '\\\\' or a drive prefix "
-            "cannot be addressed or stored"
+            "must work as a URL path segment AND a filesystem name — '.', '..', "
+            "names containing '/' or '\\\\' or a drive prefix, and names ending "
+            "in a space or a dot, cannot be addressed or stored"
         )
     return v
 
