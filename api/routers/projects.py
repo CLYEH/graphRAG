@@ -251,9 +251,54 @@ def _detach_upload_dir(project: str) -> Path | None:
     corpus_dir = safe_project_subdir(Path(get_settings().upload_corpus_dir), project)
     if corpus_dir is None or not corpus_dir.exists():
         return None
-    tombstone = corpus_dir.with_name(f".deleting-{corpus_dir.name}-{uuid.uuid4().hex}")
+    tombstone = corpus_dir.with_name(_tombstone_name(corpus_dir.name))
     corpus_dir.rename(tombstone)
     return tombstone
+
+
+#: How many UTF-8 BYTES of the project name the tombstone keeps. The name is a
+#: READABILITY hint — ``uuid4().hex`` already makes the tombstone unique — so
+#: it is truncated rather than allowed to set the length. Bytes, not
+#: characters: see _tombstone_name.
+_TOMBSTONE_NAME_HINT_BYTES = 64
+
+
+def _tombstone_name(corpus_name: str) -> str:
+    """``.deleting-<hint>-<hex>``, bounded REGARDLESS of the project's length.
+
+    Codex #149 r4: the tombstone used the full name, so it ran 43 characters
+    longer than the key (``.deleting-`` + ``-`` + 32 hex). The write boundary's
+    255-character limit therefore permitted a 298-character tombstone, and the
+    rename raised inside the deleting transaction — measured: a 213-character
+    name produced ``OSError`` winerror 123, the transaction rolled back, and
+    the project became **permanently undeletable**, answering 500 on every
+    retry for a condition its own key caused.
+
+    Bounded here rather than by budgeting the key's limit against this format
+    (``255 - len(".deleting-") - 1 - 32``). Budgeting works, but it makes the
+    project-name rule a function of an unrelated module's naming choice, so a
+    later change to this string would silently re-open the window; truncating
+    eliminates the coupling instead. Same move as the uuid stored-filenames and
+    Qdrant's ``sanitize[:32] + digest`` — both already bounded by construction
+    rather than by an upstream promise.
+
+    Truncated on a BYTE boundary, not a character one (Codex #149 r5). The
+    first version sliced code points while the key's own guard bounds UTF-8
+    bytes — the two units disagree, which is exactly why that guard moved to
+    bytes, and writing the truncation beside it in the other unit reopened the
+    same window: 63 astral-plane characters are a creatable 252-byte key whose
+    tombstone ran to 295 bytes, over the 255-byte limit ext4 and APFS enforce.
+    A Windows probe reports that green, because NTFS counts UTF-16 units —
+    "107 characters worst case" was true in the unit that does not bind.
+
+    In bytes the worst case is ``10 + 64 + 1 + 32 = 107`` for EVERY key.
+    ``errors="ignore"`` drops at most one partial character off what is
+    explicitly a readability hint.
+
+    Uniqueness is unaffected: it was always the hex, never the name.
+    """
+    hint = corpus_name.encode("utf-8")[:_TOMBSTONE_NAME_HINT_BYTES].decode("utf-8", "ignore")
+    return f".deleting-{hint}-{uuid.uuid4().hex}"
 
 
 def _reattach_upload_dir(tombstone: Path, project: str) -> None:

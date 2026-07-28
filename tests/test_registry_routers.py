@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -24,6 +25,7 @@ import api.routers.projects as projects_module
 from api.app import create_app
 from api.deps import db_conn, db_conn_provider
 from api.pagination import decode_sorted_cursor, scope_fingerprint
+from api.routers.projects import _tombstone_name
 from core.registry import (
     MANAGED_FILES_KEY,
     Project,
@@ -155,6 +157,14 @@ def test_projects_and_sources_cursors_are_not_interchangeable(
         ("name", "a|b", "as_uri() encodes to a form no build can resolve"),
         ("name", "p ", "Windows strips the trailing space -> aliases onto p"),
         ("name", "p.", "Windows strips the trailing dot -> aliases onto p"),
+        # Codex #149 r4 — the FOURTH surface: nothing above creates a
+        # directory, so an over-long name passed every check and the FIRST
+        # upload died in mkdir. Both limits apply because they disagree and a
+        # store can be shared across platforms: NTFS counts 255 UTF-16 units
+        # (200 CJK chars succeed here), ext4 counts 255 BYTES (the same name
+        # is 600 and fails there).
+        ("name", "x" * 256, "past the single-component limit on every filesystem"),
+        ("name", "海" * 90, "270 UTF-8 bytes — fits NTFS, breaks ext4"),
     ],
 )
 def test_create_refuses_a_name_the_rest_of_the_system_cannot_carry(
@@ -469,6 +479,60 @@ def test_delete_project_204_and_has_builds(
     r = client.delete("/projects/p")
     assert r.status_code == 400
     assert r.json()["error"]["details"]["builds"] == 2
+
+
+def test_a_maximum_length_project_can_still_be_deleted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Why (Codex #149 r4): the delete path DERIVES a name from the key —
+    ``.deleting-{name}-{32 hex}``, 43 characters longer than the key it is
+    built from. The new 255-byte limit on the key therefore permitted a
+    298-character tombstone, and the rename raised INSIDE the deleting
+    transaction: measured, a 213-character name gave OSError, the transaction
+    rolled back, and the project became **permanently undeletable** — a 500 on
+    every retry, for a condition its own key caused.
+
+    The lesson generalises past this one format: **a bound on a value must be a
+    bound on the longest thing the system builds from it.** The fix bounds the
+    tombstone by construction (truncating the readability hint; uniqueness was
+    always the hex) rather than budgeting the key's limit against this string,
+    which would make the project-name rule a function of an unrelated module's
+    naming choice.
+    """
+    # ASTRAL-PLANE, not ASCII (Codex #149 r5): with "x" * 255 the byte, code
+    # point and UTF-16 counts all coincide, so the test structurally cannot
+    # fail on the unit class no matter how the truncation is written. 63 emoji
+    # is a creatable 252-BYTE key whose tombstone ran to 295 bytes when the
+    # hint was sliced by code points — over the 255-byte limit ext4/APFS
+    # enforce, and invisible to a Windows probe because NTFS counts UTF-16.
+    name = "😀" * 63
+    corpus = tmp_path / name
+    corpus.mkdir()
+
+    monkeypatch.setattr(
+        projects_module,
+        "get_settings",
+        lambda: SimpleNamespace(upload_corpus_dir=str(tmp_path)),
+    )
+
+    async def ok(conn: Any, project: str) -> bool:
+        return True
+
+    _stub(monkeypatch, "projects", "delete_project", ok)
+
+    r = client.delete(f"/projects/{name}")
+
+    assert r.status_code == 204, r.json() if r.content else r.status_code
+    assert not corpus.exists()  # detached and cleaned, not stranded
+
+    # The BYTE invariant, asserted directly. The rename above cannot carry this
+    # test on its own: NTFS counts UTF-16 units, so a 295-byte tombstone renames
+    # fine on Windows and the behavioural assertion passes either way (probed —
+    # reverting the byte-slice leaves it green here). ext4/APFS count bytes, so
+    # the defect would only appear in CI. The invariant is platform-independent,
+    # so assert THAT and the test discriminates everywhere it runs.
+    for key in ("😀" * 63, "海" * 85, "x" * 255):
+        assert len(_tombstone_name(key).encode("utf-8")) <= 255, key[:8]
 
 
 def test_delete_project_404(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

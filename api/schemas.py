@@ -110,7 +110,12 @@ def _reject_unaddressable_project_name(v: str) -> str:
     * aliasing — Windows strips a trailing space or dot at ``mkdir``, so ``p``,
       ``p`` + space and ``p.`` would share ONE corpus directory. Creation-only
       by design: the containment guard cannot carry this rule without stranding
-      the corpus of projects that already exist (Codex #149 r3).
+      the corpus of projects that already exist (Codex #149 r3);
+    * LENGTH — a name past the filesystem's single-component limit passes every
+      other check (nothing here creates a directory), so the project persisted
+      and the first upload died in ``mkdir``. Measured off the backing store,
+      not an invented cap: this same task earlier declined an arbitrary
+      ``maxLength``, which remains right (Codex #149 r4).
 
     A FOURTH surface — the corpus ``file://`` uri — is checked separately in
     ``api.routers._corpus``, because it needs settings and filesystem I/O and
@@ -121,8 +126,9 @@ def _reject_unaddressable_project_name(v: str) -> str:
     if not is_creatable_project_key(v):
         raise ValueError(
             "must work as a URL path segment AND a filesystem name — '.', '..', "
-            "names containing '/' or '\\\\' or a drive prefix, and names ending "
-            "in a space or a dot, cannot be addressed or stored"
+            "names containing '/' or '\\\\' or a drive prefix, names ending in a "
+            "space or a dot, and names over 255 UTF-8 bytes, "
+            "cannot be addressed or stored"
         )
     return v
 

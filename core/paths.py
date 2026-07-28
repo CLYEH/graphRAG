@@ -141,4 +141,44 @@ def is_creatable_project_key(project: str) -> bool:
         is_path_addressable(project)
         and is_safe_path_component(project)
         and project == project.rstrip(" .")
+        and _fits_a_path_component(project)
     )
+
+
+#: The POSIX/NTFS single-component limit. Not a policy number — the filesystems
+#: enforce it, and this task deliberately declined to invent a length cap.
+_MAX_COMPONENT = 255
+
+
+def _fits_a_path_component(name: str) -> bool:
+    """Whether ``name`` fits in one directory entry on EVERY backing store.
+
+    Codex #149 r4: a name longer than the component limit passes every other
+    predicate here — and passes ``resolve()`` and the corpus-URI probe, since
+    neither creates anything — so the project was persisted and the FIRST
+    upload died in ``mkdir`` with ``ENAMETOOLONG``/``EINVAL``. Creatable and
+    permanently unusable, which is this task's recurring shape.
+
+    The UTF-8 BYTE count is the only check needed, and it is the strictest of
+    the three units in play: bytes >= UTF-16 units >= code points, for every
+    string. So bounding bytes bounds the others, and a separate ``len(name)``
+    clause could never bind — stating it as "both limits, stricter wins" would
+    describe a comparison the code does not make.
+
+    Bytes rather than the platform's own unit because the limits DISAGREE and a
+    store can be shared between workers on different platforms (measured): NTFS
+    counts 255 UTF-16 units, so 200 CJK characters succeed on Windows; ext4
+    counts 255 BYTES, where the same name is 600 and fails. Refusing on
+    every platform what breaks on any is the rule the backslash clause already
+    follows, for the same shared-store reason.
+
+    An earlier round of this task dismissed length as "an invented policy the
+    frozen contract does not set", and that was right about an ARBITRARY cap
+    and wrong here: this bound is measured off the backing store, exactly like
+    the separator and drive-prefix rules beside it.
+
+    Creation-only (it lives in :func:`is_creatable_project_key`, not the
+    containment guard) so a legacy over-long directory — reachable on a store
+    whose limit is higher — stays cleanable.
+    """
+    return len(name.encode("utf-8")) <= _MAX_COMPONENT
