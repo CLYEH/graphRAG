@@ -30,6 +30,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 from fastapi import FastAPI, Request
@@ -95,9 +96,53 @@ class _RequestContextMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class _SameOriginRedirectMiddleware(BaseHTTPMiddleware):
+    """Rewrite a self-referential absolute ``Location`` to a path-only one.
+
+    QA9/D18: Starlette's ``redirect_slashes`` answers ``/projects/`` with a 307
+    whose Location it builds from ``request.url`` — i.e. from the **Host header**,
+    which is client-controlled. Measured: ``Host: evil.example`` on ``/projects/``
+    produced ``Location: http://evil.example/projects``. Two consequences, and the
+    second is why this is fixed in the API rather than in the dev proxy:
+
+    * behind Vite's proxy the Host becomes the backend's, so the browser is sent
+      to ``http://127.0.0.1:8010`` — breaking the frozen contract's same-origin
+      shape (``servers: [{url: /}]``), pointing a LAN user's browser at *their
+      own* machine, and disclosing the internal backend address to every client;
+    * with no proxy at all the same code reflects whatever Host is sent, which is
+      redirect injection — so patching the proxy would leave the hole open.
+
+    A path-only Location is same-origin **by construction**: there is no origin
+    in it to be wrong, and no deployment topology can make one appear. That is
+    strictly better than deriving a trusted origin from configuration, which
+    would need every deployment to get the configuration right.
+
+    Only a Location whose origin EQUALS the request's own is rewritten. A
+    genuine cross-origin redirect (nothing emits one today) is left alone rather
+    than silently retargeted at ourselves — this guard removes a leak, it does
+    not seize control of every redirect.
+    """
+
+    async def dispatch(
+        self, request: Request, call_next: Callable[[Request], Awaitable[Any]]
+    ) -> Any:
+        response = await call_next(request)
+        location = response.headers.get("location")
+        if location:
+            parsed = urlsplit(location)
+            if parsed.scheme or parsed.netloc:
+                own = urlsplit(str(request.url))
+                if (parsed.scheme, parsed.netloc) == (own.scheme, own.netloc):
+                    response.headers["location"] = urlunsplit(
+                        ("", "", parsed.path, parsed.query, parsed.fragment)
+                    )
+        return response
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="graphRAG Console API", version="1.0", lifespan=lifespan)
     app.add_middleware(_RequestContextMiddleware)
+    app.add_middleware(_SameOriginRedirectMiddleware)
 
     def _error_response(
         status: int, body: dict[str, Any], *, extra_headers: Mapping[str, str] | None = None
