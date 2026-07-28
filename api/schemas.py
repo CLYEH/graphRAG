@@ -25,7 +25,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validat
 
 from core.builds.lifecycle import BuildInfo
 from core.metadata.schema import unstorable_json_reason
-from core.paths import is_path_addressable
+from core.paths import is_usable_project_key
 from core.registry import Job, Project, Source
 
 
@@ -95,20 +95,24 @@ def _reject_unaddressable_project_name(v: str) -> str:
     """A project whose name cannot ride in a REST path is unreachable the
     moment it is created (QA10).
 
-    ``core.paths.safe_project_subdir`` and the Console's ``isPathAddressable``
-    both already document the complete set — ``.``, ``..``, and any name
-    containing ``/`` — derived from the transport rather than guessed: the dot
-    tokens are normalized away by URL parsing before routing, and ``%2F``
-    decodes back to ``/`` which the single-segment ``{project}`` route misses.
-    Creating such a project succeeded and then every subsequent
-    ``GET/PATCH/DELETE /projects/{name}`` 404'd — an unreachable row with no
-    way to remove it. Refusing at creation is the only point where the caller
-    can still be told.
+    A key has to survive TWO transports and the first round of this task only
+    checked one. ``is_usable_project_key`` asks both:
+
+    * the REST path segment — ``.``/``..`` are normalized away before routing
+      and ``%2F`` decodes back to ``/``, so such a project was created and then
+      404'd on every ``GET/PATCH/DELETE /projects/{name}``, including the
+      delete that would remove it;
+    * the filesystem component — the rule ``safe_project_subdir`` enforces, now
+      shared rather than restated, so ``a\\b``/``a:b``/``C:evil`` can no longer
+      be created only to have uploads 400 and eval preflight fail (Codex #149).
+
+    Refusing at creation is the only point where the caller can still be told.
     """
-    if not is_path_addressable(v):
+    if not is_usable_project_key(v):
         raise ValueError(
-            "must be usable as a URL path segment — '.', '..' and names "
-            "containing '/' are unaddressable"
+            "must work as both a URL path segment and a filesystem name — "
+            "'.', '..', and names containing '/', '\\\\' or a drive prefix "
+            "cannot be addressed or stored"
         )
     return v
 

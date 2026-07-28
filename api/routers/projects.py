@@ -26,6 +26,7 @@ from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
 from api.pagination import decode_sorted_cursor, encode_sorted_cursor, scope_fingerprint
 from api.registry_errors import translate_registry_error
+from api.routers._corpus import reject_unsafe_corpus_path
 from api.routers._query import reject_unsupported_query
 from api.schemas import ProjectCreate, ProjectUpdate, project_dto
 from core.config import get_settings
@@ -86,6 +87,21 @@ async def create_project_endpoint(
     body: ProjectCreate,
     idempotency_key: _IdempotencyKey = None,
 ) -> JSONResponse:
+    # QA10/Codex #149: a project key has to survive THREE surfaces, and the
+    # first two are pure string rules the schema can express. The third is the
+    # canonical corpus ``file://`` uri, whose rule lives in the source resolver
+    # — ``foo|bar`` is a safe path component that ``as_uri()`` encodes to a form
+    # no build can resolve, so the project was creatable and then every upload
+    # 400'd forever. Asked here with the UPLOAD ENDPOINT'S OWN HELPER rather
+    # than restated: a second copy of the rule is how the two drift, which is
+    # exactly how this surface came to be missed. It lives in the shared
+    # `_corpus` module rather than in either router (the `_query` pattern).
+    #
+    # In the handler rather than the Pydantic validator because it needs
+    # settings and does a filesystem ``resolve()`` — the same reason
+    # ``reject_unsafe_corpus_path`` is sync and runs before any file I/O.
+    reject_unsafe_corpus_path(get_settings(), body.name)
+
     async def produce() -> tuple[int, dict[str, Any]]:
         try:
             p = await create_project(

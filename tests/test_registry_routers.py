@@ -136,6 +136,25 @@ def test_projects_and_sources_cursors_are_not_interchangeable(
         ("name", ".", "a dot segment is normalized away before routing"),
         ("name", "..", "a dot segment is normalized away before routing"),
         ("name", "a/b", "%2F decodes back to / and misses the single-segment route"),
+        # Codex #149: the FILESYSTEM half of the same defect. These pass the
+        # REST-addressability rule but `safe_project_subdir` rejects them, so
+        # the project was created and then every filesystem-backed feature
+        # broke for it — uploads 400, eval preflight failed — with the row
+        # already committed. One shared component rule now serves both.
+        ("name", "a\\b", "backslash is a separator on Windows and aliases on a shared store"),
+        ("name", "a\\..\\b", "backslash traversal"),
+        ("name", "a:b", "a colon is a drive/stream separator"),
+        ("name", "C:evil", "drive-relative paths escape the corpus root"),
+        # Codex #149 round 2 — the THIRD surface and two aliasing shapes.
+        # "a|b" is a safe path component whose corpus as_uri() encodes to a
+        # form the source resolver rejects, so the project was creatable and
+        # then every upload 400'd forever. "p " / "p." are stripped by Windows
+        # mkdir, so p, "p " and "p." would share ONE corpus dir — one
+        # project's uploads become another's documents, and deleting any of
+        # them removes the others' files.
+        ("name", "a|b", "as_uri() encodes to a form no build can resolve"),
+        ("name", "p ", "Windows strips the trailing space -> aliases onto p"),
+        ("name", "p.", "Windows strips the trailing dot -> aliases onto p"),
     ],
 )
 def test_create_refuses_a_name_the_rest_of_the_system_cannot_carry(

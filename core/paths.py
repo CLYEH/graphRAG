@@ -33,16 +33,53 @@ def safe_project_subdir(base: Path, project: str) -> Path | None:
     resolve: ``resolve()`` collapses ``foo/../bar`` to ``bar`` and takes an absolute
     right operand verbatim, so either would pass the parent-equality check below
     while ALIASING a *different* project's dir (``base/bar``) rather than naming a
-    child literally called ``foo/../bar``. ``PurePath.name`` normalizes ``.``/``..``
-    to ``''`` and drops any parent/anchor, so ``project != Path(project).name``
-    rejects separators (``/`` on any OS; ``\\`` too on Windows), absolute paths, and
-    the dot names in one shot; the explicit ``\\`` check covers a backslash on a
-    POSIX worker (where it is a legal filename char, not a separator, so it would
-    otherwise slip through and later alias on a Windows worker sharing the store)."""
-    if not project or "\\" in project or project != Path(project).name:
+    child literally called ``foo/../bar``. That component rule now lives in
+    :func:`is_safe_path_component` — see there for what it refuses and why; this
+    function adds only the resolve/parent-equality check on top of it."""
+    if not is_safe_path_component(project):
         return None
     resolved = (base / project).resolve()
     return resolved if resolved.parent == base.resolve() else None
+
+
+def is_safe_path_component(name: str) -> bool:
+    """Whether ``name`` is a single, relative, non-aliasing path component.
+
+    Extracted from :func:`safe_project_subdir` so the WRITE boundary and the
+    filesystem guard share ONE definition instead of two that can drift — the
+    drift is not hypothetical: QA10's first round validated REST addressability
+    and left this rule unshared, so ``a\\b``, ``a:b`` and ``C:evil`` were
+    accepted at creation and then rejected by every filesystem-backed feature
+    (uploads 400, eval preflight failure) for a project that already existed.
+
+    ``PurePath.name`` drops any parent/anchor, so ``name != Path(name).name``
+    rejects separators (``/`` on any OS; ``\\`` too on Windows) and absolute or
+    drive-relative paths. The explicit ``\\`` test additionally covers a
+    backslash on a POSIX worker, where it is a legal filename character rather
+    than a separator — so it would otherwise pass here and later ALIAS on a
+    Windows worker sharing the same store.
+
+    The dot names are refused EXPLICITLY rather than by that normalization: on
+    Python 3.13 only ``"."`` collapses — ``Path("..").name == ".."`` (measured),
+    so the older prose claiming both were caught "in one shot" was wrong about
+    ``..``. ``safe_project_subdir`` never had a hole (its resolve/parent-equality
+    check refuses it downstream), but this predicate is public now, and the
+    first caller to use it alone would have inherited one.
+
+    Trailing spaces and dots are refused for the same anti-aliasing reason as
+    the backslash, and on the same "refuse it everywhere" principle: Windows
+    STRIPS them at ``mkdir``, so ``p``, ``p` ``` and ``p.`` all land in ``p``
+    (measured). Three distinct projects would then share one corpus directory —
+    one project's uploads become another's documents, and deleting any of them
+    removes the others' files.
+    """
+    return (
+        bool(name)
+        and name not in (".", "..")
+        and "\\" not in name
+        and name == name.rstrip(" .")
+        and name == Path(name).name
+    )
 
 
 def is_path_addressable(project: str) -> bool:
@@ -68,3 +105,28 @@ def is_path_addressable(project: str) -> bool:
     itself, so query/hash characters, spaces, unicode and ``%`` all round-trip.
     """
     return project not in (".", "..") and "/" not in project
+
+
+def is_usable_project_key(project: str) -> bool:
+    """Whether a project key works on the two PURE-STRING surfaces.
+
+    A key has to survive several transports, and QA10 found them one at a time
+    rather than by enumeration — which is the lesson, not the list. The two
+    answerable from the string alone live here: the REST path segment
+    (:func:`is_path_addressable`) and the filesystem component
+    (:func:`is_safe_path_component`, the rule :func:`safe_project_subdir`
+    enforces). Failing either creates a project that EXISTS but cannot be used
+    — unreachable over REST, or reachable but unable to accept uploads.
+
+    There is a THIRD surface, and it is deliberately NOT here: the canonical
+    corpus ``file://`` uri (``a|b`` is a fine path component whose ``as_uri()``
+    encodes to a form no build can resolve). It needs settings and a filesystem
+    ``resolve()``, so it is asked by ``api.routers._corpus.reject_unsafe_corpus_path``
+    at the write boundary instead.
+
+    So: a new surface belongs HERE if it is decidable from the key alone, and
+    in that helper if it needs configuration or I/O. Putting an I/O rule here
+    would make this predicate unusable in the Pydantic validator that is its
+    whole point.
+    """
+    return is_path_addressable(project) and is_safe_path_component(project)
