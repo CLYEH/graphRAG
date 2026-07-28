@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from api.app import create_app
 from api.deps import db_conn
-from api.pagination import decode_id_cursor
+from api.pagination import decode_scoped_id_cursor, scope_fingerprint
 from core.graph.proposals import (
     InvalidProposalTransitionError,
     OntologyConfigIncompleteError,
@@ -124,7 +124,11 @@ def test_list_paginates_and_rejects_sort_filter(
     _FakeRepo.pages = rows
     _stub(monkeypatch, "BuildScopedRepo", _FakeRepo)
     r = client.get("/projects/p/merge-candidates", params={"limit": 2})
-    assert decode_id_cursor(r.json()["meta"]["next_cursor"]) == (rows[1].id,)
+    # QA8/D6: this asserted the UNTAGGED shape, i.e. it pinned the defect as an
+    # expectation — the token it demanded was one every other listing accepts.
+    # The tag is what the assertion is now about.
+    tag = f"id:desc|{scope_fingerprint('merge-candidates', _BUILD, None, {})}"
+    assert decode_scoped_id_cursor(r.json()["meta"]["next_cursor"], tag) == (rows[1].id,)
     assert (
         client.get("/projects/p/merge-candidates", params={"sort": "score:desc"}).status_code == 400
     )
@@ -257,10 +261,99 @@ def test_list_proposals_shape_pagination_and_no_build_id(
     assert r.status_code == 200
     body = r.json()
     assert body["meta"]["build_id"] is None  # pool is not build-scoped
-    assert decode_id_cursor(body["meta"]["next_cursor"]) == (rows[-1].id,)
+    # QA8/D6: the scope axis here is the PROJECT, not a build — the pool has no
+    # build to bind to, but a cursor can still outlive the filter it came from.
+    tag = f"id:desc|{scope_fingerprint('ontology-proposals', 'p', None, {})}"
+    assert decode_scoped_id_cursor(body["meta"]["next_cursor"], tag) == (rows[-1].id,)
     dto = body["data"][0]
     assert dto["kind"] == "entity" and dto["status"] == "proposed"
     assert dto["decided_by"] is None and dto["decided_at"] is None  # nullable, present
+
+
+def test_merge_candidate_cursor_cannot_outlive_its_status_filter(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why (QA8/D6): this listing minted an UNTAGGED token, valid on every other
+    keyset listing and — worse — valid on ITSELF under a different filter.
+
+    The consequence is sharpest here because the default `where` deliberately
+    HIDES decided rows: decided candidates become listable only when the caller
+    names the status it wants. So a page-2 replay that drops
+    filter[status]=approved does not just widen the set, it silently returns to
+    the pending-only view at an anchor computed over the merged one — an audit
+    surface under-reporting exactly the rows the auditor asked to see.
+    """
+    _bindable(monkeypatch)
+    rows = [_candidate() for _ in range(3)]
+    _FakeRepo.pages = rows
+    _stub(monkeypatch, "BuildScopedRepo", _FakeRepo)
+    base = "/projects/p/merge-candidates"
+    token = client.get(base, params={"limit": 2, "filter[status]": "approved"}).json()["meta"][
+        "next_cursor"
+    ]
+
+    # (a) the minted token carries the filter it was minted under
+    tag = f"id:desc|{scope_fingerprint('merge-candidates', _BUILD, None, {'status': 'approved'})}"
+    assert decode_scoped_id_cursor(token, tag) == (rows[1].id,)
+
+    # (b) dropping the filter on the replay is REFUSED, not silently narrowed
+    assert client.get(base, params={"limit": 2, "cursor": token}).status_code == 400
+    # ...and it is not a token for a different status either
+    assert (
+        client.get(
+            base, params={"limit": 2, "filter[status]": "pending", "cursor": token}
+        ).status_code
+        == 400
+    )
+
+    # (c) over-block dual: the same filter still pages
+    assert (
+        client.get(
+            base, params={"limit": 2, "filter[status]": "approved", "cursor": token}
+        ).status_code
+        == 200
+    )
+
+
+def test_ontology_proposal_cursor_binds_project_and_filter(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why (QA8/D6): same untagged mint, but this pool is NOT build-scoped — so
+    the axis a cursor could outlive is the PROJECT, and a token minted here was
+    additionally accepted by build-scoped listings that share the legacy shape.
+
+    Pinning the project in the tag is the point: without it, one project's
+    proposal cursor anchors another project's pool, which is a cross-tenant
+    read, not merely a miscounted page.
+    """
+    _present_project(monkeypatch)
+    rows = [_proposal(), _proposal()]
+
+    async def fake_list(conn: Any, project: str, *, limit: int, after: Any, status: Any) -> Any:
+        return rows, rows[-1].id
+
+    _stub(monkeypatch, "list_ontology_proposals", fake_list)
+    base = "/projects/p/ontology-proposals"
+    token = client.get(base, params={"filter[status]": "accepted"}).json()["meta"]["next_cursor"]
+
+    # (a) the minted token carries project AND filter
+    tag = f"id:desc|{scope_fingerprint('ontology-proposals', 'p', None, {'status': 'accepted'})}"
+    assert decode_scoped_id_cursor(token, tag) == (rows[-1].id,)
+
+    # (b) dropping the filter is REFUSED; so is carrying it to another project
+    assert client.get(base, params={"cursor": token}).status_code == 400
+    assert (
+        client.get(
+            "/projects/q/ontology-proposals",
+            params={"filter[status]": "accepted", "cursor": token},
+        ).status_code
+        == 400
+    )
+
+    # (c) over-block dual: its own listing still pages
+    assert (
+        client.get(base, params={"filter[status]": "accepted", "cursor": token}).status_code == 200
+    )
 
 
 def test_list_proposals_404_when_project_missing(

@@ -24,13 +24,12 @@ from fastapi.testclient import TestClient
 from api.app import create_app
 from api.deps import db_conn
 from api.pagination import (
-    decode_chunk_cursor,
-    decode_id_cursor,
     decode_scoped_id_cursor,
+    decode_sorted_cursor,
     encode_cursor,
     encode_sorted_cursor,
+    scope_fingerprint,
 )
-from api.routers.inspect import _scope_fingerprint
 from core.stores.repo import NoActiveBuildError
 
 pytestmark = pytest.mark.contract
@@ -170,7 +169,8 @@ def test_list_documents_pagination_cursor_round_trips(
     body = r.json()
     assert [d["id"] for d in body["data"]] == [str(rows[0].id), str(rows[1].id)]
     token = body["meta"]["next_cursor"]
-    tag = f"id:desc|{_scope_fingerprint(_BUILD, None, {})}"  # R8: default mints carry scope
+    # R8: default mints carry scope
+    tag = f"id:desc|{scope_fingerprint('documents', _BUILD, None, {})}"
     assert decode_scoped_id_cursor(token, tag) == (rows[1].id,)  # last IN-PAGE row, not the probe
     assert repo.calls[0]["limit"] == 3  # limit+1 probe
 
@@ -269,8 +269,53 @@ def test_chunks_cursor_and_compound_order(
     r = client.get("/projects/p/chunks", params={"limit": 2})
     body = r.json()
     token = body["meta"]["next_cursor"]
-    assert decode_chunk_cursor(token) == (doc, 1)  # (document_id, ordinal) of the last in-page row
+    # QA8/D6: this decoded the mint with the UNTAGGED decoder, pinning the
+    # untagged shape as an expectation. (document_id, ordinal) of the last
+    # in-page row is still what the token positions on — the tag is what makes
+    # it mean that only HERE, and only in this build.
+    tag = f"document_id:asc,ordinal:asc|{scope_fingerprint('chunks', _BUILD, None, {})}"
+    assert decode_sorted_cursor(token, tag, (uuid.UUID, int)) == (doc, 1)
     assert body["data"][0]["ordinal"] == 0 and body["data"][1]["ordinal"] == 1
+
+
+def test_chunks_cursor_is_bound_to_the_active_build(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    """Why (QA8/D6, R9): /chunks was the last untagged minter. Unlike the id
+    listings its (document_id, ordinal) pair was never interchangeable with
+    another listing's cursor, and it accepts no filter or sort — so the ONE
+    axis a token could outlive is the active build.
+
+    That axis is the DR-001/DR-006 rule this repo is built on: a keyset from
+    build A applied to build B re-anchors inside a different projection and
+    silently omits or repeats chunks. An activation between two pages of a
+    read is ordinary, not exotic, which is why this is a refusal and not a
+    best-effort continue.
+    """
+    _bindable(monkeypatch)
+    doc = uuid.uuid4()
+    repo.pages = [_chunk_row(document_id=doc, ordinal=i) for i in range(3)]
+    token = client.get("/projects/p/chunks", params={"limit": 2}).json()["meta"]["next_cursor"]
+
+    # the same token under a DIFFERENT active build is refused, not re-anchored
+    other = uuid.uuid4()
+
+    async def rebound(conn: Any, project: str) -> Any:
+        return SimpleNamespace(project=project, build_id=other)
+
+    _stub(monkeypatch, "_resolve_active_binding", rebound)
+    after_activation = client.get("/projects/p/chunks", params={"cursor": token})
+    assert after_activation.status_code == 400
+    assert (
+        "different listing/sort/search/filter context"
+        in (after_activation.json()["error"]["message"])
+    )
+
+    # over-block dual: under its own build it still pages, and returns rows
+    _bindable(monkeypatch)  # rebind to _BUILD, the build the token was minted in
+    ok = client.get("/projects/p/chunks", params={"cursor": token})
+    assert ok.status_code == 200
+    assert [row["ordinal"] for row in ok.json()["data"]] == [0, 1, 2]
 
 
 @pytest.mark.parametrize(
@@ -466,13 +511,20 @@ def test_entities_and_relations_paginate_like_documents(
     rows = [_entity_row() for _ in range(3)]
     repo.pages = rows
     r = client.get("/projects/p/entities", params={"limit": 2})
-    tag = f"id:desc|{_scope_fingerprint(_BUILD, None, {})}"  # R8: default mints carry scope
+    # R8: default mints carry scope
+    tag = f"id:desc|{scope_fingerprint('entities', _BUILD, None, {})}"
     assert decode_scoped_id_cursor(r.json()["meta"]["next_cursor"], tag) == (rows[1].id,)
 
     rel_rows = [_relation_row() for _ in range(3)]
     repo.pages = rel_rows
     r = client.get("/projects/p/relations", params={"limit": 2})
-    assert decode_id_cursor(r.json()["meta"]["next_cursor"]) == (rel_rows[1].id,)
+    # QA8/D6: relations now mints a SCOPED cursor like its siblings. The old
+    # assertion here decoded it as untagged, which is the defect written down
+    # as an expectation — an untagged token is valid on /entities and
+    # /documents too, and replaying it under different filters silently skips
+    # rows. Decoding it against the relations tag is the guarantee.
+    rel_tag = f"id:desc|{scope_fingerprint('relations', _BUILD, None, {})}"
+    assert decode_scoped_id_cursor(r.json()["meta"]["next_cursor"], rel_tag) == (rel_rows[1].id,)
     # and both honor the sort/filter rejection — filter[type] became a legal
     # SS1a facet, so the reject pin uses a non-allowlisted field instead
     assert client.get("/projects/p/entities", params={"sort": "name:asc"}).status_code == 400
@@ -604,14 +656,42 @@ def test_blank_and_overlong_q_are_rejected(
     assert client.get("/projects/p/entities", params={"q": "x" * 257}).status_code == 400
 
 
-def test_cursor_types_are_distinct_per_resource() -> None:
-    # a documents cursor replayed on chunks must fail arity/type, not page
-    # silently from the wrong keyset
-    doc_token = encode_cursor((uuid.uuid4(),))
-    from api.errors import ApiError
+def test_cursor_types_are_distinct_per_resource(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    """A documents cursor replayed on /chunks must be refused, not paged from
+    the wrong keyset.
 
-    with pytest.raises(ApiError):
-        decode_chunk_cursor(doc_token)
+    QA8: this used to assert that against `decode_chunk_cursor` directly — and
+    once /chunks moved to the tagged codec, that function had no production
+    caller, so the test was pinning dead code: /chunks could have regressed to
+    accepting a foreign token with this still green. It now goes through the
+    endpoint, which is the only place the guarantee lives.
+    """
+    _bindable(monkeypatch)
+    repo.pages = [_doc_row() for _ in range(3)]
+    doc_token = client.get("/projects/p/documents", params={"limit": 2}).json()["meta"][
+        "next_cursor"
+    ]
+
+    refused = client.get("/projects/p/chunks", params={"cursor": doc_token})
+    assert refused.status_code == 400
+    assert "different listing/sort/search/filter context" in refused.json()["error"]["message"]
+
+    # the legacy untagged 1-item shape is still accepted by /documents so
+    # in-flight tokens age out — but /chunks must never take it, since its
+    # keyset is a different arity entirely
+    assert (
+        client.get(
+            "/projects/p/chunks", params={"cursor": encode_cursor((uuid.uuid4(),))}
+        ).status_code
+        == 400
+    )
+
+    # over-block dual: a chunks cursor still pages /chunks
+    repo.pages = [_chunk_row(document_id=uuid.uuid4(), ordinal=i) for i in range(3)]
+    own = client.get("/projects/p/chunks", params={"limit": 2}).json()["meta"]["next_cursor"]
+    assert client.get("/projects/p/chunks", params={"cursor": own}).status_code == 200
 
 
 # -- GET /projects/{p}/graph/subgraph (BA3c) ---------------------------------
@@ -1065,7 +1145,7 @@ def test_tampered_naive_datetime_cursor_is_a_400_not_500(
     # the asyncpg timestamptz encoder (500) - it must be the documented
     # malformed-cursor 400 instead
     _bindable(monkeypatch)
-    tag = f"created_at:asc|{_scope_fingerprint(_BUILD, None, {})}"
+    tag = f"created_at:asc|{scope_fingerprint('entities', _BUILD, None, {})}"
     forged = encode_sorted_cursor(tag, ("2026-01-01T00:00:00", uuid.uuid4()))
     r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
     assert r.status_code == 400
@@ -1085,7 +1165,7 @@ def test_non_string_uuid_cursor_part_is_a_400_not_500(
     _bindable(monkeypatch)
     # hand-rolled: encode_cursor str()-ifies every value, so the raw JSON
     # shapes only exist in a token a client BUILT, never one the server minted
-    tag = f"created_at:asc|{_scope_fingerprint(_BUILD, None, {})}"
+    tag = f"created_at:asc|{scope_fingerprint('entities', _BUILD, None, {})}"
     raw = json.dumps([tag, "2026-01-01T00:00:00+00:00", bad]).encode()
     forged = base64.urlsafe_b64encode(raw).decode()
     r = client.get("/projects/p/entities", params={"sort": "created_at:asc", "cursor": forged})
@@ -1125,7 +1205,7 @@ def test_invalid_text_cursor_part_is_a_400_not_500(
     # non-str JSON shape would be silently repr-coerced by str(). Both must
     # be the documented malformed-cursor 400.
     _bindable(monkeypatch)
-    tag = f"canonical_name:asc|{_scope_fingerprint(_BUILD, None, {})}"
+    tag = f"canonical_name:asc|{scope_fingerprint('entities', _BUILD, None, {})}"
     raw = json.dumps([tag, bad, str(uuid.uuid4())]).encode()
     forged = base64.urlsafe_b64encode(raw).decode()
     r = client.get("/projects/p/entities", params={"sort": "canonical_name:asc", "cursor": forged})
@@ -1301,3 +1381,83 @@ def test_blank_string_metadata_filter_selects_blank_values(
     blank_number = client.get("/projects/p/documents", params={"filter[rating]": ""})
     assert blank_number.status_code == 400
     assert "expects a number" in blank_number.json()["error"]["message"]
+
+
+def test_a_cursor_is_bound_to_its_listing_and_its_filters(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    """A keyset anchor means nothing outside the result set that minted it.
+
+    Two ways that was violated (QA8/D6+D15):
+
+    * `/relations` minted an UNTAGGED cursor, so its tokens were accepted by
+      every other listing and replaying one under different filters silently
+      skipped rows. Fixing acceptance alone could never close this — the
+      scoped decoder deliberately still accepts legacy 1-item tokens so
+      in-flight ones age out, which an endpoint that keeps MINTING them keeps
+      open forever.
+    * the scope fingerprint omitted the RESOURCE, so `/entities` and
+      `/documents` computed the same tag from the same build/q/filters and
+      each accepted the other's cursor — 200 with silently duplicated rows.
+
+    Refusal here is the honest answer: the caller restarts the listing rather
+    than paging from a position that never existed in this result set.
+    """
+    _bindable(monkeypatch)
+
+    # a cursor minted by /relations...
+    repo.pages = [_relation_row() for _ in range(3)]
+    minted = client.get("/projects/p/relations", params={"limit": 2})
+    rel_cursor = minted.json()["meta"]["next_cursor"]
+    assert rel_cursor  # it paginates
+    # minted TAGGED, asserted directly: if this endpoint ever issues a bare
+    # (id,) token again the hole reopens permanently, and the sibling-refusal
+    # checks below would then fail by crashing on a foreign row shape rather
+    # than by saying what went wrong
+    assert len(json.loads(base64.urlsafe_b64decode(rel_cursor))) == 2, "cursor must carry its tag"
+
+    # ...is refused by the sibling listings, which used to accept it
+    for other in ("entities", "documents"):
+        r = client.get(f"/projects/p/{other}", params={"cursor": rel_cursor})
+        assert r.status_code == 400, other
+        assert "different listing/sort/search/filter context" in r.json()["error"]["message"], other
+
+    # ...and is refused when replayed under a filter it was not minted under
+    refiltered = client.get(
+        "/projects/p/relations", params={"cursor": rel_cursor, "filter[confidence]": "low"}
+    )
+    assert refiltered.status_code == 400
+    assert "different listing/sort/search/filter context" in refiltered.json()["error"]["message"]
+
+    # The over-block dual. A bare 200 is too weak to be the dual of a refusal:
+    # it cannot tell "the anchor was honoured" from "the tag was ignored and
+    # a page came back anyway". Asserting the returned rows does not close
+    # that gap either — _FakeRepo serves `pages` regardless of the `where` it
+    # is handed — so what is asserted is that the anchor REACHED THE QUERY:
+    # the decoded id arrives as an `id < after` predicate.
+    repo.pages = [_relation_row() for _ in range(3)]
+    ok = client.get("/projects/p/relations", params={"cursor": rel_cursor})
+    assert ok.status_code == 200
+    assert len(repo.calls[-1]["where"]) == 1  # the keyset predicate, not an unanchored page
+
+
+def test_entities_and_documents_no_longer_share_a_scope_tag(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, repo: type[_FakeRepo]
+) -> None:
+    """The resource is part of the scope (QA8/D15).
+
+    Same build, same q, same filters — before this, /entities and /documents
+    hashed to an identical tag, so each accepted the other's keyset and
+    answered 200 with rows duplicated from a different result set. The tag now
+    separates them, and the fingerprint still discriminates everything it did
+    before.
+    """
+    build = _BUILD
+    ents = scope_fingerprint("entities", build, None, {})
+    docs = scope_fingerprint("documents", build, None, {})
+    rels = scope_fingerprint("relations", build, None, {})
+    assert len({ents, docs, rels}) == 3, "each listing must own its scope"
+    # and the pre-existing axes still change the tag
+    assert scope_fingerprint("entities", build, "q", {}) != ents
+    assert scope_fingerprint("entities", build, None, {"status": "active"}) != ents
+    assert scope_fingerprint("entities", uuid.uuid4(), None, {}) != ents

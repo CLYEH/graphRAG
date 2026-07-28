@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 import api.routers.projects as projects_module
 from api.app import create_app
 from api.deps import db_conn, db_conn_provider
+from api.pagination import decode_sorted_cursor, scope_fingerprint
 from core.registry import (
     MANAGED_FILES_KEY,
     Project,
@@ -78,6 +79,52 @@ def test_list_projects_envelope_and_cursor(
     assert body["data"][0]["name"] == "p"
     assert body["meta"]["next_cursor"]  # encoded from the (ts, name) keyset
     assert body["meta"]["build_id"] is None
+
+
+def test_projects_and_sources_cursors_are_not_interchangeable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why (QA8/D6): MEASURED, not theorised — both listings minted an untagged
+    (datetime, <id>) pair, and a /sources token decoded cleanly as a /projects
+    cursor, so one project's source listing silently re-anchored the GLOBAL
+    project list. A sources token also re-anchored another project's sources.
+
+    Two distinct harms, hence two assertions: crossing listings (a page of
+    projects positioned by a source row) and crossing projects (a cross-tenant
+    read of a list the caller never asked for).
+    """
+    sid = uuid.uuid4()
+
+    async def fake_projects(conn: Any, *, limit: int, after: Any = None) -> Any:
+        return [_PROJECT], (_TS, "p")
+
+    async def fake_sources(conn: Any, project: str, *, limit: int, after: Any = None) -> Any:
+        return [_SOURCE], (_TS, sid)
+
+    async def present(conn: Any, name: str) -> Any:
+        return _PROJECT
+
+    _stub(monkeypatch, "projects", "list_projects", fake_projects)
+    _stub(monkeypatch, "sources", "list_sources", fake_sources)
+    _stub(monkeypatch, "sources", "get_project", present)
+
+    proj_token = client.get("/projects").json()["meta"]["next_cursor"]
+    src_token = client.get("/projects/p/sources").json()["meta"]["next_cursor"]
+
+    # (a) each token carries its own listing's tag
+    proj_tag = f"created_at:desc|{scope_fingerprint('projects', '', None, {})}"
+    src_tag = f"added_at:desc|{scope_fingerprint('sources', 'p', None, {})}"
+    assert decode_sorted_cursor(proj_token, proj_tag, (datetime, str)) == (_TS, "p")
+    assert decode_sorted_cursor(src_token, src_tag, (datetime, uuid.UUID)) == (_TS, sid)
+
+    # (b) the measured interchange is refused in the direction it worked
+    assert client.get("/projects", params={"cursor": src_token}).status_code == 400
+    # ...and a sources cursor no longer anchors ANOTHER project's sources
+    assert client.get("/projects/q/sources", params={"cursor": src_token}).status_code == 400
+
+    # (c) over-block dual: each still pages its own listing
+    assert client.get("/projects", params={"cursor": proj_token}).status_code == 200
+    assert client.get("/projects/p/sources", params={"cursor": src_token}).status_code == 200
 
 
 def test_create_project_201_without_key(

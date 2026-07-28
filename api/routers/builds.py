@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -43,7 +44,12 @@ from api.deps import Conn, Queue, neo4j_driver, qdrant_client, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
-from api.pagination import decode_id_cursor, decode_step_cursor, encode_cursor
+from api.pagination import (
+    decode_scoped_id_cursor,
+    decode_sorted_cursor,
+    encode_sorted_cursor,
+    scope_fingerprint,
+)
 from api.registry_errors import translate_registry_error
 from api.routers._query import reject_null_body, reject_unsupported_query, single_filter_value
 from api.schemas import (
@@ -119,13 +125,19 @@ async def list_builds_endpoint(
 ) -> dict[str, Any]:
     reject_unsupported_query(request, "id")
     await _require_project(conn, project)
-    after = decode_id_cursor(cursor)[0] if cursor else None
+    # QA8/D6: an untagged mint is accepted by every other listing, so this
+    # one's token also anchored /entities or a step's items. It takes no
+    # filters, which makes it the WEAKEST case — and it is migrated anyway,
+    # because the compatibility branch in the scoped decoder can only age out
+    # once nothing MINTS the legacy shape. One issuer keeps it alive for all.
+    tag = f"id:desc|{scope_fingerprint('builds', project, None, {})}"
+    after = decode_scoped_id_cursor(cursor, tag)[0] if cursor else None
     builds, next_after = await list_builds_page(conn, project, limit=limit, after_id=after)
     return success(
         [build_dto(b) for b in builds],
         **response_meta(request),
         paginated=True,
-        next_cursor=encode_cursor((next_after,)) if next_after else None,
+        next_cursor=encode_sorted_cursor(tag, (next_after,)) if next_after else None,
     )
 
 
@@ -156,7 +168,19 @@ async def list_build_steps_endpoint(
     reject_unsupported_query(request, None, allowed_filters=frozenset({"status"}))
     status = single_filter_value(request, "status")
     await _require_build(conn, project, build_id)  # project 404 then build 404
-    after = decode_step_cursor(cursor) if cursor else None
+    # QA8/D6: not one of the four 1-item sites — this keyset is a
+    # (started_at, step id) PAIR, so it was never accepted by the id-cursor
+    # compatibility branch and no cross-listing reuse was possible. What it DID
+    # share is the half that bites within one listing: an untagged mint under
+    # filter[status], so replaying page 2 without the filter re-anchored into a
+    # larger set. Fixed here rather than filed because the mechanism is the one
+    # this task exists to remove, and it sits in the same handler family.
+    applied = {"status": status} if status is not None else {}
+    # the axis is a TUPLE, which scope_fingerprint serializes as a JSON list:
+    # the members stay separate values, so no separator-injection edge exists
+    build_scope = (project, build_id)
+    tag = f"started_at:desc,id:desc|{scope_fingerprint('build-steps', build_scope, None, applied)}"
+    after = decode_sorted_cursor(cursor, tag, (datetime, uuid.UUID)) if cursor else None
     steps, next_after = await list_build_steps(
         conn, project, build_id, limit=limit, after=after, status=status
     )
@@ -165,7 +189,7 @@ async def list_build_steps_endpoint(
         **response_meta(request),
         build_id=build_id,
         paginated=True,
-        next_cursor=encode_cursor(next_after) if next_after is not None else None,
+        next_cursor=encode_sorted_cursor(tag, next_after) if next_after is not None else None,
     )
 
 
@@ -190,7 +214,20 @@ async def list_step_items_endpoint(
         # not) — a true 404 with the coarse code, exactly as inspect handles a
         # missing document/chunk/entity under a valid build.
         raise HTTPException(status_code=404, detail=f"step {step_id} not found in build {build_id}")
-    after = decode_id_cursor(cursor)[0] if cursor else None
+    # QA8/D6: named in the task as suspected same-root-cause and unverifiable
+    # during QA (no reachable data). Confirmed by reading: it minted an
+    # untagged token while paging under an open-vocabulary filter[status], so
+    # replaying page 2 without that filter silently answered from a LARGER set
+    # — the same defect measured on /relations, and the sharpest of the four
+    # because item lists are the failure-triage surface.
+    #
+    # The scope is the (project, build, step) triple, not the build alone: two
+    # steps of one build are different result sets, so a build-only tag would
+    # let a cursor cross between them.
+    applied = {"status": status} if status is not None else {}
+    step_scope = (project, build_id, step_id)  # a JSON list, not a joined string
+    tag = f"id:desc|{scope_fingerprint('build-step-items', step_scope, None, applied)}"
+    after = decode_scoped_id_cursor(cursor, tag)[0] if cursor else None
     items, next_after = await list_step_items(
         conn, project, build_id, step_id, limit=limit, after=after, status=status
     )
@@ -199,7 +236,7 @@ async def list_step_items_endpoint(
         **response_meta(request),
         build_id=build_id,
         paginated=True,
-        next_cursor=encode_cursor((next_after,)) if next_after is not None else None,
+        next_cursor=(encode_sorted_cursor(tag, (next_after,)) if next_after is not None else None),
     )
 
 

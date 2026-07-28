@@ -35,7 +35,11 @@ from api.deps import Conn, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
-from api.pagination import decode_id_cursor, encode_cursor
+from api.pagination import (
+    decode_scoped_id_cursor,
+    encode_sorted_cursor,
+    scope_fingerprint,
+)
 from api.registry_errors import translate_registry_error
 from api.routers._query import reject_null_body, reject_unsupported_query, single_filter_value
 from api.schemas import (
@@ -122,12 +126,21 @@ async def list_merge_candidates_endpoint(
         if status_filter is not None
         else [mc.c.status.in_(("pending", "deferred"))]
     )
+    # QA8/D6: this listing MINTED an untagged cursor, so its token was valid on
+    # every other listing and replaying it without the filter it was minted
+    # under silently changed the result set — sharpest here, because the
+    # default `where` hides decided rows, so dropping filter[status]=merged on
+    # a replay makes the audit surface under-report. Minting is the half that
+    # matters: the scoped decoder still accepts legacy tokens so in-flight ones
+    # age out, which never happens while an endpoint keeps issuing them.
+    applied = {"status": status_filter} if status_filter is not None else {}
+    tag = f"id:desc|{scope_fingerprint('merge-candidates', binding.build_id, None, applied)}"
     if cursor:
-        (after_id,) = decode_id_cursor(cursor)
+        (after_id,) = decode_scoped_id_cursor(cursor, tag)
         where.append(mc.c.id < after_id)
     rows = await repo.fetch_page(mc, *where, order_by=[mc.c.id.desc()], limit=limit + 1)
     page = rows[:limit]
-    next_cursor = encode_cursor((page[-1].id,)) if len(rows) > limit else None
+    next_cursor = encode_sorted_cursor(tag, (page[-1].id,)) if len(rows) > limit else None
     return success(
         [merge_candidate_dto(r) for r in page],
         **response_meta(request),
@@ -288,7 +301,13 @@ async def list_ontology_proposals_endpoint(
     reject_unsupported_query(request, "id", allowed_filters=frozenset({"status"}))
     status_filter = _proposal_status_filter(request)
     await _require_project(conn, project)
-    after = decode_id_cursor(cursor)[0] if cursor else None
+    # QA8/D6: same untagged-mint defect as /merge-candidates. This listing is
+    # project-scoped rather than build-scoped, so the project stands in for the
+    # build axis — what the tag must pin is the result set the keyset came
+    # from, and here that is (this project, this status filter).
+    applied = {"status": status_filter} if status_filter is not None else {}
+    tag = f"id:desc|{scope_fingerprint('ontology-proposals', project, None, applied)}"
+    after = decode_scoped_id_cursor(cursor, tag)[0] if cursor else None
     proposals, next_after = await list_ontology_proposals(
         conn, project, limit=limit, after=after, status=status_filter
     )
@@ -296,7 +315,7 @@ async def list_ontology_proposals_endpoint(
         [ontology_proposal_dto(p) for p in proposals],
         **response_meta(request),
         paginated=True,
-        next_cursor=encode_cursor((next_after,)) if next_after is not None else None,
+        next_cursor=(encode_sorted_cursor(tag, (next_after,)) if next_after is not None else None),
     )
 
 

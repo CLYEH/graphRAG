@@ -1710,7 +1710,7 @@ _PREVIEW_CHARS = 200
 
 def _browse_scope(tool: str, **facets: Any) -> str:
     """Canonical scope fingerprint of ONE browse result set (class 31 — the
-    REST ``_scope_fingerprint`` pattern): sha256 over canonical JSON of the
+    REST ``api.pagination.scope_fingerprint`` pattern): sha256 over canonical JSON of the
     tool name and every facet that shapes the set (q, type, match mode), so
     no separator-injection edge exists and any axis change flips the tag."""
     payload = json.dumps({"tool": tool, **facets}, sort_keys=True, ensure_ascii=False)
