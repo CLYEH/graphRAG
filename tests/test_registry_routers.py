@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 import api.routers.projects as projects_module
 from api.app import create_app
@@ -125,6 +126,256 @@ def test_projects_and_sources_cursors_are_not_interchangeable(
     # (c) over-block dual: each still pages its own listing
     assert client.get("/projects", params={"cursor": proj_token}).status_code == 200
     assert client.get("/projects/p/sources", params={"cursor": src_token}).status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "why"),
+    [
+        ("name", "a\x00b", "NUL cannot live in a Postgres text column"),
+        ("name", "   ", "minLength:1 is satisfied by whitespace, but a blank key names nothing"),
+        ("name", ".", "a dot segment is normalized away before routing"),
+        ("name", "..", "a dot segment is normalized away before routing"),
+        ("name", "a/b", "%2F decodes back to / and misses the single-segment route"),
+    ],
+)
+def test_create_refuses_a_name_the_rest_of_the_system_cannot_carry(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, field: str, value: str, why: str
+) -> None:
+    """Why (QA10): these all returned 201 and reached the registry.
+
+    Two distinct harms, both measured. A NUL or unpaired surrogate is legal
+    JSON that Postgres cannot store, so the write failed later in the driver
+    with a low-level error naming no cause — a 500 for what is a client error.
+    A name that is not a usable path segment is worse than an error: the
+    project was CREATED and then unreachable, because every subsequent
+    `GET/PATCH/DELETE /projects/{name}` 404s — including the delete that would
+    remove it. Creation is the only point where the caller can still be told.
+
+    `core/mcp/server.py` already described its own guard as deferring to
+    "the guard the WRITE path uses"; until now the REST write path had none.
+    """
+
+    async def must_not_run(conn: Any, **kw: Any) -> Project:
+        raise AssertionError(f"the registry must not be reached: {why}")
+
+    _stub(monkeypatch, "projects", "create_project", must_not_run)
+    r = client.post("/projects", json={field: value})
+
+    assert r.status_code == 400, (field, value)
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_create_refuses_unstorable_strings_anywhere_in_the_config_bag(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """config is an OPEN bag, so a bad string can hide in a KEY as well as a
+    value — Postgres rejects both, so both are refused here (the shared
+    `unstorable_string_reason` scans keys for exactly this reason)."""
+
+    async def must_not_run(conn: Any, **kw: Any) -> Project:
+        raise AssertionError("the registry must not be reached")
+
+    _stub(monkeypatch, "projects", "create_project", must_not_run)
+
+    # NUL only here — a lone surrogate cannot be sent through `json=` at all
+    # (httpx raises before the request leaves), so it has its own raw-body test
+    for config in ({"a\x00b": 1}, {"k": "v\x00w"}, {"k": {"nested": {"deep": "x\x00y"}}}):
+        r = client.post("/projects", json={"name": "p", "config": config})
+        assert r.status_code == 400, config
+        assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"name": "a\\ud800b"}',
+        '{"name": "p", "config": {"k": "v\\udfffw"}}',
+        '{"name": "p", "config": {"a\\ud800b": 1}}',
+    ],
+)
+def test_create_refuses_an_escaped_lone_surrogate(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Why (QA10): a lone surrogate has to be sent as a JSON ESCAPE, not as a
+    Python string — an HTTP client cannot encode one directly (httpx raises
+    before the request leaves), which is exactly why this needs a raw body and
+    why it is easy to leave untested.
+
+    `json.loads` materializes `\\ud800` as a surrogate code point (paired
+    escapes combine into the astral character at parse time, so any surrogate
+    REMAINING after parsing is unpaired), and no UTF-8 encoder — Postgres
+    included — can encode it. It used to reach the registry and fail in the
+    driver with a low-level error naming no cause.
+    """
+
+    async def must_not_run(conn: Any, **kw: Any) -> Project:
+        raise AssertionError("the registry must not be reached")
+
+    _stub(monkeypatch, "projects", "create_project", must_not_run)
+
+    r = client.post("/projects", content=raw, headers={"Content-Type": "application/json"})
+
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_a_body_too_deep_to_validate_is_refused_not_a_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why (QA10): a deeply-nested config produced INTERNAL, and the last step
+    was the one that broke — a validation error's `details` embed the OFFENDING
+    INPUT, so encoding the refusal recursed as far as validating it did. The
+    path whose whole job is to answer client errors honestly was itself
+    turning a 400 into a 500.
+
+    Measured window: 1000 deep produced INTERNAL while 20000 deep was already
+    refused by the JSON parser — deep enough to get past parsing, deep enough
+    to crash the reply. The contract sets no nesting policy, so the bound here
+    is the interpreter's own limit: exactly what cannot be processed is
+    refused, and choosing a stricter cap is left to whoever sets that policy.
+    """
+
+    async def must_not_run(conn: Any, **kw: Any) -> Project:
+        raise AssertionError("the registry must not be reached")
+
+    _stub(monkeypatch, "projects", "create_project", must_not_run)
+    body = '{"name":"p","config":' + '{"a":' * 1200 + "null" + "}" * 1200 + "}"
+
+    r = client.post("/projects", content=body, headers={"Content-Type": "application/json"})
+
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+    # the envelope survives even though the details could not be encoded
+    assert r.json()["error"]["request_id"]
+
+
+def test_sources_refuse_the_same_unstorable_strings(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same predicate on the sibling write path — one implementation for
+    every facet, so the two cannot drift into accepting different sets."""
+
+    async def must_not_run(conn: Any, project: str, **kw: Any) -> Any:
+        raise AssertionError("the registry must not be reached")
+
+    _stub(monkeypatch, "sources", "add_source", must_not_run)
+
+    for body in (
+        {"uri": "a\x00b"},
+        {"uri": "   "},
+        {"uri": "u", "metadata": {"k": "v\x00w"}},
+        {"uri": "u", "metadata": {"nested": {"k": "v\x00w"}}},
+    ):
+        r = client.post("/projects/p/sources", json=body)
+        assert r.status_code == 400, body
+        assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_a_legitimate_unicode_name_still_works(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Over-block dual. The refusals above are about what the STORE and the
+    ROUTER cannot carry, not about restricting names to ASCII — a Chinese
+    project name, spaces, and a '%' all round-trip through the path encoding
+    and must keep working."""
+    created: list[str] = []
+
+    async def fake_create(conn: Any, **kw: Any) -> Project:
+        created.append(kw["name"])
+        return _PROJECT
+
+    _stub(monkeypatch, "projects", "create_project", fake_create)
+
+    for name in ("海科館", "my project", "100% real", "a.b", "..leading"):
+        r = client.post("/projects", json={"name": name})
+        assert r.status_code == 201, name
+    assert created == ["海科館", "my project", "100% real", "a.b", "..leading"]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"name": "p", "config": {"x": NaN}}',
+        '{"name": "p", "config": {"x": Infinity}}',
+        '{"name": "p", "config": {"x": -Infinity}}',
+        '{"name": "p", "config": {"x": 1e999}}',
+        '{"name": "p", "config": {"nested": {"deep": [1, NaN]}}}',
+    ],
+)
+def test_create_refuses_non_finite_numbers_in_the_config_bag(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Why (QA10): the NUMBER facet of the same JSON-valid-but-JSONB-unstorable
+    class as NUL and surrogates — this module's own docstring already names
+    them as one class, and closing only the string half left the other open.
+
+    SQLAlchemy's default ``json_serializer=json.dumps`` emits a literal ``NaN``
+    for a non-finite float, which Postgres rejects — so it passed every shape
+    check here and failed the write later with a low-level error naming no
+    cause. ``1e999`` is included deliberately: it is a token
+    ``parse_constant`` never sees, because it has already OVERFLOWED to ``inf``
+    by the time anything can inspect it.
+
+    The parse-time hooks that close this for the uploads/sidecar paths cannot
+    run here — FastAPI parses the body, so no ``json.loads`` of ours is
+    involved — which is why the refusal has to be a walk at this boundary.
+    """
+
+    async def must_not_run(conn: Any, **kw: Any) -> Project:
+        raise AssertionError("the registry must not be reached")
+
+    _stub(monkeypatch, "projects", "create_project", must_not_run)
+
+    r = client.post("/projects", content=raw, headers={"Content-Type": "application/json"})
+
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_ordinary_numbers_still_store(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Over-block dual for the non-finite guard: it must refuse what Postgres
+    cannot hold, not numbers in general — including a very large FINITE float,
+    which is the nearest neighbour to the overflow case."""
+    stored: list[Any] = []
+
+    async def fake_create(conn: Any, **kw: Any) -> Project:
+        stored.append(kw.get("config"))
+        return _PROJECT
+
+    _stub(monkeypatch, "projects", "create_project", fake_create)
+
+    for raw in (
+        '{"name": "p", "config": {"x": 1.5}}',
+        '{"name": "p", "config": {"x": 0}}',
+        '{"name": "p", "config": {"x": 1e300}}',
+        '{"name": "p", "config": {"x": -2.5e-9}}',
+    ):
+        r = client.post("/projects", content=raw, headers={"Content-Type": "application/json"})
+        assert r.status_code == 201, raw
+    assert len(stored) == 4
+
+
+def test_a_review_decision_reason_is_guarded_like_every_stored_column(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why (QA10): ``reason`` is PERSISTED — this DTO's own docstring says it
+    lands on both the ledger entry and the candidate row — but it was a bare
+    ``str | None``, so a NUL went straight into the Postgres write.
+
+    One DTO serves all twelve review-decision endpoints named in the task, so
+    the guard is one line; the point of the test is that the guard is on the
+    SHARED type, not on one endpoint's handler.
+    """
+    from api.schemas import ReviewDecisionRequest
+
+    for bad in ("a\x00b", "   \x00"):
+        with pytest.raises(ValidationError):
+            ReviewDecisionRequest(reason=bad)
+
+    # over-block dual: an ordinary reason, and an omitted one, still validate
+    assert ReviewDecisionRequest(reason="duplicate of #4").reason == "duplicate of #4"
+    assert ReviewDecisionRequest().reason is None
+    assert ReviewDecisionRequest(reason=None).reason is None
 
 
 def test_create_project_201_without_key(

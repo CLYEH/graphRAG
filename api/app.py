@@ -76,6 +76,17 @@ def _frozen_contract() -> dict[str, Any]:
     )
 
 
+def _without_details(body: dict[str, Any]) -> dict[str, Any]:
+    """The §15 envelope minus ``details``.
+
+    The envelope is the contract; ``details`` is diagnostic. When the details
+    cannot be encoded — because they echo an input that is too deep to walk or
+    holds a character UTF-8 cannot represent — dropping them keeps the answer
+    honest (code, message, request_id) instead of failing the response.
+    """
+    return {**body, "error": {**body["error"], "details": None}}
+
+
 def _request_id(request: Request) -> uuid.UUID:
     rid = getattr(request.state, "request_id", None)
     return rid if isinstance(rid, uuid.UUID) else uuid.uuid4()
@@ -172,7 +183,47 @@ def create_app() -> FastAPI:
         # WWW-Authenticate, Retry-After); X-Request-ID is always ours last.
         rid = body["error"]["request_id"]
         headers = {**extra_headers, "X-Request-ID": rid} if extra_headers else {"X-Request-ID": rid}
-        return JSONResponse(status_code=status, content=jsonable_encoder(body), headers=headers)
+        try:
+            content = jsonable_encoder(body)
+        except RecursionError:
+            # QA10: a validation error's details embed the OFFENDING INPUT, so a
+            # deeply-nested body made encoding the refusal recurse as far as
+            # validating it did — turning a 400 into a 500 at the last step, on
+            # the very path whose job is to answer client errors honestly.
+            # Measured: config nested 1000 deep produced INTERNAL, while 20000
+            # deep was refused by the JSON parser first — a window where the
+            # payload got past parsing and crashed the reply.
+            #
+            # The ENVELOPE is the contract; `details` is diagnostic. So the
+            # envelope is rebuilt without them rather than the request failing:
+            # the caller still learns the code, the message and the request_id.
+            content = jsonable_encoder(_without_details(body))
+        try:
+            return JSONResponse(status_code=status, content=content, headers=headers)
+        except (UnicodeEncodeError, RecursionError, ValueError):
+            # QA10: `details` ECHO the offending input, so a body carrying an
+            # unpaired surrogate produced a refusal that could not be rendered —
+            # JSONResponse encodes to UTF-8 in its constructor, and no UTF-8
+            # encoder can represent a lone surrogate. The caller got a crash
+            # instead of the 400 that had already been decided. Same shape as
+            # the MCP surface's echo defect (#140 D11), reached here through the
+            # framework's own validation-error details rather than our own
+            # message building — which is why guarding the message was not
+            # enough and the guard belongs at the point of render.
+            #
+            # Three exception types because `JSONResponse.render` has three ways
+            # to reject an echoed value: UTF-8 encoding (surrogate), recursion
+            # (depth), and `allow_nan=False` (a non-finite number). What this
+            # CANNOT reach is a surrogate carried in `message` rather than
+            # `details` — no REST message echoes body text today (the validation
+            # message is fixed, and `_query.reject_unusable_text` deliberately
+            # does not echo), so the fallback is total by construction rather
+            # than by catching more.
+            return JSONResponse(
+                status_code=status,
+                content=jsonable_encoder(_without_details(body)),
+                headers=headers,
+            )
 
     @app.exception_handler(ApiError)
     async def _handle_api_error(request: Request, exc: ApiError) -> JSONResponse:

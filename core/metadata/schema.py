@@ -375,6 +375,48 @@ def unstorable_string_reason(obj: Any) -> str | None:
     return None
 
 
+def unstorable_json_reason(obj: Any) -> str | None:
+    """The first reason a parsed JSON structure cannot be stored in JSONB, or
+    ``None`` — BOTH facets of the class this module already names as one.
+
+    ``unstorable_string_reason`` covers the string facet (NUL, unpaired
+    surrogate). The number facet is the same class by the same mechanism: a
+    non-finite float is legal in a parsed JSON document, SQLAlchemy's default
+    ``json_serializer=json.dumps`` emits a literal ``NaN``/``Infinity``, and
+    Postgres rejects it — so it too passes every shape check and fails the
+    write later with a low-level error naming no cause.
+
+    The parse-time hooks (:func:`reject_non_finite_constant`,
+    :func:`finite_float`) close this where WE call ``json.loads`` — the uploads
+    metadata field and MCP sidecars. A framework that parses the body for us
+    (FastAPI) never runs them, so a boundary that cannot install parse hooks
+    needs the same refusal expressed as a walk. ``1e999`` is covered because it
+    has already overflowed to ``inf`` by the time it arrives here, which is
+    exactly the token ``parse_constant`` never sees.
+
+    Kept SEPARATE from ``unstorable_string_reason`` rather than folded into it:
+    that predicate's existing callers (MCP, ingest) already reject non-finite
+    values at parse time, and widening what they refuse is not this change's
+    business.
+    """
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return f"contains a non-finite number ({obj})"
+    if isinstance(obj, str):
+        return _string_storability_reason(obj)
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if isinstance(key, str) and (reason := _string_storability_reason(key)):
+                return reason
+            if reason := unstorable_json_reason(value):
+                return reason
+        return None
+    if isinstance(obj, list):
+        for value in obj:
+            if reason := unstorable_json_reason(value):
+                return reason
+    return None
+
+
 # --- envelope construction ---------------------------------------------------
 
 

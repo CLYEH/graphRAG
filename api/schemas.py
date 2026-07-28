@@ -24,6 +24,8 @@ from typing import Annotated, Any
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 from core.builds.lifecycle import BuildInfo
+from core.metadata.schema import unstorable_json_reason
+from core.paths import is_path_addressable
 from core.registry import Job, Project, Source
 
 
@@ -39,33 +41,123 @@ def _reject_null_config(v: dict[str, Any] | None) -> dict[str, Any] | None:
     return v
 
 
+def _reject_unstorable(v: Any) -> Any:
+    """QA10: refuse a string Postgres cannot store, at the boundary.
+
+    ``core/mcp/server.py`` already documents its own guard as deferring to
+    "the guard the WRITE path uses" — but the REST write path did not use one,
+    so that statement was aspirational. A NUL, an unpaired surrogate, or a
+    non-finite number is legal JSON that passed validation here and then failed
+    in the driver with a low-level error naming no cause (a 500 for what is a
+    client error).
+
+    BOTH facets, because they are one class: the string facet and the
+    non-finite facet fail the same write for the same reason. The parse-time
+    hooks that close the number facet elsewhere cannot run here — FastAPI parses
+    the body, so no ``json.loads`` of ours is involved — which is why the
+    refusal has to be expressed as a walk at this boundary.
+    """
+    if v is None:
+        return v
+    try:
+        reason = unstorable_json_reason(v)
+    except RecursionError:
+        # A structure nested deeper than the interpreter can walk is a client
+        # input, so it deserves a typed refusal rather than the 500 it used to
+        # produce (measured: a config nested 1000 deep answered INTERNAL, while
+        # 20000 deep was already refused by the JSON parser itself — a window
+        # where the payload got past parsing and crashed the walk). The bound
+        # is deliberately the interpreter's own recursion limit rather than an
+        # invented constant: nothing in the contract or DESIGN sets a nesting
+        # policy, so this refuses exactly what it genuinely cannot process and
+        # leaves the choice of a stricter cap to whoever sets that policy.
+        raise ValueError("is nested too deeply to validate") from None
+    if reason is not None:
+        raise ValueError(f"{reason} and cannot be stored")
+    return v
+
+
+def _reject_blank(v: str | None) -> str | None:
+    """The contract's ``minLength: 1`` is satisfied by ``"   "``.
+
+    A whitespace-only key is not a name anyone can refer to — it renders as
+    nothing in the Console, cannot be typed into the switcher's filter, and
+    ``projects.name`` is the PRIMARY KEY, so it is also an identifier. Blank is
+    a client mistake, and answering 400 says so instead of creating a project
+    nobody can name.
+    """
+    if v is not None and v.strip() == "":
+        raise ValueError("must not be blank")
+    return v
+
+
+def _reject_unaddressable_project_name(v: str) -> str:
+    """A project whose name cannot ride in a REST path is unreachable the
+    moment it is created (QA10).
+
+    ``core.paths.safe_project_subdir`` and the Console's ``isPathAddressable``
+    both already document the complete set — ``.``, ``..``, and any name
+    containing ``/`` — derived from the transport rather than guessed: the dot
+    tokens are normalized away by URL parsing before routing, and ``%2F``
+    decodes back to ``/`` which the single-segment ``{project}`` route misses.
+    Creating such a project succeeded and then every subsequent
+    ``GET/PATCH/DELETE /projects/{name}`` 404'd — an unreachable row with no
+    way to remove it. Refusing at creation is the only point where the caller
+    can still be told.
+    """
+    if not is_path_addressable(v):
+        raise ValueError(
+            "must be usable as a URL path segment — '.', '..' and names "
+            "containing '/' are unaddressable"
+        )
+    return v
+
+
+#: a required contract string that must also be storable and non-blank
+StorableName = Annotated[
+    str,
+    Field(min_length=1),
+    AfterValidator(_reject_unstorable),
+    AfterValidator(_reject_blank),
+]
+#: the project key: everything above, plus REST path-addressability
+ProjectName = Annotated[StorableName, AfterValidator(_reject_unaddressable_project_name)]
+#: an optional free-text column
+StorableText = Annotated[str | None, AfterValidator(_reject_unstorable)]
+#: an open bag whose keys AND values must be storable
+StorableBag = Annotated[dict[str, Any] | None, AfterValidator(_reject_unstorable)]
+
 #: config that rejects an explicit null but stays optional (omit → default None).
-NonNullConfig = Annotated[dict[str, Any] | None, AfterValidator(_reject_null_config)]
+NonNullConfig = Annotated[
+    dict[str, Any] | None,
+    AfterValidator(_reject_null_config),
+    AfterValidator(_reject_unstorable),
+]
 
 
 class ProjectCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1)
-    display_name: str | None = None
-    description: str | None = None
+    name: ProjectName
+    display_name: StorableText = None
+    description: StorableText = None
     config: NonNullConfig = None
 
 
 class ProjectUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    display_name: str | None = None
-    description: str | None = None
+    display_name: StorableText = None
+    description: StorableText = None
     config: NonNullConfig = None
 
 
 class SourceCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    uri: str = Field(min_length=1)
-    kind: str | None = None
-    metadata: dict[str, Any] | None = None
+    uri: StorableName
+    kind: StorableText = None
+    metadata: StorableBag = None
 
 
 class SourceUpdate(BaseModel):
@@ -215,7 +307,10 @@ class ReviewDecisionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    reason: str | None = None
+    # PERSISTED (see the docstring above: it lands on the ledger entry AND the
+    # candidate row), so it needs the same storability guard as every other
+    # stored free-text column — QA10 measured a NUL here reaching core.
+    reason: StorableText = None
 
 
 class QueryRequest(BaseModel):

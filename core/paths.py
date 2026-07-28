@@ -7,6 +7,12 @@ A project name reaches the filesystem as a PATH COMPONENT in more than one place
 resolved path ESCAPE the configured root, reading or writing outside it. This is
 the ONE guard both call sites share, so the containment rule can't be fixed in one
 place and forgotten in the sibling.
+
+
+Also hosts :func:`is_path_addressable` — a REST-transport predicate rather
+than a filesystem one, but the same question in a different medium ("can this
+project key survive being a single path segment?") and derived the same way,
+so the two rules live together instead of drifting apart.
 """
 
 from __future__ import annotations
@@ -37,3 +43,28 @@ def safe_project_subdir(base: Path, project: str) -> Path | None:
         return None
     resolved = (base / project).resolve()
     return resolved if resolved.parent == base.resolve() else None
+
+
+def is_path_addressable(project: str) -> bool:
+    """Whether a project key can ride in a REST path segment.
+
+    QA10: the write path accepted names the read path cannot address, so a
+    project could be created and then be unreachable — every subsequent
+    ``GET/PATCH/DELETE /projects/{name}`` 404s, including the delete that would
+    remove it.
+
+    The set is COMPLETE and derived from the transport, not guessed (the same
+    derivation the Console records in ``web/src/project/projectRoute.ts``):
+
+    1. ``.`` and ``..`` — ``encodeURIComponent`` leaves them as bare dot
+       tokens, which the URL parser normalizes away before routing (``.`` ->
+       ``/projects/health``, ``..`` -> ``/health``); ``%2e`` normalizes too, so
+       no encoding survives.
+    2. any name containing ``/`` — encoded to ``%2F``, which the ASGI server
+       decodes back to ``/`` before routing, so the single-segment
+       ``{project}`` route (not ``{project:path}``) misses it.
+
+    Every other character percent-encodes to a non-dot ``%XX`` that decodes to
+    itself, so query/hash characters, spaces, unicode and ``%`` all round-trip.
+    """
+    return project not in (".", "..") and "/" not in project
