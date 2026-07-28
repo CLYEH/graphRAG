@@ -210,7 +210,8 @@ Keep items small enough to finish in one loop.
 - [x] QA9 Console 打磨(D17/D18/D19)— (a) 根路徑改記憶「上次開的專案」(原取 `projects[0]`,而清單是 created_at DESC = 最新的空殼),記憶值僅在仍存在時採用;switcher 加搜尋(門檻同時管「用不用」不只「畫不畫」)。(b) 尾斜線 307 的 Location 由**用戶端可控的 Host** 導出——實測 `Host: evil.example` 即得該 origin,故非只是 proxy 問題;改鑄 path-only,構造上同源。(c) `lang=zh-TW` + 標題品牌化。
 
 ### 盲區補測
-- [ ] QA10 寫入路徑輸入驗證掃描 — 本輪 QA 全程唯讀,**所有變更路徑的輸入驗證完全未測**,報告明列為「最該看的下一個洞」:`POST /projects`、`/sources`、`/ingest`、`/uploads`、`/build`、`PATCH /sources`、`activate`/`retry`/`rollback`、review 核決端點。以可拋棄的 qaprobe 專案演練畸形/邊界/型別/unicode 輸入,確認每條寫入路徑都給型別化拒絕而非 500/靜默接受。順帶補其他盲區:開一個 sql-enabled 的 qaprobe lane 測 NL-to-SQL 輸入面(nmmst policy 停用故整個表面未測)、在可拋棄環境做 store-down 演練(`STORE_UNAVAILABLE`/`PARTIAL_RESULTS`/`QUERY_TIMEOUT` 三條降級路徑本輪皆無法覆蓋)。**這三塊目前是空白,不是綠燈。**
+- [x] QA10a 寫入路徑輸入驗證掃描 — 量測後修:不可儲存字串(NUL/落單 surrogate)與非有限數(NaN/Infinity/1e999)靜默進 registry、`.`/`..`/`a/b` 名稱建得起來卻永遠 404、空白名、review `reason` 無守衛;錯誤路徑自身兩處崩潰(details 夾帶惹禍輸入 → 遞迴/編碼)。契約未動。
+- [ ] QA10b QA10 剩餘兩塊 — (a) 開一個 sql-enabled 的 qaprobe lane 測 NL-to-SQL 輸入面(nmmst policy 停用故整個表面未測)。(b) 在可拋棄環境做 store-down 演練:`STORE_UNAVAILABLE`/`PARTIAL_RESULTS`/`QUERY_TIMEOUT` 三條降級路徑。**硬相依(QA10a 實測)**:postgres 起、其餘 store 停時,請求在碰到任何投影 store 之前就短路在 `NO_ACTIVE_BUILD`,故演練需要真的 ingest+build 過的專案(含 embedding/LLM 呼叫)。**這兩塊目前是空白,不是綠燈。**
 
 ---
 
