@@ -145,12 +145,30 @@ def _reject_side_effects(statement: exp.Select) -> None:
     structural checks above do not catch these (§21 read-only). A function call
     may take an advisory lock, change a setting, or advance a sequence
     (``pg_advisory_lock``, ``set_config``, ``nextval``), which the deferred
-    read-only role would NOT stop; so only a type CAST is allowed and every other
-    function is refused (``exp.Cast`` is itself an ``exp.Func`` subclass, hence the
-    isinstance skip). ``FOR UPDATE``/``FOR SHARE`` takes row locks; ``SELECT INTO``
-    writes a new table — both refused."""
+    read-only role would NOT stop; so every function is refused except two node
+    classes sqlglot models as ``exp.Func`` without being one in the sense this
+    check means: a type ``exp.Cast``, and ``exp.Connector`` (AND/OR/XOR), which
+    are boolean operators — see the comment below for why excluding the latter
+    was a fix rather than a loosening. The skip is on the NODE only: ``find_all``
+    still recurses, so a side-effecting call nested UNDER a connector or inside
+    a cast is refused as normal (pinned in the reject tests).
+
+    ``FOR UPDATE``/``FOR SHARE`` takes row locks; ``SELECT INTO`` writes a new
+    table — both refused."""
+    # ``exp.Connector`` (AND/OR) is a ``exp.Func`` SUBCLASS in sqlglot, so the
+    # sweep below matched the boolean connector itself and refused EVERY
+    # multi-predicate WHERE — measured (QA10b): `WHERE a = 'x' AND b = 'y'`
+    # raised "a function call (a = 'x' AND b = 'y') is not allowed", while the
+    # single-predicate form passed. That made the §8 sql mode unable to answer
+    # any question needing two conditions, and the prompt in `core/query/sql.py`
+    # explicitly instructs the model to "Narrow with WHERE" — so the shape the
+    # prompt mandates was the shape the guard rejected.
+    #
+    # A connector takes no lock, changes no setting and is not
+    # non-deterministic, which is what this check exists to refuse; it is a
+    # boolean operator that sqlglot happens to model as a function node.
     for func in statement.find_all(exp.Func):
-        if not isinstance(func, exp.Cast):
+        if not isinstance(func, exp.Cast | exp.Connector):
             rendered = func.sql(dialect=_DIALECT)
             raise GuardrailBlocked(
                 f"a function call ({rendered[:40]}) is not allowed — a function may take a lock, "

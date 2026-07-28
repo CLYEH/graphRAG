@@ -43,6 +43,16 @@ def _validate(
         "SELECT * FROM orders WHERE note = 'please delete this order'",  # blocked word in a STRING
         'SELECT * FROM orders WHERE "select" = 1',  # blocked word as a QUOTED identifier
         "SELECT * FROM orders o WHERE o.amount = '5'",  # a PLAIN table alias is harmless
+        # QA10b: sqlglot models AND/OR as exp.Func SUBCLASSES, so the
+        # side-effect sweep refused EVERY compound WHERE — the §8 sql mode
+        # could not answer any two-condition question, while the prompt in
+        # core/query/sql.py explicitly tells the model to "Narrow with WHERE".
+        # A compound filter is the mode's NORMAL shape, not an edge case,
+        # and its absence here is why a full suite passed over a broken guard.
+        "SELECT * FROM orders WHERE amount = '5' AND note = 'x'",
+        "SELECT * FROM orders WHERE amount = '5' OR note = 'x'",
+        "SELECT * FROM orders WHERE a = '1' AND b = '2' AND c = '3'",
+        "SELECT * FROM orders WHERE CAST(amount AS INT) = 5 AND note = 'x'",
     ],
 )
 def test_accepts_flat_single_table_reads(sql: str) -> None:
@@ -164,6 +174,16 @@ def test_rejects_a_nonliteral_limit_that_would_bypass_the_row_cap(sql: str) -> N
         "SELECT * FROM orders FOR UPDATE",  # row locks
         "SELECT * FROM orders FOR SHARE",  # row share locks
         "SELECT * INTO evil FROM orders",  # writes a new table
+        # QA10b: the sweep now SKIPS exp.Connector (AND/OR/XOR) so compound
+        # WHEREs work — the connector is skipped, its CHILDREN are not. These
+        # nest the dangerous call UNDER the skipped node, which is the only
+        # escape that exception could create (guards.md class 9: compose and
+        # nest, at every depth — the C1b precedent was nested and_/or_ hiding a
+        # scope escape for three rounds). Safe today only because find_all
+        # recurses; a subtree-pruning rewrite would leak silently without these.
+        "SELECT * FROM orders WHERE customer = 'acme' AND pg_advisory_lock(42) IS NULL",
+        "SELECT * FROM orders WHERE customer = 'acme' OR nextval('s') > 0",
+        "SELECT * FROM orders WHERE a = '1' AND (b = '2' OR pg_sleep(5) IS NULL)",
     ],
 )
 def test_rejects_side_effecting_reads(sql: str) -> None:

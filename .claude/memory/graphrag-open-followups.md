@@ -108,6 +108,17 @@ GitHub 為準;立案或了結後從本檔劃掉):
 
 - **`reject_unsafe_corpus_path` 在 uploads 端仍在 event loop 上(Codex #149 r6 P2 的姊妹)**:該 helper 會做 `Path.resolve()`,而 `upload_corpus_dir` 可能是網路掛載;掛載卡住時會擋住整個 worker 的 event loop。QA10a 在 `POST /projects` 的新呼叫點已改成`asyncio.to_thread`,但 `api/routers/uploads.py` 的既有呼叫點沒動(非本任務範圍,且該端點後續本來就要做檔案 I/O)。**判準記著**:把阻塞呼叫包成 sync helper 只是讓 lint 看不到,不是把它移出 loop——兩件事別混為一談。**同一呼叫點的第二個缺口(Codex #149 r7 的孿生,同樣未修)**:該呼叫在 `run_idempotent` **之前**,而它會讀檔案系統,故帶 Idempotency-Key 的**重試**可能因為暫時性掛載錯誤或目錄已變成 symlink 而拿到新的 400,而不是照約定原樣重播已存的回應。projects 端已把同一個 helper 移進 `produce` 修掉;uploads 端**刻意未動**——移進 `produce` 會把「名字不合法」的拒絕推到**整個 body 緩衝之後**,那是真實的取捨(fail-closed vs 正確重播),值得自成一個任務而非在 review 輪次順手改。順手時機:下一個動 uploads 端點的任務,兩個缺口一起處理。
 
+- **REST 的 inspect 面沒有任何 §21 wall-clock deadline(QA10b,經 gate-2 更正後的真問題)**:`api/` 全庫沒有 `asyncio.timeout`/`TimeoutError`,所以 `QUERY_TIMEOUT → 504` 這個映射在 REST 面**沒有自己的 emitter**——它只用於指名 framework/proxy 自己拋的 504(`code_for_framework_status`,`tests/test_api_skeleton.py:101,304` 有釘)。MCP 的 introspection 工具有 `_introspection_timeout`(`core/mcp/server.py:794-806`,DESIGN §292 指名),REST 的對應面(`api/routers/inspect.py`)沒有。**owner 問題**:inspect 類的長查詢該不該有自己的 deadline,還是刻意交給 proxy 逾時?
+  **我原本記的是錯的,留著記錄以免重犯**:初稿寫「同一逾時條件 MCP 發 QUERY_TIMEOUT、REST 發 PARTIAL_RESULTS,是跨介面不一致」。錯在拿**共用的** query 路徑去比**不同的** introspection 路徑——`api/routers/query.py:146` 就是呼叫 `core.mcp.server.run_bounded_query`(query.py:4-7 明寫「one machinery, two facades」),而 timeout→`PARTIAL_RESULTS` 出自`run_bounded_query` 自己的 `except TimeoutError`(server.py:681-696),**MCP 工具走同一條**。沒有分歧。DESIGN §245 也早已定調「query 逾時:回部分結果 + warning,不 500」。同輪我還誤稱那是死映射、誤稱 Console 看不到該碼——實際上 `web/src/api/queries.ts` 把 `QUERY_TIMEOUT` 放進 `SCOPE_NEUTRAL`,正是為 proxy-504。
+
+- **NL-to-SQL 輸入面已實測(QA10b,需自建結構化語料才測得到)**:nmmst 測不到,因為它是**文件語料**、`STRUCTURED_MIME` 列為零,於是每張白名單表都渲染成`- halls()`,模型照抄寫出 `FROM halls()`,sqlglot 解析成 `exp.Func`,`_reject_side_effects` 在白名單/JOIN/聚合/注入檢查**之前**就擋掉——量到的是「空 schema 一律拒絕」。故另建 3 列 CSV(`structured` kind + `metadata.table/pk_column`,指向**檔案**而非目錄)→ build → 補 golden.yaml → eval → activate,才真正跑得到這個面。
+  **結果(七個輸入,全部 200、無 500、無靜默執行)**:良性查詢正常回列;`drop table halls; --` **沒有破壞任何東西**(事後 3 列完好);`' UNION SELECT * FROM projects --` 回 0 列;**白名單守住**——`列出 projects 表的所有資料` 與直接送 `SELECT * FROM projects` 都只回`halls` 的列,registry 資料從未外洩;寫入意圖(`把…樓層改成 9`)被 `GUARDRAIL_BLOCKED`;RTL override 字元不炸。
+  **真正的發現是功能性過度阻擋,不是訊息品質(gate-2 把我的診斷倒過來,已修)**:sqlglot 的 `exp.And`/`exp.Or` 是 **`exp.Func` 的子類**,所以 `_reject_side_effects` 的`find_all(exp.Func)` 會匹配到布林連接詞本身——**每一個多條件 WHERE 都被拒**。無需 DB/LLM 即可重現:`validate_sql("SELECT * FROM t WHERE a='x' AND b='y'", ...)` → `GuardrailBlocked`,而單條件 WHERE 通過。後果:§8 的 sql 模式**答不出任何需要兩個條件的問題**,而 `core/query/sql.py` 的 `_RULES` 正好明文要模型「Narrow with WHERE」——**prompt 要求的形狀就是守衛拒絕的形狀**。已修(`exp.Cast | exp.Connector` 一併跳過;連接詞不取鎖、不改設定、不非確定,不是這個檢查存在的理由),並補上 accept-surface 測試。
+  **我原本把它記成「守衛擋對了、只是訊息指名錯節點」**——那是反的:守衛擋錯了,訊息指名的正是它拒絕的那個節點。這個誤判會讓它被當成 cosmetic 排期,而模式一直是壞的。
+  **`tests/test_sql_guard.py` 的 accept 面沒有任何雙條件 WHERE 案例**,所以 1542 支測試在一個壞掉的守衛上全綠。已補 AND/OR/三條件/含 CAST 四例,並寫明理由。
+  **七個輸入的結論需按此重讀**:白名單那條仍然成立(`_single_allowed_table` 是獨立檢查,UNION 案結構上就死),但「寫入意圖被 GUARDRAIL_BLOCKED」那條**是被連接詞 bug 擋的**,不能拿來當「守衛判斷寫入意圖正確」的證據——修好之後需要重測那一項。
+  **殘留**:`qa10b-sql` 這個測試專案留在 dev 庫(DELETE 回 400 `ProjectHasBuildsError`——QA7 的刻意設計),檔案(CSV/golden)已刪。dev 庫本就有數十個`gclone-*`/`retry-*` 測試殘留,故未強行清除。
+
 - **delta-review receipt 被 harness 自動誤旗(#125 期間兩次)**:gate-2 persistent
   reviewer 依 SendMessage delta-review 協議自查 diff 後蓋章,harness 的 security
   heuristic 兩度標為「無真審查的自我蓋章」。誤報(輸出含具體查證),但訊號值得
