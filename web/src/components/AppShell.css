@@ -71,6 +71,43 @@
   color: var(--text-h);
 }
 
+/* QA9: the switcher gained a filter for long project lists, so it is now a
+   row of labelled controls rather than a single label. */
+.switcher > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.switcher__search {
+  font: inherit;
+  font-size: 14px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  width: 12ch;
+}
+
+.switcher__empty {
+  color: var(--text);
+  font-size: 13px;
+}
+
+/* The message span is rendered UNCONDITIONALLY so its aria-live region exists
+   in the accessibility tree before it ever has text. Empty, it is still a flex
+   item and would add the .switcher gap, pushing the select off its old
+   position — so collapse it out of layout while EMPTY only.
+   Deliberately not `display: none`: that removes the node from the
+   accessibility tree and undoes the pre-existence the announcement rests on. */
+.switcher__empty:empty {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
 .switcher--muted {
   color: var(--text);
 }

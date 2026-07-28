@@ -98,11 +98,14 @@ test("console shell loads with the project switcher and section nav", async ({ p
   );
   await page.goto("/");
 
-  // the root redirects into the first project's 總覽 (UXA2) — the page that
-  // says what to do next; a fresh project points at step ①
+  // With no remembered project (fresh context = empty localStorage) the root
+  // falls back to the first LISTED project's 總覽 (UXA2) — the page that says
+  // what to do next; a fresh project points at step ①. QA9/D17 made that the
+  // FALLBACK rather than the rule; the remembered-project path has its own
+  // spec below, because only a real page load exercises real storage.
   await expect(page.getByRole("heading", { name: "總覽" })).toBeVisible();
   await expect(page.getByText(/尚未開始/)).toBeVisible();
-  await expect(page.getByRole("combobox", { name: /project/i })).toHaveValue("acme");
+  await expect(page.getByRole("combobox", { name: /專案/ })).toHaveValue("acme");
   for (const label of [
     "總覽",
     "匯入",
@@ -307,6 +310,48 @@ function mergeCandidatesResponse() {
     }),
   };
 }
+
+test("the root returns to the project last opened, across a real page load", async ({ page }) => {
+  // WHY (QA9/D17): the root used to take projects[0], and the API lists
+  // created_at DESC — so opening the Console dropped the operator into the
+  // NEWEST project, typically the empty shell someone had just created, and
+  // every session began by switching away from it.
+  //
+  // This is an e2e rather than a component test because the mechanism is a
+  // real page load reading real localStorage on a real origin: the unit tests
+  // pin the precedence rule, but only this proves the value survives a
+  // navigation that tears the SPA down and rebuilds it.
+  await page.route("**/projects*", (route) =>
+    route.fulfill(projectsResponse(["newest-shell", "beta"])),
+  );
+  await page.route("**/projects/*/health", (route) => route.fulfill(healthResponse()));
+  // the 總覽 page reads these too — stubbed so it renders its real state
+  // rather than an error state the assertions would silently tolerate
+  await page.route("**/projects/*/sources*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: [], meta: META }),
+    }),
+  );
+  await page.route("**/projects/*/builds*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: [], meta: META }),
+    }),
+  );
+
+  // open beta the way an operator would — by URL (base64url of "beta")
+  await page.goto("/p/YmV0YQ/overview");
+  await expect(page.getByRole("combobox", { name: /專案/ })).toHaveValue("beta");
+
+  // ...then come back to the root in a FRESH document
+  await page.goto("/");
+
+  // newest-shell is listed first; landing on beta proves the remembered key won
+  await expect(page.getByRole("combobox", { name: /專案/ })).toHaveValue("beta");
+});
 
 test("the jobs section shows the pipeline runs table", async ({ page }) => {
   await page.route("**/projects*", (route) => route.fulfill(projectsResponse(["acme"])));
@@ -526,7 +571,7 @@ test("console shows an empty state when there are no projects", async ({ page })
   await page.route("**/projects*", (route) => route.fulfill(projectsResponse([])));
   await page.goto("/");
 
-  await expect(page.getByText(/no projects yet/i)).toBeVisible();
+  await expect(page.getByText(/還沒有任何專案/)).toBeVisible();
 });
 
 function sourceResponse() {
@@ -1366,7 +1411,7 @@ test("the full no-terminal path: create → upload → build → eval → activa
 
   // ① create the FIRST project from the root bootstrap form
   await page.goto("/");
-  await expect(page.getByText(/No projects yet/)).toBeVisible();
+  await expect(page.getByText(/還沒有任何專案/)).toBeVisible();
   await page.getByLabel("name", { exact: true }).fill("e2e");
   await page.getByRole("button", { name: "Create project" }).click();
   await expect(page.getByText(/尚未開始/)).toBeVisible(); // landed on 總覽

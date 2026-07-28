@@ -15,6 +15,7 @@ from typing import Annotated, Any
 import pytest
 import yaml
 from fastapi import Depends, HTTPException, Request
+from fastapi.responses import RedirectResponse
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, field_validator
 
@@ -50,6 +51,18 @@ def client() -> TestClient:
         @classmethod
         def _reject(cls, value: str) -> str:
             raise ValueError("name is never valid")
+
+    @app.get("/_t/unparseable-redirect")
+    async def _unparseable() -> RedirectResponse:
+        # `urlsplit` RAISES on an unmatched IPv6 bracket ("Invalid IPv6 URL")
+        return RedirectResponse("http://[evil/x")
+
+    @app.get("/_t/offsite")
+    async def _offsite() -> RedirectResponse:
+        # a GENUINE cross-origin redirect: the same-origin guard must leave it
+        # alone (nothing in the app emits one today — this route exists so the
+        # documented decision is pinned rather than merely written down)
+        return RedirectResponse("https://elsewhere.example/x")
 
     @app.get("/_t/ok")
     async def _ok(request: Request) -> dict[str, Any]:
@@ -304,6 +317,93 @@ def test_api_error_details_with_uuid_serializes_not_crashes(client: TestClient) 
     err = resp.json()["error"]
     assert err["code"] == "BUILD_NOT_FOUND"
     assert err["details"] == {"build_id": "00000000-0000-0000-0000-0000000000ab"}
+
+
+def test_a_redirect_never_carries_a_client_controlled_origin() -> None:
+    """Why (QA9/D18): Starlette's ``redirect_slashes`` builds its Location from
+    ``request.url``, i.e. from the **Host header** — which the client sends.
+
+    Two harms rode on that, and the second is why the fix is here rather than
+    in the dev proxy: behind Vite's proxy the Host is the backend's, so the
+    browser was sent to ``http://127.0.0.1:8010`` — breaking the frozen
+    contract's same-origin shape, pointing a LAN user at their OWN machine, and
+    disclosing the internal backend address to every client. With no proxy at
+    all the same code reflects whatever Host arrives, which is redirect
+    injection: patching the proxy would have left that open.
+
+    The guarantee pinned here is the strong form — not "the origin is the right
+    one" but "there is no origin", which no deployment topology can get wrong.
+    """
+    app = create_app()
+    with TestClient(app, follow_redirects=False) as client:
+        for host in ("evil.example", "127.0.0.1:8010", "console.example.lan"):
+            r = client.get("/projects/", headers={"Host": host})
+            assert r.status_code == 307, host
+            location = r.headers["location"]
+            assert location == "/projects", (host, location)
+            # the property, stated independently of the exact path: nothing a
+            # client sends can put an origin in there
+            assert host not in location
+            assert "//" not in location
+
+        # nested paths redirect through the same router branch
+        nested = client.get("/projects/p/sources/", headers={"Host": "evil.example"})
+        assert nested.headers["location"] == "/projects/p/sources"
+
+        # over-block dual: a NON-redirect response is untouched, and the
+        # query string survives the rewrite rather than being dropped
+        ok = client.get("/healthz", headers={"Host": "evil.example"})
+        assert "location" not in ok.headers
+        with_query = client.get("/projects/?limit=2", headers={"Host": "evil.example"})
+        assert with_query.headers["location"] == "/projects?limit=2"
+
+
+def test_a_genuine_cross_origin_redirect_is_left_alone(client: TestClient) -> None:
+    """The guard removes a leak; it does not seize control of every redirect.
+
+    Without this, "just always strip the origin" would look like a harmless
+    simplification — every other test would stay green while a documented
+    decision quietly flipped, and any future off-site redirect would be
+    rewritten into a same-origin path that does not exist.
+    """
+    r = client.get("/_t/offsite", follow_redirects=False)
+
+    assert r.status_code == 307
+    assert r.headers["location"] == "https://elsewhere.example/x"
+
+
+def test_an_unparseable_location_does_not_crash_the_guard(client: TestClient) -> None:
+    """The same-origin guard runs OUTSIDE the app's exception handlers, so
+    anything it raises reaches the caller as a bare 500 with no envelope.
+
+    `urlsplit` raises on some malformed URLs (an unmatched IPv6 bracket), so a
+    Location it cannot parse used to turn a redirect into a 500. Codex #148
+    reported this as reachable through a malformed **Host** header; that
+    specific route does not reproduce — Starlette refuses to build a URL from a
+    malformed Host and falls back to the server name, so the bad value never
+    reaches `urlsplit` (pinned below). It IS reachable through a Location set
+    by a handler, which skips that sanitisation entirely — which is why the
+    guard is here.
+
+    A value that cannot be parsed cannot be judged self-referential, so it
+    passes through untouched: this middleware exists to remove an origin leak,
+    and refusing to answer at all is a worse failure than the one it prevents.
+    """
+    r = client.get("/_t/unparseable-redirect", follow_redirects=False)
+
+    assert r.status_code == 307
+    assert r.headers["location"] == "http://[evil/x"
+
+
+def test_a_malformed_host_still_gets_a_clean_relative_redirect(client: TestClient) -> None:
+    """The half of Codex #148's report that holds: a malformed Host must not
+    produce a 500 either. It does not, because Starlette never builds a URL
+    from one — pinned so that if that ever changes, this fails here rather than
+    as a 500 in production."""
+    for host in ("[evil", "[::1", "a]b", "[]"):
+        r = client.get("/projects/", headers={"Host": host}, follow_redirects=False)
+        assert r.status_code == 307, host
+        assert r.headers["location"] == "/projects", host
 
 
 def test_auth_placeholder_extracts_token_and_admits_anonymous(client: TestClient) -> None:
