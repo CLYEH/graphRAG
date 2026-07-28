@@ -98,9 +98,17 @@ async def create_project_endpoint(
     # `_corpus` module rather than in either router (the `_query` pattern).
     #
     # In the handler rather than the Pydantic validator because it needs
-    # settings and does a filesystem ``resolve()`` — the same reason
-    # ``reject_unsafe_corpus_path`` is sync and runs before any file I/O.
-    reject_unsafe_corpus_path(get_settings(), body.name)
+    # settings and does a filesystem ``resolve()``.
+    #
+    # OFF THE EVENT LOOP (Codex #149 r6). ``resolve()`` touches the filesystem,
+    # and ``upload_corpus_dir`` may be a network mount — a stalled mount would
+    # otherwise block this worker's loop and pause every unrelated request.
+    # Keeping the helper sync was a lint accommodation, not a safety property:
+    # it moves the blocking call out of the lint's sight without moving it off
+    # the loop, which is the wrong half of the problem to solve. The upload
+    # endpoint has the same shape and predates this task; it is recorded rather
+    # than changed here, since fixing it is not this task's business.
+    await asyncio.to_thread(reject_unsafe_corpus_path, get_settings(), body.name)
 
     async def produce() -> tuple[int, dict[str, Any]]:
         try:
