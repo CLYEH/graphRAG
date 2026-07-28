@@ -23,8 +23,6 @@ dedicated code lands.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -39,12 +37,10 @@ from api.deps import Conn, Graph, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.pagination import (
-    decode_chunk_cursor,
-    decode_id_cursor,
     decode_scoped_id_cursor,
     decode_sorted_cursor,
-    encode_cursor,
     encode_sorted_cursor,
+    scope_fingerprint,
 )
 from api.registry_errors import translate_registry_error
 from api.routers._query import (
@@ -107,25 +103,6 @@ EVIDENCE_FACETS: tuple[str, ...] = ("missing",)
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
-def _scope_fingerprint(build_id: Any, q: str | None, applied: dict[str, str]) -> str:
-    """Canonical fingerprint of the non-sort predicates a page answers (R8).
-    A keyset anchor positions within ONE result set — replaying it under a
-    different q/filter combination silently skips or duplicates rows — so
-    this rides in the cursor tag beside the sort and decode rejects a
-    mismatch, exactly as cross-sort reuse is rejected. The ACTIVE BUILD is
-    part of the scope too (R9): a keyset from build A applied to build B
-    would silently omit/repeat rows — the DR-001/DR-006 "never mix
-    old-version data" rule, enforced here for pagination chains. Raw filter spellings
-    on purpose: "3" vs "3.0" fingerprint differently, which over-rejects a
-    cosmetic respelling but never under-rejects a real predicate change."""
-    scope = json.dumps(
-        {"build": str(build_id), "q": q or "", "filters": applied},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(scope.encode()).hexdigest()[:12]
-
-
 def _sorted_page(
     sort: str | None,
     cursor: str | None,
@@ -141,10 +118,14 @@ def _sorted_page(
     ``sort`` arrives ALREADY validated by ``reject_unsupported_query``
     (``extra_sorts``), so an unknown field here would be a wiring bug — it
     raises KeyError loudly rather than falling back to a wrong order. The
-    default (``sort is None``) keeps the legacy untagged ``(id desc)``
-    cursor shape so in-flight pre-sort cursors stay valid; every sorted
-    order uses a TAGGED cursor bound to its sort spelling
-    (``decode_sorted_cursor`` rejects cross-sort replays). Non-unique sort
+    default (``sort is None``) MINTS a tagged ``id:desc`` cursor like every
+    other order; what it keeps is only the ACCEPTANCE of in-flight untagged
+    ones, which is what lets them age out (QA8 — an earlier revision of this
+    sentence said the default kept the legacy SHAPE, and that was the defect
+    described as the design: while any listing still mints untagged tokens,
+    they stay valid across every listing and the branch can never close).
+    Every cursor is bound to its sort spelling and its scope
+    (``decode_scoped_id_cursor`` rejects cross-sort and cross-scope replays). Non-unique sort
     columns tie-break on ``id`` in the same direction, making every keyset
     total."""
     if sort == f"{id_col.name}:desc":
@@ -355,7 +336,7 @@ async def list_documents_endpoint(
         cursor,
         docs.c.id,
         where,
-        scope=_scope_fingerprint(binding.build_id, q, applied),
+        scope=scope_fingerprint("documents", binding.build_id, q, applied),
         text_cols={},
         time_cols={"ingested_at": docs.c.ingested_at},
     )
@@ -402,8 +383,15 @@ async def list_chunks_endpoint(
     repo = BuildScopedRepo.bound_to(conn, binding)
     chunks = tables.chunks
     where = []
+    # QA8/D6: the last untagged minter. Its (document_id, ordinal) pair was
+    # never interchangeable with an id cursor, and the endpoint accepts no
+    # filter or sort — so the only axis a token could outlive is R9, the
+    # ACTIVE BUILD: replayed after an activation it re-anchors inside the new
+    # build's chunks. Narrower than the others, swept in the same pass because
+    # a single surviving minter is what keeps the legacy shape alive at all.
+    tag = f"document_id:asc,ordinal:asc|{scope_fingerprint('chunks', binding.build_id, None, {})}"
     if cursor:
-        after_doc, after_ordinal = decode_chunk_cursor(cursor)
+        after_doc, after_ordinal = decode_sorted_cursor(cursor, tag, (uuid.UUID, int))
         where.append(sa.tuple_(chunks.c.document_id, chunks.c.ordinal) > (after_doc, after_ordinal))
     rows = await repo.fetch_page(
         chunks,
@@ -413,7 +401,9 @@ async def list_chunks_endpoint(
     )
     page = rows[:limit]
     next_cursor = (
-        encode_cursor((page[-1].document_id, page[-1].ordinal)) if len(rows) > limit else None
+        encode_sorted_cursor(tag, (page[-1].document_id, page[-1].ordinal))
+        if len(rows) > limit
+        else None
     )
     return success(
         [chunk_dto(r) for r in page],
@@ -488,7 +478,7 @@ async def list_entities_endpoint(
         cursor,
         ents.c.id,
         where,
-        scope=_scope_fingerprint(binding.build_id, q, applied),
+        scope=scope_fingerprint("entities", binding.build_id, q, applied),
         text_cols={"canonical_name": ents.c.canonical_name},
         time_cols={"created_at": ents.c.created_at},
     )
@@ -555,12 +545,32 @@ async def list_relations_endpoint(
                 sa.select(sa.literal(1)).where(tables.relation_evidence.c.relation_id == rels.c.id)
             )
         )
+    # QA8/D6: this listing used to mint an UNTAGGED cursor, so its tokens were
+    # accepted by /entities and /documents, and replaying one under different
+    # filters silently skipped rows. The scoped codec still ACCEPTS legacy
+    # 1-item tokens so in-flight ones age out — which is precisely why minting
+    # had to stop: an endpoint that keeps issuing them keeps the hole open
+    # forever, and no amount of aging closes it.
+    applied = {
+        k: v
+        for k, v in (
+            ("type", rtype),
+            ("status", status),
+            ("review_status", review_status),
+            ("confidence", confidence),
+            ("evidence", evidence),
+        )
+        if v is not None
+    }
+    # the sort is fixed here, so the tag's sort half is a constant — the scope
+    # half is what this listing was missing
+    tag = f"id:desc|{scope_fingerprint('relations', binding.build_id, None, applied)}"
     if cursor:
-        (after_id,) = decode_id_cursor(cursor)
+        (after_id,) = decode_scoped_id_cursor(cursor, tag)
         where.append(rels.c.id < after_id)
     rows = await repo.fetch_page(rels, *where, order_by=[rels.c.id.desc()], limit=limit + 1)
     page = rows[:limit]
-    next_cursor = encode_cursor((page[-1].id,)) if len(rows) > limit else None
+    next_cursor = encode_sorted_cursor(tag, (page[-1].id,)) if len(rows) > limit else None
     return success(
         [relation_dto(r) for r in page],
         **response_meta(request),

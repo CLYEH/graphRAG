@@ -15,22 +15,51 @@ import pytest
 
 from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash
-from api.pagination import decode_project_cursor, decode_source_cursor, encode_cursor
+from api.pagination import decode_sorted_cursor, encode_sorted_cursor, scope_fingerprint
 
 pytestmark = pytest.mark.contract
 
 
 def test_project_cursor_round_trips() -> None:
+    """Projects page by (created_at desc, name desc) — created_at alone is not
+    unique, so the PK rides along as the tie-break (BA1b).
+
+    QA8/D6: this used to round-trip through a bare ``decode_project_cursor``,
+    and that was the defect — an UNTAGGED (datetime, str) pair is decodable by
+    any listing with the same arity. It was measured: a /sources token decoded
+    cleanly here, so one project's source listing re-anchored the global
+    project list. The tag is now part of the round trip, not an add-on to it.
+    """
     ts = datetime(2026, 7, 7, 12, 30, tzinfo=UTC)
-    token = encode_cursor((ts, "proj-x"))
-    assert decode_project_cursor(token) == (ts, "proj-x")
+    tag = f"created_at:desc|{scope_fingerprint('projects', '', None, {})}"
+    token = encode_sorted_cursor(tag, (ts, "proj-x"))
+    assert decode_sorted_cursor(token, tag, (datetime, str)) == (ts, "proj-x")
+
+    # the measured interchange, now refused from the other direction too
+    sources_tag = f"added_at:desc|{scope_fingerprint('sources', 'p', None, {})}"
+    with pytest.raises(ApiError) as ei:
+        decode_sorted_cursor(
+            encode_sorted_cursor(sources_tag, (ts, uuid.uuid4())), tag, (datetime, str)
+        )
+    assert ei.value.code is ErrorCode.VALIDATION_ERROR
 
 
-def test_source_cursor_round_trips() -> None:
+def test_source_cursor_binds_its_project() -> None:
+    """QA8/D6: a sources cursor carried no project, so replaying it under
+    another project re-anchored THAT project's list — a cross-tenant read, not
+    a miscounted page. The project is in the tag, so the two are distinct
+    tokens even for identical (added_at, id) values.
+    """
     ts = datetime(2026, 7, 7, 12, 30, tzinfo=UTC)
     sid = uuid.uuid4()
-    token = encode_cursor((ts, sid))
-    assert decode_source_cursor(token) == (ts, sid)
+    tag = f"added_at:desc|{scope_fingerprint('sources', 'p', None, {})}"
+    token = encode_sorted_cursor(tag, (ts, sid))
+    assert decode_sorted_cursor(token, tag, (datetime, uuid.UUID)) == (ts, sid)
+
+    other = f"added_at:desc|{scope_fingerprint('sources', 'q', None, {})}"
+    with pytest.raises(ApiError) as ei:
+        decode_sorted_cursor(token, other, (datetime, uuid.UUID))
+    assert ei.value.code is ErrorCode.VALIDATION_ERROR
 
 
 @pytest.mark.parametrize("bad", ["not-base64!!", "", "YWJj", "eyJhIjogMX0="])
@@ -38,7 +67,7 @@ def test_malformed_cursor_is_a_validation_error(bad: str) -> None:
     """Bad base64, wrong arity, unparseable datetime → 400, never a silent
     reset to page one."""
     with pytest.raises(ApiError) as ei:
-        decode_project_cursor(bad)
+        decode_sorted_cursor(bad, "created_at:desc|whatever", (datetime, str))
     assert ei.value.code is ErrorCode.VALIDATION_ERROR
 
 

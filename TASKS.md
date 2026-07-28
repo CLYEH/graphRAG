@@ -206,7 +206,7 @@ Keep items small enough to finish in one loop.
 
 ### 生命週期與衛生(P3)
 - [x] QA7 專案刪除的終局與 uploads 清理(D7/D16)— (a) prune 的 `keep<1` 守衛冗餘(keepers 本就無條件留 active build)且訊息在無 active 時為假,卻把 REST 指的補救路兩頭封死;改為只拒 `keep<0`(CLI 亦接成 typed REFUSED)。(b) DELETE 專案一併刪 `data/uploads/{p}/`(走 `safe_project_subdir` 防穿越);順序刻意與 prune 相反——刪除可被合法拒絕,先刪檔會在被拒請求上毀資料。
-- [ ] QA8 cursor 打標與資源綁定(D6/D15)— (a) `/relations` 鑄造**未打標的 legacy cursor** 且不綁定任何 filter:`filter[confidence]=low` 的 cursor 換到無 filter 重放 → 200、**靜默跳過 32 列**;該 cursor 也被 `/entities`、`/documents` 全部接受。不需偽造——每個 relations 頁面都在發一張到處有效的 token,相容孔因端點持續鑄造舊 token 而永遠關不掉。(b) REST cursor 的 scope fingerprint **未含資源別**:`/entities` 與 `/documents` 在同 context 算出相同 tag,cursor 互餵 → 200 + 靜默重複列。修法:`/relations` 改走 `encode_sorted_cursor`/`_scope_fingerprint`,並把資源別納入 fingerprint;順帶檢查 `/builds/{id}/steps/{step}/items`(用同一未打標 decode,同根因嫌疑,QA 期間無可達資料未能證實)。
+- [x] QA8 cursor 打標與資源綁定(D6/D15)— 鑄造端才是相容孔永不關閉之因,故九個鑄造端全掃(relations/merge-candidates/ontology-proposals/builds/build-steps/step-items/chunks/projects/sources),無殘留;fingerprint 納資源別(原 `/entities`+`/documents` 同 tag → 互餵 200+靜默重複);實測 sources token 可被 projects 解讀。
 - [ ] QA9 Console 打磨(D17/D18/D19)— (a) 根路徑導向 `projects[0]`(created_at DESC),operator 一開門就掉進最新建立的空殼專案;`ProjectSwitcher` 是**無搜尋的裸 `<select>`**(其註解假設「project counts…are small」已失真),SPA 全無刪除入口。改法:落地改為最近使用/持久化選擇的專案 + switcher 加搜尋。(b) 經 proxy 的**尾斜線**請求 307 轉址到後端 origin `http://127.0.0.1:8010`(API 由 Host header 派生 Location,Vite proxy 改寫 Host 卻不回寫 Location)——破壞 same-origin 契約,LAN 使用者跟隨轉址會打到**自己**的機器,並對每個客戶端揭露內部後端位址。(c) 服務出的 document shell 未品牌化且語言標錯:`<title>web</title>`、`<html lang="en">`,實際渲染繁中 UI——每個分頁/書籤都叫「web」,lang 錯標讓螢幕閱讀器與翻譯工具誤處理整個 UI。
 
 ### 盲區補測

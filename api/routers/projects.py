@@ -12,6 +12,7 @@ import asyncio
 import logging
 import shutil
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -23,7 +24,7 @@ from api.deps import Conn, ConnProvider, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
-from api.pagination import decode_project_cursor, encode_cursor
+from api.pagination import decode_sorted_cursor, encode_sorted_cursor, scope_fingerprint
 from api.registry_errors import translate_registry_error
 from api.routers._query import reject_unsupported_query
 from api.schemas import ProjectCreate, ProjectUpdate, project_dto
@@ -61,13 +62,20 @@ async def list_projects_endpoint(
     cursor: str | None = None,
 ) -> dict[str, Any]:
     reject_unsupported_query(request, "created_at")
-    after = decode_project_cursor(cursor) if cursor else None
+    # QA8/D6: this minted an untagged (created_at, name) pair, and a SOURCES
+    # cursor — same arity, same (datetime, str) types — decoded here cleanly,
+    # so one project's source listing silently re-anchored the global project
+    # list. The registry has exactly one global listing, so the scope is a
+    # constant; the tag is what makes the token non-interchangeable, not the
+    # scope's information content.
+    tag = f"created_at:desc|{scope_fingerprint('projects', '', None, {})}"
+    after = decode_sorted_cursor(cursor, tag, (datetime, str)) if cursor else None
     projects, next_after = await list_projects(conn, limit=limit, after=after)
     return success(
         [project_dto(p) for p in projects],
         **response_meta(request),
         paginated=True,
-        next_cursor=encode_cursor(next_after) if next_after else None,
+        next_cursor=encode_sorted_cursor(tag, next_after) if next_after else None,
     )
 
 

@@ -8,6 +8,7 @@ to PROJECT_NOT_FOUND via the single translation point.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, Query, Request
@@ -18,7 +19,7 @@ from api.deps import Conn, response_meta
 from api.envelope import success
 from api.errors import ApiError, ErrorCode
 from api.idempotency import request_hash, run_idempotent
-from api.pagination import decode_source_cursor, encode_cursor
+from api.pagination import decode_sorted_cursor, encode_sorted_cursor, scope_fingerprint
 from api.registry_errors import translate_registry_error
 from api.routers._query import reject_unsupported_query
 from api.schemas import SourceCreate, SourceUpdate, source_dto
@@ -56,13 +57,18 @@ async def list_sources_endpoint(
 ) -> dict[str, Any]:
     reject_unsupported_query(request, "added_at")
     await _require_project(conn, project)
-    after = decode_source_cursor(cursor) if cursor else None
+    # QA8/D6: measured, not assumed — a token minted here decoded cleanly as a
+    # /projects cursor (identical (datetime, str) arity), and it also
+    # re-anchored ANOTHER project's source list, which is a cross-tenant read
+    # rather than a miscounted page. The tag binds both axes at once.
+    tag = f"added_at:desc|{scope_fingerprint('sources', project, None, {})}"
+    after = decode_sorted_cursor(cursor, tag, (datetime, uuid.UUID)) if cursor else None
     sources, next_after = await list_sources(conn, project, limit=limit, after=after)
     return success(
         [source_dto(s) for s in sources],
         **response_meta(request),
         paginated=True,
-        next_cursor=encode_cursor(next_after) if next_after else None,
+        next_cursor=encode_sorted_cursor(tag, next_after) if next_after else None,
     )
 
 

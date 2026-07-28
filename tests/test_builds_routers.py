@@ -22,7 +22,7 @@ from neo4j.exceptions import ServiceUnavailable
 
 from api.app import create_app
 from api.deps import db_conn
-from api.pagination import decode_step_cursor
+from api.pagination import decode_scoped_id_cursor, decode_sorted_cursor, scope_fingerprint
 from core.builds.lifecycle import BuildInfo, PreflightReport
 
 pytestmark = pytest.mark.contract
@@ -124,6 +124,90 @@ def test_list_paginates_and_rejects_unsupported(
     assert client.get("/projects/p/builds", params={"filter[status]": "ready"}).status_code == 400
     assert client.get("/projects/p/builds", params={"sort": "started_at:desc"}).status_code == 400
     assert client.get("/projects/p/builds", params={"sort": "id:desc"}).status_code == 200
+
+
+def test_builds_list_cursor_carries_its_own_scope(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why (QA8/D6): an UNTAGGED cursor is a token every keyset listing accepts,
+    so this list's page-2 anchor also anchored /entities, /relations and a
+    step's item list — 200 with rows from a set the caller never asked for.
+
+    This listing takes no filters, so it is the weakest of the four on its own
+    terms; it is pinned anyway because the compatibility branch in the scoped
+    decoder can only age out once NOTHING mints the legacy shape. A single
+    remaining issuer keeps the hole open for every listing.
+    """
+    _project_exists(monkeypatch)
+    next_id = uuid.uuid4()
+
+    async def fake_page(conn: Any, project: str, *, limit: int, after_id: Any) -> Any:
+        return [_build()], next_id
+
+    _stub(monkeypatch, "list_builds_page", fake_page)
+    token = client.get("/projects/p/builds").json()["meta"]["next_cursor"]
+
+    # (a) the minted token carries THIS listing's tag
+    tag = f"id:desc|{scope_fingerprint('builds', 'p', None, {})}"
+    assert decode_scoped_id_cursor(token, tag) == (next_id,)
+
+    # (b) it is not a token for a different project's builds — same listing,
+    # different scope, and a keyset anchor means nothing across that boundary
+    assert client.get("/projects/other/builds", params={"cursor": token}).status_code == 400
+
+    # (c) over-block dual: its own cursor still pages
+    assert client.get("/projects/p/builds", params={"cursor": token}).status_code == 200
+
+
+def test_step_items_cursor_cannot_outlive_its_status_filter(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why (QA8/D6): the task named this endpoint as suspected same-root-cause
+    but unverifiable during QA (no reachable data). It is confirmed: it minted
+    an untagged token while paging under filter[status], so replaying page 2
+    WITHOUT the filter answered from a strictly larger set — the caller reading
+    a failure list silently walked into successes at an anchor computed over a
+    different set. This is the failure-triage surface, so under-reporting here
+    is read as "nothing more failed".
+
+    The scope is the (project, build, step) triple, not the build: two steps of
+    one build are different result sets.
+    """
+    _project_exists(monkeypatch)
+    _known_build(monkeypatch, _build())
+
+    async def in_build(conn: Any, project: str, build_id: Any, step_id: Any) -> bool:
+        return True
+
+    next_id = uuid.uuid4()
+
+    async def fake_items(
+        conn: Any, project: str, build_id: Any, step_id: Any, *, limit: int, after: Any, status: Any
+    ) -> Any:
+        return [_item_row()], next_id
+
+    _stub(monkeypatch, "step_belongs_to_build", in_build)
+    _stub(monkeypatch, "list_step_items", fake_items)
+    sid = uuid.uuid4()
+    base = f"/projects/p/builds/{_BUILD}/steps/{sid}/items"
+    token = client.get(base, params={"filter[status]": "failed"}).json()["meta"]["next_cursor"]
+
+    # (a) the minted token carries the filter it was minted under
+    scope = ("p", _BUILD, sid)
+    tag = f"id:desc|{scope_fingerprint('build-step-items', scope, None, {'status': 'failed'})}"
+    assert decode_scoped_id_cursor(token, tag) == (next_id,)
+
+    # (b) dropping the filter on the replay is REFUSED, not silently widened
+    assert client.get(base, params={"cursor": token}).status_code == 400
+    # ...and so is carrying it to a sibling step of the same build
+    other_step = client.get(
+        f"/projects/p/builds/{_BUILD}/steps/{uuid.uuid4()}/items",
+        params={"filter[status]": "failed", "cursor": token},
+    )
+    assert other_step.status_code == 400
+
+    # (c) over-block dual: the same filter still pages
+    assert client.get(base, params={"filter[status]": "failed", "cursor": token}).status_code == 200
 
 
 def test_404_precedence_and_class13(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -312,10 +396,68 @@ def test_list_build_steps_shape_pagination_and_build_id(
     assert r.status_code == 200
     body = r.json()
     assert body["meta"]["build_id"] == str(_BUILD)
-    assert decode_step_cursor(body["meta"]["next_cursor"]) == next_key
+    # QA8/D6: this decoded the minted token with the UNTAGGED decoder, i.e. it
+    # pinned the untagged shape as an expectation. The compound keyset was
+    # never cross-listing reusable (2-tuple, wrong arity for an id cursor), but
+    # it could still outlive its own filter[status] — that is what the tag ends.
+    steps_tag = (
+        f"started_at:desc,id:desc|{scope_fingerprint('build-steps', ('p', _BUILD), None, {})}"
+    )
+    assert (
+        decode_sorted_cursor(body["meta"]["next_cursor"], steps_tag, (datetime, uuid.UUID))
+        == next_key
+    )
     step = body["data"][0]
     assert step["step_name"] == "extract" and step["status"] == "failed"
     assert step["failed_count"] == 3 and step["error"] == {"kind": "PartialFailure"}
+
+
+def test_build_steps_cursor_cannot_outlive_its_status_filter(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why (QA8/D6): this listing's keyset is a (started_at, step id) PAIR, so
+    unlike the four 1-item sites it was never accepted by the id-cursor
+    compatibility branch — no cross-listing reuse was possible here.
+
+    What it did share is the half that bites WITHIN one listing: it minted an
+    untagged token while paging under filter[status], so a page-2 replay
+    without the filter re-anchored inside a larger set. Pinned separately from
+    the shape assertion above because the two failures are different: that one
+    catches a regression to the legacy encoding, this one catches a tag that
+    stops carrying the filter.
+    """
+    _project_exists(monkeypatch)
+    _known_build(monkeypatch, _build())
+    next_key = (_NOW, uuid.uuid4())
+
+    async def fake_steps(
+        conn: Any, project: str, build_id: Any, *, limit: int, after: Any, status: Any
+    ) -> Any:
+        return [_step_row()], next_key
+
+    _stub(monkeypatch, "list_build_steps", fake_steps)
+    base = f"/projects/p/builds/{_BUILD}/steps"
+    token = client.get(base, params={"filter[status]": "failed"}).json()["meta"]["next_cursor"]
+
+    # (a) the minted token carries the filter it was minted under
+    tag = (
+        "started_at:desc,id:desc|"
+        f"{scope_fingerprint('build-steps', ('p', _BUILD), None, {'status': 'failed'})}"
+    )
+    assert decode_sorted_cursor(token, tag, (datetime, uuid.UUID)) == next_key
+
+    # (b) dropping the filter on the replay is REFUSED, not silently widened
+    assert client.get(base, params={"cursor": token}).status_code == 400
+    # ...and it does not anchor another build's steps
+    assert client.get(
+        f"/projects/p/builds/{uuid.uuid4()}/steps",
+        params={"filter[status]": "failed", "cursor": token},
+    ).status_code in (400, 404)
+
+    # (c) over-block dual: the same filter still pages, and returns the rows
+    ok = client.get(base, params={"filter[status]": "failed", "cursor": token})
+    assert ok.status_code == 200
+    assert ok.json()["data"][0]["step_name"] == "extract"
 
 
 def test_list_build_steps_404_when_build_missing(

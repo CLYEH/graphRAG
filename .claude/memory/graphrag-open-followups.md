@@ -96,7 +96,9 @@ GitHub 為準;立案或了結後從本檔劃掉):
   呈現者」;真解需後端契約變更(RB1-api 加 run-error 投影欄位,或 build→job
   lookup + `GET /jobs` 清單),自成 DR-002 任務。RB1-fe 說明已標 (RB1-api)。
 
-- **relations/review 的 default cursor 未綁 query scope(SS1a-era)**:SS1b(#120 R8/R9/R10)把 entities/documents 的 cursor tag 釘到 sort+q+filters(typed)+build,但 relations 與 review 端點的 default (id,) cursor 仍是無 tag 形——filter 換值/build 切換後重放靜默 re-anchor。SS1a 既有、非 SS1b 回歸;修法=沿用 `_scope_fingerprint` + `decode_scoped_id_cursor`(pattern 見 lesson class 31)。順手時機:任何動 relations/review 分頁的任務。
+- ~~**relations/review 的 default cursor 未綁 query scope(SS1a-era)**~~ — **QA8 已結清**(2026-07-27),且範圍比原記述大。原條目只點名 relations/review,但「無 tag 鑄造」是全域缺陷:實測 `/sources` 的 token 可被 `/projects` 直接解讀(同 arity 的 (datetime, str)),等於一個專案的來源清單能重新錨定全域專案列表;`/sources` token 亦可錨定**另一專案**的來源清單(跨租戶讀)。故本次一次掃清**九個鑄造端**(8 支測試,projects/sources 共用一支):relations、merge-candidates、ontology-proposals、builds、build-steps、build-step-items、chunks、projects、sources。其中 chunks 僅 R9 build 軸可跨(該端點不收任何 q/filter/sort)。**四個 compound-keyset listing**(build-steps、chunks、projects、sources)走的 `decode_sorted_cursor` 沒有 legacy 分支,在途舊 token 於部署時即失效——刻意:失敗是明確的 400「restart from the first page」,非靜默 re-anchor。`scope_fingerprint` 已自 `api/routers/inspect.py` 升格至 `api/pagination.py`,並刪掉因此成為孤兒的五個 untagged decoder(`decode_id_cursor`/`decode_step_cursor`/`decode_project_cursor`/`decode_source_cursor`/`decode_chunk_cursor`)與其專用 helper `_decode`——留著等於留下這個任務要移除的 affordance。**目前無殘留鑄造端**(`grep encode_cursor( api/routers/*.py` 排除 sorted 後為空);`decode_scoped_id_cursor` 的 legacy 1-item 分支保留,讓在途舊 token 老化。
+
+- **`decode_scoped_id_cursor` 的 legacy 1-item 分支待拆(QA8 收尾)**:QA8 已停止所有無 tag 鑄造,但相容分支本身沒有出口——手工造的 `["<uuid>"]` token 至今仍被六個 id listing 接受(builds、build-step-items、relations、merge-candidates、ontology-proposals、documents/entities 預設序)。「讓在途 token 老化」只有在有人真的拆掉分支時才成立,故立此帳。影響有限(非授權繞道:build/project 範圍來自 repo 與路徑,不來自 cursor;後果是同一個已授權 listing 內的自傷式錯頁),故非阻斷級。順手時機:老化窗口後任何動 `api/pagination.py` 的任務。
 
 - **delta-review receipt 被 harness 自動誤旗(#125 期間兩次)**:gate-2 persistent
   reviewer 依 SendMessage delta-review 協議自查 diff 後蓋章,harness 的 security
