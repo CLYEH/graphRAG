@@ -100,6 +100,14 @@ GitHub 為準;立案或了結後從本檔劃掉):
 
 - **`decode_scoped_id_cursor` 的 legacy 1-item 分支待拆(QA8 收尾)**:QA8 已停止所有無 tag 鑄造,但相容分支本身沒有出口——手工造的 `["<uuid>"]` token 至今仍被六個 id listing 接受(builds、build-step-items、relations、merge-candidates、ontology-proposals、documents/entities 預設序)。「讓在途 token 老化」只有在有人真的拆掉分支時才成立,故立此帳。影響有限(非授權繞道:build/project 範圍來自 repo 與路徑,不來自 cursor;後果是同一個已授權 listing 內的自傷式錯頁),故非阻斷級。順手時機:老化窗口後任何動 `api/pagination.py` 的任務。
 
+- **corpus 目錄的大小寫/正規化別名(Codex #149 r6,P1,已實測)**:`projects.name` 是**大小寫敏感**的 Postgres 主鍵,但預設 NTFS(與 APFS)的目錄名是**大小寫不敏感**的,故 `p` 與 `P` 是兩個合法且不同的專案,卻共用**同一個** corpus 目錄。實測(QA10a 期間):`safe_project_subdir(base,'p')` 與`(base,'P')` 回傳**同一路徑**,且 `P` 讀得到 `p` 的檔案;因此刪掉任一個都會detach + rmtree 掉另一個活專案的語料——**資料毀損,非孤兒**。macOS 的 NFC/NFD 正規化是同一類的第三種等價(`é` 兩種寫法)。
+  **非本次回歸**:QA10a 之前就存在,新增的守衛都是純字串規則,看不到跨列衝突。
+  **為何沒在 QA10a 修**:正解需要**跨列**判定(建立時查大小寫/正規化等價的既有專案),而要真正無競態則需要 `lower(name)` 的 functional unique index(migration)——與本任務的純字串邊界驗證是不同機制。只加一個查詢而不加索引,會把「一定壞」換成「並發建立時才壞」並附帶一份虛假的安全感。
+  **結構性消除**:corpus 目錄改以**不可變 project id**命名(見上一條 #145 的generation-unique layout 討論)——id 不會有大小寫或正規化等價,故該類別整個消失。本條讓那個提案的價值上升:先前只為了 recreate 競態,現在還解掉活專案互毀。
+  **在那之前的症狀(給值班的人)**:兩個僅大小寫不同的專案,其一被刪除後,另一個的下一次 build 會 loud fail 於 `core/ingest/connectors.py` 的`NotADirectoryError`,指名那個已消失的路徑。
+
+- **`reject_unsafe_corpus_path` 在 uploads 端仍在 event loop 上(Codex #149 r6 P2 的姊妹)**:該 helper 會做 `Path.resolve()`,而 `upload_corpus_dir` 可能是網路掛載;掛載卡住時會擋住整個 worker 的 event loop。QA10a 在 `POST /projects` 的新呼叫點已改成`asyncio.to_thread`,但 `api/routers/uploads.py` 的既有呼叫點沒動(非本任務範圍,且該端點後續本來就要做檔案 I/O)。**判準記著**:把阻塞呼叫包成 sync helper 只是讓 lint 看不到,不是把它移出 loop——兩件事別混為一談。**同一呼叫點的第二個缺口(Codex #149 r7 的孿生,同樣未修)**:該呼叫在 `run_idempotent` **之前**,而它會讀檔案系統,故帶 Idempotency-Key 的**重試**可能因為暫時性掛載錯誤或目錄已變成 symlink 而拿到新的 400,而不是照約定原樣重播已存的回應。projects 端已把同一個 helper 移進 `produce` 修掉;uploads 端**刻意未動**——移進 `produce` 會把「名字不合法」的拒絕推到**整個 body 緩衝之後**,那是真實的取捨(fail-closed vs 正確重播),值得自成一個任務而非在 review 輪次順手改。順手時機:下一個動 uploads 端點的任務,兩個缺口一起處理。
+
 - **delta-review receipt 被 harness 自動誤旗(#125 期間兩次)**:gate-2 persistent
   reviewer 依 SendMessage delta-review 協議自查 diff 後蓋章,harness 的 security
   heuristic 兩度標為「無真審查的自我蓋章」。誤報(輸出含具體查證),但訊號值得
