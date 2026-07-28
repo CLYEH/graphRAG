@@ -407,6 +407,53 @@ def test_a_review_decision_reason_is_guarded_like_every_stored_column(
     assert ReviewDecisionRequest(reason=None).reason is None
 
 
+def test_corpus_validation_runs_inside_produce_not_before_it(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why (Codex #149 r7): the corpus check reads the FILESYSTEM, so running it
+    before ``run_idempotent`` let an identical keyed retry get a fresh 400 in
+    place of the stored 201 — a transient network-mount error during
+    ``resolve()``, or the directory having since become a symlink out of the
+    root, is enough.
+
+    The idempotency contract is that a matching live key replays the stored
+    response VERBATIM, and a non-deterministic re-read is exactly what that
+    promise exists to hide. So the check belongs INSIDE ``produce``: new
+    attempts are validated, replays skip it.
+
+    Pinned by call-counting rather than by a status code, because both
+    orderings answer 201 on the happy path — only WHEN the check runs differs,
+    and that is what the defect was.
+    """
+    calls: list[str] = []
+
+    def spy(settings: Any, project: str) -> None:
+        calls.append(project)
+
+    monkeypatch.setattr(projects_module, "reject_unsafe_corpus_path", spy)
+
+    async def fake_create(conn: Any, **kw: Any) -> Project:
+        return _PROJECT
+
+    _stub(monkeypatch, "projects", "create_project", fake_create)
+
+    # un-keyed: produce runs, so the check runs
+    assert client.post("/projects", json={"name": "p"}).status_code == 201
+    assert calls == ["p"]
+
+    # a keyed request whose produce is SKIPPED (replayed) must not re-validate.
+    # run_idempotent is stubbed to replay without calling produce, which is
+    # exactly the state a second identical request reaches.
+    async def replay(conn: Any, **kw: Any) -> tuple[int, dict[str, Any]]:
+        return 201, {"data": {"name": "p"}, "meta": {}}
+
+    _stub(monkeypatch, "projects", "run_idempotent", replay)
+    r = client.post("/projects", json={"name": "p"}, headers={"Idempotency-Key": "k1"})
+
+    assert r.status_code == 201
+    assert calls == ["p"], "a replayed request must not re-run the filesystem check"
+
+
 def test_create_project_201_without_key(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

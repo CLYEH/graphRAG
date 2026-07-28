@@ -99,18 +99,27 @@ async def create_project_endpoint(
     #
     # In the handler rather than the Pydantic validator because it needs
     # settings and does a filesystem ``resolve()``.
-    #
-    # OFF THE EVENT LOOP (Codex #149 r6). ``resolve()`` touches the filesystem,
-    # and ``upload_corpus_dir`` may be a network mount — a stalled mount would
-    # otherwise block this worker's loop and pause every unrelated request.
-    # Keeping the helper sync was a lint accommodation, not a safety property:
-    # it moves the blocking call out of the lint's sight without moving it off
-    # the loop, which is the wrong half of the problem to solve. The upload
-    # endpoint has the same shape and predates this task; it is recorded rather
-    # than changed here, since fixing it is not this task's business.
-    await asyncio.to_thread(reject_unsafe_corpus_path, get_settings(), body.name)
 
     async def produce() -> tuple[int, dict[str, Any]]:
+        # INSIDE produce, so a keyed retry REPLAYS rather than re-validating
+        # (Codex #149 r7). Run before ``run_idempotent``, this check could hand
+        # an identical retry a fresh 400 in place of the stored 201 — a
+        # transient network-mount error during ``resolve()``, or the directory
+        # having since become a symlink out of the root, is enough. The
+        # idempotency contract is that a matching live key replays the stored
+        # response VERBATIM, and a filesystem re-read is exactly the kind of
+        # non-deterministic input that promise exists to hide. New attempts are
+        # still validated; only replays skip it.
+        #
+        # OFF THE EVENT LOOP (Codex #149 r6). ``resolve()`` touches the
+        # filesystem, and ``upload_corpus_dir`` may be a network mount — a
+        # stalled mount would otherwise block this worker's loop and pause
+        # every unrelated request. Keeping the helper sync was a lint
+        # accommodation, not a safety property: it moves the blocking call out
+        # of the lint's sight without moving it off the loop. The upload
+        # endpoint has the same shape and predates this task; it is recorded
+        # rather than changed here.
+        await asyncio.to_thread(reject_unsafe_corpus_path, get_settings(), body.name)
         try:
             p = await create_project(
                 conn,

@@ -106,7 +106,7 @@ GitHub 為準;立案或了結後從本檔劃掉):
   **結構性消除**:corpus 目錄改以**不可變 project id**命名(見上一條 #145 的generation-unique layout 討論)——id 不會有大小寫或正規化等價,故該類別整個消失。本條讓那個提案的價值上升:先前只為了 recreate 競態,現在還解掉活專案互毀。
   **在那之前的症狀(給值班的人)**:兩個僅大小寫不同的專案,其一被刪除後,另一個的下一次 build 會 loud fail 於 `core/ingest/connectors.py` 的`NotADirectoryError`,指名那個已消失的路徑。
 
-- **`reject_unsafe_corpus_path` 在 uploads 端仍在 event loop 上(Codex #149 r6 P2 的姊妹)**:該 helper 會做 `Path.resolve()`,而 `upload_corpus_dir` 可能是網路掛載;掛載卡住時會擋住整個 worker 的 event loop。QA10a 在 `POST /projects` 的新呼叫點已改成`asyncio.to_thread`,但 `api/routers/uploads.py` 的既有呼叫點沒動(非本任務範圍,且該端點後續本來就要做檔案 I/O)。**判準記著**:把阻塞呼叫包成 sync helper 只是讓 lint 看不到,不是把它移出 loop——兩件事別混為一談。順手時機:下一個動 uploads 端點的任務。
+- **`reject_unsafe_corpus_path` 在 uploads 端仍在 event loop 上(Codex #149 r6 P2 的姊妹)**:該 helper 會做 `Path.resolve()`,而 `upload_corpus_dir` 可能是網路掛載;掛載卡住時會擋住整個 worker 的 event loop。QA10a 在 `POST /projects` 的新呼叫點已改成`asyncio.to_thread`,但 `api/routers/uploads.py` 的既有呼叫點沒動(非本任務範圍,且該端點後續本來就要做檔案 I/O)。**判準記著**:把阻塞呼叫包成 sync helper 只是讓 lint 看不到,不是把它移出 loop——兩件事別混為一談。**同一呼叫點的第二個缺口(Codex #149 r7 的孿生,同樣未修)**:該呼叫在 `run_idempotent` **之前**,而它會讀檔案系統,故帶 Idempotency-Key 的**重試**可能因為暫時性掛載錯誤或目錄已變成 symlink 而拿到新的 400,而不是照約定原樣重播已存的回應。projects 端已把同一個 helper 移進 `produce` 修掉;uploads 端**刻意未動**——移進 `produce` 會把「名字不合法」的拒絕推到**整個 body 緩衝之後**,那是真實的取捨(fail-closed vs 正確重播),值得自成一個任務而非在 review 輪次順手改。順手時機:下一個動 uploads 端點的任務,兩個缺口一起處理。
 
 - **delta-review receipt 被 harness 自動誤旗(#125 期間兩次)**:gate-2 persistent
   reviewer 依 SendMessage delta-review 協議自查 diff 後蓋章,harness 的 security

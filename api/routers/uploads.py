@@ -91,9 +91,18 @@ async def upload_documents_endpoint(
 
     # Path-safety BEFORE any filesystem I/O (a 400, fail-closed): a project name
     # like '..' or one with separators would let the corpus escape the root.
-    # (Depends only on the name — deterministic per request, so it is safe to run
-    # before the idempotent replay; project existence/config are checked inside
-    # produce, see below.)
+    #
+    # It sits ahead of the idempotent replay to fail CLOSED before the body is
+    # buffered, alongside the 415 above and the 413 below — not because it is
+    # deterministic. An earlier version of this comment claimed exactly that,
+    # and Codex #149 r7 disproved it for this same helper in the sibling
+    # router: it reads the filesystem, so a transient mount error or a
+    # since-changed directory can make a keyed RETRY answer a fresh 400 where
+    # the stored response should have replayed verbatim. That gap is real here
+    # too, and is FILED rather than fixed: moving the call inside `produce`
+    # would push the name refusal after the whole body is buffered, which is a
+    # genuine tradeoff deserving its own task. Project existence/config are
+    # checked inside produce, see below.
     reject_unsafe_corpus_path(settings, project)
 
     # 413: refuse an oversized upload by its declared Content-Length FIRST, so an
