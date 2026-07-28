@@ -52,6 +52,11 @@ def client() -> TestClient:
         def _reject(cls, value: str) -> str:
             raise ValueError("name is never valid")
 
+    @app.get("/_t/unparseable-redirect")
+    async def _unparseable() -> RedirectResponse:
+        # `urlsplit` RAISES on an unmatched IPv6 bracket ("Invalid IPv6 URL")
+        return RedirectResponse("http://[evil/x")
+
     @app.get("/_t/offsite")
     async def _offsite() -> RedirectResponse:
         # a GENUINE cross-origin redirect: the same-origin guard must leave it
@@ -365,6 +370,40 @@ def test_a_genuine_cross_origin_redirect_is_left_alone(client: TestClient) -> No
 
     assert r.status_code == 307
     assert r.headers["location"] == "https://elsewhere.example/x"
+
+
+def test_an_unparseable_location_does_not_crash_the_guard(client: TestClient) -> None:
+    """The same-origin guard runs OUTSIDE the app's exception handlers, so
+    anything it raises reaches the caller as a bare 500 with no envelope.
+
+    `urlsplit` raises on some malformed URLs (an unmatched IPv6 bracket), so a
+    Location it cannot parse used to turn a redirect into a 500. Codex #148
+    reported this as reachable through a malformed **Host** header; that
+    specific route does not reproduce — Starlette refuses to build a URL from a
+    malformed Host and falls back to the server name, so the bad value never
+    reaches `urlsplit` (pinned below). It IS reachable through a Location set
+    by a handler, which skips that sanitisation entirely — which is why the
+    guard is here.
+
+    A value that cannot be parsed cannot be judged self-referential, so it
+    passes through untouched: this middleware exists to remove an origin leak,
+    and refusing to answer at all is a worse failure than the one it prevents.
+    """
+    r = client.get("/_t/unparseable-redirect", follow_redirects=False)
+
+    assert r.status_code == 307
+    assert r.headers["location"] == "http://[evil/x"
+
+
+def test_a_malformed_host_still_gets_a_clean_relative_redirect(client: TestClient) -> None:
+    """The half of Codex #148's report that holds: a malformed Host must not
+    produce a 500 either. It does not, because Starlette never builds a URL
+    from one — pinned so that if that ever changes, this fails here rather than
+    as a 500 in production."""
+    for host in ("[evil", "[::1", "a]b", "[]"):
+        r = client.get("/projects/", headers={"Host": host}, follow_redirects=False)
+        assert r.status_code == 307, host
+        assert r.headers["location"] == "/projects", host
 
 
 def test_auth_placeholder_extracts_token_and_admits_anonymous(client: TestClient) -> None:

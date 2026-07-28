@@ -129,13 +129,28 @@ class _SameOriginRedirectMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         location = response.headers.get("location")
         if location:
-            parsed = urlsplit(location)
-            if parsed.scheme or parsed.netloc:
+            try:
+                parsed = urlsplit(location)
                 own = urlsplit(str(request.url))
-                if (parsed.scheme, parsed.netloc) == (own.scheme, own.netloc):
-                    response.headers["location"] = urlunsplit(
-                        ("", "", parsed.path, parsed.query, parsed.fragment)
-                    )
+            except ValueError:
+                # `urlsplit` RAISES on some malformed URLs (an unmatched IPv6
+                # bracket is "Invalid IPv6 URL"), and this middleware runs
+                # OUTSIDE the app's exception handlers — so an unparseable
+                # Location would leave the caller a bare 500 in place of the
+                # redirect. A value we cannot parse is one we cannot judge
+                # self-referential, so it passes through untouched: this guard
+                # exists to remove an origin leak, and refusing to answer at
+                # all is a worse failure than the one it prevents.
+                return response
+            # an absolute Location whose origin is OUR OWN — the injection case
+            # by definition, since the origin is derived from the same request
+            if (parsed.scheme or parsed.netloc) and (parsed.scheme, parsed.netloc) == (
+                own.scheme,
+                own.netloc,
+            ):
+                response.headers["location"] = urlunsplit(
+                    ("", "", parsed.path, parsed.query, parsed.fragment)
+                )
         return response
 
 
