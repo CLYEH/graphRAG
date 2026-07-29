@@ -285,7 +285,31 @@ async def _verified_path_result(
     if stale_nodes or stale_edges:
         return None, stale_nodes, stale_edges  # stale in the SoR after projection
 
-    refs = tuple(SourceRef(source_type="relation", id=str(resolved[triple][0])) for triple in clean)
+    # The evidence is ALREADY resolved above — emitting only the relation id
+    # left every path citation undereferenceable: no exposed tool takes a
+    # relation id (get_chunk wants a chunk id, get_entity a name/entity id),
+    # while the SUBGRAPH template returns these very same relations with their
+    # chunk evidence attached (_relation_results). Same relations, same build,
+    # one template citable and the other not (#153) — so append the refs the
+    # caller can actually exchange. The relation ref stays first per edge for
+    # readability (it is the edge's identity); ordering is NOT load-bearing —
+    # §20's path_validity selects refs by source_type, and relation_hit_rate
+    # reads the visible text, not the refs.
+    #
+    # Deliberately NOT adopting _relation_results' drop-when-uncited rule: a
+    # path is ONE verified claim whose rejection rule is STALENESS (§27.2/§19,
+    # the stale_nodes/stale_edges contract above), so dropping on citation
+    # count would silently shrink path results — a behavior change this fix
+    # does not need and #153 never asked for.
+    cited: list[SourceRef] = []
+    for triple in clean:
+        relation_id, evidence_rows = resolved[triple]
+        cited.append(SourceRef(source_type="relation", id=str(relation_id)))
+        for row in evidence_rows:
+            evidence = evidence_ref(row)
+            if evidence is not None:
+                cited.append(evidence)
+    refs = tuple(cited)
     names = [_display(node) for node in found["nodes"]]
     # the pattern is UNDIRECTED, so a hop can traverse an edge against its
     # stored direction — each arrow is oriented by the SoR direction the rel

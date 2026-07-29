@@ -504,10 +504,81 @@ async def test_path_cites_every_edge_with_its_sor_relation() -> None:
     assert len(response.results) == 1
     result = response.results[0]
     assert result.result_type == "path"
-    assert len(result.source_refs) == 2  # one ref PER EDGE (§27.2)
-    assert all(ref.source_type == "relation" for ref in result.source_refs)
+    relation_refs = [ref for ref in result.source_refs if ref.source_type == "relation"]
+    assert len(relation_refs) == 2  # one relation ref PER EDGE (§27.2)
+    # ...and each edge's chunk evidence rides along, so the citation can be
+    # EXCHANGED for content (#153) — see the dedicated test below for why.
+    assert [ref.source_type for ref in result.source_refs] == [
+        "relation",
+        "chunk",
+        "relation",
+        "chunk",
+    ]
     assert result.text == "A -[works_at]-> B -[owns]-> C"
     assert response.warnings == ()
+
+
+async def test_a_path_citation_can_be_exchanged_for_content() -> None:
+    """A path's refs must include something an exposed tool can dereference.
+
+    §16 lets a ref be a bare relation id, but NO tool takes one: get_chunk
+    wants a chunk id, get_entity a name or entity id, list_entities matches
+    names. So a path whose only refs were relation ids advertised evidence
+    that could never be fetched, while the SUBGRAPH template returned the
+    SAME relations with their chunk evidence attached — one template citable,
+    the other not (#153). The server's initialize instructions promise
+    "get_* exchange ids from citations for full content"; this test is that
+    promise for paths.
+    """
+    graph, sor, _a, _b, _c = _path_fixture()
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="c", hops=3)
+    )
+    refs = response.results[0].source_refs
+    exchangeable = [ref for ref in refs if ref.source_type in {"chunk", "document"}]
+    assert exchangeable, "a path cited nothing any get_* tool could resolve"
+    assert all(ref.id for ref in exchangeable)
+    # the relation ref stays first per edge (the edge's identity) — pinned for
+    # readability, not because anything depends on the order: §20's
+    # path_validity selects refs by source_type
+    assert refs[0].source_type == "relation"
+
+
+async def test_an_uncited_edge_does_not_drop_the_path() -> None:
+    """Appending evidence must not import _relation_results' drop rule.
+
+    A subgraph edge with no usable evidence is DROPPED (§27.2: a relation
+    result cites ≥1 evidence). A path is a different claim: its rejection
+    rule is STALENESS — every node active, every edge resolving to an active
+    SoR relation. Letting citation count reject a path too would silently
+    shrink path results for a fix that was only ever about making the
+    EXISTING refs dereferenceable (#153).
+    """
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    rel_ab, rel_bc = uuid.uuid4(), uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B"), _node(c, "C")],
+            "rels": [
+                {"type": "works_at", "src": str(a), "dst": str(b)},
+                {"type": "owns", "src": str(b), "dst": str(c)},
+            ],
+        }
+    )
+    sor = _FakeSoR(
+        seeds={"a": [a], "c": [c]},
+        relations={
+            (a, b, "works_at"): (rel_ab, []),  # active relation, zero evidence
+            (b, c, "owns"): (rel_bc, [_chunk_evidence()]),
+        },
+    )
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="c", hops=3)
+    )
+    assert len(response.results) == 1, "an uncited edge must not sink the whole path"
+    assert response.results[0].text == "A -[works_at]-> B -[owns]-> C"
+    kinds = [ref.source_type for ref in response.results[0].source_refs]
+    assert kinds == ["relation", "relation", "chunk"]  # both edges cited, one uncorroborated
 
 
 async def test_a_backward_traversed_edge_renders_its_stored_direction() -> None:

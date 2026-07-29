@@ -1033,8 +1033,8 @@ def build_server(project: str) -> FastMCP:
         ] = "",
     ) -> dict[str, Any]:
         """Entity-relationship retrieval via parameterized graph templates
-        (neighbors / path / subgraph). Relation results cite evidence refs;
-        a ref with source_type "chunk" carries a chunk UUID exchangeable for
+        (neighbors / path / subgraph). Relation AND path results cite evidence
+        refs; a ref with source_type "chunk" carries a chunk UUID exchangeable for
         its text via get_chunk (row/document evidence refs are other shapes —
         get_chunk does not accept them)."""
         rt = _rt()
@@ -1248,13 +1248,19 @@ def build_server(project: str) -> FastMCP:
     async def get_entity(
         name: Annotated[
             str,
-            Field(description="EXACT canonical entity name (find it with list_entities q=...)."),
+            Field(
+                description=(
+                    "EXACT canonical entity name (find it with list_entities q=...), "
+                    "or an entity UUID taken from a citation's source_ref id."
+                )
+            ),
         ],
     ) -> dict[str, Any]:
-        """Look one entity up by EXACT canonical name — unsure of the name?
-        Use list_entities(q=...) for substring search first. Introspection
-        shape (error/error_code, not the retrieval envelope); each entity
-        carries its full, uncapped mention citations."""
+        """Look one entity up by EXACT canonical name, or by the entity UUID a
+        citation carries (source_type='entity') — unsure of the name? Use
+        list_entities(q=...) for substring search first. Introspection shape
+        (error/error_code, not the retrieval envelope); each entity carries its
+        full, uncapped mention citations."""
         rt = _rt()
         # QA5 D5: validate BEFORE binding — a NUL here used to reach Postgres
         # and come back as a DBAPIError the §22 handler reported as
@@ -1631,6 +1637,32 @@ async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
         }
 
 
+async def _entity_ids_by_citation_id(repo: Any, subject: str) -> list[uuid.UUID]:
+    """A UUID-shaped subject → the ACTIVE entity it names, or ``[]``.
+
+    §16 surfaces entity UUIDs two ways — as the ``SourceRef(source_type=
+    "entity", id=…)`` a ``global_summary`` community report cites, and as the
+    entity result ids ``semantic_search``/``graph_query`` return — and
+    the initialize instructions promise ``get_entity``/``get_chunk``/
+    ``get_document`` "exchange ids from citations for full content". But
+    ``get_entity`` looked subjects up by canonical NAME only, so every entity
+    citation dead-ended: ``get_chunk`` rejects an entity id, ``list_entities``
+    substring-matches names, and the id resolved nowhere (#153). ``get_chunk``
+    and ``get_document`` already take their ids directly; this is the third
+    sibling honoring the same promise.
+
+    Tried only AFTER the name lookup misses, so a canonical name that happens
+    to be UUID-shaped still resolves as a name — this can only turn a
+    NOT_FOUND into a hit, never repoint an existing one. Active-only, the same
+    drift rule the name path applies.
+    """
+    candidate = _parse_uuid(subject)
+    if candidate is None:
+        return []
+    active = await repo.active_entity_ids([candidate])
+    return [candidate] if candidate in active else []
+
+
 async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
     """§9 ``get_entity``: name → the matching ACTIVE entities, each cited by
     its SoR mentions (§27.2's spirit: an entity with zero mentions cannot be
@@ -1647,6 +1679,8 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
         }
     entity_ids = await repo.entity_ids_by_name(name)
     if not entity_ids:
+        entity_ids = await _entity_ids_by_citation_id(repo, name)
+    if not entity_ids:
         # QA6/D8: a MISS is NOT_FOUND, like every other get_* in this family.
         # The initialize instructions define ONE taxonomy for get_*/list_* and
         # say "error_code null = success", so returning null here told a
@@ -1658,8 +1692,17 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
             "project": project,
             "build_id": str(repo.build_id),
             "name": name,
+            # the recovery channel has to be WALKABLE: list_entities(q=…) is a
+            # substring search over NAMES, so pointing a UUID-shaped miss at it
+            # names a route that can never hit. A live citation resolves above,
+            # so a UUID that misses here is almost always one carried over from
+            # a superseded build — re-running the query is the real remedy.
             "error": (
-                f"no active entity is named {_safe_echo(name, 80)!r} in this "
+                f"no active entity has the id {_safe_echo(name, 80)!r} in this build — "
+                "an entity id from an earlier build does not survive activation; "
+                "re-run the query to get citations for the active build"
+                if _parse_uuid(name) is not None
+                else f"no active entity is named {_safe_echo(name, 80)!r} in this "
                 "build — search for it with list_entities(q=…)"
             ),
             "error_code": "NOT_FOUND",

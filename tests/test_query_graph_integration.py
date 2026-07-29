@@ -277,8 +277,14 @@ async def test_path_end_to_end_cites_every_edge(
         assert len(response.results) == 1
         path = response.results[0]
         assert path.result_type == "path"
-        assert len(path.source_refs) == 2  # §27.2: one ref per edge
-        assert all(ref.source_type == "relation" for ref in path.source_refs)
+        relation_refs = [ref for ref in path.source_refs if ref.source_type == "relation"]
+        assert len(relation_refs) == 2  # §27.2: one RELATION ref per edge
+        # ...each carrying the chunk evidence that makes it dereferenceable
+        # (#153) — against real stores, so the uri/quote/offsets a caller
+        # would actually exchange are proven present, not stubbed
+        chunk_refs = [ref for ref in path.source_refs if ref.source_type == "chunk"]
+        assert len(chunk_refs) == 2
+        assert all(ref.source_uri and ref.metadata.get("quote") for ref in chunk_refs)
         assert path.text == "Acme -[works_with]-> BobCo -[supplies]-> CarolInc"
     finally:
         await _cleanup(session, project)
@@ -393,7 +399,14 @@ async def test_a_stale_shortest_path_yields_the_longer_active_path(
         assert len(response.results) == 1
         path = response.results[0]
         assert path.text == "Acme -[works_with]-> BobCo -[supplies]-> CarolInc"
-        assert len(path.source_refs) == 2  # the ACTIVE 2-hop path, fully cited
+        # the ACTIVE 2-hop path, fully cited: one relation ref per edge plus
+        # each edge's exchangeable chunk evidence (#153)
+        assert [ref.source_type for ref in path.source_refs] == [
+            "relation",
+            "chunk",
+            "relation",
+            "chunk",
+        ]
         assert response.warnings == ()
     finally:
         await _cleanup(session, project)

@@ -2024,3 +2024,62 @@ async def test_the_dispatch_guard_is_actually_wired_into_the_registered_handler(
     assert backend.isError is True
     assert backend.structuredContent is None
     assert "INVALID_INPUT" not in cast(_mcp_types.TextContent, backend.content[0]).text
+
+
+async def test_get_entity_exchanges_a_citation_entity_id_for_content() -> None:
+    """A citation's entity UUID must resolve, like get_chunk/get_document.
+
+    §16 surfaces entity UUIDs both as the ``SourceRef(source_type="entity",
+    id=…)`` a global_summary community report cites and as the entity result
+    ids semantic_search/graph_query return — and the
+    initialize instructions promise get_entity/get_chunk/get_document
+    "exchange ids from citations for full content". get_entity looked up
+    canonical NAMES only, so an entity citation dead-ended everywhere:
+    get_chunk rejects an entity id, list_entities substring-matches names,
+    and the id resolved nowhere (#153). A cited answer whose citations cannot
+    be fetched is unverifiable, which is the whole point of require_sources.
+
+    Name lookup still runs FIRST, so this can only turn a NOT_FOUND into a
+    hit — never repoint a name that already resolved.
+    """
+    import uuid as _uuid
+
+    from core.mcp.server import _get_entity
+
+    cited_id = _uuid.uuid4()
+
+    class _Repo:
+        build_id = _uuid.uuid4()
+
+        def __init__(self, *, active: set[Any]) -> None:
+            self._active = active
+            self.name_lookups: list[str] = []
+
+        async def entity_ids_by_name(self, name: str) -> list[Any]:
+            self.name_lookups.append(name)
+            return []  # nothing is named by a UUID string
+
+        async def active_entity_ids(self, ids: Any) -> set[Any]:
+            return {i for i in ids if i in self._active}
+
+        async def mentions_by_entity(self, ids: Any) -> dict[Any, Any]:
+            return {}
+
+        async def chunks_by_content_ref(self, pairs: Any) -> dict[Any, Any]:
+            return {}
+
+    repo = _Repo(active={cited_id})
+    hit = await _get_entity(cast(Any, repo), "demo", str(cited_id))
+    assert hit["error_code"] is None, "a live citation id must resolve, not 404"
+    assert [e["id"] for e in hit["entities"]] == [str(cited_id)]
+    assert repo.name_lookups == [str(cited_id)], "the NAME lookup must still go first"
+
+    # a UUID that is not an ACTIVE entity in this build stays NOT_FOUND — the
+    # id path inherits the name path's drift rule rather than inventing a hit
+    stale = await _get_entity(cast(Any, _Repo(active=set())), "demo", str(_uuid.uuid4()))
+    assert stale["error_code"] == "NOT_FOUND"
+
+    # a non-UUID miss must not change: it never reaches the id path at all
+    # (the _Repo above has no active_entity_ids call to make for it)
+    plain = await _get_entity(cast(Any, _Repo(active={cited_id})), "demo", "Nobody")
+    assert plain["error_code"] == "NOT_FOUND"

@@ -13,6 +13,7 @@
 - [CI 先於 Codex](graphrag-ci-before-codex.md) — push 後流程查:先修 CI 再 triage Codex;watch-codex 用法與 fresh-state check
 - [BA 真實 LLM 兩 lane](graphrag-ba-real-llm.md) — 動 model/eval 前查:hermetic vs 真實 LLM 兩 lane 紀律
 - [初期落地場景:博物館導覽](graphrag-goal-museum-guide.md) — 產品方向查:MCP 對外場景與「不失一般性」硬約束
+- [舊 stack 會讓 QA 證據作廢](graphrag-stale-stack-invalidates-qa.md) — 答「服務是否最新」或做/收黑箱 QA 前必查:五層 process 啟動時間 vs HEAD
 - [FE 瀏覽器操作測試](graphrag-fe-browser-qa.md) — FE 任務開 PR 前查:Claude in Chrome 真瀏覽器 QA 紀律
 - [海科館真實資料](graphrag-sample-data-hakeguan.md) — 用 dev 真資料 QA 前查:nmmst 已建置;dev 庫踩全表計數=H11
 - [UX 翻新(Track 4,已完成)](graphrag-ux-redesign.md) — 歷史:九項全 merge(#76-#84),留存協議
