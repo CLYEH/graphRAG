@@ -54,6 +54,17 @@ from core.stores.repo import BuildScopedRepo
 
 _TOOL = "graph_query"
 
+#: Per-EDGE cap on the evidence refs a path result carries (§22), matching the
+#: two citation faces that already cap — ``mentions.MENTION_REFS_CAP`` and
+#: ``global_reports.REFS_CAP``, both 8. A path cites one relation ref per hop
+#: plus that edge's evidence; a heavily-asserted relation carries dozens of
+#: rows, so uncapped a single path could dominate the response with duplicate
+#: provenance while adding nothing exchangeable (§27.2 needs ≥1 usable ref per
+#: edge, not the roster — the same reasoning MENTION_REFS_CAP records). The
+#: clip is reported as TRUNCATED, never silent; the escape hatch is get_entity/
+#: get_chunk on any ref that IS emitted (Codex #166).
+PATH_EVIDENCE_CAP = 8
+
 
 @dataclass(frozen=True)
 class GraphQueryParams:
@@ -227,13 +238,26 @@ async def _path(
             )
             if found is None:
                 break  # no (further) path for this pair — next pair
-            result, stale_nodes, stale_edges = await _verified_path_result(
+            result, stale_nodes, stale_edges, omitted = await _verified_path_result(
                 repo, found, src_id, dst_id
             )
             if result is not None:
                 # a fully-verified path IS the complete answer — earlier stale
-                # candidates were alternates, not omitted results, so no warning
-                return _response(graph, query, ordered_results([result]), ())
+                # candidates were alternates, not omitted results, so no warning.
+                # The per-edge evidence CLIP is different: refs the caller could
+                # have exchanged were withheld, so §22 requires saying so.
+                clipped = (
+                    (
+                        _warn(
+                            "TRUNCATED",
+                            f"path source_refs capped at {PATH_EVIDENCE_CAP} evidence "
+                            f"ref(s) per edge: {omitted} ref(s) omitted (§22)",
+                        ),
+                    )
+                    if omitted
+                    else ()
+                )
+                return _response(graph, query, ordered_results([result]), clipped)
             stale += 1  # this candidate failed SoR re-verification
             if not stale_nodes and not stale_edges:
                 break  # unidentifiable (corrupt) elements — can't exclude, next pair
@@ -256,7 +280,7 @@ async def _path(
 
 async def _verified_path_result(
     repo: BuildScopedRepo, found: dict[str, Any], src_id: uuid.UUID, dst_id: uuid.UUID
-) -> tuple[RetrievalResult | None, set[str], set[str]]:
+) -> tuple[RetrievalResult | None, set[str], set[str], int]:
     """One projection path → a fully SoR-verified §16 path result, or the
     STALE ELEMENTS that sank it (``(None, stale_node_ids, stale_edge_keys)``,
     exclusion-encoded) so the caller can retry the pair without them.
@@ -270,7 +294,7 @@ async def _verified_path_result(
     triples = [_edge_triple(rel) for rel in found["rels"]]
     if None in node_ids or None in triples:
         # corrupt projection values — the path can't be traced to the SoR
-        return None, set(), set()
+        return None, set(), set(), 0
     ids = [node_id for node_id in node_ids if node_id is not None]
     clean = [triple for triple in triples if triple is not None]
 
@@ -283,7 +307,7 @@ async def _verified_path_result(
         if (src, dst, rel_type) not in resolved
     }
     if stale_nodes or stale_edges:
-        return None, stale_nodes, stale_edges  # stale in the SoR after projection
+        return None, stale_nodes, stale_edges, 0  # stale in the SoR after projection
 
     # The evidence is ALREADY resolved above — emitting only the relation id
     # left every path citation undereferenceable: no exposed tool takes a
@@ -302,13 +326,21 @@ async def _verified_path_result(
     # count would silently shrink path results — a behavior change this fix
     # does not need and #153 never asked for.
     cited: list[SourceRef] = []
+    omitted = 0
     for triple in clean:
         relation_id, evidence_rows = resolved[triple]
         cited.append(SourceRef(source_type="relation", id=str(relation_id)))
-        for row in evidence_rows:
-            evidence = evidence_ref(row)
-            if evidence is not None:
-                cited.append(evidence)
+        # CAP per edge (§22), the same discipline the other two citation faces
+        # already keep — mentions.MENTION_REFS_CAP and global_reports.REFS_CAP.
+        # A heavily-asserted relation can carry hundreds of evidence rows, and
+        # serializing all of them would let ONE path dominate the response
+        # without improving exchangeability: the caller needs *an* id it can
+        # hand to get_chunk, not every occurrence. Deterministic (SoR order,
+        # no sampling) so the same path cites the same refs across calls, and
+        # the clip is SURFACED rather than silent.
+        usable = [ref for row in evidence_rows if (ref := evidence_ref(row)) is not None]
+        cited.extend(usable[:PATH_EVIDENCE_CAP])
+        omitted += max(0, len(usable) - PATH_EVIDENCE_CAP)
     refs = tuple(cited)
     names = [_display(node) for node in found["nodes"]]
     # the pattern is UNDIRECTED, so a hop can traverse an edge against its
@@ -328,7 +360,7 @@ async def _verified_path_result(
         source_refs=refs,
         text="".join(parts),
     )
-    return result, set(), set()
+    return result, set(), set(), omitted
 
 
 async def _subgraph(

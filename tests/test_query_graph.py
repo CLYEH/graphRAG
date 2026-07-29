@@ -21,7 +21,12 @@ import jsonschema
 import pytest
 from neo4j.exceptions import ClientError, ServiceUnavailable
 
-from core.query.graph import GraphQueryParams, graph_query, subgraph_context
+from core.query.graph import (
+    PATH_EVIDENCE_CAP,
+    GraphQueryParams,
+    graph_query,
+    subgraph_context,
+)
 from core.query.policy import CYPHER_ALLOWED_CLAUSES, CYPHER_BLOCKED_MIN, TextToCypher
 from core.query.results import McpResponse
 from core.stores.graph import BuildScopedGraphRepo
@@ -1289,3 +1294,64 @@ async def test_context_edge_budget_takes_citable_edges_first() -> None:
     context = await _run_subgraph(graph, sor, seed, 1)
     assert context is not None
     assert [e["id"] for e in context.edges] == [rel_ok]  # the citable edge got the seat
+
+
+async def test_a_heavily_asserted_edge_caps_its_evidence_and_says_so() -> None:
+    """Per-edge evidence is capped, and the clip is surfaced — not silent.
+
+    #153 made path refs exchangeable by appending each edge's chunk evidence.
+    Uncapped that is a new cost: a relation asserted across hundreds of chunks
+    would serialize hundreds of provenance entries into ONE path result,
+    dominating the response without improving exchangeability — the caller
+    needs *an* id it can hand to get_chunk, not the roster. That is exactly
+    the reasoning mentions.MENTION_REFS_CAP and global_reports.REFS_CAP
+    already record, so the path face keeps the same discipline at the same
+    ceiling.
+
+    §22's rule is that a clip is REPORTED: refs the caller could have
+    exchanged were withheld, so a silent cap would let an agent conclude it
+    had seen all the evidence for an edge. And the cap must be deterministic
+    (SoR order, no sampling) or the same path would cite different sources
+    across calls, which breaks reproducibility of a cited answer.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    rows = [_chunk_evidence(chunk_id=uuid.uuid4()) for _ in range(PATH_EVIDENCE_CAP + 5)]
+    sor = _FakeSoR(seeds={"a": [a], "b": [b]}, relations={(a, b, "works_at"): (rel_ab, rows)})
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    refs = response.results[0].source_refs
+    chunk_refs = [ref for ref in refs if ref.source_type == "chunk"]
+    assert len(chunk_refs) == PATH_EVIDENCE_CAP  # capped, not all 13
+    assert len([r for r in refs if r.source_type == "relation"]) == 1  # edge identity kept
+
+    # the clip is SURFACED (§22) and names how many were withheld
+    assert [w.code for w in response.warnings] == ["TRUNCATED"]
+    assert "5 ref(s) omitted" in response.warnings[0].message
+
+    # deterministic: the SAME refs, in the same order, on a repeat call — a
+    # cited answer that cites different sources each time is not reproducible
+    again = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    assert [r.id for r in again.results[0].source_refs] == [r.id for r in refs]
+    assert [r.id for r in chunk_refs] == [str(row["chunk_id"]) for row in rows[:PATH_EVIDENCE_CAP]]
+
+
+async def test_an_edge_within_the_cap_warns_about_nothing() -> None:
+    """The cap must not manufacture a TRUNCATED for a path that lost nothing —
+    a warning channel that fires when nothing was withheld trains callers to
+    ignore it (and §22 truncation is supposed to mean refs exist that you did
+    not get)."""
+    graph, sor, _a, _b, _c = _path_fixture()  # one chunk evidence row per edge
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="c", hops=3)
+    )
+    assert response.warnings == ()
