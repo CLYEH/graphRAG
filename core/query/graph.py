@@ -388,7 +388,15 @@ async def _verified_path_result(
         # citation an agent saw once might never reappear. The clip is SURFACED
         # rather than silent.
         usable = [ref for row in evidence_rows if (ref := evidence_ref(row)) is not None]
-        usable.sort(key=lambda ref: (ref.id, str(ref.metadata.get("quote", ""))))
+        # EXCHANGEABLE FIRST, then id. Sorting on id alone let eight `row` or
+        # manual `document` refs sort ahead of the one chunk ref and the slice
+        # then dropped the only id any get_* tool accepts — a capped path with
+        # citations that cannot be turned into content, i.e. #153 reintroduced
+        # by #153's own fix (Codex #166). The rank is the fix AND the
+        # reservation: if any exchangeable ref exists for an edge, it cannot be
+        # crowded out. Order stays total (rank, id, quote), so the cap is still
+        # deterministic across calls.
+        usable.sort(key=lambda ref: (0 if _is_exchangeable(ref) else 1, ref.id, quote_of(ref)))
         cited.extend(usable[:PATH_EVIDENCE_CAP])
         omitted += max(0, len(usable) - PATH_EVIDENCE_CAP)
     refs = tuple(cited)
@@ -770,6 +778,38 @@ async def _relation_results(
         dst_name = names.get(triple[1], str(triple[1]))
         kept.append((relation_id, f"{src_name} -[{triple[2]}]-> {dst_name}", refs))
     return kept, dropped
+
+
+def quote_of(ref: SourceRef) -> str:
+    """A ref's quote as a plain string — the cap sort's tie-break."""
+    return str(ref.metadata.get("quote", ""))
+
+
+def _is_exchangeable(ref: SourceRef) -> bool:
+    """Can an exposed ``get_*`` tool turn this ref into content?
+
+    Narrower than "is it a chunk/document ref", because the ID is what gets
+    exchanged and only some carry one a tool accepts:
+
+    * ``get_chunk`` takes a chunk UUID — but :func:`evidence_ref` falls back to
+      the free-form ``evidence_ref`` column when ``chunk_id`` is NULL, so a
+      chunk ref does not always carry one;
+    * ``get_document`` takes a document UUID, while a ``manual`` evidence row's
+      id is that same free-form column (§27.2 leaves its encoding UNFROZEN, so
+      it is not guaranteed to be a document id at all);
+    * a ``row`` ref has no ``get_*`` resolver in the frozen §9 tool set.
+
+    So the test is the ID's shape, not the ref's type. Being wrong in the
+    conservative direction is safe: a ref misjudged unexchangeable only loses
+    priority within the cap, never its place in an uncapped result.
+    """
+    if ref.source_type not in {"chunk", "document"}:
+        return False
+    try:
+        uuid.UUID(ref.id)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
 
 
 def evidence_ref(row: dict[str, Any]) -> SourceRef | None:

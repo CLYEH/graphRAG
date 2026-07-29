@@ -1393,3 +1393,81 @@ def test_the_refs_cap_warning_round_trips_a_colon_bearing_path_id() -> None:
     # and it must not claim unrelated messages
     assert capped_path_id("result truncated to the top_k=20 ceiling (§21)") is None
     assert capped_path_id("") is None
+
+
+def _uuid_shaped(value: str) -> bool:
+    """Whether a ref id is a UUID — what makes it exchangeable via get_*."""
+    try:
+        uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
+async def test_the_cap_never_drops_the_only_exchangeable_ref() -> None:
+    """An edge's ONE usable citation must survive the cap.
+
+    Sorting on id alone let unexchangeable refs sort ahead of the usable one
+    and the slice then removed it — a capped path whose citations cannot be
+    turned into content, i.e. #153 reintroduced by #153's own fix. Which refs
+    are usable is narrower than their type: `get_chunk` takes a chunk UUID,
+    but evidence_ref falls back to the free-form evidence_ref column when
+    chunk_id is NULL; a `manual` row becomes a `document` ref carrying that
+    same free-form value (§27.2 leaves its encoding unfrozen); and a `row` ref
+    has no get_* resolver at all. So the rank keys on the ID's shape.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    # the one exchangeable ref carries a uuid that sorts LAST, so an id-only
+    # sort would place every unexchangeable ref ahead of it and clip it away
+    winner = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    rows: list[dict[str, Any]] = [
+        {
+            "evidence_type": "row",
+            "evidence_ref": f"5:halls:{i:03d}",  # {len(table)}:{table}:{pk}
+            "quote": "q",
+            "source_uri": "file:///t.csv",
+        }
+        for i in range(PATH_EVIDENCE_CAP + 4)
+    ]
+    rows.append(_chunk_evidence(chunk_id=winner))
+    sor = _FakeSoR(seeds={"a": [a], "b": [b]}, relations={(a, b, "works_at"): (rel_ab, rows)})
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    refs = response.results[0].source_refs
+    assert str(winner) in [r.id for r in refs], "the only get_chunk-able ref was clipped away"
+    assert refs[1].source_type == "chunk"  # ranked ahead of the row refs
+
+    # a ref whose type LOOKS exchangeable but whose id is free-form does not
+    # count — that is the distinction the rank is keyed on
+    free_form = {
+        "evidence_type": "manual",
+        "evidence_ref": "not-a-uuid",
+        "quote": "q",
+        "source_uri": "file:///m.md",
+    }
+    only_unusable = _FakeSoR(
+        seeds={"a": [a], "b": [b]},
+        # a SMALL set — under the cap, so nothing is clipped and the assertion
+        # is about exchangeability alone, not about what the slice kept
+        relations={(a, b, "works_at"): (rel_ab, [rows[0], rows[1], free_form])},
+    )
+    degraded = await _run(
+        graph,
+        only_unusable,
+        GraphQueryParams(template="path", entity="a", other_entity="b", hops=3),
+    )
+    emitted = degraded.results[0].source_refs
+    assert any(r.source_type == "document" for r in emitted)  # it IS emitted...
+    # ...but resolves nowhere: no ref carries an id a get_* tool would accept
+    assert not any(_uuid_shaped(r.id) for r in emitted if r.source_type != "relation")
+    # the path still carries its edge identity — the §27.2 minimum never
+    # depends on evidence being exchangeable
+    assert emitted[0].source_type == "relation"

@@ -1653,14 +1653,25 @@ async def _entity_ids_by_citation_id(repo: Any, subject: str) -> list[uuid.UUID]
 
     Tried only AFTER the name lookup misses, so a canonical name that happens
     to be UUID-shaped still resolves as a name — this can only turn a
-    NOT_FOUND into a hit, never repoint an existing one. Active-only, the same
-    drift rule the name path applies.
+    NOT_FOUND into a hit, never repoint an existing one.
+
+    BUILD-scoped but NOT status-scoped, and the two predicates are doing
+    different jobs. The build scope is DR-006: an entity id outlives a build in
+    an agent's transcript, so a superseded build's id must not resolve. The
+    STATUS predicate would be wrong here, because it does not match what the
+    citation means: ``global_reports._known_entity_ids`` grounds a community
+    report's members at ANY status on purpose ("a member that was later
+    rejected is still historically a member"), so a report can and does cite
+    entities that later merged or were rejected. Resolving those with
+    ``active_entity_ids`` left exactly those citations unexchangeable — #153's
+    own symptom, surviving inside #153's fix (Codex #166). On the dev corpus
+    that is not hypothetical: nmmst carries 4 ``merged`` entities among 1409.
     """
     candidate = _parse_uuid(subject)
     if candidate is None:
         return []
-    active = await repo.active_entity_ids([candidate])
-    return [candidate] if candidate in active else []
+    rows = await repo.fetch_all(tables.entities, tables.entities.c.id == candidate)
+    return [candidate] if rows else []
 
 
 async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
@@ -1715,6 +1726,15 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
     # an entity may surface with zero mentions here (introspection shows
     # the uncited state rather than dropping the entity).
     refs_by_entity, _, _ = await resolved_mention_refs(repo, entity_ids, cap=None)
+    # The citation-id path can resolve a NON-active entity (a report member
+    # that later merged or was rejected — see _entity_ids_by_citation_id), and
+    # before it existed this tool could only ever answer with active rows. So
+    # the status has to be VISIBLE: an agent exchanging a citation would
+    # otherwise read a merged entity as the current one and carry it forward as
+    # fact. Emitted for the name path too — "active" there is informative, not
+    # noise, and one shape beats two.
+    status_rows = await repo.fetch_all(tables.entities, tables.entities.c.id.in_(entity_ids))
+    status_by_id = {row.id: row.status for row in status_rows}
     return {
         "project": project,
         "build_id": str(repo.build_id),
@@ -1724,6 +1744,7 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
         "entities": [
             {
                 "id": str(entity_id),
+                "status": status_by_id.get(entity_id),
                 "mentions": [
                     {
                         "source_type": ref.source_type,

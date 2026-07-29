@@ -2048,19 +2048,27 @@ async def test_get_entity_exchanges_a_citation_entity_id_for_content() -> None:
 
     cited_id = _uuid.uuid4()
 
+    class _Row:
+        def __init__(self, row_id: Any, status: str) -> None:
+            self.id = row_id
+            self.status = status
+
     class _Repo:
         build_id = _uuid.uuid4()
 
-        def __init__(self, *, active: set[Any]) -> None:
-            self._active = active
+        def __init__(self, *, present: dict[Any, str]) -> None:
+            # id -> status, at ANY status: the citation path resolves by
+            # build-scoped EXISTENCE, so the fake must be able to hold a
+            # non-active row or it cannot express the case that matters
+            self._present = present
             self.name_lookups: list[str] = []
 
         async def entity_ids_by_name(self, name: str) -> list[Any]:
             self.name_lookups.append(name)
             return []  # nothing is named by a UUID string
 
-        async def active_entity_ids(self, ids: Any) -> set[Any]:
-            return {i for i in ids if i in self._active}
+        async def fetch_all(self, table: Any, *where: Any) -> list[Any]:
+            return [_Row(i, st) for i, st in self._present.items()]
 
         async def mentions_by_entity(self, ids: Any) -> dict[Any, Any]:
             return {}
@@ -2068,7 +2076,7 @@ async def test_get_entity_exchanges_a_citation_entity_id_for_content() -> None:
         async def chunks_by_content_ref(self, pairs: Any) -> dict[Any, Any]:
             return {}
 
-    repo = _Repo(active={cited_id})
+    repo = _Repo(present={cited_id: "active"})
     hit = await _get_entity(cast(Any, repo), "demo", str(cited_id))
     assert hit["error_code"] is None, "a live citation id must resolve, not 404"
     assert [e["id"] for e in hit["entities"]] == [str(cited_id)]
@@ -2076,10 +2084,26 @@ async def test_get_entity_exchanges_a_citation_entity_id_for_content() -> None:
 
     # a UUID that is not an ACTIVE entity in this build stays NOT_FOUND — the
     # id path inherits the name path's drift rule rather than inventing a hit
-    stale = await _get_entity(cast(Any, _Repo(active=set())), "demo", str(_uuid.uuid4()))
+    stale = await _get_entity(cast(Any, _Repo(present={})), "demo", str(_uuid.uuid4()))
     assert stale["error_code"] == "NOT_FOUND"
 
     # a non-UUID miss must not change: it never reaches the id path at all
     # (the _Repo above has no active_entity_ids call to make for it)
-    plain = await _get_entity(cast(Any, _Repo(active={cited_id})), "demo", "Nobody")
+    plain = await _get_entity(cast(Any, _Repo(present={cited_id: "active"})), "demo", "Nobody")
     assert plain["error_code"] == "NOT_FOUND"
+
+    # A MERGED member's citation must still resolve. global_reports grounds a
+    # community report's members at ANY status on purpose ("a member that was
+    # later rejected is still historically a member"), so reports really do
+    # cite entities that later merged — resolving with an active-only lookup
+    # left exactly those unexchangeable, which is #153's own symptom surviving
+    # inside #153's fix. Not hypothetical: nmmst carries 4 merged among 1409.
+    merged_id = _uuid.uuid4()
+    merged = await _get_entity(
+        cast(Any, _Repo(present={merged_id: "merged"})), "demo", str(merged_id)
+    )
+    assert merged["error_code"] is None
+    # ...and the payload SAYS it is merged. Before the id path existed this
+    # tool could only answer with active rows, so a caller reading a merged
+    # entity as the current one would carry it forward as fact.
+    assert [e["status"] for e in merged["entities"]] == ["merged"]
