@@ -213,6 +213,13 @@ Keep items small enough to finish in one loop.
 - [x] QA10a 寫入路徑輸入驗證掃描 — 量測後修:不可儲存字串(NUL/落單 surrogate)與非有限數(NaN/Infinity/1e999)靜默進 registry、`.`/`..`/`a/b` 名稱建得起來卻永遠 404、空白名、review `reason` 無守衛;錯誤路徑自身兩處崩潰(details 夾帶惹禍輸入 → 遞迴/編碼)。契約未動。
 - [x] QA10b QA10 剩餘兩塊 — (b) store-down:以既有 nmmst 活躍建置實測,`STORE_UNAVAILABLE`/`PARTIAL_RESULTS` 皆降級為型別化 200。(a) NL-to-SQL:另建結構化語料才測得到,白名單守住、無破壞;**並修掉 sql_guard 的功能性過度阻擋**——`exp.And/Or` 是 `exp.Func` 子類,故每個多條件 WHERE 都被拒(accept 面無此案例,全綠掩蓋)。
 
+### 黑箱 QA issue 批次 (GitHub #151–#165)
+> 2026-07-29 開出的 15 條 issue,是打在**落後 main 29 小時且沒跑 worker** 的 stack 上,證據需重驗才可用(教訓見 `.claude/memory/graphrag-stale-stack-invalidates-qa.md`)。對 current main 逐條重驗後**確認成立者共七條**;下方僅列已立案者。不入列的三類:假陽性(#152/#156/#159)、待 owner 定案者(#151 是否改同步 404、各 issue 標籤修正),以及**確認成立但尚未經 owner 批准立案者(見本節末)**。
+
+- [x] BUG153 §16 引用無法兌現 — path 結果與 global_summary 社群報告的引用任何工具都解不開。get_entity 改為同時接受引用帶的 entity UUID(name 查詢落空後才走,只會把 NOT_FOUND 變命中);`_verified_path_result` 把早已取得卻被丟棄的 evidence 展開成 refs。契約未動(DR-002)。(PR #166)
+
+其餘經重驗確認成立者(#154/#157/#158/#163/#164/#165)**尚未立案** —— 依 GAPS 的 accumulate→ratify→promote 協議待 owner 批准後才進佇列;逐條重驗結論記在 PR #166 的說明中。
+
 ---
 
 ## 路線圖 — P2 擴張與正式營運  *(functional review §P2 + roadmap; NOT queued tasks — the accumulate-in-ledger → owner-ratify → promote-to-task protocol from GAPS applies. Detailed here so nothing is lost; promoted to Track 5 tasks item-by-item on owner sign-off.)*
