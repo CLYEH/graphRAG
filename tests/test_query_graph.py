@@ -1375,11 +1375,13 @@ def test_the_refs_cap_warning_round_trips_a_colon_bearing_path_id() -> None:
 
     A path id is f"path:{src}->{dst}", so it carries colons — unlike the bare
     UUID `global_reports.capped_report_id` parses, whose shape invites
-    partitioning on the FIRST colon. Doing that here returns "path", the
-    warning never matches its own result, and hybrid's refit fails OPEN: the
-    warning outlives every clipped path, which is the exact defect the
-    subject-bearing message exists to prevent. Pinned as a round trip so the
-    two sides cannot drift apart.
+    partitioning on the FIRST colon. Doing that here returns "path", which
+    matches no result — and hybrid's predicate keeps a warning only when the
+    parse says "not ours" (None) or names a path still on the page, so an
+    unmatched non-None id is dropped EITHER WAY. The clip notice then vanishes
+    for a path the caller actually received: a §22 truncation silently
+    suppressed, not a warning outliving its subject. Pinned as a round trip so
+    builder and parser cannot drift apart.
     """
     path_id = f"path:{uuid.uuid4()}->{uuid.uuid4()}"
     warning = path_refs_cap_warning(path_id, 5)

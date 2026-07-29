@@ -105,9 +105,14 @@ def capped_path_id(message: str) -> str | None:
         return None
     # split from the RIGHT, unlike global_reports' report-id parser: a report
     # id is a bare UUID, but a path id is f"path:{src}->{dst}" and CONTAINS
-    # colons, so partitioning on the first one returns "path" and the warning
-    # would never match its own result — it would then outlive every clipped
-    # path (fails open, the failure this parser exists to prevent).
+    # colons, so partitioning on the first one returns "path", which matches no
+    # result. Note WHICH WAY that fails: the call-site predicate keeps a
+    # warning when the parse returns None (not ours) or when the named id is on
+    # the page, so an unmatched non-None id is dropped in BOTH cases — the
+    # warning disappears even for a path the caller DID receive, silently
+    # suppressing a true §22 clip notice. "Unrecognized → keep" is the SAFE
+    # direction here; hardening this parser to return None on ambiguity would
+    # be the change that actually lets a warning outlive its clipped subject.
     path_id, sep, _ = text[len(_PATH_REFS_CAP_ID_PREFIX) :].rpartition(": ")
     return path_id if sep else None
 
