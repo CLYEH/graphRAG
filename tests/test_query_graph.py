@@ -24,7 +24,9 @@ from neo4j.exceptions import ClientError, ServiceUnavailable
 from core.query.graph import (
     PATH_EVIDENCE_CAP,
     GraphQueryParams,
+    capped_path_id,
     graph_query,
+    path_refs_cap_warning,
     subgraph_context,
 )
 from core.query.policy import CYPHER_ALLOWED_CLAUSES, CYPHER_BLOCKED_MIN, TextToCypher
@@ -1336,13 +1338,24 @@ async def test_a_heavily_asserted_edge_caps_its_evidence_and_says_so() -> None:
     assert [w.code for w in response.warnings] == ["TRUNCATED"]
     assert "5 ref(s) omitted" in response.warnings[0].message
 
-    # deterministic: the SAME refs, in the same order, on a repeat call — a
-    # cited answer that cites different sources each time is not reproducible
+    # Deterministic across a DIFFERENT DB ROW ORDER — the property that
+    # actually discriminates. relations_with_evidence selects with no ORDER BY,
+    # so the plan decides row order (seq vs index scan, a HOT update, a VACUUM).
+    # Uncapped that was cosmetic; a cap makes order SELECTIVE, so without a sort
+    # the same query on the same build would cite a different 8 chunks. Feeding
+    # the SAME rows in a shuffled order must produce the SAME refs — asserting a
+    # repeat call on one fake would only prove we don't shuffle or sample.
+    shuffled = list(reversed(rows))
+    assert shuffled != rows
+    other = _FakeSoR(seeds={"a": [a], "b": [b]}, relations={(a, b, "works_at"): (rel_ab, shuffled)})
     again = await _run(
-        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+        graph, other, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
     )
     assert [r.id for r in again.results[0].source_refs] == [r.id for r in refs]
-    assert [r.id for r in chunk_refs] == [str(row["chunk_id"]) for row in rows[:PATH_EVIDENCE_CAP]]
+    # ...and the 8 that survive are the sort's first 8, not the fixture's
+    assert [r.id for r in chunk_refs] == sorted(str(row["chunk_id"]) for row in rows)[
+        :PATH_EVIDENCE_CAP
+    ]
 
 
 async def test_an_edge_within_the_cap_warns_about_nothing() -> None:
@@ -1355,3 +1368,26 @@ async def test_an_edge_within_the_cap_warns_about_nothing() -> None:
         graph, sor, GraphQueryParams(template="path", entity="a", other_entity="c", hops=3)
     )
     assert response.warnings == ()
+
+
+def test_the_refs_cap_warning_round_trips_a_colon_bearing_path_id() -> None:
+    """Builder and parser must agree on an id that CONTAINS the separator.
+
+    A path id is f"path:{src}->{dst}", so it carries colons — unlike the bare
+    UUID `global_reports.capped_report_id` parses, whose shape invites
+    partitioning on the FIRST colon. Doing that here returns "path", the
+    warning never matches its own result, and hybrid's refit fails OPEN: the
+    warning outlives every clipped path, which is the exact defect the
+    subject-bearing message exists to prevent. Pinned as a round trip so the
+    two sides cannot drift apart.
+    """
+    path_id = f"path:{uuid.uuid4()}->{uuid.uuid4()}"
+    warning = path_refs_cap_warning(path_id, 5)
+    assert warning.code == "TRUNCATED"
+    assert capped_path_id(warning.message) == path_id
+    # ...through hybrid's origin prefix too, whatever the mode is called
+    assert capped_path_id(f"[graph] {warning.message}") == path_id
+    assert capped_path_id(f"[some_future_mode] {warning.message}") == path_id
+    # and it must not claim unrelated messages
+    assert capped_path_id("result truncated to the top_k=20 ceiling (§21)") is None
+    assert capped_path_id("") is None

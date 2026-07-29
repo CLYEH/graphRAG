@@ -46,7 +46,7 @@ from typing import Any
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.llms import LLM
 
-from core.query.graph import GraphQueryParams, graph_query
+from core.query.graph import GraphQueryParams, capped_path_id, graph_query
 from core.query.linking import GraphPlan, plan_graph_query
 from core.query.mentions import (
     mention_warnings,
@@ -241,6 +241,20 @@ async def hybrid_query(
         if result.result_type == "entity" and (parsed := _entity_uuid(result.id)) is not None
     }
     warnings = _refit_mention_warnings(warnings, fused_entity_ids)
+    # Same rule for the path REFS-CAP warning (#166): it claims "THIS returned
+    # path's citations were clipped", so it is only meaningful while that path
+    # is on the fused page. The graph bucket's floor is top_k // 4 — ZERO for
+    # top_k <= 3 — so the single path result really can be evicted here while
+    # its warning rides along, leaving a claim about a result the caller never
+    # got. Unlike the aggregate TRUNCATEDs (which say results were withheld
+    # UPSTREAM, true whatever survives), this one has a subject, so it is
+    # dropped with its subject rather than rebuilt.
+    fused_path_ids = {result.id for result in fused if result.result_type == "path"}
+    warnings = [
+        warning
+        for warning in warnings
+        if (named := capped_path_id(warning.message)) is None or named in fused_path_ids
+    ]
     if truncated:
         warnings.append(
             QueryWarning("TRUNCATED", f"result truncated to the top_k={policy.top_k} ceiling (§21)")

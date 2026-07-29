@@ -65,6 +65,52 @@ _TOOL = "graph_query"
 #: get_chunk on any ref that IS emitted (Codex #166).
 PATH_EVIDENCE_CAP = 8
 
+#: The path refs-cap warning's message prefix; the full message names the
+#: capped PATH RESULT's id so hybrid_query can drop the warning when fusion
+#: clips that exact path off the fused page (the #123 class). Distinct from
+#: this module's other TRUNCATEDs on purpose: those claim RESULTS were
+#: withheld upstream — true whatever survives fusion — while this one claims
+#: THIS returned result's citations were clipped, which is only meaningful
+#: while that result is on the page.
+PATH_REFS_CAP_MESSAGE = f"path source_refs capped at {PATH_EVIDENCE_CAP} evidence ref(s) per edge"
+
+_PATH_REFS_CAP_ID_PREFIX = f"{PATH_REFS_CAP_MESSAGE} — path "
+
+
+def path_refs_cap_warning(path_id: str, omitted: int) -> QueryWarning:
+    """The path refs-cap TRUNCATED warning, naming its subject.
+
+    Mirrors :func:`core.query.global_reports.refs_cap_warning`: the id is the
+    provenance hybrid_query needs to keep the warning only while the named
+    path is still on the fused page."""
+    return QueryWarning(
+        "TRUNCATED",
+        f"{_PATH_REFS_CAP_ID_PREFIX}{path_id}: {omitted} ref(s) omitted (§22)",
+    )
+
+
+def capped_path_id(message: str) -> str | None:
+    """The path id a refs-cap warning names — None for any other message.
+
+    Parser beside the builder so the message shape has ONE owner. Tolerates
+    ANY ``[mode] `` origin prefix hybrid may stamp on (it builds them as
+    ``f"[{mode}] "``, and the graph modality's mode name is not this module's
+    to assume) — matching on a hard-coded one would silently stop recognizing
+    the warning if that name ever changed, which fails OPEN: the warning would
+    outlive its clipped path instead of being dropped."""
+    text = message
+    if text.startswith("[") and "] " in text:
+        text = text.split("] ", 1)[1]
+    if not text.startswith(_PATH_REFS_CAP_ID_PREFIX):
+        return None
+    # split from the RIGHT, unlike global_reports' report-id parser: a report
+    # id is a bare UUID, but a path id is f"path:{src}->{dst}" and CONTAINS
+    # colons, so partitioning on the first one returns "path" and the warning
+    # would never match its own result — it would then outlive every clipped
+    # path (fails open, the failure this parser exists to prevent).
+    path_id, sep, _ = text[len(_PATH_REFS_CAP_ID_PREFIX) :].rpartition(": ")
+    return path_id if sep else None
+
 
 @dataclass(frozen=True)
 class GraphQueryParams:
@@ -246,17 +292,7 @@ async def _path(
                 # candidates were alternates, not omitted results, so no warning.
                 # The per-edge evidence CLIP is different: refs the caller could
                 # have exchanged were withheld, so §22 requires saying so.
-                clipped = (
-                    (
-                        _warn(
-                            "TRUNCATED",
-                            f"path source_refs capped at {PATH_EVIDENCE_CAP} evidence "
-                            f"ref(s) per edge: {omitted} ref(s) omitted (§22)",
-                        ),
-                    )
-                    if omitted
-                    else ()
-                )
+                clipped = (path_refs_cap_warning(result.id, omitted),) if omitted else ()
                 return _response(graph, query, ordered_results([result]), clipped)
             stale += 1  # this candidate failed SoR re-verification
             if not stale_nodes and not stale_edges:
@@ -335,10 +371,19 @@ async def _verified_path_result(
         # A heavily-asserted relation can carry hundreds of evidence rows, and
         # serializing all of them would let ONE path dominate the response
         # without improving exchangeability: the caller needs *an* id it can
-        # hand to get_chunk, not every occurrence. Deterministic (SoR order,
-        # no sampling) so the same path cites the same refs across calls, and
-        # the clip is SURFACED rather than silent.
+        # hand to get_chunk, not every occurrence.
+        #
+        # SORT BEFORE SLICING (the #34 rule — mentions.py:107 does the same and
+        # says why): relations_with_evidence selects relation_evidence with NO
+        # order_by, so row order is whatever the plan yields — seq vs index
+        # scan, a HOT update, a VACUUM, a plan flip. Uncapped that was merely
+        # cosmetic; a cap makes order SELECTIVE — it decides which evidence is
+        # cited and which is withheld — so an unsorted slice would let the same
+        # query on the same build cite different chunks across calls, and a
+        # citation an agent saw once might never reappear. The clip is SURFACED
+        # rather than silent.
         usable = [ref for row in evidence_rows if (ref := evidence_ref(row)) is not None]
+        usable.sort(key=lambda ref: (ref.id, str(ref.metadata.get("quote", ""))))
         cited.extend(usable[:PATH_EVIDENCE_CAP])
         omitted += max(0, len(usable) - PATH_EVIDENCE_CAP)
     refs = tuple(cited)
