@@ -1471,3 +1471,48 @@ async def test_the_cap_never_drops_the_only_exchangeable_ref() -> None:
     # the path still carries its edge identity — the §27.2 minimum never
     # depends on evidence being exchangeable
     assert emitted[0].source_type == "relation"
+
+
+async def test_a_type_look_alike_ref_does_not_outrank_a_resolvable_one() -> None:
+    """The rank keys on the ID's SHAPE, not on the ref's type.
+
+    A `manual` evidence row becomes a `document` ref whose id is the free-form
+    `evidence_ref` column — §27.2 leaves that encoding unfrozen, so it is not
+    a document UUID and `get_document` cannot take it. Ranking by TYPE would
+    treat those look-alikes as exchangeable, and when their ids sort ahead of
+    the real chunk UUID they take every slot in the cap, leaving a path whose
+    citations resolve nowhere: #153 again.
+
+    This is the case the sibling test cannot make. Its unexchangeable refs are
+    `row`-typed, so a type check ranks the chunk first too and the mutation
+    survives — the id-shape argument stays unpinned. `manual` has no writer
+    today (`core/graph/documents.py` and `core/graph/structured.py` write
+    chunk-with-chunk_id and row), but it is contract- and DDL-legal, and
+    `chunk_id` is deliberately nullable for §27.4 prune survival, so this is
+    one writer away from live.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    winner = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    rows: list[dict[str, Any]] = [
+        {
+            "evidence_type": "manual",  # -> a `document` ref: the look-alike
+            "evidence_ref": f"aaa-doc-{i:03d}",  # sorts BEFORE the chunk uuid
+            "quote": "q",
+            "source_uri": "file:///m.md",
+        }
+        for i in range(PATH_EVIDENCE_CAP + 4)
+    ]
+    rows.append(_chunk_evidence(chunk_id=winner))
+    sor = _FakeSoR(seeds={"a": [a], "b": [b]}, relations={(a, b, "works_at"): (rel_ab, rows)})
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    ids = [r.id for r in response.results[0].source_refs]
+    assert str(winner) in ids, "type-ranking let unresolvable look-alikes take every slot"

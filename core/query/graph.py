@@ -396,7 +396,7 @@ async def _verified_path_result(
         # reservation: if any exchangeable ref exists for an edge, it cannot be
         # crowded out. Order stays total (rank, id, quote), so the cap is still
         # deterministic across calls.
-        usable.sort(key=lambda ref: (0 if _is_exchangeable(ref) else 1, ref.id, quote_of(ref)))
+        usable.sort(key=lambda ref: (0 if _is_exchangeable(ref) else 1, ref.id, _quote_of(ref)))
         cited.extend(usable[:PATH_EVIDENCE_CAP])
         omitted += max(0, len(usable) - PATH_EVIDENCE_CAP)
     refs = tuple(cited)
@@ -780,7 +780,7 @@ async def _relation_results(
     return kept, dropped
 
 
-def quote_of(ref: SourceRef) -> str:
+def _quote_of(ref: SourceRef) -> str:
     """A ref's quote as a plain string — the cap sort's tie-break."""
     return str(ref.metadata.get("quote", ""))
 
