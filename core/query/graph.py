@@ -838,34 +838,50 @@ async def _resolvable_evidence_ids(
     and it is the only one where being wrong costs a citation. Batched by table
     across the whole path, build-scoped through the repo (DR-006).
     """
-    chunk_ids: set[uuid.UUID] = set()
-    document_ids: set[uuid.UUID] = set()
+    # (source_type, parsed uuid) -> the RAW ref.id spellings that named it.
+    #
+    # Keying on the raw spelling is the point, not bookkeeping. `_parse_ref_uuid`
+    # accepts any spelling `uuid.UUID` does — uppercase, dashless — and so does
+    # `get_chunk`/`get_document` (both go through `_parse_uuid`), so those refs
+    # ARE exchangeable. But the grounding row comes back canonical, so recording
+    # `str(row.id)` and then testing `ref.id in resolvable` compared a raw
+    # spelling against a canonical string: the live ref read as unresolved and
+    # eight dangling refs sorting ahead of it evicted the only citation that
+    # actually resolves (Codex #166). Free-form ids are not hypothetical here —
+    # `evidence_ref` falls back to the free-form column when `chunk_id` is NULL,
+    # and a `manual` row's document id is ALWAYS that column.
+    #
+    # Keyed WITH the source_type, too: the two id spaces are separate, and a
+    # flat set unioned across both tables would mark a document ref resolvable
+    # because some chunk row happened to share its id.
+    candidates: dict[tuple[str, uuid.UUID], set[str]] = {}
     for _relation_id, usable in per_edge:
         if len(usable) <= PATH_EVIDENCE_CAP:
             continue  # nothing dropped here — rank changes nothing
         for ref in usable:
+            if ref.source_type not in {"chunk", "document"}:
+                continue  # no get_* resolver takes a row ref (§9)
             parsed = _parse_ref_uuid(ref.id)
             if parsed is None:
                 continue
-            if ref.source_type == "chunk":
-                chunk_ids.add(parsed)
-            elif ref.source_type == "document":
-                document_ids.add(parsed)
+            candidates.setdefault((ref.source_type, parsed), set()).add(ref.id)
+    if not candidates:
+        return frozenset()
+
     resolvable: set[str] = set()
-    for table, wanted in ((tables.chunks, chunk_ids), (tables.documents, document_ids)):
+    for source_type, table in (("chunk", tables.chunks), ("document", tables.documents)):
+        wanted = sorted(u for (kind, u) in candidates if kind == source_type)
         # BATCHED for the same reason global_reports._GROUNDING_BATCH exists:
         # the IN predicate binds one parameter per id and PostgreSQL's extended
         # protocol caps a statement at 32767 binds. This path runs BECAUSE the
         # evidence count is large, and an overflow here would raise a driver
         # error that graph_query's `except (Neo4jError, ServiceUnavailable)`
         # does not catch — a 500 out of the module whose contract is
-        # "degradation, never a 500". Deterministic batch boundaries (sorted),
-        # though the union is order-independent either way.
-        ordered = sorted(wanted)
-        for start in range(0, len(ordered), _GROUNDING_BATCH):
-            batch = ordered[start : start + _GROUNDING_BATCH]
-            rows = await repo.fetch_all(table, table.c.id.in_(batch))
-            resolvable.update(str(row.id) for row in rows)
+        # "degradation, never a 500". Deterministic batch boundaries (sorted).
+        for start in range(0, len(wanted), _GROUNDING_BATCH):
+            batch = wanted[start : start + _GROUNDING_BATCH]
+            for row in await repo.fetch_all(table, table.c.id.in_(batch)):
+                resolvable.update(candidates.get((source_type, row.id), ()))
     return frozenset(resolvable)
 
 

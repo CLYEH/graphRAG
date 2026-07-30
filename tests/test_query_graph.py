@@ -1618,3 +1618,108 @@ async def test_an_under_cap_edge_still_lists_its_resolvable_ref_first() -> None:
     kinds = [r.source_type for r in response.results[0].source_refs]
     assert kinds == ["relation", "chunk", "row"], "the unresolvable ref was listed first"
     assert response.warnings == ()  # nothing withheld — no TRUNCATED
+
+
+async def test_a_non_canonical_uuid_spelling_still_ranks_as_resolvable() -> None:
+    """Grounding must compare like with like.
+
+    `_parse_ref_uuid` accepts every spelling `uuid.UUID` does — uppercase,
+    dashless — and so does `get_chunk`/`get_document` (both parse with
+    `_parse_uuid`), so a ref spelled that way IS exchangeable. But the grounded
+    row comes back canonical: recording `str(row.id)` and then testing
+    `ref.id in resolvable` compares a raw spelling against a canonical string,
+    the live ref reads as unresolved, and refs sorting ahead of it take every
+    slot — the only citation that actually resolves, evicted.
+
+    Free-form ids are the ordinary case, not a contrivance: `evidence_ref`
+    falls back to the free-form column when `chunk_id` is NULL, and a `manual`
+    row's `document` id is ALWAYS that column (§27.2 leaves it unfrozen).
+
+    Neither sibling test can see this. Both spell their live id canonically, so
+    raw and canonical coincide and the comparison happens to work.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    live_doc = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    shouted = str(live_doc).upper()  # a spelling get_document accepts
+    assert shouted != str(live_doc)
+    # the dangling ids are digits, so they sort BEFORE the uppercase spelling
+    rows: list[dict[str, Any]] = [
+        {
+            "evidence_type": "manual",
+            "evidence_ref": f"0000000{i}-0000-4000-8000-000000000000",
+            "quote": "q",
+            "source_uri": "file:///m.md",
+        }
+        for i in range(PATH_EVIDENCE_CAP + 1)
+    ]
+    rows.append(
+        {
+            "evidence_type": "manual",
+            "evidence_ref": shouted,
+            "quote": "q",
+            "source_uri": "file:///live.md",
+        }
+    )
+    sor = _FakeSoR(
+        seeds={"a": [a], "b": [b]},
+        relations={(a, b, "works_at"): (rel_ab, rows)},
+        stored_documents={live_doc},  # only the shouted one names a real row
+    )
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    ids = [r.id for r in response.results[0].source_refs]
+    assert shouted in ids, "a resolvable ref was evicted over its UUID spelling"
+
+
+async def test_a_document_ref_is_not_grounded_by_a_chunk_row() -> None:
+    """The two id spaces are separate, so the grounding key carries the type.
+
+    Unioning both tables' hits into one flat id set would mark a `document`
+    ref resolvable because some CHUNK row happened to share its id — ranking
+    refs `get_document` cannot resolve ahead of the one chunk it can. Enough
+    of them to FILL the cap is what makes the difference visible: with only a
+    couple of false positives the live ref keeps a slot either way, which is
+    how the first version of this test passed under the very mutation it was
+    written to catch.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    # a cap's worth of DOCUMENT refs whose ids exist only as CHUNK rows, all
+    # sorting before the live chunk
+    impostors = [uuid.UUID(f"0000000{i}-0000-4000-8000-000000000000") for i in range(9)]
+    live_chunk = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    rows: list[dict[str, Any]] = [
+        {
+            "evidence_type": "manual",  # -> a `document` ref
+            "evidence_ref": str(impostor),
+            "quote": "q",
+            "source_uri": "file:///m.md",
+        }
+        for impostor in impostors
+    ]
+    rows.append(_chunk_evidence(chunk_id=live_chunk))
+    sor = _FakeSoR(
+        seeds={"a": [a], "b": [b]},
+        relations={(a, b, "works_at"): (rel_ab, rows)},
+        stored_chunks={*impostors, live_chunk},  # the impostor ids exist as CHUNKS
+        stored_documents=set(),  # ...and as no document at all
+    )
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    ids = [r.id for r in response.results[0].source_refs]
+    assert str(live_chunk) in ids, "the live chunk lost its slot to cross-type false positives"
