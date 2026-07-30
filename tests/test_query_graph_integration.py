@@ -167,6 +167,14 @@ async def _relation(
         relation_id=relation_id,
         evidence_type="chunk",
         evidence_ref=f"ev-{relation_id}",
+        # DELIBERATELY names no chunk row. §27.4 keeps relation_evidence after
+        # the chunk it quotes is pruned (chunk_id is not an FK), so this fixture
+        # has always modelled the TOLERATED dangling state rather than the
+        # ordinary one — harmless here because a single-evidence edge never
+        # reaches a decision that depends on the chunk existing. Any future
+        # assertion about "the chunk behind this evidence" is testing
+        # prune-survival semantics whether or not its author meant to; seed a
+        # real chunk locally (as the cap-grounding test does) if you need one.
         chunk_id=uuid.uuid4(),
         start_offset=0,
         end_offset=10,
