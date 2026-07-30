@@ -580,9 +580,13 @@ async def test_active_job_ids_are_returned_in_creation_order(migrated: None) -> 
     the ORDER BY left this green — and dropping the ORDER BY entirely was a
     coin flip against two random uuids):
 
-    * ``older_high``/``older_low`` share a ``created_at`` and are INSERTED
-      high-id-first, so physical/heap order is the reverse of the expected
-      order — an unordered scan can never coincidentally match.
+    * THREE rows share a ``created_at``, inserted NON-MONOTONICALLY (3, 2, 4).
+      Two tied rows are not enough: a seq scan returns insertion order and a
+      backward index scan returns its exact reverse, so whichever way you
+      insert them, one of "no ORDER BY" and "created_at only" coincidentally
+      matches and goes unpinned. With 3-2-4 the expectation ``[2,3,4]``
+      differs from insertion order ``[3,2,4]`` AND from its reverse
+      ``[4,2,3]``, so neither plan can fake it.
     * ``newer_lowest`` is created LATER but carries the lowest id, so ordering
       by id alone would float it to the front. It must come last.
 
@@ -594,8 +598,8 @@ async def test_active_job_ids_are_returned_in_creation_order(migrated: None) -> 
     project = _proj()
     older = datetime(2026, 1, 1, tzinfo=UTC)
     newer = datetime(2026, 1, 2, tzinfo=UTC)
-    older_high = uuid.UUID(int=3)
-    older_low = uuid.UUID(int=2)
+    # inserted 3, 2, 4 — unequal to both the expected order and its reverse
+    tied_first, tied_second, tied_third = (uuid.UUID(int=n) for n in (3, 2, 4))
     newer_lowest = uuid.UUID(int=1)
     try:
         async with engine.connect() as conn:
@@ -603,9 +607,10 @@ async def test_active_job_ids_are_returned_in_creation_order(migrated: None) -> 
             try:
                 await create_project(conn, name=project)
                 for job_id, created in (
-                    (older_high, older),  # inserted FIRST, expected SECOND
-                    (older_low, older),
-                    (newer_lowest, newer),
+                    (tied_first, older),  # id 3 — inserted first, expected second
+                    (tied_second, older),  # id 2 — expected FIRST
+                    (tied_third, older),  # id 4 — expected third
+                    (newer_lowest, newer),  # id 1 — expected LAST, despite the id
                 ):
                     await conn.execute(
                         jobs.insert().values(
@@ -618,7 +623,7 @@ async def test_active_job_ids_are_returned_in_creation_order(migrated: None) -> 
                     )
 
                 ordered = await active_job_ids(conn, project)
-                assert ordered == [older_low, older_high, newer_lowest], (
+                assert ordered == [tied_second, tied_first, tied_third, newer_lowest], (
                     "creation order first, id only as the same-instant tie-break"
                 )
                 assert ordered == await active_job_ids(conn, project)  # stable across calls
