@@ -583,8 +583,13 @@ async def active_job_ids(conn: AsyncConnection, project: str) -> list[uuid.UUID]
 
 
 async def count_active_jobs(conn: AsyncConnection, project: str) -> int:
-    """Number of still-running (queued/running) jobs for a project — the
-    delete_project guard reads this to refuse deletion mid-operation."""
+    """Number of still-running (queued/running) jobs for a project.
+
+    The delete guard now reads :func:`active_job_ids` (its refusal has to NAME
+    the jobs, #151); this is the gauge side of that same population —
+    ``/health``'s ``counts.active_jobs``, which exists to explain that refusal.
+    Both must count the same rows, so they share this predicate rather than
+    transcribing it."""
     return int(
         (
             await conn.execute(

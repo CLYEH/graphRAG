@@ -9,7 +9,6 @@ test; the live CRUD/idempotency behavior is proved in the integration suite.
 from __future__ import annotations
 
 import uuid
-import uuid as _uuid
 from datetime import UTC, datetime
 
 import pytest
@@ -101,7 +100,7 @@ def test_translate_registry_error_maps_each_domain_error() -> None:
     assert ex.code is ErrorCode.VALIDATION_ERROR and ex.details == {"name": "p"}
     hb = translate_registry_error(ProjectHasBuildsError("p", 3))
     assert hb.code is ErrorCode.VALIDATION_ERROR and hb.details == {"project": "p", "builds": 3}
-    blocking = [_uuid.UUID(int=1), _uuid.UUID(int=2)]
+    blocking = [uuid.UUID(int=1), uuid.UUID(int=2)]
     aj = translate_registry_error(ProjectHasActiveJobsError("p", blocking))
     assert aj.code is ErrorCode.VALIDATION_ERROR
     # the count STAYS (existing consumers read it) and the ids ride alongside,

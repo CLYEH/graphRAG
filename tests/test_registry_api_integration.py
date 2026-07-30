@@ -298,6 +298,19 @@ async def test_error_mappings(api: tuple[AsyncClient, AsyncConnection]) -> None:
     health = await client.get(f"/projects/{jobless}/health")
     assert health.json()["data"]["counts"]["active_jobs"] == 1
 
+    # IN FLIGHT is the whole point — the operator asked "wait for what", so the
+    # gauge has to fall when the wait is over. Asserting only the 1 would pass
+    # with the status predicate deleted, leaving a count of all jobs ever.
+    from sqlalchemy import func as _func
+
+    await conn.execute(
+        jobs.update()
+        .where(jobs.c.project == jobless)
+        .values(status="done", finished_at=_func.now())
+    )
+    settled = await client.get(f"/projects/{jobless}/health")
+    assert settled.json()["data"]["counts"]["active_jobs"] == 0
+
 
 async def test_request_validation(api: tuple[AsyncClient, AsyncConnection]) -> None:
     client, _ = api

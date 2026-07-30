@@ -38,7 +38,7 @@ from core.registry import (
     request_cancel,
     set_progress,
 )
-from core.registry.jobs import JobNotFoundError, acquire_lease
+from core.registry.jobs import JobNotFoundError, acquire_lease, active_job_ids
 from core.stores.tables import jobs, projects
 
 pytestmark = pytest.mark.integration
@@ -562,4 +562,38 @@ async def test_find_unenqueued_jobs_matches_only_lost_queued_rows(migrated: None
             assert {j for j, *_ in await find_unenqueued_jobs(conn, 3600.0)} & mine == set()
             await trans.rollback()
     finally:
+        await engine.dispose()
+
+
+async def test_active_job_ids_are_returned_in_creation_order(migrated: None) -> None:
+    """The refusal lists its blocking jobs in a STABLE order.
+
+    delete_project's error names the jobs the caller must wait for or cancel
+    (#151). Two calls returning them in different orders would make the refusal
+    read as a different answer each time, and an operator working down the list
+    could not tell whether progress was being made. Pinned because the ordering
+    is a promise the docstring makes, and `jobs.created_at` alone does not keep
+    it: now() is transaction-stable, so same-transaction rows tie and fall back
+    to the id — which is exactly the case this fixture builds.
+    """
+    engine = _engine()
+    project = _proj()
+    try:
+        async with engine.connect() as conn:
+            await create_project(conn, name=project)
+            first = await create_job(conn, project, "build")
+            second = await create_job(conn, project, "build")
+            await conn.commit()
+
+            ordered = await active_job_ids(conn, project)
+            assert len(ordered) == 2
+            assert ordered == sorted([first.id, second.id], key=str), (
+                "same-transaction jobs must fall back to a total order, not the plan's whim"
+            )
+            assert ordered == await active_job_ids(conn, project)  # stable across calls
+    finally:
+        async with engine.connect() as cleanup:
+            await cleanup.execute(jobs.delete().where(jobs.c.project == project))
+            await delete_project(cleanup, project)
+            await cleanup.commit()
         await engine.dispose()

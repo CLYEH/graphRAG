@@ -66,6 +66,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from core.builds.lifecycle import drift_failures, list_builds
 from core.config import get_settings
 from core.eval.spec import is_eval_regression
+from core.registry.jobs import count_active_jobs
 from core.stores import tables
 
 #: what the drift probe can raise per store (mirrors the MCP layer's
@@ -263,12 +264,13 @@ async def health_report(
     # has none either (STORE_UNAVAILABLE would be a lie, PARTIAL_RESULTS is
     # about degraded retrieval). counts is additionalProperties-typed, so the
     # number rides the frozen shape as-is.
-    metrics["active_jobs"] = await _count(
-        conn,
-        sa.select(sa.func.count())
-        .select_from(tables.jobs)
-        .where(tables.jobs.c.project == project, tables.jobs.c.status.in_(("queued", "running"))),
-    )
+    # Through count_active_jobs, NOT a local status literal: this gauge exists
+    # to explain the delete guard's refusal, so it must count the SAME
+    # population. A transcribed ("queued","running") would fork the denominator
+    # from the guard and mislead the operator at exactly the moment this is
+    # meant to help — the rule this file already states for LOW_CONFIDENCE_BELOW
+    # ("ONE tuning point, both consumers move together", Codex #109).
+    metrics["active_jobs"] = await count_active_jobs(conn, project)
     # §19's "pending review" is the WHOLE §17 queue — ANY of its pending
     # states alone must light Needs review (Codex rounds 4/8: a
     # proposal-only or needs_review-only backlog was hidden)
