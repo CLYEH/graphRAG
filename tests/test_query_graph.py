@@ -180,7 +180,20 @@ class _FakeSoR:
 
     async def fetch_all(self, table: Any, *where: Any) -> list[Any]:
         stored = self._stored_chunks if table.name == "chunks" else self._stored_documents
-        return [SimpleNamespace(id=row_id) for row_id in sorted(stored, key=str)]
+        # HONOUR the IN predicate. A fake that returns every stored row answers
+        # a question the real store cannot be asked, and that infidelity is not
+        # inert: it supplied the discrimination for a cross-type test that could
+        # not otherwise fail, hiding a real defect behind a green suite. A
+        # fake's simplification is a claim about the CURRENT consumer, and it
+        # expires silently the moment the consumer gains an axis — here, when
+        # grounding started asking per-TABLE rather than per-id.
+        asked: set[uuid.UUID] | None = None
+        for clause in where:
+            value = getattr(getattr(clause, "right", None), "value", None)
+            if isinstance(value, list | tuple | set):
+                asked = set(value)
+        rows = stored if asked is None else stored & asked
+        return [SimpleNamespace(id=row_id) for row_id in sorted(rows, key=str)]
 
     async def entity_ids_by_name(self, name: str) -> list[uuid.UUID]:
         return self._seeds.get(name.lower(), [])
@@ -1680,15 +1693,20 @@ async def test_a_non_canonical_uuid_spelling_still_ranks_as_resolvable() -> None
 
 
 async def test_a_document_ref_is_not_grounded_by_a_chunk_row() -> None:
-    """The two id spaces are separate, so the grounding key carries the type.
+    """A chunk row must not vouch for a document ref sharing its spelling.
 
-    Unioning both tables' hits into one flat id set would mark a `document`
-    ref resolvable because some CHUNK row happened to share its id — ranking
-    refs `get_document` cannot resolve ahead of the one chunk it can. Enough
-    of them to FILL the cap is what makes the difference visible: with only a
-    couple of false positives the live ref keeps a slot either way, which is
-    how the first version of this test passed under the very mutation it was
-    written to catch.
+    The two id spaces are separate. Grounding asks per table, so the ANSWER
+    has to carry the type it was asked under — a flat set of spellings lets a
+    chunk's legitimate hit make a `document` ref look resolvable, ranking a
+    ref `get_document` cannot resolve ahead of one it can.
+
+    The fixture has to make ONE id both a chunk candidate and a document
+    candidate, or production never sends the impostor to the chunks query at
+    all and the case cannot arise. An earlier version of this test used
+    document-only impostors and went red purely because the fake ignored its
+    IN predicate — the fake's infidelity supplying the discrimination, not the
+    defect. It also needs a cap's worth of them: with a couple, the live ref
+    keeps a slot either way.
     """
     a, b = uuid.uuid4(), uuid.uuid4()
     rel_ab = uuid.uuid4()
@@ -1698,28 +1716,31 @@ async def test_a_document_ref_is_not_grounded_by_a_chunk_row() -> None:
             "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
         }
     )
-    # a cap's worth of DOCUMENT refs whose ids exist only as CHUNK rows, all
-    # sorting before the live chunk
-    impostors = [uuid.UUID(f"0000000{i}-0000-4000-8000-000000000000") for i in range(9)]
-    live_chunk = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
-    rows: list[dict[str, Any]] = [
+    # ids that exist as CHUNK rows, each carried by a chunk ref AND a document
+    # ref — the document ref is the impostor the chunk row must not vouch for
+    shared = [uuid.UUID(f"0000000{i}-0000-4000-8000-000000000000") for i in range(4)]
+    dangling = [uuid.UUID(f"1000000{i}-0000-4000-8000-000000000000") for i in range(4)]
+    live_chunk = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")  # sorts LAST
+    rows: list[dict[str, Any]] = [_chunk_evidence(chunk_id=cid) for cid in shared]
+    rows += [
         {
-            "evidence_type": "manual",  # -> a `document` ref
-            "evidence_ref": str(impostor),
+            "evidence_type": "manual",  # -> a `document` ref wearing a chunk's id
+            "evidence_ref": str(cid),
             "quote": "q",
             "source_uri": "file:///m.md",
         }
-        for impostor in impostors
+        for cid in shared
     ]
+    rows += [_chunk_evidence(chunk_id=cid) for cid in dangling]
     rows.append(_chunk_evidence(chunk_id=live_chunk))
     sor = _FakeSoR(
         seeds={"a": [a], "b": [b]},
         relations={(a, b, "works_at"): (rel_ab, rows)},
-        stored_chunks={*impostors, live_chunk},  # the impostor ids exist as CHUNKS
-        stored_documents=set(),  # ...and as no document at all
+        stored_chunks={*shared, live_chunk},
+        stored_documents=set(),  # none of those ids is a document
     )
     response = await _run(
         graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
     )
     ids = [r.id for r in response.results[0].source_refs]
-    assert str(live_chunk) in ids, "the live chunk lost its slot to cross-type false positives"
+    assert str(live_chunk) in ids, "a chunk row vouched for a document ref and evicted the live one"

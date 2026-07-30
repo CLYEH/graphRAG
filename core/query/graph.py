@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import sqlalchemy as sa
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from core.graph.structured import split_row_source_ref
@@ -71,6 +72,17 @@ PATH_EVIDENCE_CAP = 8
 #: imported: it is a tuning number each grounding site owns, not a shared
 #: invariant two callers must agree on.
 _GROUNDING_BATCH = 1000
+
+#: The evidence ref types a ``get_*`` tool can resolve, and the table each
+#: one grounds against. ONE source for all three sites that must agree —
+#: which refs become candidates, which table answers for them, and how the
+#: rank keys the answer. They were three literals nothing forced to match;
+#: a third exchangeable type could half-land. (``row`` refs are absent on
+#: purpose: the frozen §9 set has no resolver for them.)
+_GROUNDED_TABLES: dict[str, sa.Table] = {
+    "chunk": tables.chunks,
+    "document": tables.documents,
+}
 
 #: The path refs-cap warning's message prefix; the full message names the
 #: capped PATH RESULT's id so hybrid_query can drop the warning when fusion
@@ -421,8 +433,8 @@ async def _verified_path_result(
         # The type component costs no read and restores that order.
         usable.sort(
             key=lambda ref: (
-                0 if ref.id in resolvable else 1,
-                0 if ref.source_type in {"chunk", "document"} else 1,
+                0 if (ref.source_type, ref.id) in resolvable else 1,
+                0 if ref.source_type in _GROUNDED_TABLES else 1,
                 ref.id,
                 _quote_of(ref),
             )
@@ -817,8 +829,8 @@ def _quote_of(ref: SourceRef) -> str:
 
 async def _resolvable_evidence_ids(
     repo: BuildScopedRepo, per_edge: Sequence[tuple[uuid.UUID, list[SourceRef]]]
-) -> frozenset[str]:
-    """The candidate evidence ids a ``get_*`` tool can ACTUALLY resolve.
+) -> frozenset[tuple[str, str]]:
+    """The ``(source_type, spelling)`` pairs a ``get_*`` tool can ACTUALLY resolve.
 
     UUID shape is not resolvability, which is the whole reason this is a store
     read and not a string test:
@@ -859,7 +871,7 @@ async def _resolvable_evidence_ids(
         if len(usable) <= PATH_EVIDENCE_CAP:
             continue  # nothing dropped here — rank changes nothing
         for ref in usable:
-            if ref.source_type not in {"chunk", "document"}:
+            if ref.source_type not in _GROUNDED_TABLES:
                 continue  # no get_* resolver takes a row ref (§9)
             parsed = _parse_ref_uuid(ref.id)
             if parsed is None:
@@ -868,8 +880,8 @@ async def _resolvable_evidence_ids(
     if not candidates:
         return frozenset()
 
-    resolvable: set[str] = set()
-    for source_type, table in (("chunk", tables.chunks), ("document", tables.documents)):
+    resolvable: set[tuple[str, str]] = set()
+    for source_type, table in _GROUNDED_TABLES.items():
         wanted = sorted(u for (kind, u) in candidates if kind == source_type)
         # BATCHED for the same reason global_reports._GROUNDING_BATCH exists:
         # the IN predicate binds one parameter per id and PostgreSQL's extended
@@ -881,7 +893,15 @@ async def _resolvable_evidence_ids(
         for start in range(0, len(wanted), _GROUNDING_BATCH):
             batch = wanted[start : start + _GROUNDING_BATCH]
             for row in await repo.fetch_all(table, table.c.id.in_(batch)):
-                resolvable.update(candidates.get((source_type, row.id), ()))
+                # the ANSWER carries what the question was keyed on. A flat
+                # set of spellings would let a chunk row's legitimate
+                # grounding vouch for a document ref that merely shares its
+                # spelling — the confusion the key exists to prevent, undone
+                # at the return boundary.
+                resolvable.update(
+                    (source_type, spelling)
+                    for spelling in candidates.get((source_type, row.id), ())
+                )
     return frozenset(resolvable)
 
 
