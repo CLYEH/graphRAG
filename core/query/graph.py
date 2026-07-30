@@ -366,10 +366,20 @@ async def _verified_path_result(
     # the stale_nodes/stale_edges contract above), so dropping on citation
     # count would silently shrink path results — a behavior change this fix
     # does not need and #153 never asked for.
-    cited: list[SourceRef] = []
-    omitted = 0
+    # Resolve every edge's usable refs FIRST: the rank below asks whether an id
+    # actually resolves, and that answer is a store read worth batching across
+    # the whole path rather than paying per edge.
+    per_edge: list[tuple[uuid.UUID, list[SourceRef]]] = []
     for triple in clean:
         relation_id, evidence_rows = resolved[triple]
+        per_edge.append(
+            (relation_id, [ref for row in evidence_rows if (ref := evidence_ref(row)) is not None])
+        )
+    resolvable = await _resolvable_evidence_ids(repo, per_edge)
+
+    cited: list[SourceRef] = []
+    omitted = 0
+    for relation_id, usable in per_edge:
         cited.append(SourceRef(source_type="relation", id=str(relation_id)))
         # CAP per edge (§22), the same discipline the other two citation faces
         # already keep — mentions.MENTION_REFS_CAP and global_reports.REFS_CAP.
@@ -387,16 +397,16 @@ async def _verified_path_result(
         # query on the same build cite different chunks across calls, and a
         # citation an agent saw once might never reappear. The clip is SURFACED
         # rather than silent.
-        usable = [ref for row in evidence_rows if (ref := evidence_ref(row)) is not None]
-        # EXCHANGEABLE FIRST, then id. Sorting on id alone let eight `row` or
-        # manual `document` refs sort ahead of the one chunk ref and the slice
-        # then dropped the only id any get_* tool accepts — a capped path with
-        # citations that cannot be turned into content, i.e. #153 reintroduced
-        # by #153's own fix (Codex #166). The rank is the fix AND the
-        # reservation: if any exchangeable ref exists for an edge, it cannot be
-        # crowded out. Order stays total (rank, id, quote), so the cap is still
-        # deterministic across calls.
-        usable.sort(key=lambda ref: (0 if _is_exchangeable(ref) else 1, ref.id, _quote_of(ref)))
+        #
+        # RESOLVABLE FIRST, then id. Rank on what the store says, never on the
+        # id's spelling: `relation_evidence.chunk_id` is deliberately not an FK
+        # (§27.4 prune survival — evidence outlives the chunk it quotes), so a
+        # perfectly well-formed chunk id can name a PRUNED chunk, and a manual
+        # row's free-form evidence_ref can be UUID-shaped without naming any
+        # document. Eight such ids sorting ahead of the one live chunk would
+        # take every slot and leave the path uncitable again (Codex #166).
+        # Order stays total (rank, id, quote), so the cap is deterministic.
+        usable.sort(key=lambda ref: (0 if ref.id in resolvable else 1, ref.id, _quote_of(ref)))
         cited.extend(usable[:PATH_EVIDENCE_CAP])
         omitted += max(0, len(usable) - PATH_EVIDENCE_CAP)
     refs = tuple(cited)
@@ -785,31 +795,61 @@ def _quote_of(ref: SourceRef) -> str:
     return str(ref.metadata.get("quote", ""))
 
 
-def _is_exchangeable(ref: SourceRef) -> bool:
-    """Can an exposed ``get_*`` tool turn this ref into content?
+async def _resolvable_evidence_ids(
+    repo: BuildScopedRepo, per_edge: Sequence[tuple[uuid.UUID, list[SourceRef]]]
+) -> frozenset[str]:
+    """The candidate evidence ids a ``get_*`` tool can ACTUALLY resolve.
 
-    Narrower than "is it a chunk/document ref", because the ID is what gets
-    exchanged and only some carry one a tool accepts:
+    UUID shape is not resolvability, which is the whole reason this is a store
+    read and not a string test:
 
-    * ``get_chunk`` takes a chunk UUID — but :func:`evidence_ref` falls back to
-      the free-form ``evidence_ref`` column when ``chunk_id`` is NULL, so a
-      chunk ref does not always carry one;
-    * ``get_document`` takes a document UUID, while a ``manual`` evidence row's
-      id is that same free-form column (§27.2 leaves its encoding UNFROZEN, so
-      it is not guaranteed to be a document id at all);
-    * a ``row`` ref has no ``get_*`` resolver in the frozen §9 tool set.
+    * ``relation_evidence.chunk_id`` is deliberately NOT an FK — §27.4 prune
+      survival, evidence outlives the chunk it quotes — so a well-formed chunk
+      id can name a pruned chunk that ``get_chunk`` will not find;
+    * a ``manual`` row becomes a ``document`` ref carrying the free-form
+      ``evidence_ref`` column, whose encoding §27.2 leaves UNFROZEN, so it can
+      be UUID-shaped without naming any document;
+    * a ``row`` ref has no ``get_*`` resolver in the frozen §9 set at all, so it
+      is never a candidate.
 
-    So the test is the ID's shape, not the ref's type. Being wrong in the
-    conservative direction is safe: a ref misjudged unexchangeable only loses
-    priority within the cap, never its place in an uncapped result.
+    Only edges whose usable refs EXCEED the cap are grounded. Below the cap
+    nothing is withheld, so the ordering decides nothing and the read would be
+    pure cost on the common path — a heavily-asserted relation is the rare case,
+    and it is the only one where being wrong costs a citation. Batched by table
+    across the whole path, build-scoped through the repo (DR-006).
     """
-    if ref.source_type not in {"chunk", "document"}:
-        return False
+    chunk_ids: set[uuid.UUID] = set()
+    document_ids: set[uuid.UUID] = set()
+    for _relation_id, usable in per_edge:
+        if len(usable) <= PATH_EVIDENCE_CAP:
+            continue  # nothing dropped here — rank changes nothing
+        for ref in usable:
+            parsed = _parse_ref_uuid(ref.id)
+            if parsed is None:
+                continue
+            if ref.source_type == "chunk":
+                chunk_ids.add(parsed)
+            elif ref.source_type == "document":
+                document_ids.add(parsed)
+    resolvable: set[str] = set()
+    for table, wanted in ((tables.chunks, chunk_ids), (tables.documents, document_ids)):
+        if not wanted:
+            continue
+        rows = await repo.fetch_all(table, table.c.id.in_(sorted(wanted)))
+        resolvable.update(str(row.id) for row in rows)
+    return frozenset(resolvable)
+
+
+def _parse_ref_uuid(raw: str) -> uuid.UUID | None:
+    """A ref id as a UUID, or None — the cheap pre-filter before the store read.
+
+    A non-UUID id cannot name a chunk or document row, so it never becomes a
+    grounding candidate; being wrong here only costs rank, never emission.
+    """
     try:
-        uuid.UUID(ref.id)
+        return uuid.UUID(raw)
     except (AttributeError, TypeError, ValueError):
-        return False
-    return True
+        return None
 
 
 def evidence_ref(row: dict[str, Any]) -> SourceRef | None:

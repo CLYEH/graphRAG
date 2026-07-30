@@ -146,6 +146,8 @@ class _FakeSoR:
         relations: dict[tuple[uuid.UUID, uuid.UUID, str], tuple[uuid.UUID, list[dict[str, Any]]]]
         | None = None,
         pairs: set[tuple[uuid.UUID, uuid.UUID]] | None = None,
+        stored_chunks: set[uuid.UUID] | None = None,
+        stored_documents: set[uuid.UUID] | None = None,
     ) -> None:
         self.project = _PROJECT
         self.build_id = _BUILD
@@ -158,6 +160,27 @@ class _FakeSoR:
         self._pairs = (
             pairs if pairs is not None else {(src, dst) for (src, dst, _rtype) in self._relations}
         )
+        # Which chunk/document rows EXIST. The evidence cap ranks on whether an
+        # id resolves, not on its spelling — §27.4 lets relation_evidence keep a
+        # chunk_id whose chunk was pruned — so a fake that could not express
+        # "well-formed but gone" could not exercise the rank at all. Default:
+        # every chunk_id the fixture's evidence mentions exists, which is the
+        # ordinary case; a fixture that wants a dangling ref names its live rows.
+        self._stored_chunks = (
+            stored_chunks
+            if stored_chunks is not None
+            else {
+                chunk_id
+                for _rel, rows in self._relations.values()
+                for row in rows
+                if isinstance(chunk_id := row.get("chunk_id"), uuid.UUID)
+            }
+        )
+        self._stored_documents = stored_documents if stored_documents is not None else set()
+
+    async def fetch_all(self, table: Any, *where: Any) -> list[Any]:
+        stored = self._stored_chunks if table.name == "chunks" else self._stored_documents
+        return [SimpleNamespace(id=row_id) for row_id in sorted(stored, key=str)]
 
     async def entity_ids_by_name(self, name: str) -> list[uuid.UUID]:
         return self._seeds.get(name.lower(), [])
@@ -1516,3 +1539,43 @@ async def test_a_type_look_alike_ref_does_not_outrank_a_resolvable_one() -> None
     )
     ids = [r.id for r in response.results[0].source_refs]
     assert str(winner) in ids, "type-ranking let unresolvable look-alikes take every slot"
+
+
+async def test_a_pruned_chunks_ref_does_not_outrank_a_live_one() -> None:
+    """The rank asks the STORE, not the id's spelling.
+
+    §27.4 keeps `relation_evidence` alive after the chunk it quotes is pruned —
+    `chunk_id` is deliberately not an FK — so a perfectly well-formed chunk id
+    can name a row `get_chunk` will never find. A rank that only parsed the id
+    as a UUID would treat those dead refs as exchangeable, and when their ids
+    sort before the live chunk they take every slot: a capped path whose
+    citations resolve nowhere, which is #153 yet again.
+
+    This is the case neither sibling test can make. The look-alike test's
+    unexchangeable refs are `manual`/`row`, so a SHAPE check ranks the live
+    chunk first too; only a pruned chunk is well-formed, right-typed, and dead.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    # every pruned id sorts BEFORE the live one, so an id-ordered slice keeps
+    # exactly the wrong eight
+    pruned = [uuid.UUID(f"0000000{i}-0000-4000-8000-000000000000") for i in range(9)]
+    live = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    rows = [_chunk_evidence(chunk_id=cid) for cid in [*pruned, live]]
+    sor = _FakeSoR(
+        seeds={"a": [a], "b": [b]},
+        relations={(a, b, "works_at"): (rel_ab, rows)},
+        stored_chunks={live},  # the pruned ones are GONE from the store
+    )
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    ids = [r.id for r in response.results[0].source_refs]
+    assert str(live) in ids, "a pruned chunk's ref outranked the only live one"
+    assert response.warnings[0].code == "TRUNCATED"  # the clip is still surfaced

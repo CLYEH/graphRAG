@@ -2052,6 +2052,9 @@ async def test_get_entity_exchanges_a_citation_entity_id_for_content() -> None:
         def __init__(self, row_id: Any, status: str) -> None:
             self.id = row_id
             self.status = status
+            self.canonical_name = f"Entity {row_id}"
+            self.type = "ORG"
+            self.attributes = {"founded": 1984}
 
     class _Repo:
         build_id = _uuid.uuid4()
@@ -2107,3 +2110,15 @@ async def test_get_entity_exchanges_a_citation_entity_id_for_content() -> None:
     # tool could only answer with active rows, so a caller reading a merged
     # entity as the current one would carry it forward as fact.
     assert [e["status"] for e in merged["entities"]] == ["merged"]
+
+    # ...and it carries the entity's own IDENTIFYING CONTENT. This is the case
+    # that proves why: a merged loser's mentions were repointed to the
+    # canonical (§7), so `mentions` is empty and the top-level `name` echoes
+    # the caller's subject — the UUID they already had. Without these fields,
+    # exchanging a citation returns nothing at all, from the tool whose
+    # instructions promise "exchange ids from citations for full content".
+    entity = merged["entities"][0]
+    assert entity["mentions"] == []  # the zero-mention case, not a contrived one
+    assert entity["name"] == f"Entity {merged_id}"
+    assert entity["type"] == "ORG"
+    assert entity["attributes"] == {"founded": 1984}

@@ -1637,6 +1637,15 @@ async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
         }
 
 
+def _row_value(row: Any, column: str) -> Any:
+    """One column off an entity row, or None when the row is absent.
+
+    The row lookup and the mention lookup are separate reads, so a row can go
+    missing between them (a concurrent activation). Introspection answers with
+    what it HAS — nulls beside the id — rather than raising (§22)."""
+    return getattr(row, column, None) if row is not None else None
+
+
 async def _entity_ids_by_citation_id(repo: Any, subject: str) -> list[uuid.UUID]:
     """A UUID-shaped subject → the ACTIVE entity it names, or ``[]``.
 
@@ -1733,8 +1742,10 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
     # otherwise read a merged entity as the current one and carry it forward as
     # fact. Emitted for the name path too — "active" there is informative, not
     # noise, and one shape beats two.
-    status_rows = await repo.fetch_all(tables.entities, tables.entities.c.id.in_(entity_ids))
-    status_by_id = {row.id: row.status for row in status_rows}
+    rows_by_id = {
+        row.id: row
+        for row in await repo.fetch_all(tables.entities, tables.entities.c.id.in_(entity_ids))
+    }
     return {
         "project": project,
         "build_id": str(repo.build_id),
@@ -1744,7 +1755,21 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
         "entities": [
             {
                 "id": str(entity_id),
-                "status": status_by_id.get(entity_id),
+                # The entity's OWN identifying content, not just its id. On the
+                # name path the caller already knew the name; on the CITATION-ID
+                # path they did not — and the top-level ``name`` echoes their
+                # subject, which is then the same UUID they came in with. Without
+                # these fields, exchanging a citation returned the id you already
+                # had plus a status: no content, from the tool whose instructions
+                # promise "exchange ids from citations for full content" (Codex
+                # #166). Sharpest for a MERGED member, whose mentions were
+                # repointed to the canonical (§7) — that entity has zero mentions,
+                # so these fields are the ONLY thing identifying what was cited.
+                # Field names match list_entities' page rows (id/name/type).
+                "name": _row_value(rows_by_id.get(entity_id), "canonical_name"),
+                "type": _row_value(rows_by_id.get(entity_id), "type"),
+                "attributes": _row_value(rows_by_id.get(entity_id), "attributes"),
+                "status": _row_value(rows_by_id.get(entity_id), "status"),
                 "mentions": [
                     {
                         "source_type": ref.source_type,
