@@ -588,8 +588,11 @@ async def count_active_jobs(conn: AsyncConnection, project: str) -> int:
     The delete guard now reads :func:`active_job_ids` (its refusal has to NAME
     the jobs, #151); this is the gauge side of that same population —
     ``/health``'s ``counts.active_jobs``, which exists to explain that refusal.
-    Both must count the same rows, so they share this predicate rather than
-    transcribing it."""
+    Both must count the same rows. What they actually share is the STATUS
+    VOCABULARY (``_ACTIVE_STATUSES``) — the where-clause itself is written out
+    at each of its three readers (here, :func:`active_job_ids`, and the
+    JOB_CONFLICT exclusivity probe), so the vocabulary is the single source
+    that keeps them agreeing."""
     return int(
         (
             await conn.execute(

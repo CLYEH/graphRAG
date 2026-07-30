@@ -38,7 +38,12 @@ SEMANTICS (spec-first — the judge-surface lesson):
     Ontology proposals are not build-scoped and stay project-wide.
 - **Metrics** are point-in-time counts, active-build-scoped where the metric
   is about content (docs/chunks/entities/relations), project-scoped where it
-  is about workflow (builds, pending review). ``low_confidence_relations``
+  is about workflow (builds, pending review, in-flight jobs).
+  ``active_jobs`` counts queued/running jobs THROUGH ``count_active_jobs`` —
+  the delete guard refuses on that same population, and this gauge exists to
+  answer the "wait for what" its refusal raises, so a transcribed predicate
+  here would fork the denominator from the thing it explains.
+  ``low_confidence_relations``
   counts ACTIVE relations with ``confidence < LOW_CONFIDENCE_BELOW`` (🔧 the
   module constant is the ONE tuning point — the /relations confidence facet
   reads the same constant, so gauge and list can never disagree; GOV2-facet);
