@@ -898,7 +898,12 @@ async def _resolvable_evidence_ids(
         # "degradation, never a 500". Deterministic batch boundaries (sorted).
         for start in range(0, len(wanted), _GROUNDING_BATCH):
             batch = wanted[start : start + _GROUNDING_BATCH]
-            for row in await repo.fetch_all(table, table.c.id.in_(batch)):
+            # ID-ONLY: fetch_all would select every column, and on `documents`
+            # that is `raw` — the whole document — for a question whose answer
+            # is a primary key. A batch of a thousand candidates would transfer
+            # hundreds of full documents to read nothing but their ids, on the
+            # path that runs precisely BECAUSE evidence counts are large.
+            for row_id in await repo.existing_ids(table, batch):
                 # the ANSWER carries what the question was keyed on. A flat
                 # set of spellings would let a chunk row's legitimate
                 # grounding vouch for a document ref that merely shares its
@@ -906,7 +911,7 @@ async def _resolvable_evidence_ids(
                 # at the return boundary.
                 resolvable.update(
                     (source_type, spelling)
-                    for spelling in candidates.get((source_type, row.id), ())
+                    for spelling in candidates.get((source_type, row_id), ())
                 )
     return frozenset(resolvable)
 

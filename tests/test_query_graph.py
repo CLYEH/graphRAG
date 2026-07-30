@@ -178,6 +178,14 @@ class _FakeSoR:
         )
         self._stored_documents = stored_documents if stored_documents is not None else set()
 
+    async def existing_ids(self, table: Any, ids: Any) -> set[uuid.UUID]:
+        """Mirrors BuildScopedRepo.existing_ids: ID-ONLY, and it must HONOUR
+        the ids it is asked about. A fake that answered from its whole stored
+        set would once again supply discrimination the production query cannot
+        — the failure that hid a cross-type defect two rounds ago."""
+        stored = self._stored_chunks if table.name == "chunks" else self._stored_documents
+        return {row_id for row_id in ids if row_id in stored}
+
     async def fetch_all(self, table: Any, *where: Any) -> list[Any]:
         stored = self._stored_chunks if table.name == "chunks" else self._stored_documents
         # HONOUR the IN predicate. A fake that returns every stored row answers
