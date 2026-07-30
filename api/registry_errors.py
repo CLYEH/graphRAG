@@ -75,6 +75,12 @@ def translate_registry_error(exc: Exception) -> ApiError:
         return ApiError(
             ErrorCode.VALIDATION_ERROR,  # GAP: no frozen "active jobs"/conflict code
             str(exc),
-            details={"project": exc.name, "jobs": exc.count},
+            # the ids make the message's remedy walkable — GET /jobs/{id} and
+            # POST /jobs/{id}/cancel both exist; only the ids were missing (#151)
+            details={
+                "project": exc.name,
+                "jobs": exc.count,
+                "job_ids": [str(job_id) for job_id in exc.job_ids],
+            },
         )
     raise exc

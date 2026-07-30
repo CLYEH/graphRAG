@@ -250,6 +250,25 @@ async def health_report(
             ),
         ),
     }
+    # Jobs IN FLIGHT (#151). §19's other counts are all about the build's
+    # CONTENT, which is why a project with a queued job read as entirely clean:
+    # /builds shows nothing (the job may not have minted a build yet), /health
+    # said healthy, and /metrics agreed — while that same job refuses DELETE.
+    # An operator following the refusal's "wait or cancel them first" had no
+    # surface answering "wait for what".
+    #
+    # A COUNT is the whole change available here without touching the frozen
+    # contract: HealthStatus's enum has no value for "busy" (and a job in
+    # flight is not unhealthy — it is the normal build path), and WarningCode
+    # has none either (STORE_UNAVAILABLE would be a lie, PARTIAL_RESULTS is
+    # about degraded retrieval). counts is additionalProperties-typed, so the
+    # number rides the frozen shape as-is.
+    metrics["active_jobs"] = await _count(
+        conn,
+        sa.select(sa.func.count())
+        .select_from(tables.jobs)
+        .where(tables.jobs.c.project == project, tables.jobs.c.status.in_(("queued", "running"))),
+    )
     # §19's "pending review" is the WHOLE §17 queue — ANY of its pending
     # states alone must light Needs review (Codex rounds 4/8: a
     # proposal-only or needs_review-only backlog was hidden)

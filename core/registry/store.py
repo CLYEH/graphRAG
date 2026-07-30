@@ -12,7 +12,7 @@ to the frozen error codes; SQL never leaks upward.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -89,10 +89,16 @@ class ProjectHasActiveJobsError(Exception):
     (the jobs row would CASCADE away mid-run). Refuse until it finishes or is
     cancelled."""
 
-    def __init__(self, name: str, count: int) -> None:
-        super().__init__(f"project {name!r} has {count} active job(s); wait or cancel them first")
+    def __init__(self, name: str, job_ids: Sequence[uuid.UUID]) -> None:
+        super().__init__(
+            f"project {name!r} has {len(job_ids)} active job(s); wait or cancel them first"
+        )
         self.name = name
-        self.count = count
+        self.count = len(job_ids)
+        #: The blocking jobs, so the message's named remedy is walkable: the
+        #: caller can GET /jobs/{id} and POST /jobs/{id}/cancel. Without them
+        #: the instruction pointed at ids no endpoint exposes (#151).
+        self.job_ids = list(job_ids)
 
 
 class _Unset:
@@ -311,9 +317,9 @@ async def delete_project(conn: AsyncConnection, name: str) -> bool:
     )
     if builds_count > 0:
         raise ProjectHasBuildsError(name, builds_count)
-    active_jobs = await jobs.count_active_jobs(conn, name)
-    if active_jobs > 0:
-        raise ProjectHasActiveJobsError(name, active_jobs)
+    blocking = await jobs.active_job_ids(conn, name)
+    if blocking:
+        raise ProjectHasActiveJobsError(name, blocking)
     for tbl in _PROJECT_SCOPED_CARRYFORWARD:
         await conn.execute(tbl.delete().where(tbl.c.project == name))
     result = await conn.execute(tables.projects.delete().where(tables.projects.c.name == name))

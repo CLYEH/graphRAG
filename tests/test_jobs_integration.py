@@ -271,7 +271,7 @@ async def test_delete_project_refuses_while_a_job_is_active(migrated: None) -> N
         await engine.dispose()
 
 
-async def test_delete_project_locks_the_row_before_counting_jobs(
+async def test_delete_project_locks_the_row_before_reading_active_jobs(
     migrated: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Execution-level proof the count-then-delete TOCTOU is closed. The race is
@@ -279,7 +279,7 @@ async def test_delete_project_locks_the_row_before_counting_jobs(
     create_job committing there is silently CASCADE-removed. The fix takes
     FOR UPDATE on the projects row BEFORE the count, so a competing
     FOR KEY SHARE (exactly a create_job FK insert's lock) is already blocked
-    during that window. We pause inside count_active_jobs (after the lock, before
+    during that window. We pause inside active_job_ids (after the lock, before
     the delete) and probe with NOWAIT — without the pre-count lock the row is
     still free there, so this test fails; the DELETE's own lock (which happens
     later) would mask the bug if we probed after delete_project returned."""
@@ -294,14 +294,20 @@ async def test_delete_project_locks_the_row_before_counting_jobs(
     project = _proj()
     entered = asyncio.Event()
     release = asyncio.Event()
-    real_count = jobs_mod.count_active_jobs
+    # instruments the call the DELETE PATH actually makes. It reads the
+    # blocking ids rather than a bare count (#151 — the refusal has to name
+    # jobs the caller can reach), but the guarantee under test is unchanged:
+    # the projects row is locked BEFORE this read, so a competing create_job
+    # cannot slip into the window. Patching the function that is no longer on
+    # the path would silently stop instrumenting anything.
+    real_lookup = jobs_mod.active_job_ids
 
-    async def paused_count(conn: object, name: str) -> int:
+    async def paused_lookup(conn: object, name: str) -> list[uuid.UUID]:
         entered.set()
         await release.wait()
-        return await real_count(conn, name)  # type: ignore[arg-type]
+        return await real_lookup(conn, name)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(jobs_mod, "count_active_jobs", paused_count)
+    monkeypatch.setattr(jobs_mod, "active_job_ids", paused_lookup)
     try:
         async with engine.connect() as setup:
             await create_project(setup, name=project)
@@ -331,7 +337,7 @@ async def test_delete_project_locks_the_row_before_counting_jobs(
             await deleter
     finally:
         async with engine.connect() as cleanup:
-            monkeypatch.setattr(jobs_mod, "count_active_jobs", real_count)
+            monkeypatch.setattr(jobs_mod, "active_job_ids", real_lookup)
             await delete_project(cleanup, project)
             await cleanup.commit()
         await engine.dispose()

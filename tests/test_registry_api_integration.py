@@ -280,7 +280,23 @@ async def test_error_mappings(api: tuple[AsyncClient, AsyncConnection]) -> None:
     blocked_jobs = await client.delete(f"/projects/{jobless}")
     assert blocked_jobs.status_code == 400
     assert blocked_jobs.json()["error"]["code"] == "VALIDATION_ERROR"
-    assert blocked_jobs.json()["error"]["details"]["jobs"] == 1
+    details = blocked_jobs.json()["error"]["details"]
+    assert details["jobs"] == 1
+    # ...and the REMEDY the message names must be walkable (#151). It says
+    # "wait or cancel them first", but with only a count the caller could not
+    # reach the job: no listing endpoint exposes it and /builds, /health and
+    # /metrics all reported the project as clean. The ids close that loop —
+    # GET /jobs/{id} and POST /jobs/{id}/cancel already exist.
+    assert "wait or cancel them first" in blocked_jobs.json()["error"]["message"]
+    blocking = details["job_ids"]
+    assert len(blocking) == 1
+    reachable = await client.get(f"/jobs/{blocking[0]}")
+    assert reachable.status_code == 200, "the error named a job id the API cannot serve"
+    assert reachable.json()["data"]["project"] == jobless
+
+    # ...and the project no longer reads as clean while that job is in flight
+    health = await client.get(f"/projects/{jobless}/health")
+    assert health.json()["data"]["counts"]["active_jobs"] == 1
 
 
 async def test_request_validation(api: tuple[AsyncClient, AsyncConnection]) -> None:
