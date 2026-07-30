@@ -11,6 +11,16 @@ metadata:
 散落在已刪除記憶檔裡仍然「活著」的 follow-ups,集中一處(狀態以 TASKS.md/
 GitHub 為準;立案或了結後從本檔劃掉):
 
+- **`global_reports._known_entity_ids` 用 SELECT * 做存在性檢查**(BUG153/PR #166
+  review 的同類掃描,未順手修):它批次呼叫 `repo.fetch_all(tables.entities,
+  id.in_(batch))` 卻只讀 `row.id`,而 `entities` 帶 `attributes` JSONB + 12 個
+  欄位;批次上限 1000,等於為了拿主鍵搬運整批實體。BUG153 已為此新增
+  `BuildScopedRepo.existing_ids()`(只投影 id、scope 注入沿用 `_select`),
+  這裡是 drop-in:`known.update(await repo.existing_ids(tables.entities, batch))`
+  加上 `tests/test_query_global.py` 的 fake 更新,約 15 行。**沒有順手修的理由**:
+  它是 PR #166 沒碰過的接縫,而該 PR 已進行到 Codex 第五輪;在收斂中的 PR 上
+  展開新模組會把審查面重開。屬獨立小任務。
+
 - **useCancelJob 無 Idempotency-Key**(FE8 殘留,owner deferred):Console 寫入
   的 retry-safe 一致性缺一角;FE5 同類已修。小任務量級。
 - **ontology-configuration UI**(FE1 殘留,owner 未授權):Import 頁只 surface

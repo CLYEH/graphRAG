@@ -390,7 +390,12 @@ async def test_existing_ids_projects_only_the_key_and_keeps_the_build_scope(
             # primary key. The ROWS look identical either way, which is why
             # this is asserted on the statement.
             assert "documents.raw" not in emitted
-            assert "select documents.id" in emitted
+            # the select LIST, not a substring of it: "select documents.id" is
+            # still present in "select documents.id, documents.project, …,
+            # documents.raw, …", so a containment check cannot fail for the
+            # defect this test names
+            select_list = emitted.split("from documents")[0].strip()
+            assert select_list == "select documents.id", select_list
             assert "build_id" in emitted  # ...and the scope survived the projection
 
             await trans.rollback()

@@ -186,23 +186,6 @@ class _FakeSoR:
         stored = self._stored_chunks if table.name == "chunks" else self._stored_documents
         return {row_id for row_id in ids if row_id in stored}
 
-    async def fetch_all(self, table: Any, *where: Any) -> list[Any]:
-        stored = self._stored_chunks if table.name == "chunks" else self._stored_documents
-        # HONOUR the IN predicate. A fake that returns every stored row answers
-        # a question the real store cannot be asked, and that infidelity is not
-        # inert: it supplied the discrimination for a cross-type test that could
-        # not otherwise fail, hiding a real defect behind a green suite. A
-        # fake's simplification is a claim about the CURRENT consumer, and it
-        # expires silently the moment the consumer gains an axis — here, when
-        # grounding started asking per-TABLE rather than per-id.
-        asked: set[uuid.UUID] | None = None
-        for clause in where:
-            value = getattr(getattr(clause, "right", None), "value", None)
-            if isinstance(value, list | tuple | set):
-                asked = set(value)
-        rows = stored if asked is None else stored & asked
-        return [SimpleNamespace(id=row_id) for row_id in sorted(rows, key=str)]
-
     async def entity_ids_by_name(self, name: str) -> list[uuid.UUID]:
         return self._seeds.get(name.lower(), [])
 
