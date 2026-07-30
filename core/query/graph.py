@@ -431,6 +431,12 @@ async def _verified_path_result(
         # fall through to `id` — putting the ref no get_* tool accepts first on
         # the ORDINARY path, which is the very thing this task exists to fix.
         # The type component costs no read and restores that order.
+        # Two refs naming the SAME row are not redundant: two spellings imply
+        # at least one free-form ref, and §27.4's identity is
+        # `relation_signature | evidence_ref | norm(quote)` — so they are
+        # distinct evidence ROWS, separated on evidence_ref whatever the
+        # quotes say. Collapsing them by row would drop a citation, not a
+        # duplicate.
         usable.sort(
             key=lambda ref: (
                 0 if (ref.source_type, ref.id) in resolvable else 1,
