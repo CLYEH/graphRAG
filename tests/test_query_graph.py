@@ -1579,3 +1579,42 @@ async def test_a_pruned_chunks_ref_does_not_outrank_a_live_one() -> None:
     ids = [r.id for r in response.results[0].source_refs]
     assert str(live) in ids, "a pruned chunk's ref outranked the only live one"
     assert response.warnings[0].code == "TRUNCATED"  # the clip is still surfaced
+
+
+async def test_an_under_cap_edge_still_lists_its_resolvable_ref_first() -> None:
+    """The cap gate must not reorder the COMMON path.
+
+    Grounding is cap-gated: below the cap nothing is withheld, so paying for a
+    store read would buy no decision. But that leaves an under-cap edge with
+    nothing in `resolvable`, and if rank were grounding-only every ref would
+    tie and fall through to `id` — putting the ref no `get_*` tool accepts
+    first on the ordinary path, which is exactly what this task exists to fix.
+    A free shape component keeps the order right where the read is skipped.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    # a two-ref edge — far under the cap, so no grounding read happens. The
+    # row ref's id sorts BEFORE the chunk's, so an id-only fallback inverts them
+    chunk_id = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    rows = [
+        {
+            "evidence_type": "row",
+            "evidence_ref": "5:halls:001",
+            "quote": "q",
+            "source_uri": "file:///t.csv",
+        },
+        _chunk_evidence(chunk_id=chunk_id),
+    ]
+    sor = _FakeSoR(seeds={"a": [a], "b": [b]}, relations={(a, b, "works_at"): (rel_ab, rows)})
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    kinds = [r.source_type for r in response.results[0].source_refs]
+    assert kinds == ["relation", "chunk", "row"], "the unresolvable ref was listed first"
+    assert response.warnings == ()  # nothing withheld — no TRUNCATED

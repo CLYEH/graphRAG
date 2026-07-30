@@ -65,6 +65,13 @@ _TOOL = "graph_query"
 #: get_chunk on any ref that IS emitted (Codex #166).
 PATH_EVIDENCE_CAP = 8
 
+#: Evidence-grounding lookups run in batches of this many ids per query —
+#: same bind-limit reason as ``global_reports._GROUNDING_BATCH`` (PostgreSQL's
+#: extended protocol caps a statement at 32767 binds). Kept local rather than
+#: imported: it is a tuning number each grounding site owns, not a shared
+#: invariant two callers must agree on.
+_GROUNDING_BATCH = 1000
+
 #: The path refs-cap warning's message prefix; the full message names the
 #: capped PATH RESULT's id so hybrid_query can drop the warning when fusion
 #: clips that exact path off the fused page (the #123 class). Distinct from
@@ -406,7 +413,20 @@ async def _verified_path_result(
         # document. Eight such ids sorting ahead of the one live chunk would
         # take every slot and leave the path uncitable again (Codex #166).
         # Order stays total (rank, id, quote), so the cap is deterministic.
-        usable.sort(key=lambda ref: (0 if ref.id in resolvable else 1, ref.id, _quote_of(ref)))
+        # Store truth first where it was paid for, SHAPE as the free tiebreak
+        # everywhere else. The grounding read is cap-gated, so under-cap edges
+        # have nothing in `resolvable` and would otherwise tie at rank 1 and
+        # fall through to `id` — putting the ref no get_* tool accepts first on
+        # the ORDINARY path, which is the very thing this task exists to fix.
+        # The type component costs no read and restores that order.
+        usable.sort(
+            key=lambda ref: (
+                0 if ref.id in resolvable else 1,
+                0 if ref.source_type in {"chunk", "document"} else 1,
+                ref.id,
+                _quote_of(ref),
+            )
+        )
         cited.extend(usable[:PATH_EVIDENCE_CAP])
         omitted += max(0, len(usable) - PATH_EVIDENCE_CAP)
     refs = tuple(cited)
@@ -833,10 +853,19 @@ async def _resolvable_evidence_ids(
                 document_ids.add(parsed)
     resolvable: set[str] = set()
     for table, wanted in ((tables.chunks, chunk_ids), (tables.documents, document_ids)):
-        if not wanted:
-            continue
-        rows = await repo.fetch_all(table, table.c.id.in_(sorted(wanted)))
-        resolvable.update(str(row.id) for row in rows)
+        # BATCHED for the same reason global_reports._GROUNDING_BATCH exists:
+        # the IN predicate binds one parameter per id and PostgreSQL's extended
+        # protocol caps a statement at 32767 binds. This path runs BECAUSE the
+        # evidence count is large, and an overflow here would raise a driver
+        # error that graph_query's `except (Neo4jError, ServiceUnavailable)`
+        # does not catch — a 500 out of the module whose contract is
+        # "degradation, never a 500". Deterministic batch boundaries (sorted),
+        # though the union is order-independent either way.
+        ordered = sorted(wanted)
+        for start in range(0, len(ordered), _GROUNDING_BATCH):
+            batch = ordered[start : start + _GROUNDING_BATCH]
+            rows = await repo.fetch_all(table, table.c.id.in_(batch))
+            resolvable.update(str(row.id) for row in rows)
     return frozenset(resolvable)
 
 
