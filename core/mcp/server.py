@@ -1084,7 +1084,12 @@ def build_server(project: str) -> FastMCP:
 
         async def _run(deps: Any, _remaining_ms: int) -> McpResponse:
             return await run_sql(
-                deps.sql_reader, deps.llm, rt.policy.sql_policy(), query, rt.policy.sql_rows()
+                deps.sql_reader,
+                deps.llm,
+                rt.policy.sql_policy(),
+                query,
+                rt.policy.sql_rows(),
+                expose_debug=rt.policy.expose_debug,
             )
 
         return await _bounded(rt, "sql_query", query, _run)

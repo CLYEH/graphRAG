@@ -13,6 +13,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -22,7 +23,11 @@ from llama_index.core.llms import LLM
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from core.graph.structured import row_source_ref
-from core.query.policy import SQL_BLOCKED_KEYWORDS_MIN, TextToSql
+from core.query.policy import (
+    GUARDRAIL_WARNING_CODE,
+    SQL_BLOCKED_KEYWORDS_MIN,
+    TextToSql,
+)
 from core.query.results import McpResponse
 from core.query.sql import sql_query
 from core.stores.sqlreader import BuildScopedSqlReader
@@ -120,7 +125,13 @@ class _FakeReader:
         return list(self._rows), self._truncated
 
 
-def _run(reader: _FakeReader, llm: _FakeLLM, policy: TextToSql = _POLICY) -> McpResponse:
+def _run(
+    reader: _FakeReader,
+    llm: _FakeLLM,
+    policy: TextToSql = _POLICY,
+    *,
+    expose_debug: bool = False,
+) -> McpResponse:
     import asyncio
 
     return asyncio.run(
@@ -129,6 +140,7 @@ def _run(reader: _FakeReader, llm: _FakeLLM, policy: TextToSql = _POLICY) -> Mcp
             cast(LLM, llm),
             policy,
             "how many orders",
+            expose_debug=expose_debug,
             max_rows=policy.max_rows,
         )
     )
@@ -309,3 +321,63 @@ def test_a_fenced_llm_reply_is_unwrapped() -> None:
     response = _run(reader, _FakeLLM("```sql\nSELECT * FROM orders\n```"))
     _VALIDATOR.validate(response.to_dict())
     assert len(response.results) == 1 and response.warnings == ()
+
+
+def test_the_generated_sql_is_surfaced_when_debug_is_authorised() -> None:
+    """An empty answer is unreadable without the SQL that produced it.
+
+    The caller sends a QUESTION; the rows come from a machine translation of it
+    they never see. So "0 rows" carries two completely different meanings — the
+    data does not match, or the model understood something else — and nothing in
+    the response distinguishes them. Every refusal path here already emits a
+    typed warning, so the silent-empty case is precisely the one where NOTHING
+    was refused and the caller has no other handle.
+
+    This is provenance, not an answerability verdict: §19/MCP4 measured that one
+    and refused it (out-of-domain questions outscored in-domain ones, so no
+    threshold separates them). Saying WHAT RAN needs no such judgement.
+    """
+    reader = _FakeReader(rows=[])
+    response = _run(reader, _FakeLLM("SELECT * FROM orders"), expose_debug=True)
+
+    assert response.results == ()
+    assert response.warnings == ()  # nothing was refused — that is the whole problem
+    assert response.debug is not None
+    plan = response.debug["retrieval_plan"]
+    assert any("orders" in line for line in plan), plan
+    assert response.debug["stores_used"] == ["postgres"]
+    assert response.debug["latency_ms"] >= 0
+
+
+def test_debug_is_withheld_unless_the_caller_is_authorised() -> None:
+    """§16/§21 gate it — the SQL names real tables and columns, so it is not
+    free to hand out. The DEFAULT must be closed: a caller that forgets to pass
+    the flag gets nothing, rather than the schema leaking on every call."""
+    reader = _FakeReader(rows=[])
+    assert _run(reader, _FakeLLM("SELECT * FROM orders")).debug is None
+
+
+def test_a_refused_query_still_shows_what_was_refused() -> None:
+    """The guardrail case is where the SQL matters MOST: the caller gets a
+    reason but, without this, no way to see the statement it applied to. The
+    REFUSED candidate is what is shown — not a sanitised version — because the
+    question 'what did my prompt turn into?' is the one being answered."""
+    reader = _FakeReader(rows=[])
+    response = _run(reader, _FakeLLM("DELETE FROM orders"), expose_debug=True)
+
+    assert [w.code for w in response.warnings] == [GUARDRAIL_WARNING_CODE]
+    assert response.debug is not None
+    assert any("DELETE FROM orders" in line for line in response.debug["retrieval_plan"])
+
+
+def test_a_disabled_mode_says_so_rather_than_showing_nothing() -> None:
+    """No SQL exists on this path, and that IS the answer to "what ran" — the
+    block still has to appear, or an authorised caller cannot tell a disabled
+    mode from a mode that ran and found nothing."""
+    disabled = replace(_POLICY, enabled=False)
+    response = _run(_FakeReader(rows=[]), _FakeLLM("SELECT 1"), disabled, expose_debug=True)
+
+    assert [w.code for w in response.warnings] == ["MODE_SKIPPED"]
+    assert response.debug is not None
+    assert any("disabled" in line for line in response.debug["retrieval_plan"])
+    assert not any("generated:" in line for line in response.debug["retrieval_plan"])

@@ -212,7 +212,14 @@ async def query_sql_endpoint(request: Request, project: str, body: QueryRequest)
             # of the SAME shared envelope, not a facade divergence.
             ceiling = policy.sql_rows()
             rows = min(policy.top_k(body.top_k), ceiling) if body.top_k is not None else ceiling
-            return await run_sql(deps.sql_reader, deps.llm, policy.sql_policy(), body.query, rows)
+            return await run_sql(
+                deps.sql_reader,
+                deps.llm,
+                policy.sql_policy(),
+                body.query,
+                rows,
+                expose_debug=policy.expose_debug,
+            )
 
         return _run
 
