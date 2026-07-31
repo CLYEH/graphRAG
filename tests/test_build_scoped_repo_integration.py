@@ -317,3 +317,87 @@ async def test_structural_or_predicates_cannot_widen_the_scope(migrated: None) -
             await trans.rollback()
     finally:
         await engine.dispose()
+
+
+async def test_existing_ids_projects_only_the_key_and_keeps_the_build_scope(
+    migrated: None,
+) -> None:
+    """An existence check must not pay for the row, and must not escape the build.
+
+    `fetch_all` selects every column, so asking `documents` "which of these
+    ids are still here" would transfer `raw` — the whole document — for an
+    answer that is a primary key. On the caller that motivated this
+    (evidence grounding, core/query/graph.py) a batch is up to 1000 ids, so
+    that is hundreds of full documents read for nothing, on the code path
+    that runs precisely BECAUSE the evidence count is large.
+
+    Pinned on the COMPILED statement rather than the result, because a
+    correct-looking result is exactly what a `SELECT *` would also produce —
+    the defect is invisible from the rows. The scope half is pinned on
+    behaviour: a stale build's document must not answer.
+    """
+    engine = _engine()
+    project = f"itest-{uuid.uuid4().hex[:10]}"
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            active = await _insert_build(conn, project, "active")
+            stale = await _insert_build(conn, project, "ready")
+            # inserted here rather than through _insert_document: this test
+            # needs the ids back, and widening the shared helper's return would
+            # touch every other caller for one test's convenience
+            doc_ids: list[uuid.UUID] = []
+            for build in (active, stale):
+                doc_ids.append(
+                    (
+                        await conn.execute(
+                            documents.insert()
+                            .values(
+                                project=project,
+                                build_id=build,
+                                source_uri=f"s3://bucket/{build}",
+                                content_hash=f"c-{build}",
+                                raw="x" * 4096,  # the column an existence check must not read
+                            )
+                            .returning(documents.c.id)
+                        )
+                    ).scalar_one()
+                )
+            live_doc, stale_doc = doc_ids
+
+            repo = await BuildScopedRepo.for_active_build(conn, project)
+
+            # OBSERVE the statement the method actually issues. Compiling a
+            # query the test builds itself would assert on the test's own
+            # construction — a checker that is its own consumer, which passes
+            # whatever production does.
+            issued: list[str] = []
+
+            def _record(_conn, _cursor, statement, *_args):  # type: ignore[no-untyped-def]
+                issued.append(statement)
+
+            sa.event.listen(conn.sync_connection, "before_cursor_execute", _record)
+            try:
+                found = await repo.existing_ids(documents, [live_doc, stale_doc])
+            finally:
+                sa.event.remove(conn.sync_connection, "before_cursor_execute", _record)
+
+            assert found == {live_doc}, "a stale build's row answered an active-build check"
+            assert len(issued) == 1
+            emitted = issued[0].lower()
+            # id and nothing else — `raw` is the whole document, and a batch of
+            # a thousand candidates would transfer hundreds of them to read a
+            # primary key. The ROWS look identical either way, which is why
+            # this is asserted on the statement.
+            assert "documents.raw" not in emitted
+            # the select LIST, not a substring of it: "select documents.id" is
+            # still present in "select documents.id, documents.project, …,
+            # documents.raw, …", so a containment check cannot fail for the
+            # defect this test names
+            select_list = emitted.split("from documents")[0].strip()
+            assert select_list == "select documents.id", select_list
+            assert "build_id" in emitted  # ...and the scope survived the projection
+
+            await trans.rollback()
+    finally:
+        await engine.dispose()

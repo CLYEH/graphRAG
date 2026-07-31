@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from sqlalchemy.pool import NullPool
 
 from core.config import get_settings
-from core.query.graph import GraphQueryParams, graph_query
+from core.query.graph import PATH_EVIDENCE_CAP, GraphQueryParams, graph_query
 from core.query.policy import CYPHER_ALLOWED_CLAUSES, CYPHER_BLOCKED_MIN, TextToCypher
 from core.resolve import fingerprints
 from core.stores.graph import BuildScopedGraphProjector, BuildScopedGraphRepo, graph_driver
@@ -167,6 +167,14 @@ async def _relation(
         relation_id=relation_id,
         evidence_type="chunk",
         evidence_ref=f"ev-{relation_id}",
+        # DELIBERATELY names no chunk row. §27.4 keeps relation_evidence after
+        # the chunk it quotes is pruned (chunk_id is not an FK), so this fixture
+        # has always modelled the TOLERATED dangling state rather than the
+        # ordinary one — harmless here because a single-evidence edge never
+        # reaches a decision that depends on the chunk existing. Any future
+        # assertion about "the chunk behind this evidence" is testing
+        # prune-survival semantics whether or not its author meant to; seed a
+        # real chunk locally (as the cap-grounding test does) if you need one.
         chunk_id=uuid.uuid4(),
         start_offset=0,
         end_offset=10,
@@ -277,8 +285,14 @@ async def test_path_end_to_end_cites_every_edge(
         assert len(response.results) == 1
         path = response.results[0]
         assert path.result_type == "path"
-        assert len(path.source_refs) == 2  # §27.2: one ref per edge
-        assert all(ref.source_type == "relation" for ref in path.source_refs)
+        relation_refs = [ref for ref in path.source_refs if ref.source_type == "relation"]
+        assert len(relation_refs) == 2  # §27.2: one RELATION ref per edge
+        # ...each carrying the chunk evidence that makes it dereferenceable
+        # (#153) — against real stores, so the uri/quote/offsets a caller
+        # would actually exchange are proven present, not stubbed
+        chunk_refs = [ref for ref in path.source_refs if ref.source_type == "chunk"]
+        assert len(chunk_refs) == 2
+        assert all(ref.source_uri and ref.metadata.get("quote") for ref in chunk_refs)
         assert path.text == "Acme -[works_with]-> BobCo -[supplies]-> CarolInc"
     finally:
         await _cleanup(session, project)
@@ -393,7 +407,14 @@ async def test_a_stale_shortest_path_yields_the_longer_active_path(
         assert len(response.results) == 1
         path = response.results[0]
         assert path.text == "Acme -[works_with]-> BobCo -[supplies]-> CarolInc"
-        assert len(path.source_refs) == 2  # the ACTIVE 2-hop path, fully cited
+        # the ACTIVE 2-hop path, fully cited: one relation ref per edge plus
+        # each edge's exchangeable chunk evidence (#153)
+        assert [ref.source_type for ref in path.source_refs] == [
+            "relation",
+            "chunk",
+            "relation",
+            "chunk",
+        ]
         assert response.warnings == ()
     finally:
         await _cleanup(session, project)
@@ -429,5 +450,108 @@ async def test_a_drifted_entity_is_dropped_not_surfaced(
         assert str(b) not in ids  # the drifted entity is gone
         assert str(c) not in ids  # …and so is the node reachable only through it
         assert "PARTIAL_RESULTS" in [w.code for w in response.warnings]  # the drops are surfaced
+    finally:
+        await _cleanup(session, project)
+
+
+async def test_the_evidence_cap_grounds_its_ranking_in_postgres(
+    stores: tuple[AsyncConnection, AsyncSession],
+) -> None:
+    """The cap's "resolvable" rank, against real Postgres.
+
+    §27.4 keeps `relation_evidence` after the chunk it quotes is pruned —
+    `chunk_id` is deliberately not an FK — so a well-formed chunk id can name
+    a row that is simply gone. The unit fake answers that question from a set
+    the test hands it; only a real store proves the *query* asks it correctly
+    (right table, right column, and the build scope the repo injects).
+
+    This face has now been wrong three rounds running — by type, then by id
+    shape, then by existence — and each time the fake was adequate for the
+    criterion it was written against. That is what earns this test its tier.
+    """
+    conn, session = stores
+    project = f"graphq-{uuid.uuid4().hex[:10]}"
+    try:
+        writer = await _new_build(conn, project)
+        a = await _entity(writer, "Acme")
+        b = await _entity(writer, "BobCo")
+        relation_id = await _relation(writer, a, "works_with", b)
+
+        # one REAL chunk, whose id sorts last so an ungrounded rank clips it
+        document_id = uuid.uuid4()
+        await writer.insert(
+            documents,
+            id=document_id,
+            source_uri="file:///live.md",
+            raw="the live chunk",
+            content_hash=f"bb{uuid.uuid4().hex[:10]}",
+            mime="text/markdown",
+            metadata={},
+            ingested_at=NOW,
+        )
+        live_chunk = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+        await writer.insert(
+            chunks,
+            id=live_chunk,
+            document_id=document_id,
+            ordinal=0,
+            text="the live chunk",
+            token_count=3,
+            start_offset=0,
+            end_offset=14,
+        )
+
+        # …and a cap's worth of evidence whose chunks were PRUNED: well-formed
+        # ids, no rows behind them, all sorting before the live one
+        signature = fingerprints.relation_signature(a[1], "works_with", b[1])
+        for i in range(PATH_EVIDENCE_CAP + 1):
+            ref = f"pruned-{i:03d}"
+            await writer.insert(
+                relation_evidence,
+                id=uuid.uuid4(),
+                relation_id=relation_id,
+                evidence_type="chunk",
+                evidence_ref=ref,
+                chunk_id=uuid.UUID(f"0000000{i}-0000-4000-8000-000000000000"),
+                start_offset=0,
+                end_offset=10,
+                quote="the quote",
+                source_uri="file:///doc.txt",
+                evidence_hash=fingerprints.evidence_hash(signature, ref, "the quote"),
+                created_at=NOW,
+            )
+        live_ref = "live-evidence"
+        await writer.insert(
+            relation_evidence,
+            id=uuid.uuid4(),
+            relation_id=relation_id,
+            evidence_type="chunk",
+            evidence_ref=live_ref,
+            chunk_id=live_chunk,
+            start_offset=0,
+            end_offset=10,
+            quote="the quote",
+            source_uri="file:///live.md",
+            evidence_hash=fingerprints.evidence_hash(signature, live_ref, "the quote"),
+            created_at=NOW,
+        )
+        await conn.commit()
+        await _project_all(conn, session, writer)
+        await _activate(conn, writer.build_id)
+        await conn.commit()
+
+        graph, repo = await _bound(conn, session, project)
+        response = await graph_query(
+            graph,
+            repo,
+            _POLICY,
+            GraphQueryParams(template="path", entity="Acme", other_entity="BobCo", hops=3),
+            "how are they connected",
+            max_graph_hops=3,
+        )
+        _VALIDATOR.validate(response.to_dict())
+        ids = [ref.id for ref in response.results[0].source_refs]
+        assert str(live_chunk) in ids, "the only chunk that still exists was capped away"
+        assert [w.code for w in response.warnings] == ["TRUNCATED"]  # the clip is surfaced
     finally:
         await _cleanup(session, project)

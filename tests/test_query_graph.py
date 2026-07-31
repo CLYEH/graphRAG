@@ -21,7 +21,14 @@ import jsonschema
 import pytest
 from neo4j.exceptions import ClientError, ServiceUnavailable
 
-from core.query.graph import GraphQueryParams, graph_query, subgraph_context
+from core.query.graph import (
+    PATH_EVIDENCE_CAP,
+    GraphQueryParams,
+    capped_path_id,
+    graph_query,
+    path_refs_cap_warning,
+    subgraph_context,
+)
 from core.query.policy import CYPHER_ALLOWED_CLAUSES, CYPHER_BLOCKED_MIN, TextToCypher
 from core.query.results import McpResponse
 from core.stores.graph import BuildScopedGraphRepo
@@ -139,6 +146,8 @@ class _FakeSoR:
         relations: dict[tuple[uuid.UUID, uuid.UUID, str], tuple[uuid.UUID, list[dict[str, Any]]]]
         | None = None,
         pairs: set[tuple[uuid.UUID, uuid.UUID]] | None = None,
+        stored_chunks: set[uuid.UUID] | None = None,
+        stored_documents: set[uuid.UUID] | None = None,
     ) -> None:
         self.project = _PROJECT
         self.build_id = _BUILD
@@ -151,6 +160,31 @@ class _FakeSoR:
         self._pairs = (
             pairs if pairs is not None else {(src, dst) for (src, dst, _rtype) in self._relations}
         )
+        # Which chunk/document rows EXIST. The evidence cap ranks on whether an
+        # id resolves, not on its spelling — §27.4 lets relation_evidence keep a
+        # chunk_id whose chunk was pruned — so a fake that could not express
+        # "well-formed but gone" could not exercise the rank at all. Default:
+        # every chunk_id the fixture's evidence mentions exists, which is the
+        # ordinary case; a fixture that wants a dangling ref names its live rows.
+        self._stored_chunks = (
+            stored_chunks
+            if stored_chunks is not None
+            else {
+                chunk_id
+                for _rel, rows in self._relations.values()
+                for row in rows
+                if isinstance(chunk_id := row.get("chunk_id"), uuid.UUID)
+            }
+        )
+        self._stored_documents = stored_documents if stored_documents is not None else set()
+
+    async def existing_ids(self, table: Any, ids: Any) -> set[uuid.UUID]:
+        """Mirrors BuildScopedRepo.existing_ids: ID-ONLY, and it must HONOUR
+        the ids it is asked about. A fake that answered from its whole stored
+        set would once again supply discrimination the production query cannot
+        — the failure that hid a cross-type defect two rounds ago."""
+        stored = self._stored_chunks if table.name == "chunks" else self._stored_documents
+        return {row_id for row_id in ids if row_id in stored}
 
     async def entity_ids_by_name(self, name: str) -> list[uuid.UUID]:
         return self._seeds.get(name.lower(), [])
@@ -504,10 +538,81 @@ async def test_path_cites_every_edge_with_its_sor_relation() -> None:
     assert len(response.results) == 1
     result = response.results[0]
     assert result.result_type == "path"
-    assert len(result.source_refs) == 2  # one ref PER EDGE (§27.2)
-    assert all(ref.source_type == "relation" for ref in result.source_refs)
+    relation_refs = [ref for ref in result.source_refs if ref.source_type == "relation"]
+    assert len(relation_refs) == 2  # one relation ref PER EDGE (§27.2)
+    # ...and each edge's chunk evidence rides along, so the citation can be
+    # EXCHANGED for content (#153) — see the dedicated test below for why.
+    assert [ref.source_type for ref in result.source_refs] == [
+        "relation",
+        "chunk",
+        "relation",
+        "chunk",
+    ]
     assert result.text == "A -[works_at]-> B -[owns]-> C"
     assert response.warnings == ()
+
+
+async def test_a_path_citation_can_be_exchanged_for_content() -> None:
+    """A path's refs must include something an exposed tool can dereference.
+
+    §16 lets a ref be a bare relation id, but NO tool takes one: get_chunk
+    wants a chunk id, get_entity a name or entity id, list_entities matches
+    names. So a path whose only refs were relation ids advertised evidence
+    that could never be fetched, while the SUBGRAPH template returned the
+    SAME relations with their chunk evidence attached — one template citable,
+    the other not (#153). The server's initialize instructions promise
+    "get_* exchange ids from citations for full content"; this test is that
+    promise for paths.
+    """
+    graph, sor, _a, _b, _c = _path_fixture()
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="c", hops=3)
+    )
+    refs = response.results[0].source_refs
+    exchangeable = [ref for ref in refs if ref.source_type in {"chunk", "document"}]
+    assert exchangeable, "a path cited nothing any get_* tool could resolve"
+    assert all(ref.id for ref in exchangeable)
+    # the relation ref stays first per edge (the edge's identity) — pinned for
+    # readability, not because anything depends on the order: §20's
+    # path_validity selects refs by source_type
+    assert refs[0].source_type == "relation"
+
+
+async def test_an_uncited_edge_does_not_drop_the_path() -> None:
+    """Appending evidence must not import _relation_results' drop rule.
+
+    A subgraph edge with no usable evidence is DROPPED (§27.2: a relation
+    result cites ≥1 evidence). A path is a different claim: its rejection
+    rule is STALENESS — every node active, every edge resolving to an active
+    SoR relation. Letting citation count reject a path too would silently
+    shrink path results for a fix that was only ever about making the
+    EXISTING refs dereferenceable (#153).
+    """
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    rel_ab, rel_bc = uuid.uuid4(), uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B"), _node(c, "C")],
+            "rels": [
+                {"type": "works_at", "src": str(a), "dst": str(b)},
+                {"type": "owns", "src": str(b), "dst": str(c)},
+            ],
+        }
+    )
+    sor = _FakeSoR(
+        seeds={"a": [a], "c": [c]},
+        relations={
+            (a, b, "works_at"): (rel_ab, []),  # active relation, zero evidence
+            (b, c, "owns"): (rel_bc, [_chunk_evidence()]),
+        },
+    )
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="c", hops=3)
+    )
+    assert len(response.results) == 1, "an uncited edge must not sink the whole path"
+    assert response.results[0].text == "A -[works_at]-> B -[owns]-> C"
+    kinds = [ref.source_type for ref in response.results[0].source_refs]
+    assert kinds == ["relation", "relation", "chunk"]  # both edges cited, one uncorroborated
 
 
 async def test_a_backward_traversed_edge_renders_its_stored_direction() -> None:
@@ -1218,3 +1323,415 @@ async def test_context_edge_budget_takes_citable_edges_first() -> None:
     context = await _run_subgraph(graph, sor, seed, 1)
     assert context is not None
     assert [e["id"] for e in context.edges] == [rel_ok]  # the citable edge got the seat
+
+
+async def test_a_heavily_asserted_edge_caps_its_evidence_and_says_so() -> None:
+    """Per-edge evidence is capped, and the clip is surfaced — not silent.
+
+    #153 made path refs exchangeable by appending each edge's chunk evidence.
+    Uncapped that is a new cost: a relation asserted across hundreds of chunks
+    would serialize hundreds of provenance entries into ONE path result,
+    dominating the response without improving exchangeability — the caller
+    needs *an* id it can hand to get_chunk, not the roster. That is exactly
+    the reasoning mentions.MENTION_REFS_CAP and global_reports.REFS_CAP
+    already record, so the path face keeps the same discipline at the same
+    ceiling.
+
+    §22's rule is that a clip is REPORTED: refs the caller could have
+    exchanged were withheld, so a silent cap would let an agent conclude it
+    had seen all the evidence for an edge. And the cap must be deterministic
+    (SoR order, no sampling) or the same path would cite different sources
+    across calls, which breaks reproducibility of a cited answer.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    rows = [_chunk_evidence(chunk_id=uuid.uuid4()) for _ in range(PATH_EVIDENCE_CAP + 5)]
+    sor = _FakeSoR(seeds={"a": [a], "b": [b]}, relations={(a, b, "works_at"): (rel_ab, rows)})
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    refs = response.results[0].source_refs
+    chunk_refs = [ref for ref in refs if ref.source_type == "chunk"]
+    assert len(chunk_refs) == PATH_EVIDENCE_CAP  # capped, not all 13
+    assert len([r for r in refs if r.source_type == "relation"]) == 1  # edge identity kept
+
+    # the clip is SURFACED (§22) and names how many were withheld
+    assert [w.code for w in response.warnings] == ["TRUNCATED"]
+    assert "5 ref(s) omitted" in response.warnings[0].message
+
+    # Deterministic across a DIFFERENT DB ROW ORDER — the property that
+    # actually discriminates. relations_with_evidence selects with no ORDER BY,
+    # so the plan decides row order (seq vs index scan, a HOT update, a VACUUM).
+    # Uncapped that was cosmetic; a cap makes order SELECTIVE, so without a sort
+    # the same query on the same build would cite a different 8 chunks. Feeding
+    # the SAME rows in a shuffled order must produce the SAME refs — asserting a
+    # repeat call on one fake would only prove we don't shuffle or sample.
+    shuffled = list(reversed(rows))
+    assert shuffled != rows
+    other = _FakeSoR(seeds={"a": [a], "b": [b]}, relations={(a, b, "works_at"): (rel_ab, shuffled)})
+    again = await _run(
+        graph, other, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    assert [r.id for r in again.results[0].source_refs] == [r.id for r in refs]
+    # ...and the 8 that survive are the sort's first 8, not the fixture's
+    assert [r.id for r in chunk_refs] == sorted(str(row["chunk_id"]) for row in rows)[
+        :PATH_EVIDENCE_CAP
+    ]
+
+
+async def test_an_edge_within_the_cap_warns_about_nothing() -> None:
+    """The cap must not manufacture a TRUNCATED for a path that lost nothing —
+    a warning channel that fires when nothing was withheld trains callers to
+    ignore it (and §22 truncation is supposed to mean refs exist that you did
+    not get)."""
+    graph, sor, _a, _b, _c = _path_fixture()  # one chunk evidence row per edge
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="c", hops=3)
+    )
+    assert response.warnings == ()
+
+
+def test_the_refs_cap_warning_round_trips_a_colon_bearing_path_id() -> None:
+    """Builder and parser must agree on an id that CONTAINS the separator.
+
+    A path id is f"path:{src}->{dst}", so it carries colons — unlike the bare
+    UUID `global_reports.capped_report_id` parses, whose shape invites
+    partitioning on the FIRST colon. Doing that here returns "path", which
+    matches no result — and hybrid's predicate keeps a warning only when the
+    parse says "not ours" (None) or names a path still on the page, so an
+    unmatched non-None id is dropped EITHER WAY. The clip notice then vanishes
+    for a path the caller actually received: a §22 truncation silently
+    suppressed, not a warning outliving its subject. Pinned as a round trip so
+    builder and parser cannot drift apart.
+    """
+    path_id = f"path:{uuid.uuid4()}->{uuid.uuid4()}"
+    warning = path_refs_cap_warning(path_id, 5)
+    assert warning.code == "TRUNCATED"
+    assert capped_path_id(warning.message) == path_id
+    # ...through hybrid's origin prefix too, whatever the mode is called
+    assert capped_path_id(f"[graph] {warning.message}") == path_id
+    assert capped_path_id(f"[some_future_mode] {warning.message}") == path_id
+    # and it must not claim unrelated messages
+    assert capped_path_id("result truncated to the top_k=20 ceiling (§21)") is None
+    assert capped_path_id("") is None
+
+
+def _uuid_shaped(value: str) -> bool:
+    """Whether a ref id is a UUID — what makes it exchangeable via get_*."""
+    try:
+        uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
+async def test_the_cap_never_drops_the_only_exchangeable_ref() -> None:
+    """An edge's ONE usable citation must survive the cap.
+
+    Sorting on id alone let unexchangeable refs sort ahead of the usable one
+    and the slice then removed it — a capped path whose citations cannot be
+    turned into content, i.e. #153 reintroduced by #153's own fix. Which refs
+    are usable is narrower than their type: `get_chunk` takes a chunk UUID,
+    but evidence_ref falls back to the free-form evidence_ref column when
+    chunk_id is NULL; a `manual` row becomes a `document` ref carrying that
+    same free-form value (§27.2 leaves its encoding unfrozen); and a `row` ref
+    has no get_* resolver at all. So the rank keys on the ID's shape.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    # the one exchangeable ref carries a uuid that sorts LAST, so an id-only
+    # sort would place every unexchangeable ref ahead of it and clip it away
+    winner = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    rows: list[dict[str, Any]] = [
+        {
+            "evidence_type": "row",
+            "evidence_ref": f"5:halls:{i:03d}",  # {len(table)}:{table}:{pk}
+            "quote": "q",
+            "source_uri": "file:///t.csv",
+        }
+        for i in range(PATH_EVIDENCE_CAP + 4)
+    ]
+    rows.append(_chunk_evidence(chunk_id=winner))
+    sor = _FakeSoR(seeds={"a": [a], "b": [b]}, relations={(a, b, "works_at"): (rel_ab, rows)})
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    refs = response.results[0].source_refs
+    assert str(winner) in [r.id for r in refs], "the only get_chunk-able ref was clipped away"
+    assert refs[1].source_type == "chunk"  # ranked ahead of the row refs
+
+    # a ref whose type LOOKS exchangeable but whose id is free-form does not
+    # count — that is the distinction the rank is keyed on
+    free_form = {
+        "evidence_type": "manual",
+        "evidence_ref": "not-a-uuid",
+        "quote": "q",
+        "source_uri": "file:///m.md",
+    }
+    only_unusable = _FakeSoR(
+        seeds={"a": [a], "b": [b]},
+        # a SMALL set — under the cap, so nothing is clipped and the assertion
+        # is about exchangeability alone, not about what the slice kept
+        relations={(a, b, "works_at"): (rel_ab, [rows[0], rows[1], free_form])},
+    )
+    degraded = await _run(
+        graph,
+        only_unusable,
+        GraphQueryParams(template="path", entity="a", other_entity="b", hops=3),
+    )
+    emitted = degraded.results[0].source_refs
+    assert any(r.source_type == "document" for r in emitted)  # it IS emitted...
+    # ...but resolves nowhere: no ref carries an id a get_* tool would accept
+    assert not any(_uuid_shaped(r.id) for r in emitted if r.source_type != "relation")
+    # the path still carries its edge identity — the §27.2 minimum never
+    # depends on evidence being exchangeable
+    assert emitted[0].source_type == "relation"
+
+
+async def test_a_type_look_alike_ref_does_not_outrank_a_resolvable_one() -> None:
+    """The rank keys on the ID's SHAPE, not on the ref's type.
+
+    A `manual` evidence row becomes a `document` ref whose id is the free-form
+    `evidence_ref` column — §27.2 leaves that encoding unfrozen, so it is not
+    a document UUID and `get_document` cannot take it. Ranking by TYPE would
+    treat those look-alikes as exchangeable, and when their ids sort ahead of
+    the real chunk UUID they take every slot in the cap, leaving a path whose
+    citations resolve nowhere: #153 again.
+
+    This is the case the sibling test cannot make. Its unexchangeable refs are
+    `row`-typed, so a type check ranks the chunk first too and the mutation
+    survives — the id-shape argument stays unpinned. `manual` has no writer
+    today (`core/graph/documents.py` and `core/graph/structured.py` write
+    chunk-with-chunk_id and row), but it is contract- and DDL-legal, and
+    `chunk_id` is deliberately nullable for §27.4 prune survival, so this is
+    one writer away from live.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    winner = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    rows: list[dict[str, Any]] = [
+        {
+            "evidence_type": "manual",  # -> a `document` ref: the look-alike
+            "evidence_ref": f"aaa-doc-{i:03d}",  # sorts BEFORE the chunk uuid
+            "quote": "q",
+            "source_uri": "file:///m.md",
+        }
+        for i in range(PATH_EVIDENCE_CAP + 4)
+    ]
+    rows.append(_chunk_evidence(chunk_id=winner))
+    sor = _FakeSoR(seeds={"a": [a], "b": [b]}, relations={(a, b, "works_at"): (rel_ab, rows)})
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    ids = [r.id for r in response.results[0].source_refs]
+    assert str(winner) in ids, "type-ranking let unresolvable look-alikes take every slot"
+
+
+async def test_a_pruned_chunks_ref_does_not_outrank_a_live_one() -> None:
+    """The rank asks the STORE, not the id's spelling.
+
+    §27.4 keeps `relation_evidence` alive after the chunk it quotes is pruned —
+    `chunk_id` is deliberately not an FK — so a perfectly well-formed chunk id
+    can name a row `get_chunk` will never find. A rank that only parsed the id
+    as a UUID would treat those dead refs as exchangeable, and when their ids
+    sort before the live chunk they take every slot: a capped path whose
+    citations resolve nowhere, which is #153 yet again.
+
+    This is the case neither sibling test can make. The look-alike test's
+    unexchangeable refs are `manual`/`row`, so a SHAPE check ranks the live
+    chunk first too; only a pruned chunk is well-formed, right-typed, and dead.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    # every pruned id sorts BEFORE the live one, so an id-ordered slice keeps
+    # exactly the wrong eight
+    pruned = [uuid.UUID(f"0000000{i}-0000-4000-8000-000000000000") for i in range(9)]
+    live = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    rows = [_chunk_evidence(chunk_id=cid) for cid in [*pruned, live]]
+    sor = _FakeSoR(
+        seeds={"a": [a], "b": [b]},
+        relations={(a, b, "works_at"): (rel_ab, rows)},
+        stored_chunks={live},  # the pruned ones are GONE from the store
+    )
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    ids = [r.id for r in response.results[0].source_refs]
+    assert str(live) in ids, "a pruned chunk's ref outranked the only live one"
+    assert response.warnings[0].code == "TRUNCATED"  # the clip is still surfaced
+
+
+async def test_an_under_cap_edge_still_lists_its_resolvable_ref_first() -> None:
+    """The cap gate must not reorder the COMMON path.
+
+    Grounding is cap-gated: below the cap nothing is withheld, so paying for a
+    store read would buy no decision. But that leaves an under-cap edge with
+    nothing in `resolvable`, and if rank were grounding-only every ref would
+    tie and fall through to `id` — putting the ref no `get_*` tool accepts
+    first on the ordinary path, which is exactly what this task exists to fix.
+    A free shape component keeps the order right where the read is skipped.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    # a two-ref edge — far under the cap, so no grounding read happens. The
+    # row ref's id sorts BEFORE the chunk's, so an id-only fallback inverts them
+    chunk_id = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    rows = [
+        {
+            "evidence_type": "row",
+            "evidence_ref": "5:halls:001",
+            "quote": "q",
+            "source_uri": "file:///t.csv",
+        },
+        _chunk_evidence(chunk_id=chunk_id),
+    ]
+    sor = _FakeSoR(seeds={"a": [a], "b": [b]}, relations={(a, b, "works_at"): (rel_ab, rows)})
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    kinds = [r.source_type for r in response.results[0].source_refs]
+    assert kinds == ["relation", "chunk", "row"], "the unresolvable ref was listed first"
+    assert response.warnings == ()  # nothing withheld — no TRUNCATED
+
+
+async def test_a_non_canonical_uuid_spelling_still_ranks_as_resolvable() -> None:
+    """Grounding must compare like with like.
+
+    `_parse_ref_uuid` accepts every spelling `uuid.UUID` does — uppercase,
+    dashless — and so does `get_chunk`/`get_document` (both parse with
+    `_parse_uuid`), so a ref spelled that way IS exchangeable. But the grounded
+    row comes back canonical: recording `str(row.id)` and then testing
+    `ref.id in resolvable` compares a raw spelling against a canonical string,
+    the live ref reads as unresolved, and refs sorting ahead of it take every
+    slot — the only citation that actually resolves, evicted.
+
+    Free-form ids are the ordinary case, not a contrivance: `evidence_ref`
+    falls back to the free-form column when `chunk_id` is NULL, and a `manual`
+    row's `document` id is ALWAYS that column (§27.2 leaves it unfrozen).
+
+    Neither sibling test can see this. Both spell their live id canonically, so
+    raw and canonical coincide and the comparison happens to work.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    live_doc = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    shouted = str(live_doc).upper()  # a spelling get_document accepts
+    assert shouted != str(live_doc)
+    # the dangling ids are digits, so they sort BEFORE the uppercase spelling
+    rows: list[dict[str, Any]] = [
+        {
+            "evidence_type": "manual",
+            "evidence_ref": f"0000000{i}-0000-4000-8000-000000000000",
+            "quote": "q",
+            "source_uri": "file:///m.md",
+        }
+        for i in range(PATH_EVIDENCE_CAP + 1)
+    ]
+    rows.append(
+        {
+            "evidence_type": "manual",
+            "evidence_ref": shouted,
+            "quote": "q",
+            "source_uri": "file:///live.md",
+        }
+    )
+    sor = _FakeSoR(
+        seeds={"a": [a], "b": [b]},
+        relations={(a, b, "works_at"): (rel_ab, rows)},
+        stored_documents={live_doc},  # only the shouted one names a real row
+    )
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    ids = [r.id for r in response.results[0].source_refs]
+    assert shouted in ids, "a resolvable ref was evicted over its UUID spelling"
+
+
+async def test_a_document_ref_is_not_grounded_by_a_chunk_row() -> None:
+    """A chunk row must not vouch for a document ref sharing its spelling.
+
+    The two id spaces are separate. Grounding asks per table, so the ANSWER
+    has to carry the type it was asked under — a flat set of spellings lets a
+    chunk's legitimate hit make a `document` ref look resolvable, ranking a
+    ref `get_document` cannot resolve ahead of one it can.
+
+    The fixture has to make ONE id both a chunk candidate and a document
+    candidate, or production never sends the impostor to the chunks query at
+    all and the case cannot arise. An earlier version of this test used
+    document-only impostors and went red purely because the fake ignored its
+    IN predicate — the fake's infidelity supplying the discrimination, not the
+    defect. It also needs a cap's worth of them: with a couple, the live ref
+    keeps a slot either way.
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    rel_ab = uuid.uuid4()
+    graph = _FakeGraph(
+        path={
+            "nodes": [_node(a, "A"), _node(b, "B")],
+            "rels": [{"type": "works_at", "src": str(a), "dst": str(b)}],
+        }
+    )
+    # ids that exist as CHUNK rows, each carried by a chunk ref AND a document
+    # ref — the document ref is the impostor the chunk row must not vouch for
+    shared = [uuid.UUID(f"0000000{i}-0000-4000-8000-000000000000") for i in range(4)]
+    dangling = [uuid.UUID(f"1000000{i}-0000-4000-8000-000000000000") for i in range(4)]
+    live_chunk = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")  # sorts LAST
+    rows: list[dict[str, Any]] = [_chunk_evidence(chunk_id=cid) for cid in shared]
+    rows += [
+        {
+            "evidence_type": "manual",  # -> a `document` ref wearing a chunk's id
+            "evidence_ref": str(cid),
+            "quote": "q",
+            "source_uri": "file:///m.md",
+        }
+        for cid in shared
+    ]
+    rows += [_chunk_evidence(chunk_id=cid) for cid in dangling]
+    rows.append(_chunk_evidence(chunk_id=live_chunk))
+    sor = _FakeSoR(
+        seeds={"a": [a], "b": [b]},
+        relations={(a, b, "works_at"): (rel_ab, rows)},
+        stored_chunks={*shared, live_chunk},
+        stored_documents=set(),  # none of those ids is a document
+    )
+    response = await _run(
+        graph, sor, GraphQueryParams(template="path", entity="a", other_entity="b", hops=3)
+    )
+    ids = [r.id for r in response.results[0].source_refs]
+    assert str(live_chunk) in ids, "a chunk row vouched for a document ref and evicted the live one"

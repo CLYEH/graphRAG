@@ -1033,8 +1033,8 @@ def build_server(project: str) -> FastMCP:
         ] = "",
     ) -> dict[str, Any]:
         """Entity-relationship retrieval via parameterized graph templates
-        (neighbors / path / subgraph). Relation results cite evidence refs;
-        a ref with source_type "chunk" carries a chunk UUID exchangeable for
+        (neighbors / path / subgraph). Relation AND path results cite evidence
+        refs; a ref with source_type "chunk" carries a chunk UUID exchangeable for
         its text via get_chunk (row/document evidence refs are other shapes —
         get_chunk does not accept them)."""
         rt = _rt()
@@ -1248,13 +1248,19 @@ def build_server(project: str) -> FastMCP:
     async def get_entity(
         name: Annotated[
             str,
-            Field(description="EXACT canonical entity name (find it with list_entities q=...)."),
+            Field(
+                description=(
+                    "EXACT canonical entity name (find it with list_entities q=...), "
+                    "or an entity UUID taken from a citation's source_ref id."
+                )
+            ),
         ],
     ) -> dict[str, Any]:
-        """Look one entity up by EXACT canonical name — unsure of the name?
-        Use list_entities(q=...) for substring search first. Introspection
-        shape (error/error_code, not the retrieval envelope); each entity
-        carries its full, uncapped mention citations."""
+        """Look one entity up by EXACT canonical name, or by the entity UUID a
+        citation carries (source_type='entity') — unsure of the name? Use
+        list_entities(q=...) for substring search first. Introspection shape
+        (error/error_code, not the retrieval envelope); each entity carries its
+        full, uncapped mention citations."""
         rt = _rt()
         # QA5 D5: validate BEFORE binding — a NUL here used to reach Postgres
         # and come back as a DBAPIError the §22 handler reported as
@@ -1631,6 +1637,52 @@ async def _list_schema(runtime: _Runtime) -> dict[str, Any]:
         }
 
 
+def _row_value(row: Any, column: str) -> Any:
+    """One column off an entity row, or None when the row is absent.
+
+    The row lookup and the mention lookup are separate reads, so a row can go
+    missing between them (a concurrent activation). Introspection answers with
+    what it HAS — nulls beside the id — rather than raising (§22)."""
+    return getattr(row, column, None) if row is not None else None
+
+
+async def _entity_ids_by_citation_id(repo: Any, subject: str) -> list[uuid.UUID]:
+    """A UUID-shaped subject → the ACTIVE entity it names, or ``[]``.
+
+    §16 surfaces entity UUIDs two ways — as the ``SourceRef(source_type=
+    "entity", id=…)`` a ``global_summary`` community report cites, and as the
+    entity result ids ``semantic_search``/``graph_query`` return — and
+    the initialize instructions promise ``get_entity``/``get_chunk``/
+    ``get_document`` "exchange ids from citations for full content". But
+    ``get_entity`` looked subjects up by canonical NAME only, so every entity
+    citation dead-ended: ``get_chunk`` rejects an entity id, ``list_entities``
+    substring-matches names, and the id resolved nowhere (#153). ``get_chunk``
+    and ``get_document`` already take their ids directly; this is the third
+    sibling honoring the same promise.
+
+    Tried only AFTER the name lookup misses, so a canonical name that happens
+    to be UUID-shaped still resolves as a name — this can only turn a
+    NOT_FOUND into a hit, never repoint an existing one.
+
+    BUILD-scoped but NOT status-scoped, and the two predicates are doing
+    different jobs. The build scope is DR-006: an entity id outlives a build in
+    an agent's transcript, so a superseded build's id must not resolve. The
+    STATUS predicate would be wrong here, because it does not match what the
+    citation means: ``global_reports._known_entity_ids`` grounds a community
+    report's members at ANY status on purpose ("a member that was later
+    rejected is still historically a member"), so a report can and does cite
+    entities that later merged or were rejected. Resolving those with
+    ``active_entity_ids`` left exactly those citations unexchangeable — #153's
+    own symptom, surviving inside #153's fix (Codex #166). On the dev corpus
+    that is not hypothetical: nmmst carries 4 ``merged`` entities among 1409.
+    """
+    candidate = _parse_uuid(subject)
+    if candidate is None:
+        return []
+    rows = await repo.fetch_all(tables.entities, tables.entities.c.id == candidate)
+    return [candidate] if rows else []
+
+
 async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
     """§9 ``get_entity``: name → the matching ACTIVE entities, each cited by
     its SoR mentions (§27.2's spirit: an entity with zero mentions cannot be
@@ -1647,6 +1699,8 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
         }
     entity_ids = await repo.entity_ids_by_name(name)
     if not entity_ids:
+        entity_ids = await _entity_ids_by_citation_id(repo, name)
+    if not entity_ids:
         # QA6/D8: a MISS is NOT_FOUND, like every other get_* in this family.
         # The initialize instructions define ONE taxonomy for get_*/list_* and
         # say "error_code null = success", so returning null here told a
@@ -1658,8 +1712,17 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
             "project": project,
             "build_id": str(repo.build_id),
             "name": name,
+            # the recovery channel has to be WALKABLE: list_entities(q=…) is a
+            # substring search over NAMES, so pointing a UUID-shaped miss at it
+            # names a route that can never hit. A live citation resolves above,
+            # so a UUID that misses here is almost always one carried over from
+            # a superseded build — re-running the query is the real remedy.
             "error": (
-                f"no active entity is named {_safe_echo(name, 80)!r} in this "
+                f"no active entity has the id {_safe_echo(name, 80)!r} in this build — "
+                "an entity id from an earlier build does not survive activation; "
+                "re-run the query to get citations for the active build"
+                if _parse_uuid(name) is not None
+                else f"no active entity is named {_safe_echo(name, 80)!r} in this "
                 "build — search for it with list_entities(q=…)"
             ),
             "error_code": "NOT_FOUND",
@@ -1672,6 +1735,17 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
     # an entity may surface with zero mentions here (introspection shows
     # the uncited state rather than dropping the entity).
     refs_by_entity, _, _ = await resolved_mention_refs(repo, entity_ids, cap=None)
+    # The citation-id path can resolve a NON-active entity (a report member
+    # that later merged or was rejected — see _entity_ids_by_citation_id), and
+    # before it existed this tool could only ever answer with active rows. So
+    # the status has to be VISIBLE: an agent exchanging a citation would
+    # otherwise read a merged entity as the current one and carry it forward as
+    # fact. Emitted for the name path too — "active" there is informative, not
+    # noise, and one shape beats two.
+    rows_by_id = {
+        row.id: row
+        for row in await repo.fetch_all(tables.entities, tables.entities.c.id.in_(entity_ids))
+    }
     return {
         "project": project,
         "build_id": str(repo.build_id),
@@ -1681,6 +1755,21 @@ async def _get_entity(repo: Any, project: str, name: str) -> dict[str, Any]:
         "entities": [
             {
                 "id": str(entity_id),
+                # The entity's OWN identifying content, not just its id. On the
+                # name path the caller already knew the name; on the CITATION-ID
+                # path they did not — and the top-level ``name`` echoes their
+                # subject, which is then the same UUID they came in with. Without
+                # these fields, exchanging a citation returned the id you already
+                # had plus a status: no content, from the tool whose instructions
+                # promise "exchange ids from citations for full content" (Codex
+                # #166). Sharpest for a MERGED member, whose mentions were
+                # repointed to the canonical (§7) — that entity has zero mentions,
+                # so these fields are the ONLY thing identifying what was cited.
+                # Field names match list_entities' page rows (id/name/type).
+                "name": _row_value(rows_by_id.get(entity_id), "canonical_name"),
+                "type": _row_value(rows_by_id.get(entity_id), "type"),
+                "attributes": _row_value(rows_by_id.get(entity_id), "attributes"),
+                "status": _row_value(rows_by_id.get(entity_id), "status"),
                 "mentions": [
                     {
                         "source_type": ref.source_type,

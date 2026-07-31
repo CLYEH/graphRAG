@@ -481,6 +481,22 @@ class BuildScopedRepo:
             query = query.where(predicate)
         return (await self._execute(query)).fetchall()
 
+    async def existing_ids(self, table: sa.Table, ids: Collection[uuid.UUID]) -> set[uuid.UUID]:
+        """Which of ``ids`` exist in this build's rows of ``table`` — ID ONLY.
+
+        An existence check must not pay for the row. :meth:`fetch_all` selects
+        every column, which on ``documents`` means ``raw`` (the whole document)
+        and on ``chunks`` means ``text``; a caller batching a thousand
+        candidates to ask "which of these are still here" would transfer
+        hundreds of full documents to read nothing but the primary key
+        (Codex #166). Same scope injection as every other read (DR-006 — the
+        build filter is in :meth:`_select`'s shared path, not re-derived here).
+        """
+        if not ids:
+            return set()
+        query = self._select(table).with_only_columns(table.c.id).where(table.c.id.in_(list(ids)))
+        return {row.id for row in (await self._execute(query)).fetchall()}
+
     async def fetch_count(self, table: sa.Table, *where: sa.ColumnExpressionArgument[bool]) -> int:
         """The exact count of scoped rows under the same predicates a
         :meth:`fetch_page` would read (SS1b totals). Same narrowing-only

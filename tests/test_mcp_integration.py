@@ -215,6 +215,44 @@ async def test_get_entity_returns_cited_entities_from_the_active_build(
     assert empty["entities"] == []
 
 
+async def test_a_citation_entity_id_is_exchangeable_and_build_scoped(
+    context: ProjectContext,
+) -> None:
+    """The citation-id lookup, against Postgres — both halves of its promise.
+
+    get_entity now accepts the entity UUID a citation carries (#153), joining
+    get_chunk/get_document which already take their ids. Two things must hold
+    on LIVE stores, and a hand-written fake can only pin the first:
+
+    1. the id is exchangeable at all — it resolves to the same entity the
+       canonical name does;
+    2. it is BUILD-SCOPED (DR-006). An entity UUID is exactly the value that
+       outlives a build in an agent's context — it sits in a transcript from
+       an earlier answer — so a lookup that ignored build_id/status would keep
+       serving a superseded build's entity and the "never mix old-version
+       data" guarantee would leak through introspection. The fake's
+       active_entity_ids IS the scoping, so only a real store can fail this.
+    """
+    await _activate_build(context.project, entity_name="Acme")
+    async with context.bound() as deps:
+        by_name = await _get_entity(deps.repo, context.project, "Acme")
+        cited_id = by_name["entities"][0]["id"]
+        by_id = await _get_entity(deps.repo, context.project, cited_id)
+    assert by_id["error_code"] is None
+    assert [e["id"] for e in by_id["entities"]] == [cited_id]
+    assert by_id["entities"][0]["mentions"] == by_name["entities"][0]["mentions"]
+
+    # supersede the build the citation came from — the id is now historical
+    await _activate_build(context.project, entity_name="Acme")
+    async with context.bound() as deps:
+        stale = await _get_entity(deps.repo, context.project, cited_id)
+    assert stale["error_code"] == "NOT_FOUND", "a superseded build's entity id must not resolve"
+    assert stale["entities"] == []
+    # and the miss has to name a WALKABLE remedy: list_entities(q=…) is a
+    # substring search over names, which a UUID can never hit
+    assert "list_entities" not in stale["error"]
+
+
 async def test_a_registered_tool_calls_through_on_live_stores(
     context: ProjectContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:

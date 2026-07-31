@@ -22,7 +22,7 @@ import jsonschema
 import pytest
 
 import core.query.hybrid as hybrid_module
-from core.query.graph import GraphQueryParams
+from core.query.graph import GraphQueryParams, capped_path_id, path_refs_cap_warning
 from core.query.hybrid import HybridDeps, HybridPolicy, _fuse, hybrid_query
 from core.query.mentions import mention_warnings
 from core.query.policy import (
@@ -743,3 +743,46 @@ async def test_fused_results_carry_the_origin_modes_raw_score_as_confidence(
     # outranks the single-mode hit despite its lower origin score
     assert response.results[0].id == shared
     assert response.results[0].score != 0.7224  # score stays the RRF value
+
+
+async def test_a_path_refs_cap_warning_dies_with_its_clipped_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#166: the path refs-cap TRUNCATED names its subject, so it must not
+    outlive it.
+
+    This warning is a DIFFERENT family from the aggregate TRUNCATEDs beside
+    it. Those say "results were withheld UPSTREAM" — still true whatever
+    survives fusion. This one says "THIS returned path's citations were
+    clipped", which is only meaningful while that path is on the page. And
+    the path really can be evicted here: `_fair_page` floors the graph bucket
+    at `top_k // 4`, which is ZERO for top_k <= 3, so at top_k=1 a
+    higher-ranked hit takes the only seat and the path is dropped — leaving,
+    without this refit, a claim about citations the caller never received.
+    """
+    # the frozen path branch requires a relation ref (contains) — the very
+    # invariant that makes the decline on "reject uncitable edges" safe
+    path = _result(
+        result_type="path",
+        rid="path:src->dst",
+        source_refs=(SourceRef(source_type="relation", id=str(uuid.uuid4())),),
+    )
+    warnings = (path_refs_cap_warning(path.id, 5),)
+    _patch_modes(
+        monkeypatch,
+        semantic=_mode_response("semantic_search", _result(rid="a-hit")),
+        graph=_mode_response("graph_query", path, warnings=warnings),
+    )
+
+    # the path SURVIVES → its warning survives and still names it
+    kept = await _run(_deps(), _policy(top_k=10))
+    assert any(r.id == path.id for r in kept.results)
+    assert any(capped_path_id(w.message) == path.id for w in kept.warnings)
+
+    # the path is CLIPPED (top_k=1; "a-hit" sorts before "path:src->dst")
+    clipped = await _run(_deps(), _policy(top_k=1))
+    assert [r.id for r in clipped.results] == ["a-hit"]
+    assert not any("source_refs capped" in w.message for w in clipped.warnings)
+    # ...while the aggregate top_k TRUNCATED — a claim about upstream, not
+    # about a returned result — correctly stays
+    assert any("top_k" in w.message for w in clipped.warnings)

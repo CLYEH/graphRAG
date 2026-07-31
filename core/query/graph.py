@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import sqlalchemy as sa
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from core.graph.structured import split_row_source_ref
@@ -53,6 +54,86 @@ from core.stores.graph import BuildScopedGraphRepo
 from core.stores.repo import BuildScopedRepo
 
 _TOOL = "graph_query"
+
+#: Per-EDGE cap on the evidence refs a path result carries (§22), matching the
+#: two citation faces that already cap — ``mentions.MENTION_REFS_CAP`` and
+#: ``global_reports.REFS_CAP``, both 8. A path cites one relation ref per hop
+#: plus that edge's evidence; a heavily-asserted relation carries dozens of
+#: rows, so uncapped a single path could dominate the response with duplicate
+#: provenance while adding nothing exchangeable (§27.2 needs ≥1 usable ref per
+#: edge, not the roster — the same reasoning MENTION_REFS_CAP records). The
+#: clip is reported as TRUNCATED, never silent; the escape hatch is get_entity/
+#: get_chunk on any ref that IS emitted (Codex #166).
+PATH_EVIDENCE_CAP = 8
+
+#: Evidence-grounding lookups run in batches of this many ids per query —
+#: same bind-limit reason as ``global_reports._GROUNDING_BATCH`` (PostgreSQL's
+#: extended protocol caps a statement at 32767 binds). Kept local rather than
+#: imported: it is a tuning number each grounding site owns, not a shared
+#: invariant two callers must agree on.
+_GROUNDING_BATCH = 1000
+
+#: The evidence ref types a ``get_*`` tool can resolve, and the table each
+#: one grounds against. ONE source for all three sites that must agree —
+#: which refs become candidates, which table answers for them, and how the
+#: rank keys the answer. They were three literals nothing forced to match;
+#: a third exchangeable type could half-land. (``row`` refs are absent on
+#: purpose: the frozen §9 set has no resolver for them.)
+_GROUNDED_TABLES: dict[str, sa.Table] = {
+    "chunk": tables.chunks,
+    "document": tables.documents,
+}
+
+#: The path refs-cap warning's message prefix; the full message names the
+#: capped PATH RESULT's id so hybrid_query can drop the warning when fusion
+#: clips that exact path off the fused page (the #123 class). Distinct from
+#: this module's other TRUNCATEDs on purpose: those claim RESULTS were
+#: withheld upstream — true whatever survives fusion — while this one claims
+#: THIS returned result's citations were clipped, which is only meaningful
+#: while that result is on the page.
+PATH_REFS_CAP_MESSAGE = f"path source_refs capped at {PATH_EVIDENCE_CAP} evidence ref(s) per edge"
+
+_PATH_REFS_CAP_ID_PREFIX = f"{PATH_REFS_CAP_MESSAGE} — path "
+
+
+def path_refs_cap_warning(path_id: str, omitted: int) -> QueryWarning:
+    """The path refs-cap TRUNCATED warning, naming its subject.
+
+    Mirrors :func:`core.query.global_reports.refs_cap_warning`: the id is the
+    provenance hybrid_query needs to keep the warning only while the named
+    path is still on the fused page."""
+    return QueryWarning(
+        "TRUNCATED",
+        f"{_PATH_REFS_CAP_ID_PREFIX}{path_id}: {omitted} ref(s) omitted (§22)",
+    )
+
+
+def capped_path_id(message: str) -> str | None:
+    """The path id a refs-cap warning names — None for any other message.
+
+    Parser beside the builder so the message shape has ONE owner. Tolerates
+    ANY ``[mode] `` origin prefix hybrid may stamp on (it builds them as
+    ``f"[{mode}] "``, and the graph modality's mode name is not this module's
+    to assume) — matching on a hard-coded one would silently stop recognizing
+    the warning if that name ever changed, which fails OPEN: the warning would
+    outlive its clipped path instead of being dropped."""
+    text = message
+    if text.startswith("[") and "] " in text:
+        text = text.split("] ", 1)[1]
+    if not text.startswith(_PATH_REFS_CAP_ID_PREFIX):
+        return None
+    # split from the RIGHT, unlike global_reports' report-id parser: a report
+    # id is a bare UUID, but a path id is f"path:{src}->{dst}" and CONTAINS
+    # colons, so partitioning on the first one returns "path", which matches no
+    # result. Note WHICH WAY that fails: the call-site predicate keeps a
+    # warning when the parse returns None (not ours) or when the named id is on
+    # the page, so an unmatched non-None id is dropped in BOTH cases — the
+    # warning disappears even for a path the caller DID receive, silently
+    # suppressing a true §22 clip notice. "Unrecognized → keep" is the SAFE
+    # direction here; hardening this parser to return None on ambiguity would
+    # be the change that actually lets a warning outlive its clipped subject.
+    path_id, sep, _ = text[len(_PATH_REFS_CAP_ID_PREFIX) :].rpartition(": ")
+    return path_id if sep else None
 
 
 @dataclass(frozen=True)
@@ -227,13 +308,16 @@ async def _path(
             )
             if found is None:
                 break  # no (further) path for this pair — next pair
-            result, stale_nodes, stale_edges = await _verified_path_result(
+            result, stale_nodes, stale_edges, omitted = await _verified_path_result(
                 repo, found, src_id, dst_id
             )
             if result is not None:
                 # a fully-verified path IS the complete answer — earlier stale
-                # candidates were alternates, not omitted results, so no warning
-                return _response(graph, query, ordered_results([result]), ())
+                # candidates were alternates, not omitted results, so no warning.
+                # The per-edge evidence CLIP is different: refs the caller could
+                # have exchanged were withheld, so §22 requires saying so.
+                clipped = (path_refs_cap_warning(result.id, omitted),) if omitted else ()
+                return _response(graph, query, ordered_results([result]), clipped)
             stale += 1  # this candidate failed SoR re-verification
             if not stale_nodes and not stale_edges:
                 break  # unidentifiable (corrupt) elements — can't exclude, next pair
@@ -256,7 +340,7 @@ async def _path(
 
 async def _verified_path_result(
     repo: BuildScopedRepo, found: dict[str, Any], src_id: uuid.UUID, dst_id: uuid.UUID
-) -> tuple[RetrievalResult | None, set[str], set[str]]:
+) -> tuple[RetrievalResult | None, set[str], set[str], int]:
     """One projection path → a fully SoR-verified §16 path result, or the
     STALE ELEMENTS that sank it (``(None, stale_node_ids, stale_edge_keys)``,
     exclusion-encoded) so the caller can retry the pair without them.
@@ -270,7 +354,7 @@ async def _verified_path_result(
     triples = [_edge_triple(rel) for rel in found["rels"]]
     if None in node_ids or None in triples:
         # corrupt projection values — the path can't be traced to the SoR
-        return None, set(), set()
+        return None, set(), set(), 0
     ids = [node_id for node_id in node_ids if node_id is not None]
     clean = [triple for triple in triples if triple is not None]
 
@@ -283,9 +367,87 @@ async def _verified_path_result(
         if (src, dst, rel_type) not in resolved
     }
     if stale_nodes or stale_edges:
-        return None, stale_nodes, stale_edges  # stale in the SoR after projection
+        return None, stale_nodes, stale_edges, 0  # stale in the SoR after projection
 
-    refs = tuple(SourceRef(source_type="relation", id=str(resolved[triple][0])) for triple in clean)
+    # The evidence is ALREADY resolved above — emitting only the relation id
+    # left every path citation undereferenceable: no exposed tool takes a
+    # relation id (get_chunk wants a chunk id, get_entity a name/entity id),
+    # while the SUBGRAPH template returns these very same relations with their
+    # chunk evidence attached (_relation_results). Same relations, same build,
+    # one template citable and the other not (#153) — so append the refs the
+    # caller can actually exchange. The relation ref stays first per edge for
+    # readability (it is the edge's identity); ordering is NOT load-bearing —
+    # §20's path_validity selects refs by source_type, and relation_hit_rate
+    # reads the visible text, not the refs.
+    #
+    # Deliberately NOT adopting _relation_results' drop-when-uncited rule: a
+    # path is ONE verified claim whose rejection rule is STALENESS (§27.2/§19,
+    # the stale_nodes/stale_edges contract above), so dropping on citation
+    # count would silently shrink path results — a behavior change this fix
+    # does not need and #153 never asked for.
+    # Resolve every edge's usable refs FIRST: the rank below asks whether an id
+    # actually resolves, and that answer is a store read worth batching across
+    # the whole path rather than paying per edge.
+    per_edge: list[tuple[uuid.UUID, list[SourceRef]]] = []
+    for triple in clean:
+        relation_id, evidence_rows = resolved[triple]
+        per_edge.append(
+            (relation_id, [ref for row in evidence_rows if (ref := evidence_ref(row)) is not None])
+        )
+    resolvable = await _resolvable_evidence_ids(repo, per_edge)
+
+    cited: list[SourceRef] = []
+    omitted = 0
+    for relation_id, usable in per_edge:
+        cited.append(SourceRef(source_type="relation", id=str(relation_id)))
+        # CAP per edge (§22), the same discipline the other two citation faces
+        # already keep — mentions.MENTION_REFS_CAP and global_reports.REFS_CAP.
+        # A heavily-asserted relation can carry hundreds of evidence rows, and
+        # serializing all of them would let ONE path dominate the response
+        # without improving exchangeability: the caller needs *an* id it can
+        # hand to get_chunk, not every occurrence.
+        #
+        # SORT BEFORE SLICING (the #34 rule — mentions.py:107 does the same and
+        # says why): relations_with_evidence selects relation_evidence with NO
+        # order_by, so row order is whatever the plan yields — seq vs index
+        # scan, a HOT update, a VACUUM, a plan flip. Uncapped that was merely
+        # cosmetic; a cap makes order SELECTIVE — it decides which evidence is
+        # cited and which is withheld — so an unsorted slice would let the same
+        # query on the same build cite different chunks across calls, and a
+        # citation an agent saw once might never reappear. The clip is SURFACED
+        # rather than silent.
+        #
+        # RESOLVABLE FIRST, then id. Rank on what the store says, never on the
+        # id's spelling: `relation_evidence.chunk_id` is deliberately not an FK
+        # (§27.4 prune survival — evidence outlives the chunk it quotes), so a
+        # perfectly well-formed chunk id can name a PRUNED chunk, and a manual
+        # row's free-form evidence_ref can be UUID-shaped without naming any
+        # document. Eight such ids sorting ahead of the one live chunk would
+        # take every slot and leave the path uncitable again (Codex #166).
+        # Order stays total (rank, id, quote), so the cap is deterministic.
+        # Store truth first where it was paid for, SHAPE as the free tiebreak
+        # everywhere else. The grounding read is cap-gated, so under-cap edges
+        # have nothing in `resolvable` and would otherwise tie at rank 1 and
+        # fall through to `id` — putting the ref no get_* tool accepts first on
+        # the ORDINARY path, which is the very thing this task exists to fix.
+        # The type component costs no read and restores that order.
+        # Two refs naming the SAME row are not redundant: two spellings imply
+        # at least one free-form ref, and §27.4's identity is
+        # `relation_signature | evidence_ref | norm(quote)` — so they are
+        # distinct evidence ROWS, separated on evidence_ref whatever the
+        # quotes say. Collapsing them by row would drop a citation, not a
+        # duplicate.
+        usable.sort(
+            key=lambda ref: (
+                0 if (ref.source_type, ref.id) in resolvable else 1,
+                0 if ref.source_type in _GROUNDED_TABLES else 1,
+                ref.id,
+                _quote_of(ref),
+            )
+        )
+        cited.extend(usable[:PATH_EVIDENCE_CAP])
+        omitted += max(0, len(usable) - PATH_EVIDENCE_CAP)
+    refs = tuple(cited)
     names = [_display(node) for node in found["nodes"]]
     # the pattern is UNDIRECTED, so a hop can traverse an edge against its
     # stored direction — each arrow is oriented by the SoR direction the rel
@@ -304,7 +466,7 @@ async def _verified_path_result(
         source_refs=refs,
         text="".join(parts),
     )
-    return result, set(), set()
+    return result, set(), set(), omitted
 
 
 async def _subgraph(
@@ -664,6 +826,106 @@ async def _relation_results(
         dst_name = names.get(triple[1], str(triple[1]))
         kept.append((relation_id, f"{src_name} -[{triple[2]}]-> {dst_name}", refs))
     return kept, dropped
+
+
+def _quote_of(ref: SourceRef) -> str:
+    """A ref's quote as a plain string — the cap sort's tie-break."""
+    return str(ref.metadata.get("quote", ""))
+
+
+async def _resolvable_evidence_ids(
+    repo: BuildScopedRepo, per_edge: Sequence[tuple[uuid.UUID, list[SourceRef]]]
+) -> frozenset[tuple[str, str]]:
+    """The ``(source_type, spelling)`` pairs a ``get_*`` tool can ACTUALLY resolve.
+
+    UUID shape is not resolvability, which is the whole reason this is a store
+    read and not a string test:
+
+    * ``relation_evidence.chunk_id`` is deliberately NOT an FK — §27.4 prune
+      survival, evidence outlives the chunk it quotes — so a well-formed chunk
+      id can name a pruned chunk that ``get_chunk`` will not find;
+    * a ``manual`` row becomes a ``document`` ref carrying the free-form
+      ``evidence_ref`` column, whose encoding §27.2 leaves UNFROZEN, so it can
+      be UUID-shaped without naming any document;
+    * a ``row`` ref has no ``get_*`` resolver in the frozen §9 set at all, so it
+      is never a candidate.
+
+    Only edges whose usable refs EXCEED the cap are grounded. Below the cap
+    nothing is withheld, so the ordering decides nothing and the read would be
+    pure cost on the common path — a heavily-asserted relation is the rare case,
+    and it is the only one where being wrong costs a citation. Batched by table
+    across the whole path, build-scoped through the repo (DR-006).
+    """
+    # (source_type, parsed uuid) -> the RAW ref.id spellings that named it.
+    #
+    # Keying on the raw spelling is the point, not bookkeeping. `_parse_ref_uuid`
+    # accepts any spelling `uuid.UUID` does — uppercase, dashless — and so does
+    # `get_chunk`/`get_document` (both go through `_parse_uuid`), so those refs
+    # ARE exchangeable. But the grounding row comes back canonical, so recording
+    # `str(row.id)` and then testing `ref.id in resolvable` compared a raw
+    # spelling against a canonical string: the live ref read as unresolved and
+    # eight dangling refs sorting ahead of it evicted the only citation that
+    # actually resolves (Codex #166). Free-form ids are not hypothetical here —
+    # `evidence_ref` falls back to the free-form column when `chunk_id` is NULL,
+    # and a `manual` row's document id is ALWAYS that column.
+    #
+    # Keyed WITH the source_type, too: the two id spaces are separate, and a
+    # flat set unioned across both tables would mark a document ref resolvable
+    # because some chunk row happened to share its id.
+    candidates: dict[tuple[str, uuid.UUID], set[str]] = {}
+    for _relation_id, usable in per_edge:
+        if len(usable) <= PATH_EVIDENCE_CAP:
+            continue  # nothing dropped here — rank changes nothing
+        for ref in usable:
+            if ref.source_type not in _GROUNDED_TABLES:
+                continue  # no get_* resolver takes a row ref (§9)
+            parsed = _parse_ref_uuid(ref.id)
+            if parsed is None:
+                continue
+            candidates.setdefault((ref.source_type, parsed), set()).add(ref.id)
+    if not candidates:
+        return frozenset()
+
+    resolvable: set[tuple[str, str]] = set()
+    for source_type, table in _GROUNDED_TABLES.items():
+        wanted = sorted(u for (kind, u) in candidates if kind == source_type)
+        # BATCHED for the same reason global_reports._GROUNDING_BATCH exists:
+        # the IN predicate binds one parameter per id and PostgreSQL's extended
+        # protocol caps a statement at 32767 binds. This path runs BECAUSE the
+        # evidence count is large, and an overflow here would raise a driver
+        # error that graph_query's `except (Neo4jError, ServiceUnavailable)`
+        # does not catch — a 500 out of the module whose contract is
+        # "degradation, never a 500". Deterministic batch boundaries (sorted).
+        for start in range(0, len(wanted), _GROUNDING_BATCH):
+            batch = wanted[start : start + _GROUNDING_BATCH]
+            # ID-ONLY: fetch_all would select every column, and on `documents`
+            # that is `raw` — the whole document — for a question whose answer
+            # is a primary key. A batch of a thousand candidates would transfer
+            # hundreds of full documents to read nothing but their ids, on the
+            # path that runs precisely BECAUSE evidence counts are large.
+            for row_id in await repo.existing_ids(table, batch):
+                # the ANSWER carries what the question was keyed on. A flat
+                # set of spellings would let a chunk row's legitimate
+                # grounding vouch for a document ref that merely shares its
+                # spelling — the confusion the key exists to prevent, undone
+                # at the return boundary.
+                resolvable.update(
+                    (source_type, spelling)
+                    for spelling in candidates.get((source_type, row_id), ())
+                )
+    return frozenset(resolvable)
+
+
+def _parse_ref_uuid(raw: str) -> uuid.UUID | None:
+    """A ref id as a UUID, or None — the cheap pre-filter before the store read.
+
+    A non-UUID id cannot name a chunk or document row, so it never becomes a
+    grounding candidate; being wrong here only costs rank, never emission.
+    """
+    try:
+        return uuid.UUID(raw)
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def evidence_ref(row: dict[str, Any]) -> SourceRef | None:
