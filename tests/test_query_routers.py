@@ -199,8 +199,13 @@ def test_top_k_is_accepted_and_reaches_the_mode(
     # ceiling — never ignored, never widening past EITHER bound
     captured_rows: list[int] = []
 
-    async def fake_run_sql(reader: Any, llm: Any, policy: Any, q: Any, rows: int) -> Any:
+    captured_debug_gate: list[bool] = []
+
+    async def fake_run_sql(
+        reader: Any, llm: Any, policy: Any, q: Any, rows: int, *, expose_debug: bool = False
+    ) -> Any:
         captured_rows.append(rows)
+        captured_debug_gate.append(expose_debug)
         return _mcp_dict()
 
     async def fake_bounded_sql(
@@ -218,6 +223,13 @@ def test_top_k_is_accepted_and_reaches_the_mode(
     assert client.post("/projects/p/query/sql", json={"query": "q"}).status_code == 200
     # 1 passes; 999 → max_top_k (20), NOT just sql_rows (100); absent → ceiling
     assert captured_rows == [1, 20, 100]
+    # ...and the §16 debug gate reaches the mode too. The router is the only
+    # place that knows the caller's authorisation, so a mode that never
+    # receives the flag can only ever answer with debug null — the failure
+    # this whole change is about (#157).
+    assert captured_debug_gate == [True, True, True], (
+        "the mode must receive the policy's real expose_debug, not a hardcoded default"
+    )
 
 
 def test_an_over_cap_top_k_is_disclosed_on_this_surface_too(

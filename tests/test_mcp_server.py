@@ -2024,3 +2024,76 @@ async def test_the_dispatch_guard_is_actually_wired_into_the_registered_handler(
     assert backend.isError is True
     assert backend.structuredContent is None
     assert "INVALID_INPUT" not in cast(_mcp_types.TextContent, backend.content[0]).text
+
+
+async def test_the_mcp_sql_tool_passes_the_policys_debug_gate_to_the_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MCP facade must hand the mode the caller's §16 debug authorisation.
+
+    The mode is the only layer that knows the SQL it generated, and the facade
+    is the only layer that knows whether this caller may see it. If the facade
+    never passes the flag, `sql_query` can only ever answer `debug: null` —
+    which is the exact defect #157 was re-scoped to (expose_debug true in the
+    project's policy, debug null in every response).
+
+    Pinned on the MCP side specifically because that is the surface #157 was
+    filed and re-verified on; its REST twin is pinned in test_query_routers.
+    """
+    from types import SimpleNamespace as _NS
+
+    from mcp import types as _mcp_types
+
+    import core.mcp.server as server_module
+    from core.mcp.server import build_server
+    from core.query.results import McpResponse
+
+    for factory in ("chat_model", "query_embedding_model", "vector_client", "graph_driver"):
+        monkeypatch.setattr(server_module, factory, lambda: cast(Any, object()))
+    monkeypatch.setattr(server_module, "create_async_engine", lambda *a, **k: _NS(dispose=None))
+    server = build_server("demo")
+
+    seen: list[bool] = []
+
+    async def fake_run_sql(
+        reader: Any, llm: Any, policy: Any, q: Any, rows: int, *, expose_debug: bool = False
+    ) -> Any:
+        seen.append(expose_debug)
+        return McpResponse(
+            query=q,
+            tool="sql_query",
+            project="demo",
+            build_id=str(uuid.uuid4()),
+            results=(),
+        )
+
+    monkeypatch.setattr(server_module, "run_sql", fake_run_sql)
+
+    async def _bounded(rt: Any, tool: str, query: str, runner: Any) -> dict[str, Any]:
+        deps = _NS(sql_reader=None, llm=None)
+        response: McpResponse = await runner(deps, 1000)
+        return response.to_dict()
+
+    monkeypatch.setattr(server_module, "_bounded", _bounded)
+
+    policy = _NS(
+        max_latency_ms=10_000,
+        max_top_k=20,
+        expose_debug=True,  # the project authorises it
+        sql_policy=lambda: None,
+        sql_rows=lambda: 10,
+    )
+    runtime = _NS(context=_NS(project="demo", bound=None), policy=policy, exposure=None)
+    monkeypatch.setattr(
+        server, "get_context", lambda: _NS(request_context=_NS(lifespan_context=runtime))
+    )
+    handler = server._mcp_server.request_handlers[_mcp_types.CallToolRequest]  # noqa: SLF001
+    await handler(
+        _mcp_types.CallToolRequest(
+            method="tools/call",
+            params=_mcp_types.CallToolRequestParams(
+                name="sql_query", arguments={"query": "how many halls"}
+            ),
+        )
+    )
+    assert seen == [True], "the tool dropped the policy's expose_debug on the floor"
