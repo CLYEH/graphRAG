@@ -226,7 +226,7 @@ graphRAG/
 三層 runs/steps/items。`item_ref` 用**穩定鍵**（document=content_hash、entity=entity_key），確保重跑對得上。**只重跑失敗項**須冪等（依 item_ref 去重）。verbosity 🔧 `observability.item_logging: failures(預設)|sampled|all`；retention 🔧 `observability.item_retention_days`。Console 呈現「Build failed at graph · failed docs:3 · chunks:17 · reason:LLM schema validation · [retry failed only]」。
 
 ## 19. 品質報告與 Project Health
-首頁狀態燈：`Healthy | Needs review | Build failed | Index drift | Eval regression`。指標：active/last-success/last-failed build、source/doc/chunk/entity/relation count、pending review、**projection drift**(PG vs Neo4j/Qdrant 依 build_id 計數對帳)、low-confidence relation、missing-evidence、eval 趨勢。`GET /projects/{p}/health`。
+首頁狀態燈：`Healthy | Needs review | Build failed | Index drift | Eval regression`。指標：active/last-success/last-failed build、source/doc/chunk/entity/relation count、pending review、**projection drift**(PG vs Neo4j/Qdrant 依 build_id 計數對帳)、low-confidence relation、missing-evidence、**in-flight job count**(`counts.active_jobs` — 其餘指標都在描述建置的*內容*,所以有 job 在跑的專案讀起來完全乾淨,而同一個 job 正在拒絕 DELETE;此數與 delete guard 的拒絕同源)、eval 趨勢。`GET /projects/{p}/health`。
 
 ## 20. 評估框架
 每專案 `eval/golden.yaml`（question, mode, expects{must_contain_entities, must_cite_sources, answer_regex}, min_score）。評分：entity/source recall、答案相似度、citation 覆蓋。（答案相似度需 golden 增補參考答案欄位——additive schema 演進——之前不發此指標；C10 runner 註記。）回歸門檻 🟡 `eval.regression_threshold`：新 build eval 低於 active 超門檻 → 阻擋 auto-activate、Health 顯示 `Eval regression`。`graphrag eval` / `GET /projects/{p}/eval`。

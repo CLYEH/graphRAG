@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,7 @@ from core.registry import (
     request_cancel,
     set_progress,
 )
-from core.registry.jobs import JobNotFoundError, acquire_lease
+from core.registry.jobs import JobNotFoundError, acquire_lease, active_job_ids
 from core.stores.tables import jobs, projects
 
 pytestmark = pytest.mark.integration
@@ -271,7 +272,7 @@ async def test_delete_project_refuses_while_a_job_is_active(migrated: None) -> N
         await engine.dispose()
 
 
-async def test_delete_project_locks_the_row_before_counting_jobs(
+async def test_delete_project_locks_the_row_before_reading_active_jobs(
     migrated: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Execution-level proof the count-then-delete TOCTOU is closed. The race is
@@ -279,7 +280,7 @@ async def test_delete_project_locks_the_row_before_counting_jobs(
     create_job committing there is silently CASCADE-removed. The fix takes
     FOR UPDATE on the projects row BEFORE the count, so a competing
     FOR KEY SHARE (exactly a create_job FK insert's lock) is already blocked
-    during that window. We pause inside count_active_jobs (after the lock, before
+    during that window. We pause inside active_job_ids (after the lock, before
     the delete) and probe with NOWAIT — without the pre-count lock the row is
     still free there, so this test fails; the DELETE's own lock (which happens
     later) would mask the bug if we probed after delete_project returned."""
@@ -294,14 +295,20 @@ async def test_delete_project_locks_the_row_before_counting_jobs(
     project = _proj()
     entered = asyncio.Event()
     release = asyncio.Event()
-    real_count = jobs_mod.count_active_jobs
+    # instruments the call the DELETE PATH actually makes. It reads the
+    # blocking ids rather than a bare count (#151 — the refusal has to name
+    # jobs the caller can reach), but the guarantee under test is unchanged:
+    # the projects row is locked BEFORE this read, so a competing create_job
+    # cannot slip into the window. Patching the function that is no longer on
+    # the path would silently stop instrumenting anything.
+    real_lookup = jobs_mod.active_job_ids
 
-    async def paused_count(conn: object, name: str) -> int:
+    async def paused_lookup(conn: object, name: str) -> list[uuid.UUID]:
         entered.set()
         await release.wait()
-        return await real_count(conn, name)  # type: ignore[arg-type]
+        return await real_lookup(conn, name)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(jobs_mod, "count_active_jobs", paused_count)
+    monkeypatch.setattr(jobs_mod, "active_job_ids", paused_lookup)
     try:
         async with engine.connect() as setup:
             await create_project(setup, name=project)
@@ -331,7 +338,7 @@ async def test_delete_project_locks_the_row_before_counting_jobs(
             await deleter
     finally:
         async with engine.connect() as cleanup:
-            monkeypatch.setattr(jobs_mod, "count_active_jobs", real_count)
+            monkeypatch.setattr(jobs_mod, "active_job_ids", real_lookup)
             await delete_project(cleanup, project)
             await cleanup.commit()
         await engine.dispose()
@@ -555,5 +562,72 @@ async def test_find_unenqueued_jobs_matches_only_lost_queued_rows(migrated: None
             # the grace is respected: nothing 10 minutes old matches an hour-long grace
             assert {j for j, *_ in await find_unenqueued_jobs(conn, 3600.0)} & mine == set()
             await trans.rollback()
+    finally:
+        await engine.dispose()
+
+
+async def test_active_job_ids_are_returned_in_creation_order(migrated: None) -> None:
+    """The refusal lists its blocking jobs in a STABLE, creation-first order.
+
+    delete_project's error names the jobs the caller must wait for or cancel
+    (#151). Two calls returning them in different orders make the refusal read
+    as a different answer each time, and an operator working down the list
+    cannot tell whether progress is being made.
+
+    The fixture is built to contradict BOTH sort keys, because a natural one
+    contradicts neither and the test then pins nothing (measured: with two
+    rows written in one transaction, `created_at` ties, so dropping it from
+    the ORDER BY left this green — and dropping the ORDER BY entirely was a
+    coin flip against two random uuids):
+
+    * THREE rows share a ``created_at``, inserted NON-MONOTONICALLY (3, 2, 4).
+      Two tied rows are not enough: a seq scan returns insertion order and a
+      backward index scan returns its exact reverse, so whichever way you
+      insert them, one of "no ORDER BY" and "created_at only" coincidentally
+      matches and goes unpinned. With 3-2-4 the expectation ``[2,3,4]``
+      differs from insertion order ``[3,2,4]`` AND from its reverse
+      ``[4,2,3]``, so neither plan can fake it.
+    * ``newer_lowest`` is created LATER but carries the lowest id, so ordering
+      by id alone would float it to the front. It must come last.
+
+    Timestamps and ids are explicit rather than server-generated: `now()` is
+    transaction-stable, so two rows written together would tie no matter how
+    the test is arranged, and uuid4s cannot be relied on to sort any way.
+    """
+    engine = _engine()
+    project = _proj()
+    older = datetime(2026, 1, 1, tzinfo=UTC)
+    newer = datetime(2026, 1, 2, tzinfo=UTC)
+    # inserted 3, 2, 4 — unequal to both the expected order and its reverse
+    tied_first, tied_second, tied_third = (uuid.UUID(int=n) for n in (3, 2, 4))
+    newer_lowest = uuid.UUID(int=1)
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            try:
+                await create_project(conn, name=project)
+                for job_id, created in (
+                    (tied_first, older),  # id 3 — inserted first, expected second
+                    (tied_second, older),  # id 2 — expected FIRST
+                    (tied_third, older),  # id 4 — expected third
+                    (newer_lowest, newer),  # id 1 — expected LAST, despite the id
+                ):
+                    await conn.execute(
+                        jobs.insert().values(
+                            id=job_id,
+                            project=project,
+                            kind="build",
+                            status="queued",
+                            created_at=created,
+                        )
+                    )
+
+                ordered = await active_job_ids(conn, project)
+                assert ordered == [tied_second, tied_first, tied_third, newer_lowest], (
+                    "creation order first, id only as the same-instant tie-break"
+                )
+                assert ordered == await active_job_ids(conn, project)  # stable across calls
+            finally:
+                await trans.rollback()  # nothing lands in the dev DB (H11)
     finally:
         await engine.dispose()

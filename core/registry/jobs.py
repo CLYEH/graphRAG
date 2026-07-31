@@ -560,9 +560,39 @@ async def capture_config_snapshot(
     return row.config_snapshot if row is not None else live_config
 
 
+async def active_job_ids(conn: AsyncConnection, project: str) -> list[uuid.UUID]:
+    """The still-running (queued/running) job ids for a project.
+
+    The delete guard used to read only the COUNT, and its refusal message says
+    "wait or cancel them first" — a remedy the caller could not walk: the ids
+    are not in the error, and no listing endpoint exposes them, so the one job
+    blocking the delete was unreachable through the API (#151). Ordered by
+    creation so the refusal is stable across calls.
+    """
+    rows = (
+        await conn.execute(
+            sa.select(tables.jobs.c.id)
+            .where(
+                tables.jobs.c.project == project,
+                tables.jobs.c.status.in_(_ACTIVE_STATUSES),
+            )
+            .order_by(tables.jobs.c.created_at, tables.jobs.c.id)
+        )
+    ).fetchall()
+    return [row.id for row in rows]
+
+
 async def count_active_jobs(conn: AsyncConnection, project: str) -> int:
-    """Number of still-running (queued/running) jobs for a project — the
-    delete_project guard reads this to refuse deletion mid-operation."""
+    """Number of still-running (queued/running) jobs for a project.
+
+    The delete guard now reads :func:`active_job_ids` (its refusal has to NAME
+    the jobs, #151); this is the gauge side of that same population —
+    ``/health``'s ``counts.active_jobs``, which exists to explain that refusal.
+    Both must count the same rows. What they actually share is the STATUS
+    VOCABULARY (``_ACTIVE_STATUSES``) — the where-clause itself is written out
+    at each of its three readers (here, :func:`active_job_ids`, and the
+    JOB_CONFLICT exclusivity probe), so the vocabulary is the single source
+    that keeps them agreeing."""
     return int(
         (
             await conn.execute(

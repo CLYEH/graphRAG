@@ -32,6 +32,7 @@ const COUNT_LABELS: Record<string, string> = {
   needs_review_relations: "待審關聯",
   low_confidence_relations: "低信心關聯",
   missing_evidence_relations: "缺證據關聯",
+  active_jobs: "進行中的工作",
 };
 
 // A non-zero quality count deep-links into its governance tab (`../review?tab=`).

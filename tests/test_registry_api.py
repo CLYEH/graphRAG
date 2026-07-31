@@ -100,8 +100,17 @@ def test_translate_registry_error_maps_each_domain_error() -> None:
     assert ex.code is ErrorCode.VALIDATION_ERROR and ex.details == {"name": "p"}
     hb = translate_registry_error(ProjectHasBuildsError("p", 3))
     assert hb.code is ErrorCode.VALIDATION_ERROR and hb.details == {"project": "p", "builds": 3}
-    aj = translate_registry_error(ProjectHasActiveJobsError("p", 2))
-    assert aj.code is ErrorCode.VALIDATION_ERROR and aj.details == {"project": "p", "jobs": 2}
+    blocking = [uuid.UUID(int=1), uuid.UUID(int=2)]
+    aj = translate_registry_error(ProjectHasActiveJobsError("p", blocking))
+    assert aj.code is ErrorCode.VALIDATION_ERROR
+    # the count STAYS (existing consumers read it) and the ids ride alongside,
+    # so the message's "wait or cancel them first" names something the caller
+    # can actually reach via GET /jobs/{id} (#151)
+    assert aj.details == {
+        "project": "p",
+        "jobs": 2,
+        "job_ids": [str(job_id) for job_id in blocking],
+    }
     # an unexpected error is re-raised, never silently reshaped into a 4xx
     with pytest.raises(RuntimeError):
         translate_registry_error(RuntimeError("boom"))

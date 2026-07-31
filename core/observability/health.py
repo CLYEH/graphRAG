@@ -38,7 +38,12 @@ SEMANTICS (spec-first — the judge-surface lesson):
     Ontology proposals are not build-scoped and stay project-wide.
 - **Metrics** are point-in-time counts, active-build-scoped where the metric
   is about content (docs/chunks/entities/relations), project-scoped where it
-  is about workflow (builds, pending review). ``low_confidence_relations``
+  is about workflow (builds, pending review, in-flight jobs).
+  ``active_jobs`` counts queued/running jobs THROUGH ``count_active_jobs`` —
+  the delete guard refuses on that same population, and this gauge exists to
+  answer the "wait for what" its refusal raises, so a transcribed predicate
+  here would fork the denominator from the thing it explains.
+  ``low_confidence_relations``
   counts ACTIVE relations with ``confidence < LOW_CONFIDENCE_BELOW`` (🔧 the
   module constant is the ONE tuning point — the /relations confidence facet
   reads the same constant, so gauge and list can never disagree; GOV2-facet);
@@ -66,6 +71,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from core.builds.lifecycle import drift_failures, list_builds
 from core.config import get_settings
 from core.eval.spec import is_eval_regression
+from core.registry.jobs import count_active_jobs
 from core.stores import tables
 
 #: what the drift probe can raise per store (mirrors the MCP layer's
@@ -250,6 +256,26 @@ async def health_report(
             ),
         ),
     }
+    # Jobs IN FLIGHT (#151). §19's other counts are all about the build's
+    # CONTENT, which is why a project with a queued job read as entirely clean:
+    # /builds shows nothing (the job may not have minted a build yet), /health
+    # said healthy, and /metrics agreed — while that same job refuses DELETE.
+    # An operator following the refusal's "wait or cancel them first" had no
+    # surface answering "wait for what".
+    #
+    # A COUNT is the whole change available here without touching the frozen
+    # contract: HealthStatus's enum has no value for "busy" (and a job in
+    # flight is not unhealthy — it is the normal build path), and WarningCode
+    # has none either (STORE_UNAVAILABLE would be a lie, PARTIAL_RESULTS is
+    # about degraded retrieval). counts is additionalProperties-typed, so the
+    # number rides the frozen shape as-is.
+    # Through count_active_jobs, NOT a local status literal: this gauge exists
+    # to explain the delete guard's refusal, so it must count the SAME
+    # population. A transcribed ("queued","running") would fork the denominator
+    # from the guard and mislead the operator at exactly the moment this is
+    # meant to help — the rule this file already states for LOW_CONFIDENCE_BELOW
+    # ("ONE tuning point, both consumers move together", Codex #109).
+    metrics["active_jobs"] = await count_active_jobs(conn, project)
     # §19's "pending review" is the WHOLE §17 queue — ANY of its pending
     # states alone must light Needs review (Codex rounds 4/8: a
     # proposal-only or needs_review-only backlog was hidden)
