@@ -76,7 +76,7 @@ async def sql_query(
 
     ``expose_debug`` carries §16's ``debug`` gate down from the caller (which
     combines ``query_policy.expose_debug`` with the caller's role, §21). It
-    surfaces the SQL this mode actually GENERATED and ran — the one fact that
+    surfaces the SQL this mode GENERATED from the question — the one fact that
     makes a result of this shape interpretable, because the caller wrote a
     QUESTION and the rows came from a machine translation of it they never
     saw. Without it an empty answer is unreadable: "no matching data" and "the
@@ -95,7 +95,9 @@ async def sql_query(
             query,
             (),
             (_warn("MODE_SKIPPED", "sql mode is disabled"),),
-            _debug(expose_debug, started, sql=None, note="sql mode is disabled"),
+            _debug(
+                expose_debug, started, sql=None, note="sql mode is disabled", reached_store=False
+            ),
         )
 
     # Phase 1 — schema discovery in its OWN short timed transaction, ended before
@@ -138,12 +140,21 @@ async def sql_query(
             (),
             (_warn(GUARDRAIL_WARNING_CODE, blocked.reason),),
             _debug(
-                expose_debug, started, sql=validated.statement.sql(), note="refused at execution"
+                expose_debug,
+                started,
+                sql=validated.statement.sql(dialect="postgres"),
+                note="refused at execution",
             ),
         )
     except DBAPIError as exc:
         return _degrade(
-            reader, query, exc, policy.timeout_ms, expose_debug, started, validated.statement.sql()
+            reader,
+            query,
+            exc,
+            policy.timeout_ms,
+            expose_debug,
+            started,
+            validated.statement.sql(dialect="postgres"),
         )
 
     results, dropped = _to_results(rows, validated.table)
@@ -162,7 +173,12 @@ async def sql_query(
         query,
         results,
         tuple(warnings),
-        _debug(expose_debug, started, sql=validated.statement.sql(), note=f"{len(results)} row(s)"),
+        _debug(
+            expose_debug,
+            started,
+            sql=validated.statement.sql(dialect="postgres"),
+            note=f"{len(results)} row(s)",
+        ),
     )
 
 
@@ -303,7 +319,14 @@ def _response(
     )
 
 
-def _debug(expose: bool, started: float, *, sql: str | None, note: str) -> dict[str, Any] | None:
+def _debug(
+    expose: bool,
+    started: float,
+    *,
+    sql: str | None,
+    note: str,
+    reached_store: bool = True,
+) -> dict[str, Any] | None:
     """The §16 debug block for one sql call, or None when not authorised.
 
     ``retrieval_plan`` carries the GENERATED SQL — the field hybrid already
@@ -313,14 +336,25 @@ def _debug(expose: bool, started: float, *, sql: str | None, note: str) -> dict[
     answer to "what ran".
 
     Shape matches the frozen ``Debug`` (§16: stores_used · retrieval_plan ·
-    routing_decision · latency_ms, additive evolution). Single-mode, so
-    ``routing_decision`` records that there was nothing to route.
+    routing_decision · latency_ms, additive evolution). ``routing_decision``
+    is NULL because the schema says so for single-mode tools that bypass the
+    router, and ``reached_store`` is False on the one path that answers
+    without touching Postgres at all.
     """
     if not expose:
         return None
     return {
-        "stores_used": ["postgres"],
+        # ONLY what was actually read. The mode-disabled path reaches no store,
+        # and a provenance block whose whole argument is honesty must not claim
+        # one — the rule hybrid already keeps by computing this from COMPLETED
+        # modes only.
+        "stores_used": ["postgres"] if reached_store else [],
         "retrieval_plan": [f"sql: {note}"] + ([f"generated: {sql}"] if sql else []),
-        "routing_decision": {"selected": ["sql"], "skipped": [], "reason": "single-mode call"},
+        # NULL by contract, not by omission: the frozen schema says "Null for
+        # single-mode tools that bypass the router", and there is no router
+        # here to trace. Fabricating one is also user-visible — the Console
+        # renders routing_decision and nothing else of this block, so a made-up
+        # trace would be the ONE part of it a person sees.
+        "routing_decision": None,
         "latency_ms": max(0, int((time.monotonic() - started) * 1000)),
     }

@@ -101,7 +101,9 @@ class McpResponse:
     ``graph_context`` and ``debug`` are pre-serialized (``Mapping``/``None``):
     the semantic tool has neither (single-mode, no router trace), so both are
     ``None``; graph-flavored tools and the C8 tool boundary (which reads
-    ``query_policy.expose_debug`` and measures latency) fill them in.
+    ``query_policy.expose_debug`` and measures latency) fill them in — EXCEPT
+    where only the mode holds the fact worth reporting: the sql mode builds its
+    own block because the generated SQL exists nowhere else (#157).
     """
 
     query: str

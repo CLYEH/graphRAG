@@ -340,9 +340,14 @@ def test_the_generated_sql_is_surfaced_when_debug_is_authorised() -> None:
     reader = _FakeReader(rows=[])
     response = _run(reader, _FakeLLM("SELECT * FROM orders"), expose_debug=True)
 
+    _VALIDATOR.validate(response.to_dict())  # the block crosses the FROZEN schema
     assert response.results == ()
     assert response.warnings == ()  # nothing was refused — that is the whole problem
     assert response.debug is not None
+    # null by contract for a single-mode tool — "Null for single-mode tools
+    # that bypass the router"; a fabricated trace validates structurally, so
+    # only the validator plus this assertion catch it
+    assert response.debug["routing_decision"] is None
     plan = response.debug["retrieval_plan"]
     assert any("orders" in line for line in plan), plan
     assert response.debug["stores_used"] == ["postgres"]
@@ -354,7 +359,9 @@ def test_debug_is_withheld_unless_the_caller_is_authorised() -> None:
     free to hand out. The DEFAULT must be closed: a caller that forgets to pass
     the flag gets nothing, rather than the schema leaking on every call."""
     reader = _FakeReader(rows=[])
-    assert _run(reader, _FakeLLM("SELECT * FROM orders")).debug is None
+    response = _run(reader, _FakeLLM("SELECT * FROM orders"))
+    _VALIDATOR.validate(response.to_dict())  # debug null is contract-legal too
+    assert response.debug is None
 
 
 def test_a_refused_query_still_shows_what_was_refused() -> None:
@@ -365,6 +372,7 @@ def test_a_refused_query_still_shows_what_was_refused() -> None:
     reader = _FakeReader(rows=[])
     response = _run(reader, _FakeLLM("DELETE FROM orders"), expose_debug=True)
 
+    _VALIDATOR.validate(response.to_dict())
     assert [w.code for w in response.warnings] == [GUARDRAIL_WARNING_CODE]
     assert response.debug is not None
     assert any("DELETE FROM orders" in line for line in response.debug["retrieval_plan"])
@@ -377,7 +385,10 @@ def test_a_disabled_mode_says_so_rather_than_showing_nothing() -> None:
     disabled = replace(_POLICY, enabled=False)
     response = _run(_FakeReader(rows=[]), _FakeLLM("SELECT 1"), disabled, expose_debug=True)
 
+    _VALIDATOR.validate(response.to_dict())
     assert [w.code for w in response.warnings] == ["MODE_SKIPPED"]
     assert response.debug is not None
     assert any("disabled" in line for line in response.debug["retrieval_plan"])
     assert not any("generated:" in line for line in response.debug["retrieval_plan"])
+    # ...and it claims NO store: nothing was read to produce this answer
+    assert response.debug["stores_used"] == []
