@@ -1,7 +1,8 @@
 # LOOP — controlled agent workflow
 
-How agents make changes here safely. Guardrails: [`CLAUDE.md`](../CLAUDE.md). Queue:
-[`TASKS.md`](../TASKS.md). Design: [`DESIGN.md`](DESIGN.md).
+How agents make changes here safely. Guardrails: [`CLAUDE.md`](../CLAUDE.md). Queue: the
+repo's **open GitHub issues** ([`TASKS.md`](../TASKS.md) is the historical build-out record).
+Design: [`DESIGN.md`](DESIGN.md).
 
 ## Per-iteration protocol — one task = one branch = one PR
 Two review gates guard every task: a **local agent review** before push, and the
@@ -202,7 +203,8 @@ loop back to step 3.
    - **Repeated class** ⇒ the existing prevention isn't biting — strengthen it (sharpen
      the reviewer checklist / hook / CI check that should have caught it).
    - **New class** ⇒ add it to the catalog, and when it is mechanically preventable,
-     file an `H<n>` harness task in TASKS.md.
+     file it as a **harness issue** (the historical `H<n>` numbering lives in TASKS.md,
+     which is no longer edited to add work).
    - Nothing new ⇒ note nothing and move on; the retro is a sweep, not a ceremony.
    Record the retro as **class-entry updates only** (a sub-point with the PR anchor on
    the matching class, or a new stable-numbered class); per-PR narrative blocks are
@@ -216,9 +218,9 @@ loop back to step 3.
    fails the PR that wrote it). Finish the retro by running
    `uv run python scripts/archive_task.py <TASK-ID>`. It moves the entry's as-built
    narrative out of `TASKS.md` into `docs/TASKS_ARCHIVE.md`, leaving the one-line
-   summary the queue actually needs — the loop re-reads `TASKS.md` on every iteration
-   to pick the next task, so prose about finished work is a recurring context tax on
-   a decision it cannot inform (H22: it had reached 83% of the file). The `governance`
+   summary the record actually needs — `TASKS.md` is loaded as context whenever the
+   file is consulted, so prose about finished work is a recurring tax on decisions it
+   cannot inform (H22: it had reached 83% of the file). The `governance`
    CI job fails the PR if a `- [x]` line is still over the ceiling, so this is enforced,
    not remembered. **Never open the archive to read it** — the script appends, and
    appending needs no read; look entries up with `grep -A40 '^## <TASK-ID>'`. Reading
@@ -281,8 +283,9 @@ Two options — both use the same protocol above:
   > a hook blocks merge otherwise); if Codex comments, triage each suggestion per step 7
   > (must-fix → fix on the same branch and re-review; else reply-and-resolve with the
   > step-7 checkable rationale).
-  > Only once CI is green and Codex has `+1`'d, merge (the checkoff rode in the PR), run
-  > the step-8 post-merge retro, then take the next task. If Codex never `+1`s, stop and
+  > Only once CI is green and Codex has `+1`'d, merge (the issue closure — or, for a
+  > TASKS.md-era item, the checkoff — rode in the PR), run
+  > the step-8 post-merge retro, then take the next issue. If Codex never `+1`s, stop and
   > ask — don't merge around it.
   > If a task is ambiguous or conflicts with DESIGN.md, stop and ask instead of guessing.
 
