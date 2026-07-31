@@ -8,9 +8,17 @@ Two review gates guard every task: a **local agent review** before push, and the
 **GitHub gates** (CI + bound Codex review) before merge. A failure at either sends the
 loop back to step 3.
 
-1. **Pick** the top unchecked task in `TASKS.md` (respect deps). If ambiguous or in
-   conflict with `DESIGN.md`, **stop and ask** — don't guess.
-   Then branch off latest main: `git switch main && git pull && git switch -c task/<id>`.
+1. **Pick** the next open GitHub issue (owner, 2026-07-30: **issues are the queue**; `TASKS.md`
+   is the historical build-out record and is not edited for new work). Work by severity, then
+   by what unblocks the most. If ambiguous or in conflict with `DESIGN.md`, **stop and ask** —
+   don't guess. **Re-verify the issue before implementing it.** An issue filed against a stale
+   or incomplete stack can be a false positive, or real with the wrong severity: the local
+   stack is five layers (docker ×4 · API · MCP gateway · Console · **arq worker**), none of
+   which reload on their own, so compare each process's start time against `git log -1
+   --format=%cI` and confirm the behaviour still reproduces before writing any code.
+   Then branch off latest main: `git switch main && git pull && git switch -c bug/<issue>`
+   (`task/<id>` remains valid for a `TASKS.md`-era item and is the only prefix that owes a
+   `TASKS.md` checkoff).
 2. **Scope** the change to that task only (surgical; no unrelated refactors).
 3. **Implement** following the guardrails in `CLAUDE.md`, with tests for the tier.
 4. **Verify (local gates)** — run until green (tier that matches the change):
@@ -61,7 +69,7 @@ loop back to step 3.
 6. **Commit → push → open PR** (one task, one PR):
    ```bash
    git commit -m "<id>: <summary>"
-   git push -u origin task/<id>
+   git push -u origin bug/<issue>        # task/<id> for a TASKS.md-era item
    gh pr create --fill --base main
    ```
 7. **Wait for GitHub gates** on the PR — all must be satisfied:
@@ -112,8 +120,18 @@ loop back to step 3.
      duplicate pass. So before *any* poke — including on a watcher `20`=timeout —
      re-query the reactions and unresolved threads, and poke **only** when there is
      genuinely no `eyes`, no `+1`, and no Codex thread/comment/review that landed after
-     your last push. A push **auto-triggers** a Codex re-review, so **never poke right
-     after pushing**: wait for `eyes` to appear, then wait for the verdict. Two watcher
+     your last push.
+
+     **On the auto-trigger (measured, 2026-07-30).** This file used to say a push
+     auto-triggers a re-review and therefore to never poke after pushing. Across **five
+     consecutive rounds on PR #166** that did not happen once: every push was followed by a
+     full watcher cycle (60 polls, ~30 min) with no reaction, no review and no comment, and
+     Codex responded within minutes of an explicit `@codex review` every time. So the rule
+     is now: after pushing, **wait for `eyes` up to ~10 minutes; if it has not appeared,
+     poke**. The quota-protecting half is unchanged and is the part that actually matters —
+     **never poke while `eyes` is showing**, because that is when a second request buys a
+     duplicate pass. Re-measure before trusting this either way: if the auto-trigger starts
+     working, waiting it out becomes correct again. Two watcher
      failure modes that have caused false pokes, both to guard against: (1) a `20`=timeout
      can be a *stale-review bootstrap* re-flagging an already-triaged response — confirm
      the flagged response is genuinely new (submitted after your last push) before acting;
@@ -173,7 +191,8 @@ loop back to step 3.
    `main`** (never off the waiting branch). Each PR still merges only when its own gates
    clear; if the waiting PR gets Codex feedback, finishing it takes priority over new work.
 8. **Merge & advance** — only after Codex `+1` on the head commit (the hook enforces it):
-   merge the PR (its TASKS.md checkoff rode in it), delete the branch,
+   merge the PR (a `task/<id>` PR carries its TASKS.md checkoff; a `bug/<issue>` PR closes
+   its issue instead), delete the branch,
    `git switch main && git pull`.
 
    **Post-merge retro (owner rule, 2026-07-03):** before returning to step 1, sweep the
@@ -254,8 +273,9 @@ Never weaken `ruff`/`mypy`/`tsconfig`/tests to go green.
 Two options — both use the same protocol above:
 
 - **Claude Code `/loop`** — recurring self-paced runs. Suggested prompt:
-  > Do the next unchecked task in TASKS.md following docs/LOOP.md's 8-step protocol:
-  > branch `task/<id>`, implement with tests, run `uv run poe check-all` until green,
+  > Do the next open GitHub issue following docs/LOOP.md's 8-step protocol: re-verify it
+  > reproduces on current main first, then branch `bug/<issue>` (`task/<id>` only for a
+  > TASKS.md-era item), implement with tests, run `uv run poe check-all` until green,
   > then run the `code-reviewer` subagent — if it FAILs, fix and re-review. Then commit,
   > push, and `gh pr create`. Wait for CI green **and** Codex to react `+1` (no exceptions —
   > a hook blocks merge otherwise); if Codex comments, triage each suggestion per step 7

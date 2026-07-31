@@ -59,7 +59,8 @@ cd web && npm run test:e2e   # Console e2e (once: npx playwright install)
 ```
 
 ## The loop (controlled agent workflow)
-Work is driven task-by-task from [`TASKS.md`](TASKS.md); the protocol and guardrails
+Work is driven task-by-task from the repo's **open GitHub issues** ([`TASKS.md`](TASKS.md) is
+the historical build-out record); the protocol and guardrails
 are in [`docs/LOOP.md`](docs/LOOP.md). One task = one PR, and "done" is four gates, not just a
 green test run: **local gates** (`uv run poe check-all`) → **agent code review** → **CI green** →
 **Codex approval**. The full flow, including what to do when a gate fails, is in `docs/LOOP.md`.

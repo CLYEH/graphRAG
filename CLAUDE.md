@@ -2,7 +2,9 @@
 
 Read this before working in this repo. The full design & rationale is the source of
 truth: **[`docs/DESIGN.md`](docs/DESIGN.md)** (spec **v0.5, implementation-freeze**).
-Work is driven task-by-task per **[`docs/LOOP.md`](docs/LOOP.md)** from **[`TASKS.md`](TASKS.md)**.
+Work is driven task-by-task per **[`docs/LOOP.md`](docs/LOOP.md)**. **The queue is the repo's
+OPEN GitHub issues** (owner, 2026-07-30) — `TASKS.md` is the historical record of the build-out
+and is no longer edited to add or check off work.
 
 ## Definition of Done (one task = one PR)
 A task is done only when it passes **four gates** and its PR merges (full flow in [`docs/LOOP.md`](docs/LOOP.md)):
@@ -23,7 +25,10 @@ fast-forward to `main`. Mechanically enforced by the push-gate hook; see LOOP.md
 "Doc-only fast lane". Any non-`.md` file ⇒ full lane above.
 A failure at gate 2, 3, or 4 sends you back to implementation. Never loosen
 `ruff`/`mypy`/`tsconfig`/test configs to pass — fix the code. Push is per-task to a
-`task/<id>` branch → PR; never commit straight to `main`.
+`bug/<issue>` branch (or `task/<id>` for a TASKS.md-era item) → PR; never commit straight to
+`main`. Only the `task/*` prefix makes `scripts/governance-check.sh` demand a `TASKS.md`
+checkoff; every non-`docs/*` branch takes the full lane either way
+(`.claude/hooks/require-push-gates.sh`), so review strength does not depend on the prefix.
 Backend-only gate: `uv run poe check` · Frontend-only: `uv run poe web-check`.
 
 ### Tests — write them with every task
